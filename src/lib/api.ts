@@ -20,6 +20,8 @@ import type {
   GithubStatus,
   RepoStats,
   Settings,
+  SkillSource,
+  SkillSourceResult,
   UpdateCheckOutcome,
 } from "./types";
 
@@ -70,6 +72,34 @@ export function settingsSet(settings: Settings): Promise<Settings> {
  */
 export function settingsReset(): Promise<Settings> {
   return invoke<Settings>("settings_reset");
+}
+
+// ============================================================
+// Skill sources
+// ============================================================
+
+export function skillSourcesList(): Promise<SkillSource[]> {
+  return invoke<SkillSource[]>("skill_sources_list");
+}
+
+export function skillSourceAddLocal(root: string): Promise<SkillSource> {
+  return invoke<SkillSource>("skill_source_add_local", { root });
+}
+
+export function skillSourceAddGithub(
+  repository: string,
+  gitRef: string | null = null,
+  subdirectory: string | null = null,
+): Promise<SkillSource> {
+  return invoke<SkillSource>("skill_source_add_github", {
+    repository,
+    gitRef,
+    subdirectory,
+  });
+}
+
+export function skillSourceRefresh(sourceId: string): Promise<SkillSourceResult> {
+  return invoke<SkillSourceResult>("skill_source_refresh", { sourceId });
 }
 
 // ============================================================

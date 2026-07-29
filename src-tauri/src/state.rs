@@ -35,6 +35,9 @@ pub struct AppState {
     /// `catalog_refresh_in_flight`.
     pub corpus_refresh_in_flight: Arc<Mutex<()>>,
 
+    /// Serializes read-modify-write updates to `state/skill-sources.json`.
+    pub skill_sources_write_lock: Arc<Mutex<()>>,
+
     /// Persisted user settings (Phase 12d). Three-state container that
     /// distinguishes file-absent (defaults apply) from file-corrupt
     /// (fail closed — every outbound call denied until repaired).
@@ -82,6 +85,7 @@ impl AppState {
             app_data_dir,
             corpus_cache: Arc::new(Mutex::new(None)),
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
+            skill_sources_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(settings_state)),
             updater_state: crate::commands::updater::empty_state(),
         })

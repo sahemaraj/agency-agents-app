@@ -11,7 +11,6 @@ mod github;
 mod install;
 mod registry;
 mod render;
-#[cfg(test)]
 mod skills;
 mod state;
 mod types;
@@ -171,6 +170,9 @@ pub fn run() {
             corpus::catalog_status,
             corpus::catalog_check_updates,
             corpus::runbooks_list,
+            skills::skill_sources_list,
+            skills::skill_source_add_local,
+            skills::skill_source_refresh,
             // Phase 2 — install + reconcile (contracts.md §C). The cross-tool
             // agent state layer: render/ledger/reconcile/tools/projects.
             install::install_agent,

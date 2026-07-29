@@ -6,6 +6,79 @@
 use serde::{Deserialize, Serialize};
 
 // =========================================================
+// Agent Skills — trusted source subsystem
+// =========================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SkillSourceKind {
+    Local {
+        root: String,
+    },
+    Github {
+        repository: String,
+        git_ref: Option<String>,
+        subdirectory: Option<String>,
+        active_checkout: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSource {
+    pub id: String,
+    pub kind: SkillSourceKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPackageFile {
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillValidationCode {
+    InvalidMetadata,
+    UnsafeEntry,
+    Io,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillValidationError {
+    pub code: SkillValidationCode,
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPackageResult {
+    pub source_id: String,
+    pub relative_path: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub files: Vec<SkillPackageFile>,
+    pub errors: Vec<SkillValidationError>,
+    pub installable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSourceResult {
+    pub source: SkillSource,
+    pub packages: Vec<SkillPackageResult>,
+    pub errors: Vec<SkillValidationError>,
+}
+
+// =========================================================
 // Agency Agents — corpus subsystem (contracts.md §A)
 // =========================================================
 //

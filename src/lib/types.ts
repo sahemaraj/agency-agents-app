@@ -310,6 +310,51 @@ export type Tool = string;
     project-scoped tools install into a tracked `projectPath`. */
 export type Scope = "user" | "project";
 
+export type SkillSourceKind =
+  | { kind: "local"; root: string }
+  | {
+      kind: "github";
+      repository: string;
+      gitRef: string | null;
+      subdirectory: string | null;
+      activeCheckout: string | null;
+    };
+
+export interface SkillSource {
+  id: string;
+  kind: SkillSourceKind;
+}
+
+export interface SkillPackageFile {
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export type SkillValidationCode = "invalidMetadata" | "unsafeEntry" | "io";
+
+export interface SkillValidationError {
+  code: SkillValidationCode;
+  path: string;
+  message: string;
+}
+
+export interface SkillPackageResult {
+  sourceId: string;
+  relativePath: string;
+  name: string | null;
+  description: string | null;
+  files: SkillPackageFile[];
+  errors: SkillValidationError[];
+  installable: boolean;
+}
+
+export interface SkillSourceResult {
+  source: SkillSource;
+  packages: SkillPackageResult[];
+  errors: SkillValidationError[];
+}
+
 /**
  * An agent as parsed from a single corpus `.md` file. `body` is the
  * markdown persona — empty in list views (`corpusList`) to keep payloads
