@@ -1011,7 +1011,7 @@ fn has_git_dir(root: &Path) -> bool {
 
 /// Run `git` with `args` (optionally in `cwd`) off the async runtime. Errors
 /// carry git's stderr so failures are diagnosable.
-async fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String, AppError> {
+pub(crate) async fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String, AppError> {
     let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let cwd = cwd.map(|p| p.to_path_buf());
     let out = tokio::task::spawn_blocking(move || {

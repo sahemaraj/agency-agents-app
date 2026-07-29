@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fs::{File, Metadata};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::corpus::state_dir;
 use crate::error::AppError;
+use crate::github::url::parse_github_url;
 use crate::state::AppState;
 use crate::types::{
     SkillPackageFile, SkillPackageResult, SkillSource, SkillSourceKind, SkillSourceResult,
@@ -20,6 +21,40 @@ use crate::util::fs::atomic_write;
 pub const MAX_SKILL_FILES: usize = 512;
 pub const MAX_SKILL_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_SKILL_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+
+#[cfg(test)]
+type RefreshFsProbe = Vec<(&'static str, std::thread::ThreadId)>;
+
+#[cfg(test)]
+fn refresh_fs_probe() -> &'static std::sync::Mutex<RefreshFsProbe> {
+    static PROBE: std::sync::OnceLock<std::sync::Mutex<RefreshFsProbe>> =
+        std::sync::OnceLock::new();
+    PROBE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn record_refresh_fs(event: &'static str) {
+    refresh_fs_probe()
+        .lock()
+        .expect("refresh filesystem probe")
+        .push((event, std::thread::current().id()));
+}
+
+#[cfg(not(test))]
+fn record_refresh_fs(_: &'static str) {}
+
+#[cfg(test)]
+fn reset_refresh_fs_probe() {
+    refresh_fs_probe()
+        .lock()
+        .expect("refresh filesystem probe")
+        .clear();
+}
+
+#[cfg(test)]
+fn take_refresh_fs_probe() -> RefreshFsProbe {
+    std::mem::take(&mut *refresh_fs_probe().lock().expect("refresh filesystem probe"))
+}
 
 pub(crate) fn skill_sources_path(app_data_dir: &Path) -> PathBuf {
     state_dir(app_data_dir).join("skill-sources.json")
@@ -100,6 +135,355 @@ pub(crate) async fn add_local_source(
     sources.push(source.clone());
     save_skill_sources(&state.app_data_dir, &sources).await?;
     Ok(source)
+}
+
+fn canonical_github_repository(repository: &str) -> Result<String, AppError> {
+    let trimmed = repository.trim();
+    let authority = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    if authority.contains('@') {
+        return Err(AppError::InvalidArgument {
+            message: "GitHub repository URL must not contain credentials".into(),
+        });
+    }
+    let repo = parse_github_url(trimmed).ok_or_else(|| AppError::InvalidArgument {
+        message: "repository must be a valid github.com repository URL".into(),
+    })?;
+    Ok(format!(
+        "https://github.com/{}/{}.git",
+        repo.owner, repo.repo
+    ))
+}
+
+fn validated_git_ref(git_ref: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(value) = git_ref else {
+        return Ok(None);
+    };
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.ends_with(['.', '/'])
+        || value.contains([
+            ' ', '\t', '\n', '\r', '\\', '~', '^', ':', '?', '*', '[', '\0',
+        ])
+        || value.contains("..")
+        || value.contains("//")
+        || value.contains("@{")
+        || value.split('/').any(|part| part.ends_with(".lock"))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Git ref is empty, option-like, or not a normalized ref name".into(),
+        });
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn validated_subdirectory(subdirectory: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(value) = subdirectory else {
+        return Ok(None);
+    };
+    let path = Path::new(value);
+    let parts = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_str().ok_or_else(|| AppError::InvalidArgument {
+                message: "GitHub source subdirectory must be valid UTF-8".into(),
+            }),
+            _ => Err(AppError::InvalidArgument {
+                message: "GitHub source subdirectory must be normalized and relative".into(),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let normalized = parts.join("/");
+    if normalized.is_empty() || normalized != value || value.contains('\\') {
+        return Err(AppError::InvalidArgument {
+            message: "GitHub source subdirectory must be normalized and relative".into(),
+        });
+    }
+    Ok(Some(normalized))
+}
+
+pub(crate) async fn add_github_source(
+    state: &AppState,
+    repository: &str,
+    git_ref: Option<&str>,
+    subdirectory: Option<&str>,
+) -> Result<SkillSource, AppError> {
+    let repository = canonical_github_repository(repository)?;
+    let git_ref = validated_git_ref(git_ref)?;
+    let subdirectory = validated_subdirectory(subdirectory)?;
+
+    let _guard = state.skill_sources_write_lock.lock().await;
+    let mut sources = load_skill_sources(&state.app_data_dir).await?;
+    if let Some(existing) = sources.iter().find(|source| {
+        matches!(
+            &source.kind,
+            SkillSourceKind::Github {
+                repository: existing_repository,
+                git_ref: existing_ref,
+                subdirectory: existing_subdirectory,
+                ..
+            } if existing_repository == &repository
+                && existing_ref == &git_ref
+                && existing_subdirectory == &subdirectory
+        )
+    }) {
+        return Ok(existing.clone());
+    }
+
+    let source = SkillSource {
+        id: Uuid::new_v4().to_string(),
+        kind: SkillSourceKind::Github {
+            repository,
+            git_ref,
+            subdirectory,
+            active_checkout: None,
+        },
+    };
+    sources.push(source.clone());
+    save_skill_sources(&state.app_data_dir, &sources).await?;
+    Ok(source)
+}
+
+async fn refresh_fs<T, F>(event: &'static str, operation: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        record_refresh_fs(event);
+        operation()
+    })
+    .await
+    .map_err(|error| AppError::Internal {
+        message: format!("skill source refresh filesystem task failed: {error}"),
+    })?
+}
+
+async fn cleanup_unreferenced(path: PathBuf) {
+    let _ = refresh_fs("failed_stage_cleanup", move || {
+        record_refresh_fs("recursive_cleanup");
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(AppError::Io {
+                message: format!("remove unreferenced checkout {}: {error}", path.display()),
+            }),
+        }
+    })
+    .await;
+}
+
+pub(crate) async fn refresh_git_source(
+    state: &AppState,
+    source_id: &str,
+) -> Result<SkillSourceResult, AppError> {
+    let source = load_skill_sources(&state.app_data_dir)
+        .await?
+        .into_iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("unknown skill source id: {source_id}"),
+        })?;
+    let repository = match source.kind {
+        SkillSourceKind::Github { repository, .. } => repository,
+        SkillSourceKind::Local { .. } => {
+            return Err(AppError::InvalidArgument {
+                message: "local skill sources do not use Git refresh".into(),
+            });
+        }
+    };
+    refresh_git_source_from(state, source_id, &repository).await
+}
+
+async fn refresh_git_source_from(
+    state: &AppState,
+    source_id: &str,
+    clone_source: &str,
+) -> Result<SkillSourceResult, AppError> {
+    state.require_network("skill_source_refresh").await?;
+    let _guard = state.skill_sources_write_lock.lock().await;
+    let mut sources = load_skill_sources(&state.app_data_dir).await?;
+    let source_index = sources
+        .iter()
+        .position(|source| source.id == source_id)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("unknown skill source id: {source_id}"),
+        })?;
+    let (git_ref, subdirectory) = match &sources[source_index].kind {
+        SkillSourceKind::Github {
+            git_ref,
+            subdirectory,
+            ..
+        } => (git_ref.clone(), subdirectory.clone()),
+        SkillSourceKind::Local { .. } => {
+            return Err(AppError::InvalidArgument {
+                message: "local skill sources do not use Git refresh".into(),
+            });
+        }
+    };
+
+    let managed_root = state.app_data_dir.join("skills").join("sources");
+    let staging = managed_root.join(format!(".staging-{}", Uuid::new_v4()));
+    let staging_for_create = staging.clone();
+    refresh_fs("staging_create", move || {
+        std::fs::create_dir_all(&managed_root).map_err(|error| AppError::Io {
+            message: format!(
+                "create managed skill source directory {}: {error}",
+                managed_root.display()
+            ),
+        })?;
+        std::fs::create_dir(&staging_for_create).map_err(|error| AppError::Io {
+            message: format!(
+                "create skill source staging directory {}: {error}",
+                staging_for_create.display()
+            ),
+        })
+    })
+    .await?;
+
+    let staging_arg = staging.to_string_lossy().into_owned();
+    if let Err(error) = crate::corpus::run_git(
+        &["clone", "--no-checkout", "--", clone_source, &staging_arg],
+        None,
+    )
+    .await
+    {
+        cleanup_unreferenced(staging).await;
+        return Err(error);
+    }
+    let checkout_ref = git_ref.as_deref().unwrap_or("HEAD");
+    if let Err(error) = crate::corpus::run_git(
+        &["checkout", "--detach", checkout_ref, "--"],
+        Some(&staging),
+    )
+    .await
+    {
+        cleanup_unreferenced(staging).await;
+        return Err(error);
+    }
+
+    let candidate_source = sources[source_index].clone();
+    let staging_for_validation = staging.clone();
+    let subdirectory_for_validation = subdirectory.clone();
+    let candidate = match refresh_fs("canonicalize", move || {
+        let checkout_root =
+            std::fs::canonicalize(&staging_for_validation).map_err(|error| AppError::Io {
+                message: format!(
+                    "resolve staged checkout {}: {error}",
+                    staging_for_validation.display()
+                ),
+            })?;
+        let selected = subdirectory_for_validation
+            .as_deref()
+            .map(|subdirectory| checkout_root.join(subdirectory))
+            .unwrap_or_else(|| checkout_root.clone());
+        let metadata = std::fs::symlink_metadata(&selected).map_err(|error| AppError::Io {
+            message: format!(
+                "inspect selected skill source {}: {error}",
+                selected.display()
+            ),
+        })?;
+        if metadata.file_type().is_symlink()
+            || metadata_is_reparse_point(&metadata)
+            || !metadata.is_dir()
+        {
+            return Err(AppError::InvalidArgument {
+                message: "GitHub source subdirectory must be a real directory".into(),
+            });
+        }
+        let selected = std::fs::canonicalize(&selected).map_err(|error| AppError::Io {
+            message: format!(
+                "resolve selected skill source {}: {error}",
+                selected.display()
+            ),
+        })?;
+        if !selected.starts_with(&checkout_root) {
+            return Err(AppError::InvalidArgument {
+                message: "GitHub source subdirectory resolves outside the staged checkout".into(),
+            });
+        }
+        let mut staged_source = candidate_source;
+        if let SkillSourceKind::Github {
+            active_checkout, ..
+        } = &mut staged_source.kind
+        {
+            *active_checkout = Some(selected.to_string_lossy().into_owned());
+        }
+        discover_source_blocking(staged_source)
+    })
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            cleanup_unreferenced(staging).await;
+            return Err(error);
+        }
+    };
+
+    let generation_id = Uuid::new_v4().to_string();
+    let source_directory = state.app_data_dir.join("skills/sources").join(source_id);
+    let generation = source_directory.join(&generation_id);
+    let staging_for_rename = staging.clone();
+    let generation_for_rename = generation.clone();
+    if let Err(error) = refresh_fs("activation_rename", move || {
+        std::fs::create_dir_all(&source_directory).map_err(|error| AppError::Io {
+            message: format!(
+                "create managed source directory {}: {error}",
+                source_directory.display()
+            ),
+        })?;
+        std::fs::rename(&staging_for_rename, &generation_for_rename).map_err(|error| AppError::Io {
+            message: format!(
+                "activate staged checkout {} -> {}: {error}",
+                staging_for_rename.display(),
+                generation_for_rename.display()
+            ),
+        })
+    })
+    .await
+    {
+        cleanup_unreferenced(staging).await;
+        return Err(error);
+    }
+
+    let active_checkout = subdirectory
+        .as_deref()
+        .map(|subdirectory| generation.join(subdirectory))
+        .unwrap_or_else(|| generation.clone());
+    let mut active_source = candidate.source;
+    if let SkillSourceKind::Github {
+        active_checkout: active,
+        ..
+    } = &mut active_source.kind
+    {
+        *active = Some(active_checkout.to_string_lossy().into_owned());
+    }
+    sources[source_index] = active_source.clone();
+    let bytes = serde_json::to_vec_pretty(&sources).map_err(|error| AppError::Internal {
+        message: format!("serialize skill-sources.json: {error}"),
+    })?;
+    let state_directory = state_dir(&state.app_data_dir);
+    let state_path = skill_sources_path(&state.app_data_dir);
+    let runtime = tokio::runtime::Handle::current();
+    if let Err(error) = refresh_fs("state_persist", move || {
+        std::fs::create_dir_all(&state_directory).map_err(|error| AppError::Io {
+            message: format!("create state dir {}: {error}", state_directory.display()),
+        })?;
+        runtime.block_on(atomic_write(&state_path, &bytes))
+    })
+    .await
+    {
+        cleanup_unreferenced(generation).await;
+        return Err(error);
+    }
+
+    Ok(SkillSourceResult {
+        source: active_source,
+        packages: candidate.packages,
+        errors: candidate.errors,
+    })
 }
 
 pub(crate) async fn discover_source(source: SkillSource) -> Result<SkillSourceResult, AppError> {
@@ -718,6 +1102,22 @@ pub async fn skill_source_add_local(
 }
 
 #[tauri::command]
+pub async fn skill_source_add_github(
+    state: State<'_, AppState>,
+    repository: String,
+    git_ref: Option<String>,
+    subdirectory: Option<String>,
+) -> Result<SkillSource, AppError> {
+    add_github_source(
+        &state,
+        &repository,
+        git_ref.as_deref(),
+        subdirectory.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn skill_source_refresh(
     state: State<'_, AppState>,
     source_id: String,
@@ -729,12 +1129,15 @@ pub async fn skill_source_refresh(
         .ok_or_else(|| AppError::InvalidArgument {
             message: format!("unknown skill source id: {source_id}"),
         })?;
-    discover_source(source).await
+    match source.kind {
+        SkillSourceKind::Local { .. } => discover_source(source).await,
+        SkillSourceKind::Github { .. } => refresh_git_source(&state, &source_id).await,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
 
@@ -805,7 +1208,10 @@ mod tests {
     fn local_git_repo() -> tempfile::TempDir {
         let repo = tempdir().expect("git repo");
         git(repo.path(), &["init", "-q"]);
-        git(repo.path(), &["config", "user.email", "tests@example.invalid"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "tests@example.invalid"],
+        );
         git(repo.path(), &["config", "user.name", "Tests"]);
         write_skill(repo.path(), "skills/example", "example", "Example");
         write_skill(repo.path(), "outside", "outside", "Outside");
@@ -873,10 +1279,18 @@ mod tests {
             ("https://example.com/owner/repo", None, None),
             ("https://user:secret@github.com/owner/repo", None, None),
             ("https://github.com/owner/repo", Some(""), None),
-            ("https://github.com/owner/repo", Some("--upload-pack=x"), None),
+            (
+                "https://github.com/owner/repo",
+                Some("--upload-pack=x"),
+                None,
+            ),
             ("https://github.com/owner/repo", None, Some("/absolute")),
             ("https://github.com/owner/repo", None, Some("../escape")),
-            ("https://github.com/owner/repo", None, Some("skills//example")),
+            (
+                "https://github.com/owner/repo",
+                None,
+                Some("skills//example"),
+            ),
         ] {
             assert!(matches!(
                 add_github_source(&state, repository, git_ref, subdirectory).await,
@@ -901,15 +1315,13 @@ mod tests {
             let state = test_state(app.path());
             set_settings(&state, settings).await;
             let source = register_test_github(&state, Some("v1"), Some("skills")).await;
-            assert!(
-                refresh_git_source_from(
-                    &state,
-                    &source.id,
-                    repo.path().to_string_lossy().as_ref()
-                )
-                .await
-                .is_ok()
-            );
+            assert!(refresh_git_source_from(
+                &state,
+                &source.id,
+                repo.path().to_string_lossy().as_ref()
+            )
+            .await
+            .is_ok());
         }
 
         let mut paranoid = Settings::default();
@@ -942,13 +1354,10 @@ mod tests {
         set_settings(&state, SettingsLoadState::FirstLaunch).await;
         let source = register_test_github(&state, Some("v1"), Some("skills")).await;
 
-        let result = refresh_git_source_from(
-            &state,
-            &source.id,
-            repo.path().to_string_lossy().as_ref(),
-        )
-        .await
-        .expect("refresh local repository");
+        let result =
+            refresh_git_source_from(&state, &source.id, repo.path().to_string_lossy().as_ref())
+                .await
+                .expect("refresh local repository");
 
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].relative_path, "example");
@@ -957,14 +1366,14 @@ mod tests {
             SkillSourceKind::Github {
                 active_checkout: Some(path),
                 ..
-            } => Path::new(&path),
+            } => PathBuf::from(path),
             other => panic!("missing active checkout: {other:?}"),
         };
         assert!(active.ends_with("skills"));
         assert!(active.join("example/SKILL.md").is_file());
-        assert!(active
-            .ancestors()
-            .any(|path| path.file_name().is_some_and(|name| name == source.id.as_str())));
+        assert!(active.ancestors().any(|path| path
+            .file_name()
+            .is_some_and(|name| name == source.id.as_str())));
         assert_eq!(
             load_skill_sources(app.path()).await.expect("reload")[0],
             result.source
@@ -981,18 +1390,18 @@ mod tests {
         let state = test_state(app.path());
         set_settings(&state, SettingsLoadState::FirstLaunch).await;
         let source = register_test_github(&state, Some("v1"), Some("skills")).await;
-        let first = refresh_git_source_from(
-            &state,
-            &source.id,
-            repo.path().to_string_lossy().as_ref(),
-        )
-        .await
-        .expect("seed active generation");
+        let first =
+            refresh_git_source_from(&state, &source.id, repo.path().to_string_lossy().as_ref())
+                .await
+                .expect("seed active generation");
         let state_path = skill_sources_path(app.path());
         let before = std::fs::read(&state_path).expect("state bytes");
         let active_before = first.source.kind.clone();
 
-        for clone_source in ["/missing/repository", repo.path().to_string_lossy().as_ref()] {
+        for clone_source in [
+            "/missing/repository",
+            repo.path().to_string_lossy().as_ref(),
+        ] {
             let result = refresh_git_source_from(&state, &source.id, clone_source).await;
             if clone_source != "/missing/repository" {
                 assert!(result.is_ok(), "control refresh must succeed");
@@ -1023,7 +1432,10 @@ mod tests {
         let escaped_repo = local_git_repo();
         symlink("..", escaped_repo.path().join("escape")).expect("escaping symlink");
         git(escaped_repo.path(), &["add", "escape"]);
-        git(escaped_repo.path(), &["commit", "-qm", "escaping subdirectory"]);
+        git(
+            escaped_repo.path(),
+            &["commit", "-qm", "escaping subdirectory"],
+        );
         let escaped = register_test_github(&state, None, Some("escape")).await;
         let escaped_before = std::fs::read(&state_path).expect("before escape");
         assert!(refresh_git_source_from(
@@ -1066,13 +1478,10 @@ mod tests {
         set_settings(&state, SettingsLoadState::FirstLaunch).await;
         let source = register_test_github(&state, None, Some("skills")).await;
 
-        let result = refresh_git_source_from(
-            &state,
-            &source.id,
-            repo.path().to_string_lossy().as_ref(),
-        )
-        .await
-        .expect("refresh invalid package");
+        let result =
+            refresh_git_source_from(&state, &source.id, repo.path().to_string_lossy().as_ref())
+                .await
+                .expect("refresh invalid package");
 
         assert_eq!(result.packages.len(), 1);
         assert!(!result.packages[0].installable);
@@ -1108,11 +1517,14 @@ mod tests {
         let refresh = |source: SkillSource| {
             let state = Arc::clone(&state);
             let clone_source = repo.path().to_string_lossy().into_owned();
-            tokio::spawn(async move {
-                refresh_git_source_from(&state, &source.id, &clone_source).await
-            })
+            tokio::spawn(
+                async move { refresh_git_source_from(&state, &source.id, &clone_source).await },
+            )
         };
-        let first_result = refresh(first).await.expect("first join").expect("first refresh");
+        let first_result = refresh(first)
+            .await
+            .expect("first join")
+            .expect("first refresh");
         let second_result = refresh(second)
             .await
             .expect("second join")
@@ -1120,8 +1532,12 @@ mod tests {
         let persisted = load_skill_sources(app.path()).await.expect("load sources");
 
         assert_eq!(persisted.len(), 2);
-        assert!(persisted.iter().any(|source| source == &first_result.source));
-        assert!(persisted.iter().any(|source| source == &second_result.source));
+        assert!(persisted
+            .iter()
+            .any(|source| source == &first_result.source));
+        assert!(persisted
+            .iter()
+            .any(|source| source == &second_result.source));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1134,23 +1550,17 @@ mod tests {
         let async_thread = std::thread::current().id();
         reset_refresh_fs_probe();
 
-        refresh_git_source_from(
-            &state,
-            &source.id,
-            repo.path().to_string_lossy().as_ref(),
-        )
-        .await
-        .expect("successful refresh");
-        refresh_git_source_from(
-            &state,
-            &source.id,
-            repo.path().to_string_lossy().as_ref(),
-        )
-        .await
-        .expect("second successful refresh");
-        assert!(refresh_git_source_from(&state, &source.id, "/missing/repository")
+        refresh_git_source_from(&state, &source.id, repo.path().to_string_lossy().as_ref())
             .await
-            .is_err());
+            .expect("successful refresh");
+        refresh_git_source_from(&state, &source.id, repo.path().to_string_lossy().as_ref())
+            .await
+            .expect("second successful refresh");
+        assert!(
+            refresh_git_source_from(&state, &source.id, "/missing/repository")
+                .await
+                .is_err()
+        );
 
         let probe = take_refresh_fs_probe();
         for required in [
@@ -1162,7 +1572,7 @@ mod tests {
             "recursive_cleanup",
         ] {
             assert!(
-                probe.iter().any(|(event, _)| event == required),
+                probe.iter().any(|(event, _)| *event == required),
                 "missing probe {required}: {probe:?}"
             );
         }
@@ -1171,7 +1581,7 @@ mod tests {
             "filesystem transaction touched async thread: {probe:?}"
         );
         assert!(
-            !probe.iter().any(|(event, _)| event == "obsolete_cleanup"),
+            !probe.iter().any(|(event, _)| *event == "obsolete_cleanup"),
             "successful obsolete generations must not be cleaned in Phase 1"
         );
         let source_dir = app.path().join("skills/sources").join(&source.id);

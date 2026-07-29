@@ -172,6 +172,7 @@ pub fn run() {
             corpus::runbooks_list,
             skills::skill_sources_list,
             skills::skill_source_add_local,
+            skills::skill_source_add_github,
             skills::skill_source_refresh,
             // Phase 2 — install + reconcile (contracts.md §C). The cross-tool
             // agent state layer: render/ledger/reconcile/tools/projects.
