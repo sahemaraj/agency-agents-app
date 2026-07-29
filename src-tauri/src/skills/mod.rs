@@ -486,15 +486,16 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
+    use sha2::Digest;
     use tempfile::tempdir;
 
     use super::{
         add_local_source, discover_source, is_windows_reparse_point, load_skill_sources,
-        skill_sources_path,
+        skill_sources_path, validate_package, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
     };
     use crate::error::AppError;
     use crate::state::AppState;
-    use crate::types::{SkillSourceKind, SkillValidationCode};
+    use crate::types::{SkillSource, SkillSourceKind, SkillValidationCode};
 
     fn test_state(app_data_dir: &Path) -> AppState {
         let mut state = AppState::build().expect("build app state");
@@ -510,6 +511,27 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
         )
         .expect("write SKILL.md");
+    }
+
+    fn write_skill_md(package: &Path, frontmatter: &str) {
+        std::fs::create_dir_all(package).expect("create package");
+        std::fs::write(
+            package.join("SKILL.md"),
+            format!("---\n{frontmatter}---\n\n# Skill\n"),
+        )
+        .expect("write SKILL.md");
+    }
+
+    fn validate_fixture(source: &Path, relative_dir: &str) -> crate::types::SkillPackageResult {
+        validate_package("source-id", source, &source.join(relative_dir))
+    }
+
+    fn error_paths(result: &crate::types::SkillPackageResult) -> Vec<&str> {
+        result
+            .errors
+            .iter()
+            .map(|error| error.path.as_str())
+            .collect()
     }
 
     #[test]
@@ -675,5 +697,370 @@ mod tests {
         assert_eq!(persisted.len(), 2);
         assert!(persisted.iter().any(|source| source.id == first_source.id));
         assert!(persisted.iter().any(|source| source.id == second_source.id));
+    }
+
+    #[test]
+    fn validation_matrix() {
+        let source = tempdir().expect("source");
+        for name in ["a".to_string(), "a".repeat(64)] {
+            write_skill(source.path(), &name, &name, "d");
+            assert!(
+                validate_fixture(source.path(), &name).installable,
+                "valid name length {}",
+                name.len()
+            );
+        }
+
+        for (directory, name) in [
+            ("empty-name", ""),
+            ("overlong", &"a".repeat(65)),
+            ("uppercase", "Uppercase"),
+            ("underscore", "under_score"),
+            ("leading-hyphen", "-leading"),
+            ("trailing-hyphen", "trailing-"),
+            ("double-hyphen", "double--hyphen"),
+            ("folder", "different"),
+        ] {
+            write_skill(source.path(), directory, name, "description");
+            let result = validate_fixture(source.path(), directory);
+            assert!(!result.installable, "invalid name {name:?} was accepted");
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|error| error.code == SkillValidationCode::InvalidMetadata),
+                "invalid name {name:?} lacked a metadata error"
+            );
+        }
+
+        let descriptions = [
+            ("missing-description", "name: missing-description\n"),
+            (
+                "empty-description",
+                "name: empty-description\ndescription: ''\n",
+            ),
+            (
+                "non-string-description",
+                "name: non-string-description\ndescription:\n  nested: value\n",
+            ),
+            (
+                "overlong-description",
+                &format!(
+                    "name: overlong-description\ndescription: '{}'\n",
+                    "d".repeat(1025)
+                ),
+            ),
+        ];
+        for (directory, frontmatter) in descriptions {
+            let package = source.path().join(directory);
+            write_skill_md(&package, frontmatter);
+            let result = validate_fixture(source.path(), directory);
+            assert!(
+                !result.installable
+                    && result
+                        .errors
+                        .iter()
+                        .any(|error| error.code == SkillValidationCode::InvalidMetadata),
+                "invalid description for {directory} was accepted"
+            );
+        }
+
+        let valid_description = source.path().join("description-limit");
+        write_skill_md(
+            &valid_description,
+            &format!(
+                "name: description-limit\ndescription: '{}'\n",
+                "d".repeat(1024)
+            ),
+        );
+        assert!(
+            validate_fixture(source.path(), "description-limit").installable,
+            "1024-character description should be valid"
+        );
+
+        let malformed = source.path().join("malformed");
+        std::fs::create_dir_all(&malformed).expect("create malformed package");
+        std::fs::write(
+            malformed.join("SKILL.md"),
+            b"---\nname: malformed\ndescription: [\n---\n",
+        )
+        .expect("write malformed frontmatter");
+        assert!(
+            !validate_fixture(source.path(), "malformed").installable,
+            "malformed frontmatter was accepted"
+        );
+
+        let inert = source.path().join("inert-files");
+        write_skill(&inert, "", "inert-files", "Inert content");
+        let fixtures = [
+            ("references/guide.md", b"# Guide\n".as_slice()),
+            ("assets/image.bin", &[0, 1, 2, 3]),
+            ("templates/example.txt", b"{{ exact }}\n".as_slice()),
+        ];
+        for (relative, bytes) in fixtures {
+            let path = inert.join(relative);
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture parent");
+            std::fs::write(path, bytes).expect("write inert fixture");
+        }
+        let result = validate_fixture(source.path(), "inert-files");
+        assert!(result.installable, "{:?}", result.errors);
+        for (relative, bytes) in fixtures {
+            let file = result
+                .files
+                .iter()
+                .find(|file| file.relative_path == relative)
+                .unwrap_or_else(|| panic!("missing inventory entry {relative}"));
+            assert_eq!(file.size_bytes, bytes.len() as u64);
+            assert_eq!(file.sha256, format!("{:x}", sha2::Sha256::digest(bytes)));
+        }
+    }
+
+    #[test]
+    fn cross_platform_executable_surfaces_are_rejected() {
+        let source = tempdir().expect("source");
+        let package = source.path().join("unsafe-surfaces");
+        write_skill(&package, "", "unsafe-surfaces", "Unsafe surfaces");
+
+        for relative in [
+            "nested/run.sh",
+            "nested/run.BASH",
+            "nested/run.zsh",
+            "nested/run.fish",
+            "nested/run.ps1",
+            "nested/run.bat",
+            "nested/run.cmd",
+            "nested/run.com",
+            "nested/run.exe",
+            "nested/run.dll",
+            "nested/run.dylib",
+            "nested/run.so",
+            "scripts/tool.txt",
+            "HOOKS/config.json",
+            "mcp.json",
+            "plugin.yaml",
+        ] {
+            let path = package.join(relative);
+            std::fs::create_dir_all(path.parent().expect("unsafe parent"))
+                .expect("create unsafe parent");
+            std::fs::write(path, b"unsafe").expect("write unsafe file");
+        }
+        std::fs::create_dir_all(package.join("nested/Bundle.APP"))
+            .expect("create app bundle directory");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+
+            std::fs::write(package.join("executable.txt"), b"executable")
+                .expect("write executable");
+            let mut permissions = std::fs::metadata(package.join("executable.txt"))
+                .expect("executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(package.join("executable.txt"), permissions)
+                .expect("set executable mode");
+            symlink("SKILL.md", package.join("linked.md")).expect("create package symlink");
+
+            use std::os::unix::net::UnixListener;
+            UnixListener::bind(package.join("special.sock")).expect("create special entry");
+        }
+
+        let result = validate_fixture(source.path(), "unsafe-surfaces");
+        assert!(!result.installable);
+        let paths = error_paths(&result);
+        for expected in [
+            "HOOKS",
+            "mcp.json",
+            "nested/Bundle.APP",
+            "nested/run.sh",
+            "plugin.yaml",
+            "scripts",
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "missing {expected} in {:?}",
+                result.errors
+            );
+        }
+        #[cfg(unix)]
+        for expected in ["executable.txt", "linked.md", "special.sock"] {
+            assert!(
+                paths.contains(&expected),
+                "missing {expected} in {:?}",
+                result.errors
+            );
+        }
+
+        let outside = tempdir().expect("outside");
+        write_skill(outside.path(), "escaped", "escaped", "Outside source");
+        let escaped = validate_package("source-id", source.path(), &outside.path().join("escaped"));
+        assert!(
+            !escaped.installable
+                && escaped
+                    .errors
+                    .iter()
+                    .any(|error| error.code == SkillValidationCode::UnsafeEntry),
+            "package outside source root was accepted"
+        );
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        assert!(is_windows_reparse_point(FILE_ATTRIBUTE_REPARSE_POINT));
+    }
+
+    #[test]
+    fn package_bounds_are_inclusive() {
+        let source = tempdir().expect("source");
+
+        let count_limit = source.path().join("count-limit");
+        write_skill(&count_limit, "", "count-limit", "Count limit");
+        for index in 0..(MAX_SKILL_FILES - 1) {
+            std::fs::write(count_limit.join(format!("file-{index:03}.txt")), b"x")
+                .expect("write counted file");
+        }
+        let exact_count = validate_fixture(source.path(), "count-limit");
+        assert!(
+            exact_count.installable,
+            "exact file-count limit should be valid"
+        );
+        assert_eq!(exact_count.files.len(), MAX_SKILL_FILES);
+        std::fs::write(count_limit.join("file-512.txt"), b"x").expect("write file 513");
+        let over_count = validate_fixture(source.path(), "count-limit");
+        assert!(!over_count.installable, "file 513 should be rejected");
+        assert_eq!(
+            over_count.files.len(),
+            MAX_SKILL_FILES,
+            "the first 512 files should remain inspectable"
+        );
+        assert!(error_paths(&over_count).contains(&"file-512.txt"));
+
+        let file_limit = source.path().join("file-limit");
+        write_skill(&file_limit, "", "file-limit", "File limit");
+        std::fs::write(
+            file_limit.join("exact.bin"),
+            vec![0_u8; MAX_SKILL_FILE_BYTES as usize],
+        )
+        .expect("write exact-size file");
+        assert!(
+            validate_fixture(source.path(), "file-limit").installable,
+            "exact per-file limit should be valid"
+        );
+        std::fs::write(
+            file_limit.join("too-large.bin"),
+            vec![0_u8; MAX_SKILL_FILE_BYTES as usize + 1],
+        )
+        .expect("write oversize file");
+        assert!(
+            !validate_fixture(source.path(), "file-limit").installable,
+            "file beyond per-file limit should be rejected"
+        );
+
+        let total_limit = source.path().join("total-limit");
+        write_skill(&total_limit, "", "total-limit", "Total limit");
+        let skill_size = std::fs::metadata(total_limit.join("SKILL.md"))
+            .expect("SKILL.md metadata")
+            .len();
+        for index in 0..7 {
+            std::fs::write(
+                total_limit.join(format!("part-{index}.bin")),
+                vec![0_u8; MAX_SKILL_FILE_BYTES as usize],
+            )
+            .expect("write total-limit part");
+        }
+        std::fs::write(
+            total_limit.join("part-7.bin"),
+            vec![0_u8; (MAX_SKILL_FILE_BYTES - skill_size) as usize],
+        )
+        .expect("write total-limit remainder");
+        assert!(
+            validate_fixture(source.path(), "total-limit").installable,
+            "exact total byte limit should be valid"
+        );
+        std::fs::write(total_limit.join("zz-extra.bin"), b"x").expect("write aggregate overflow");
+        assert!(
+            !validate_fixture(source.path(), "total-limit").installable,
+            "first byte beyond total limit should be rejected"
+        );
+    }
+
+    #[test]
+    fn cap_failures_continue_and_collect_later_errors() {
+        let source = tempdir().expect("source");
+        let package = source.path().join("continue-after-caps");
+        write_skill(
+            &package,
+            "",
+            "continue-after-caps",
+            "Continue after cap failures",
+        );
+        std::fs::write(
+            package.join("a-too-large.bin"),
+            vec![0_u8; MAX_SKILL_FILE_BYTES as usize + 1],
+        )
+        .expect("write oversize file");
+        std::fs::create_dir_all(package.join("scripts")).expect("create reserved directory");
+        std::fs::write(package.join("scripts/ignored.txt"), b"unsafe")
+            .expect("write reserved content");
+        std::fs::write(package.join("z-last.sh"), b"unsafe").expect("write executable suffix");
+
+        let result = validate_fixture(source.path(), "continue-after-caps");
+
+        assert!(!result.installable);
+        let paths = error_paths(&result);
+        for expected in ["a-too-large.bin", "scripts", "z-last.sh"] {
+            assert!(
+                paths.contains(&expected),
+                "missing later error {expected} in {:?}",
+                result.errors
+            );
+        }
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|file| file.relative_path == "SKILL.md"),
+            "valid files should remain inspectable after cap failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_packages_remain_inspectable() {
+        let source = tempdir().expect("source");
+        write_skill(
+            source.path(),
+            "inspectable",
+            "inspectable",
+            "Inspectable invalid package",
+        );
+        std::fs::write(source.path().join("inspectable/run.sh"), b"unsafe")
+            .expect("write executable surface");
+        let registered = SkillSource {
+            id: "source-id".into(),
+            kind: SkillSourceKind::Local {
+                root: source.path().to_string_lossy().into_owned(),
+            },
+        };
+
+        let result = discover_source(registered).await.expect("discover source");
+
+        assert_eq!(result.packages.len(), 1);
+        let package = &result.packages[0];
+        assert_eq!(package.name.as_deref(), Some("inspectable"));
+        assert_eq!(
+            package.description.as_deref(),
+            Some("Inspectable invalid package")
+        );
+        assert!(!package.installable);
+        assert!(package
+            .files
+            .iter()
+            .any(|file| file.relative_path == "SKILL.md"));
+        assert!(
+            package.errors.iter().any(|error| {
+                error.code == SkillValidationCode::UnsafeEntry && error.path == "run.sh"
+            }),
+            "{:?}",
+            package.errors
+        );
     }
 }
