@@ -63,6 +63,7 @@ export type VibrancyMaterial = (typeof VIBRANCY_MATERIALS)[number];
 const DEFAULT_SECTION_VALUES = [
   "dashboard",
   "personas",
+  "skills",
   "tools",
   "teams",
   "projects",

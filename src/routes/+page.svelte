@@ -7,6 +7,7 @@
   import Teams from "$lib/components/Teams.svelte";
   import Projects from "$lib/components/Projects.svelte";
   import AgentsWorkspace from "$lib/components/AgentsWorkspace.svelte";
+  import SkillsWorkspace from "$lib/components/SkillsWorkspace.svelte";
   import ToolsView from "$lib/components/ToolsView.svelte";
   import ActivityHistory from "$lib/components/ActivityHistory.svelte";
   import Runbooks from "$lib/components/Runbooks.svelte";
@@ -41,6 +42,7 @@
   function sectionTitle(s: SidebarSection): string {
     if (s === "dashboard") return i18n.t("nav.dashboard");
     if (s === "personas") return i18n.t("nav.agents");
+    if (s === "skills") return "Skills";
     if (s === "tools") return i18n.t("nav.tools");
     if (s === "teams") return i18n.t("nav.teams");
     if (s === "projects") return i18n.t("nav.projects");
@@ -91,17 +93,18 @@
     if (meta && e.key === "[") { e.preventDefault(); ui.back(); return; }
     if (meta && e.key === "]") { e.preventDefault(); ui.forward(); return; }
 
-    // Cmd+0..6: agency section nav. Matches the sidebar.
-    if (meta && ["0","1","2","3","4","5","6"].includes(e.key)) {
+    // Cmd+0..7: agency section nav. Matches the sidebar.
+    if (meta && ["0","1","2","3","4","5","6","7"].includes(e.key)) {
       e.preventDefault();
       const map: Record<string, SidebarSection> = {
         "0": "dashboard",
         "1": "personas",
-        "2": "tools",
-        "3": "teams",
-        "4": "projects",
-        "5": "runbooks",
-        "6": "activity",
+        "2": "skills",
+        "3": "tools",
+        "4": "teams",
+        "5": "projects",
+        "6": "runbooks",
+        "7": "activity",
       };
       ui.setSection(map[e.key]);
       return;
@@ -223,6 +226,8 @@
         <div class="section-pane">
           {#if ui.section === "dashboard"}
             <AgencyDashboard />
+          {:else if ui.section === "skills"}
+            <SkillsWorkspace />
           {:else if ui.section === "tools"}
             <ToolsView />
           {:else if ui.section === "teams"}

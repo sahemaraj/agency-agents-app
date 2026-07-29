@@ -611,6 +611,7 @@ export interface ProjectInfo {
 export type SidebarSection =
   | "dashboard"
   | "personas"
+  | "skills"
   | "tools"
   | "teams"
   | "projects"
