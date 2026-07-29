@@ -263,7 +263,19 @@ fn validate_package(
     source_root: &Path,
     package_root: &Path,
 ) -> SkillPackageResult {
-    let relative = relative_path(source_root, package_root);
+    let relative = match normalized_relative_path(source_root, package_root) {
+        Ok(relative) if relative != "." => relative,
+        Ok(_) => {
+            return invalid_package_root(
+                source_id,
+                ".",
+                "A skill package must be a directory below the registered source root.",
+            );
+        }
+        Err(error) => {
+            return invalid_package_root(source_id, ".", &error.message);
+        }
+    };
     let mut result = SkillPackageResult {
         source_id: source_id.into(),
         relative_path: relative,
@@ -274,10 +286,29 @@ fn validate_package(
         installable: false,
     };
 
-    match inventory_package(package_root) {
-        Ok(files) => result.files = files,
-        Err(error) => result.errors.push(error),
+    match std::fs::symlink_metadata(package_root) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && !metadata_is_reparse_point(&metadata) => {}
+        Ok(_) => {
+            result.errors.push(unsafe_entry_error(
+                ".".into(),
+                "Skill package roots must be real directories, not links, reparse points, or special entries.",
+            ));
+            return result;
+        }
+        Err(error) => {
+            result.errors.push(SkillValidationError {
+                code: SkillValidationCode::Io,
+                path: ".".into(),
+                message: format!("Could not inspect skill package root: {error}"),
+            });
+            return result;
+        }
     }
+
+    result.files = inventory_package(package_root, &mut result.errors);
 
     match read_bounded(&package_root.join("SKILL.md"), MAX_SKILL_FILE_BYTES) {
         Ok(bytes) => match parse_skill_metadata(&bytes) {
@@ -303,71 +334,165 @@ fn validate_package(
                 message,
             }),
         },
-        Err(message) => result.errors.push(SkillValidationError {
-            code: SkillValidationCode::Io,
-            path: "SKILL.md".into(),
-            message,
-        }),
+        Err(error) => {
+            let code = error.code();
+            result.errors.push(SkillValidationError {
+                code,
+                path: "SKILL.md".into(),
+                message: error.message(),
+            });
+        }
     }
 
+    sort_validation_errors(&mut result.errors);
     result.installable = result.errors.is_empty();
     result
 }
 
-fn inventory_package(package_root: &Path) -> Result<Vec<SkillPackageFile>, SkillValidationError> {
+fn invalid_package_root(source_id: &str, relative_path: &str, message: &str) -> SkillPackageResult {
+    SkillPackageResult {
+        source_id: source_id.into(),
+        relative_path: relative_path.into(),
+        name: None,
+        description: None,
+        files: Vec::new(),
+        errors: vec![unsafe_entry_error(
+            ".".into(),
+            &format!("{message} Keep the package inside its registered source."),
+        )],
+        installable: false,
+    }
+}
+
+fn inventory_package(
+    package_root: &Path,
+    errors: &mut Vec<SkillValidationError>,
+) -> Vec<SkillPackageFile> {
     let mut files = Vec::new();
+    let mut file_count = 0_usize;
     let mut total_bytes = 0_u64;
     let mut directories = VecDeque::from([package_root.to_path_buf()]);
 
     while let Some(directory) = directories.pop_front() {
-        let entries = read_directory_sorted(&directory).map_err(|error| SkillValidationError {
-            code: SkillValidationCode::Io,
-            path: relative_path(package_root, &directory),
-            message: error.to_string(),
-        })?;
+        let entries = match read_directory_sorted(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                errors.push(SkillValidationError {
+                    code: SkillValidationCode::Io,
+                    path: normalized_relative_path(package_root, &directory)
+                        .unwrap_or_else(|_| ".".into()),
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
         for (path, metadata) in entries {
-            let relative = relative_path(package_root, &path);
+            let relative = match normalized_relative_path(package_root, &path) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
             if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
-                return Err(unsafe_entry_error(
+                errors.push(unsafe_entry_error(
                     relative,
                     "Links and reparse points are not allowed in skill packages. Remove the entry and refresh.",
                 ));
+                continue;
             }
             if metadata.is_dir() {
-                directories.push_back(path);
+                if has_executable_suffix(&path) {
+                    errors.push(unsafe_entry_error(
+                        relative,
+                        "Executable and script file types are not allowed in skill packages. Remove the entry and refresh.",
+                    ));
+                } else if has_reserved_surface(&path) {
+                    errors.push(unsafe_entry_error(
+                        relative,
+                        "Scripts, hooks, MCP, and plugin surfaces are not allowed in skill packages. Remove the entry and refresh.",
+                    ));
+                } else {
+                    directories.push_back(path);
+                }
                 continue;
             }
             if !metadata.is_file() {
-                return Err(unsafe_entry_error(
+                errors.push(unsafe_entry_error(
                     relative,
                     "Special filesystem entries are not allowed in skill packages. Remove the entry and refresh.",
                 ));
+                continue;
             }
-            if files.len() == MAX_SKILL_FILES {
-                return Err(SkillValidationError {
-                    code: SkillValidationCode::UnsafeEntry,
-                    path: relative,
-                    message: format!("Skill package exceeds the {MAX_SKILL_FILES}-file limit."),
-                });
-            }
-            let bytes = read_bounded(&path, MAX_SKILL_FILE_BYTES).map_err(|message| {
-                SkillValidationError {
+            file_count += 1;
+            let mut rejected = false;
+            if file_count > MAX_SKILL_FILES {
+                errors.push(SkillValidationError {
                     code: SkillValidationCode::UnsafeEntry,
                     path: relative.clone(),
-                    message,
+                    message: format!(
+                        "Skill package exceeds the {MAX_SKILL_FILES}-file limit. Remove files and refresh."
+                    ),
+                });
+                rejected = true;
+            }
+            if has_executable_suffix(&path) {
+                errors.push(unsafe_entry_error(
+                    relative.clone(),
+                    "Executable and script file types are not allowed in skill packages. Remove the entry and refresh.",
+                ));
+                rejected = true;
+            }
+            if has_reserved_surface(&path) {
+                errors.push(unsafe_entry_error(
+                    relative.clone(),
+                    "Scripts, hooks, MCP, and plugin surfaces are not allowed in skill packages. Remove the entry and refresh.",
+                ));
+                rejected = true;
+            }
+            if metadata_is_executable(&metadata) {
+                errors.push(unsafe_entry_error(
+                    relative.clone(),
+                    "Executable permission bits are not allowed in skill packages. Remove execute permissions and refresh.",
+                ));
+                rejected = true;
+            }
+            if rejected {
+                continue;
+            }
+            let bytes = match read_bounded(&path, MAX_SKILL_FILE_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let code = error.code();
+                    errors.push(SkillValidationError {
+                        code,
+                        path: relative,
+                        message: format!(
+                            "{} {}",
+                            error.message(),
+                            if code == SkillValidationCode::UnsafeEntry {
+                                "Reduce the file size and refresh."
+                            } else {
+                                "Fix file access and refresh."
+                            }
+                        ),
+                    });
+                    continue;
                 }
-            })?;
-            total_bytes += bytes.len() as u64;
-            if total_bytes > MAX_SKILL_TOTAL_BYTES {
-                return Err(SkillValidationError {
+            };
+            let next_total = total_bytes + bytes.len() as u64;
+            if next_total > MAX_SKILL_TOTAL_BYTES {
+                errors.push(SkillValidationError {
                     code: SkillValidationCode::UnsafeEntry,
                     path: relative,
                     message: format!(
-                        "Skill package exceeds the {}-byte total limit.",
+                        "Skill package exceeds the {}-byte total limit. Remove content and refresh.",
                         MAX_SKILL_TOTAL_BYTES
                     ),
                 });
+                continue;
             }
+            total_bytes = next_total;
             files.push(SkillPackageFile {
                 relative_path: relative,
                 size_bytes: bytes.len() as u64,
@@ -376,21 +501,45 @@ fn inventory_package(package_root: &Path) -> Result<Vec<SkillPackageFile>, Skill
         }
     }
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(files)
+    files
 }
 
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+enum BoundedReadError {
+    Io(String),
+    TooLarge(String),
+}
+
+impl BoundedReadError {
+    fn code(&self) -> SkillValidationCode {
+        match self {
+            Self::Io(_) => SkillValidationCode::Io,
+            Self::TooLarge(_) => SkillValidationCode::UnsafeEntry,
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            Self::Io(message) | Self::TooLarge(message) => message,
+        }
+    }
+}
+
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
     let mut bytes = Vec::new();
     File::open(path)
-        .map_err(|error| format!("Could not open {}: {error}", path.display()))?
+        .map_err(|error| {
+            BoundedReadError::Io(format!("Could not open {}: {error}", path.display()))
+        })?
         .take(limit + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        .map_err(|error| {
+            BoundedReadError::Io(format!("Could not read {}: {error}", path.display()))
+        })?;
     if bytes.len() as u64 > limit {
-        return Err(format!(
+        return Err(BoundedReadError::TooLarge(format!(
             "{} exceeds the {limit}-byte file limit.",
             path.display()
-        ));
+        )));
     }
     Ok(bytes)
 }
@@ -413,10 +562,102 @@ fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
     let yaml = &rest[..end];
     let metadata: SkillMetadata = serde_yaml::from_str(&yaml)
         .map_err(|error| format!("SKILL.md frontmatter is invalid: {error}"))?;
-    if metadata.name.trim().is_empty() || metadata.description.trim().is_empty() {
-        return Err("SKILL.md name and description must be non-empty.".into());
+    if !valid_skill_name(&metadata.name) {
+        return Err(
+            "SKILL.md name must be 1-64 lowercase ASCII letters, digits, or single hyphens.".into(),
+        );
+    }
+    let description_length = metadata.description.trim().chars().count();
+    if !(1..=1024).contains(&description_length) {
+        return Err("SKILL.md description must contain 1-1024 trimmed characters.".into());
     }
     Ok(metadata)
+}
+
+fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn has_executable_suffix(path: &Path) -> bool {
+    const SUFFIXES: [&str; 13] = [
+        ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd", ".com", ".exe", ".dll", ".dylib",
+        ".so", ".app",
+    ];
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+}
+
+fn has_reserved_surface(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    let normalized = lower.trim_start_matches('.');
+    ["scripts", "hooks", "mcp", "plugin", "plugins"]
+        .iter()
+        .any(|surface| {
+            normalized == *surface
+                || normalized
+                    .strip_prefix(surface)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+}
+
+fn normalized_relative_path(root: &Path, path: &Path) -> Result<String, SkillValidationError> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        unsafe_entry_error(
+            ".".into(),
+            "Skill package paths must remain inside the package root. Move the entry inside the package and refresh.",
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Ok(".".into());
+    }
+
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(value) = component else {
+            return Err(unsafe_entry_error(
+                relative.to_string_lossy().into_owned(),
+                "Skill package paths must contain only normal relative components. Rename the entry and refresh.",
+            ));
+        };
+        let Some(value) = value.to_str() else {
+            return Err(unsafe_entry_error(
+                relative.to_string_lossy().into_owned(),
+                "Skill package paths must be valid UTF-8. Rename the entry and refresh.",
+            ));
+        };
+        parts.push(value);
+    }
+    Ok(parts.join("/"))
+}
+
+fn sort_validation_errors(errors: &mut [SkillValidationError]) {
+    errors.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| validation_code_rank(left.code).cmp(&validation_code_rank(right.code)))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+}
+
+fn validation_code_rank(code: SkillValidationCode) -> u8 {
+    match code {
+        SkillValidationCode::InvalidMetadata => 0,
+        SkillValidationCode::UnsafeEntry => 1,
+        SkillValidationCode::Io => 2,
+    }
 }
 
 fn unsafe_entry_error(path: String, message: &str) -> SkillValidationError {
@@ -449,6 +690,17 @@ fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
 
 #[cfg(not(windows))]
 fn metadata_is_reparse_point(_: &Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn metadata_is_executable(metadata: &Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_is_executable(_: &Metadata) -> bool {
     false
 }
 
