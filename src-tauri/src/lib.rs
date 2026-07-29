@@ -11,6 +11,8 @@ mod github;
 mod install;
 mod registry;
 mod render;
+#[cfg(test)]
+mod skills;
 mod state;
 mod types;
 mod util;
