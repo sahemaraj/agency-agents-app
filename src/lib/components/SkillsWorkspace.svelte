@@ -6,6 +6,7 @@
   import Button from "$lib/components/Button.svelte";
   import DestructiveConfirm from "$lib/components/DestructiveConfirm.svelte";
   import EmptyState from "$lib/components/EmptyState.svelte";
+  import Input from "$lib/components/Input.svelte";
   import LoadingState from "$lib/components/LoadingState.svelte";
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import type { SkillSource, SkillSourceResult } from "$lib/types";
@@ -13,6 +14,10 @@
   let localPath = $state("");
   let announcement = $state("");
   let removeCandidate: SkillSource | null = $state(null);
+  let githubRepository = $state("");
+  let githubRef = $state("");
+  let githubSubdirectory = $state("");
+  let githubRegistrationRejected = $state(false);
 
   onMount(() => {
     void skillSources.load();
@@ -53,6 +58,22 @@
     }
   }
 
+  async function addGithub(): Promise<void> {
+    const outcome = await skillSources.addGithub(
+      githubRepository,
+      githubRef,
+      githubSubdirectory,
+    );
+    githubRegistrationRejected = !outcome.registrationSucceeded;
+    if (outcome.registrationSucceeded && outcome.initialRefreshSucceeded) {
+      announcement = "GitHub skill source added and refreshed.";
+      githubRepository = "";
+      githubRef = "";
+      githubSubdirectory = "";
+      githubRegistrationRejected = false;
+    }
+  }
+
   async function removeSource(): Promise<void> {
     if (!removeCandidate) return;
     const source = removeCandidate;
@@ -67,7 +88,7 @@
   <header>
     <div>
       <h2>Skill sources</h2>
-      <p>Add trusted folders and refresh them only when you choose.</p>
+      <p>Add trusted folders or GitHub repositories and refresh them only when you choose.</p>
     </div>
     <section class="local-add" aria-label="Add local skill source" aria-busy={skillSources.loading || skillSources.adding}>
       {#if localPath}<span class="picked" title={localPath}>{localPath}</span>{/if}
@@ -87,8 +108,55 @@
   <div class="announcement" role="status" aria-live="polite">{announcement}</div>
 
   {#if skillSources.addError}
-    <div class="alert" role="alert">{skillSources.addError}</div>
+    <div id="skill-source-add-error" class="alert add-alert" role="alert">{skillSources.addError}</div>
   {/if}
+
+  <form
+    class="github-add"
+    aria-label="Add GitHub skill source"
+    aria-busy={skillSources.adding}
+    onsubmit={(event) => {
+      event.preventDefault();
+      void addGithub();
+    }}
+  >
+    <div class="github-fields">
+      <Input
+        bind:value={githubRepository}
+        placeholder="https://github.com/owner/repository"
+        ariaLabel="GitHub repository URL"
+        ariaDescribedby="github-source-help skill-source-add-error"
+        invalid={githubRegistrationRejected}
+        disabled={skillSources.adding}
+      />
+      <Input
+        bind:value={githubRef}
+        placeholder="Ref (optional)"
+        ariaLabel="Git ref, optional"
+        ariaDescribedby="github-source-help skill-source-add-error"
+        invalid={githubRegistrationRejected && githubRef.trim().length > 0}
+        disabled={skillSources.adding}
+      />
+      <Input
+        bind:value={githubSubdirectory}
+        placeholder="Subdirectory (optional)"
+        ariaLabel="Repository subdirectory, optional"
+        ariaDescribedby="github-source-help skill-source-add-error"
+        invalid={githubRegistrationRejected && githubSubdirectory.trim().length > 0}
+        disabled={skillSources.adding}
+      />
+    </div>
+    <Button
+      type="submit"
+      variant="primary"
+      loading={skillSources.adding}
+      disabled={skillSources.loading || skillSources.adding}
+      ariaLabel="Add GitHub skill source"
+    >
+      Add GitHub source
+    </Button>
+    <p id="github-source-help">Use a github.com repository URL. Ref and subdirectory are optional.</p>
+  </form>
 
   <div class="content">
     {#if skillSources.loading && skillSources.sources.length === 0}
@@ -113,6 +181,13 @@
               <div class="identity">
                 <span class="kind">{source.kind.kind === "local" ? "Local folder" : "GitHub"}</span>
                 <strong title={sourceLabel(source)}>{sourceLabel(source)}</strong>
+                {#if source.kind.kind === "github" && (source.kind.gitRef || source.kind.subdirectory)}
+                  <span class="source-detail">
+                    {source.kind.gitRef ? `Ref: ${source.kind.gitRef}` : ""}
+                    {source.kind.gitRef && source.kind.subdirectory ? " · " : ""}
+                    {source.kind.subdirectory ? `Folder: ${source.kind.subdirectory}` : ""}
+                  </span>
+                {/if}
               </div>
               <div class="source-actions">
                 <Button
@@ -252,6 +327,27 @@
     overflow-y: auto;
     padding: var(--space-4);
   }
+  .github-add {
+    flex: none;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--color-border);
+  }
+  .github-fields {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr;
+    gap: var(--space-2);
+  }
+  .github-add p {
+    grid-column: 1 / -1;
+    color: var(--color-text-muted);
+    font-size: var(--text-caption);
+  }
+  .add-alert {
+    margin: var(--space-3) var(--space-4) 0;
+  }
   .sources {
     display: grid;
     gap: var(--space-3);
@@ -284,6 +380,10 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--color-text-primary);
+  }
+  .source-detail {
+    color: var(--color-text-muted);
+    font-size: var(--text-caption);
   }
   .kind {
     color: var(--color-text-muted);
@@ -318,4 +418,9 @@
     gap: var(--space-2);
   }
   code { font-family: var(--font-mono); }
+  @media (max-width: 900px) {
+    .github-add, .github-fields {
+      grid-template-columns: 1fr;
+    }
+  }
 </style>

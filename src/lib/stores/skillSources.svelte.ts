@@ -1,4 +1,5 @@
 import {
+  skillSourceAddGithub,
   skillSourceAddLocal,
   skillSourceRefresh,
   skillSourceRemove,
@@ -54,6 +55,40 @@ class SkillSourcesStore {
       const source = await skillSourceAddLocal(root);
       this.mergeSource(source);
       this.addError = null;
+      const initialRefreshSucceeded = await this.refresh(source.id);
+      return { registrationSucceeded: true, initialRefreshSucceeded };
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return { registrationSucceeded: false, initialRefreshSucceeded: false };
+    } finally {
+      this.adding = false;
+    }
+  }
+
+  async addGithub(
+    repository: string,
+    gitRef: string,
+    subdirectory: string,
+  ): Promise<AddSourceResult> {
+    if (this.loading || this.adding) {
+      return { registrationSucceeded: false, initialRefreshSucceeded: false };
+    }
+
+    const trimmedRepository = repository.trim();
+    if (!trimmedRepository) {
+      this.addError = "GitHub repository URL is required.";
+      return { registrationSucceeded: false, initialRefreshSucceeded: false };
+    }
+
+    this.adding = true;
+    this.addError = null;
+    try {
+      const source = await skillSourceAddGithub(
+        trimmedRepository,
+        gitRef.trim() || null,
+        subdirectory.trim() || null,
+      );
+      this.mergeSource(source);
       const initialRefreshSucceeded = await this.refresh(source.id);
       return { registrationSucceeded: true, initialRefreshSucceeded };
     } catch (error) {
