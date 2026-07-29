@@ -735,6 +735,7 @@ pub async fn skill_source_refresh(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::process::Command;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -742,9 +743,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        add_local_source, discover_source, is_windows_reparse_point, load_skill_sources,
-        skill_sources_path, validate_package, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
+        add_github_source, add_local_source, discover_source, is_windows_reparse_point,
+        load_skill_sources, refresh_git_source_from, reset_refresh_fs_probe, skill_sources_path,
+        take_refresh_fs_probe, validate_package, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
     };
+    use crate::commands::settings::{Settings, SettingsLoadState};
     use crate::error::AppError;
     use crate::state::AppState;
     use crate::types::{SkillSource, SkillSourceKind, SkillValidationCode};
@@ -784,6 +787,401 @@ mod tests {
             .iter()
             .map(|error| error.path.as_str())
             .collect()
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn local_git_repo() -> tempfile::TempDir {
+        let repo = tempdir().expect("git repo");
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "tests@example.invalid"]);
+        git(repo.path(), &["config", "user.name", "Tests"]);
+        write_skill(repo.path(), "skills/example", "example", "Example");
+        write_skill(repo.path(), "outside", "outside", "Outside");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "initial"]);
+        git(repo.path(), &["tag", "v1"]);
+        repo
+    }
+
+    async fn set_settings(state: &AppState, value: SettingsLoadState) {
+        *state.settings.write().await = value;
+    }
+
+    async fn register_test_github(
+        state: &AppState,
+        git_ref: Option<&str>,
+        subdirectory: Option<&str>,
+    ) -> SkillSource {
+        add_github_source(
+            state,
+            "https://github.com/owner/repo",
+            git_ref,
+            subdirectory,
+        )
+        .await
+        .expect("register GitHub source")
+    }
+
+    #[tokio::test]
+    async fn github_source_registration_rejects_untrusted_inputs() {
+        let app = tempdir().expect("app data");
+        let state = test_state(app.path());
+
+        let source = add_github_source(
+            &state,
+            "http://github.com/Owner/Repo.git",
+            Some("v1"),
+            Some("skills/example"),
+        )
+        .await
+        .expect("register canonical source");
+        let duplicate = add_github_source(
+            &state,
+            "https://github.com/Owner/Repo",
+            Some("v1"),
+            Some("skills/example"),
+        )
+        .await
+        .expect("deduplicate canonical source");
+        assert_eq!(duplicate.id, source.id);
+        assert!(matches!(
+            source.kind,
+            SkillSourceKind::Github {
+                ref repository,
+                git_ref: Some(ref git_ref),
+                subdirectory: Some(ref subdirectory),
+                active_checkout: None,
+            } if repository == "https://github.com/Owner/Repo.git"
+                && git_ref == "v1"
+                && subdirectory == "skills/example"
+        ));
+        let before = std::fs::read(skill_sources_path(app.path())).expect("state bytes");
+
+        for (repository, git_ref, subdirectory) in [
+            ("https://example.com/owner/repo", None, None),
+            ("https://user:secret@github.com/owner/repo", None, None),
+            ("https://github.com/owner/repo", Some(""), None),
+            ("https://github.com/owner/repo", Some("--upload-pack=x"), None),
+            ("https://github.com/owner/repo", None, Some("/absolute")),
+            ("https://github.com/owner/repo", None, Some("../escape")),
+            ("https://github.com/owner/repo", None, Some("skills//example")),
+        ] {
+            assert!(matches!(
+                add_github_source(&state, repository, git_ref, subdirectory).await,
+                Err(AppError::InvalidArgument { .. })
+            ));
+        }
+        assert_eq!(
+            std::fs::read(skill_sources_path(app.path())).expect("preserved state"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn github_refresh_network_policy_matrix() {
+        let repo = local_git_repo();
+
+        for settings in [
+            SettingsLoadState::FirstLaunch,
+            SettingsLoadState::Loaded(Settings::default()),
+        ] {
+            let app = tempdir().expect("app data");
+            let state = test_state(app.path());
+            set_settings(&state, settings).await;
+            let source = register_test_github(&state, Some("v1"), Some("skills")).await;
+            assert!(
+                refresh_git_source_from(
+                    &state,
+                    &source.id,
+                    repo.path().to_string_lossy().as_ref()
+                )
+                .await
+                .is_ok()
+            );
+        }
+
+        let mut paranoid = Settings::default();
+        paranoid.paranoid_mode = true;
+        for settings in [
+            SettingsLoadState::Loaded(paranoid),
+            SettingsLoadState::Corrupt {
+                message: "bad settings".into(),
+            },
+        ] {
+            let app = tempdir().expect("app data");
+            let state = test_state(app.path());
+            set_settings(&state, settings).await;
+            let source = register_test_github(&state, None, None).await;
+            let result =
+                refresh_git_source_from(&state, &source.id, "/definitely/not/a/git/repo").await;
+            assert!(matches!(
+                result,
+                Err(AppError::ParanoidModeBlocked { feature })
+                    if feature == "skill_source_refresh"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn github_refresh_transaction_uses_local_repo() {
+        let app = tempdir().expect("app data");
+        let repo = local_git_repo();
+        let state = test_state(app.path());
+        set_settings(&state, SettingsLoadState::FirstLaunch).await;
+        let source = register_test_github(&state, Some("v1"), Some("skills")).await;
+
+        let result = refresh_git_source_from(
+            &state,
+            &source.id,
+            repo.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .expect("refresh local repository");
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].relative_path, "example");
+        assert!(result.packages[0].installable);
+        let active = match &result.source.kind {
+            SkillSourceKind::Github {
+                active_checkout: Some(path),
+                ..
+            } => Path::new(&path),
+            other => panic!("missing active checkout: {other:?}"),
+        };
+        assert!(active.ends_with("skills"));
+        assert!(active.join("example/SKILL.md").is_file());
+        assert!(active
+            .ancestors()
+            .any(|path| path.file_name().is_some_and(|name| name == source.id.as_str())));
+        assert_eq!(
+            load_skill_sources(app.path()).await.expect("reload")[0],
+            result.source
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_refresh_preserves_active_generation() {
+        use std::os::unix::fs::symlink;
+
+        let app = tempdir().expect("app data");
+        let repo = local_git_repo();
+        let state = test_state(app.path());
+        set_settings(&state, SettingsLoadState::FirstLaunch).await;
+        let source = register_test_github(&state, Some("v1"), Some("skills")).await;
+        let first = refresh_git_source_from(
+            &state,
+            &source.id,
+            repo.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .expect("seed active generation");
+        let state_path = skill_sources_path(app.path());
+        let before = std::fs::read(&state_path).expect("state bytes");
+        let active_before = first.source.kind.clone();
+
+        for clone_source in ["/missing/repository", repo.path().to_string_lossy().as_ref()] {
+            let result = refresh_git_source_from(&state, &source.id, clone_source).await;
+            if clone_source != "/missing/repository" {
+                assert!(result.is_ok(), "control refresh must succeed");
+                continue;
+            }
+            assert!(result.is_err());
+            assert_eq!(
+                load_skill_sources(app.path()).await.expect("preserved")[0].kind,
+                active_before
+            );
+            assert_eq!(std::fs::read(&state_path).expect("state bytes"), before);
+        }
+
+        let missing_ref = register_test_github(&state, Some("missing-ref"), None).await;
+        let missing_ref_before = std::fs::read(&state_path).expect("before missing ref");
+        assert!(refresh_git_source_from(
+            &state,
+            &missing_ref.id,
+            repo.path().to_string_lossy().as_ref()
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            std::fs::read(&state_path).expect("after missing ref"),
+            missing_ref_before
+        );
+
+        let escaped_repo = local_git_repo();
+        symlink("..", escaped_repo.path().join("escape")).expect("escaping symlink");
+        git(escaped_repo.path(), &["add", "escape"]);
+        git(escaped_repo.path(), &["commit", "-qm", "escaping subdirectory"]);
+        let escaped = register_test_github(&state, None, Some("escape")).await;
+        let escaped_before = std::fs::read(&state_path).expect("before escape");
+        assert!(refresh_git_source_from(
+            &state,
+            &escaped.id,
+            escaped_repo.path().to_string_lossy().as_ref()
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            std::fs::read(&state_path).expect("after escape"),
+            escaped_before
+        );
+
+        let tmp_path = Path::new(&format!("{}.tmp", state_path.display())).to_path_buf();
+        std::fs::create_dir(&tmp_path).expect("block atomic temp file");
+        let persist_before = std::fs::read(&state_path).expect("before persistence failure");
+        assert!(refresh_git_source_from(
+            &state,
+            &source.id,
+            repo.path().to_string_lossy().as_ref()
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            std::fs::read(&state_path).expect("after persistence failure"),
+            persist_before
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_git_packages_remain_inspectable() {
+        let app = tempdir().expect("app data");
+        let repo = local_git_repo();
+        std::fs::write(repo.path().join("skills/example/run.sh"), b"unsafe")
+            .expect("write unsafe surface");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "unsafe package"]);
+        let state = test_state(app.path());
+        set_settings(&state, SettingsLoadState::FirstLaunch).await;
+        let source = register_test_github(&state, None, Some("skills")).await;
+
+        let result = refresh_git_source_from(
+            &state,
+            &source.id,
+            repo.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .expect("refresh invalid package");
+
+        assert_eq!(result.packages.len(), 1);
+        assert!(!result.packages[0].installable);
+        assert!(result.packages[0]
+            .errors
+            .iter()
+            .any(|error| error.path == "run.sh"));
+        assert!(matches!(
+            result.source.kind,
+            SkillSourceKind::Github {
+                active_checkout: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_git_refresh_preserves_source_records() {
+        let app = tempdir().expect("app data");
+        let repo = local_git_repo();
+        let state = Arc::new(test_state(app.path()));
+        set_settings(&state, SettingsLoadState::FirstLaunch).await;
+        let first = register_test_github(&state, None, Some("skills")).await;
+        let second = add_github_source(
+            &state,
+            "https://github.com/other/repo",
+            None,
+            Some("skills"),
+        )
+        .await
+        .expect("register second source");
+
+        let refresh = |source: SkillSource| {
+            let state = Arc::clone(&state);
+            let clone_source = repo.path().to_string_lossy().into_owned();
+            tokio::spawn(async move {
+                refresh_git_source_from(&state, &source.id, &clone_source).await
+            })
+        };
+        let first_result = refresh(first).await.expect("first join").expect("first refresh");
+        let second_result = refresh(second)
+            .await
+            .expect("second join")
+            .expect("second refresh");
+        let persisted = load_skill_sources(app.path()).await.expect("load sources");
+
+        assert_eq!(persisted.len(), 2);
+        assert!(persisted.iter().any(|source| source == &first_result.source));
+        assert!(persisted.iter().any(|source| source == &second_result.source));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn github_refresh_filesystem_transaction_runs_in_spawn_blocking() {
+        let app = tempdir().expect("app data");
+        let repo = local_git_repo();
+        let state = test_state(app.path());
+        set_settings(&state, SettingsLoadState::FirstLaunch).await;
+        let source = register_test_github(&state, None, Some("skills")).await;
+        let async_thread = std::thread::current().id();
+        reset_refresh_fs_probe();
+
+        refresh_git_source_from(
+            &state,
+            &source.id,
+            repo.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .expect("successful refresh");
+        refresh_git_source_from(
+            &state,
+            &source.id,
+            repo.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .expect("second successful refresh");
+        assert!(refresh_git_source_from(&state, &source.id, "/missing/repository")
+            .await
+            .is_err());
+
+        let probe = take_refresh_fs_probe();
+        for required in [
+            "staging_create",
+            "canonicalize",
+            "activation_rename",
+            "state_persist",
+            "failed_stage_cleanup",
+            "recursive_cleanup",
+        ] {
+            assert!(
+                probe.iter().any(|(event, _)| event == required),
+                "missing probe {required}: {probe:?}"
+            );
+        }
+        assert!(
+            probe.iter().all(|(_, thread)| *thread != async_thread),
+            "filesystem transaction touched async thread: {probe:?}"
+        );
+        assert!(
+            !probe.iter().any(|(event, _)| event == "obsolete_cleanup"),
+            "successful obsolete generations must not be cleaned in Phase 1"
+        );
+        let source_dir = app.path().join("skills/sources").join(&source.id);
+        assert_eq!(
+            std::fs::read_dir(source_dir)
+                .expect("source generations")
+                .count(),
+            2,
+            "both successful immutable generations remain"
+        );
     }
 
     #[test]
