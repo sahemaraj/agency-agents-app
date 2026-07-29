@@ -174,6 +174,7 @@ pub fn run() {
             skills::skill_source_add_local,
             skills::skill_source_add_github,
             skills::skill_source_refresh,
+            skills::skill_source_remove,
             // Phase 2 — install + reconcile (contracts.md §C). The cross-tool
             // agent state layer: render/ledger/reconcile/tools/projects.
             install::install_agent,

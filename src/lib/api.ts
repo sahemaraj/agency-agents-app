@@ -102,6 +102,10 @@ export function skillSourceRefresh(sourceId: string): Promise<SkillSourceResult>
   return invoke<SkillSourceResult>("skill_source_refresh", { sourceId });
 }
 
+export function skillSourceRemove(sourceId: string): Promise<boolean> {
+  return invoke<boolean>("skill_source_remove", { sourceId });
+}
+
 // ============================================================
 // GitHub integration
 // ============================================================

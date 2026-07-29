@@ -137,6 +137,21 @@ pub(crate) async fn add_local_source(
     Ok(source)
 }
 
+pub(crate) async fn remove_skill_source(
+    state: &AppState,
+    source_id: &str,
+) -> Result<bool, AppError> {
+    let _guard = state.skill_sources_write_lock.lock().await;
+    let mut sources = load_skill_sources(&state.app_data_dir).await?;
+    let original_len = sources.len();
+    sources.retain(|source| source.id != source_id);
+    if sources.len() == original_len {
+        return Ok(false);
+    }
+    save_skill_sources(&state.app_data_dir, &sources).await?;
+    Ok(true)
+}
+
 fn canonical_github_repository(repository: &str) -> Result<String, AppError> {
     let trimmed = repository.trim();
     let authority = trimmed
@@ -648,14 +663,7 @@ fn validate_package(
     package_root: &Path,
 ) -> SkillPackageResult {
     let relative = match normalized_relative_path(source_root, package_root) {
-        Ok(relative) if relative != "." => relative,
-        Ok(_) => {
-            return invalid_package_root(
-                source_id,
-                ".",
-                "A skill package must be a directory below the registered source root.",
-            );
-        }
+        Ok(relative) => relative,
         Err(error) => {
             return invalid_package_root(source_id, ".", &error.message);
         }
@@ -1135,6 +1143,14 @@ pub async fn skill_source_refresh(
     }
 }
 
+#[tauri::command]
+pub async fn skill_source_remove(
+    state: State<'_, AppState>,
+    source_id: String,
+) -> Result<bool, AppError> {
+    remove_skill_source(&state, &source_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1147,8 +1163,9 @@ mod tests {
 
     use super::{
         add_github_source, add_local_source, discover_source, is_windows_reparse_point,
-        load_skill_sources, refresh_git_source_from, reset_refresh_fs_probe, skill_sources_path,
-        take_refresh_fs_probe, validate_package, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
+        load_skill_sources, refresh_git_source_from, remove_skill_source, reset_refresh_fs_probe,
+        skill_sources_path, take_refresh_fs_probe, validate_package, MAX_SKILL_FILES,
+        MAX_SKILL_FILE_BYTES,
     };
     use crate::commands::settings::{Settings, SettingsLoadState};
     use crate::error::AppError;
@@ -1666,6 +1683,25 @@ mod tests {
         assert!(skill_sources_path(app.path()).exists());
     }
 
+    #[tokio::test]
+    async fn root_skill_package_is_discovered() {
+        let parent = tempdir().expect("source parent");
+        let source = parent.path().join("root-skill");
+        write_skill(&source, "", "root-skill", "Root skill");
+        let registered = SkillSource {
+            id: "source-id".into(),
+            kind: SkillSourceKind::Local {
+                root: source.to_string_lossy().into_owned(),
+            },
+        };
+
+        let result = discover_source(registered).await.expect("discover source");
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].relative_path, ".");
+        assert!(result.packages[0].installable, "{:?}", result.packages[0]);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn discovery_rejects_symlinked_ancestor_outside_source() {
@@ -1730,6 +1766,29 @@ mod tests {
             std::fs::read(&state_path).expect("read preserved state"),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn removing_source_only_unregisters_it() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        write_skill(source.path(), "example", "example", "Example");
+        let state = test_state(app.path());
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+
+        assert!(remove_skill_source(&state, &registered.id)
+            .await
+            .expect("remove source"));
+        assert!(load_skill_sources(app.path())
+            .await
+            .expect("reload sources")
+            .is_empty());
+        assert!(source.path().join("example/SKILL.md").is_file());
+        assert!(!remove_skill_source(&state, &registered.id)
+            .await
+            .expect("remove missing source"));
     }
 
     #[tokio::test]

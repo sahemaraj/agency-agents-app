@@ -4,6 +4,7 @@
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
 
   import Button from "$lib/components/Button.svelte";
+  import DestructiveConfirm from "$lib/components/DestructiveConfirm.svelte";
   import EmptyState from "$lib/components/EmptyState.svelte";
   import LoadingState from "$lib/components/LoadingState.svelte";
   import { skillSources } from "$lib/stores/skillSources.svelte";
@@ -11,6 +12,7 @@
 
   let localPath = $state("");
   let announcement = $state("");
+  let removeCandidate: SkillSource | null = $state(null);
 
   onMount(() => {
     void skillSources.load();
@@ -48,6 +50,15 @@
     const succeeded = await skillSources.refresh(source.id);
     if (succeeded) {
       announcement = `${sourceLabel(source)} refreshed with ${packageCount(skillSources.results[source.id])} valid packages.`;
+    }
+  }
+
+  async function removeSource(): Promise<void> {
+    if (!removeCandidate) return;
+    const source = removeCandidate;
+    if (await skillSources.remove(source.id)) {
+      announcement = `${sourceLabel(source)} removed from Agency Agents.`;
+      removeCandidate = null;
     }
   }
 </script>
@@ -95,25 +106,38 @@
           {@const result = skillSources.results[source.id]}
           {@const refreshError = skillSources.refreshErrors[source.id]}
           {@const refreshing = skillSources.isRefreshing(source.id)}
-          <article class="source" aria-busy={refreshing}>
+          {@const removeError = skillSources.removeErrors[source.id]}
+          {@const removing = skillSources.isRemoving(source.id)}
+          <article class="source" aria-busy={refreshing || removing}>
             <div class="source-head">
               <div class="identity">
                 <span class="kind">{source.kind.kind === "local" ? "Local folder" : "GitHub"}</span>
                 <strong title={sourceLabel(source)}>{sourceLabel(source)}</strong>
               </div>
-              <Button
-                size="sm"
-                loading={refreshing}
-                disabled={refreshing}
-                ariaLabel={`Refresh skill source ${sourceLabel(source)}`}
-                onclick={() => void refresh(source)}
-              >
-                Refresh
-              </Button>
+              <div class="source-actions">
+                <Button
+                  size="sm"
+                  loading={refreshing}
+                  disabled={refreshing || removing}
+                  ariaLabel={`Refresh skill source ${sourceLabel(source)}`}
+                  onclick={() => void refresh(source)}
+                >
+                  Refresh
+                </Button>
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled={refreshing || removing}
+                  ariaLabel={`Remove skill source ${sourceLabel(source)}`}
+                  onclick={() => (removeCandidate = source)}
+                >
+                  Remove
+                </Button>
+              </div>
             </div>
 
-            {#if refreshError}
-              <div class="alert" role="alert">{refreshError}</div>
+            {#if refreshError || removeError}
+              <div class="alert" role="alert">{refreshError ?? removeError}</div>
             {/if}
 
             {#if result}
@@ -158,6 +182,17 @@
     {/if}
   </div>
 </div>
+
+<DestructiveConfirm
+  open={removeCandidate !== null}
+  title="Remove skill source?"
+  confirmLabel="Remove source"
+  confirmDisabled={removeCandidate ? skillSources.isRemoving(removeCandidate.id) : false}
+  onConfirm={() => void removeSource()}
+  onCancel={() => (removeCandidate = null)}
+>
+  <p>This only removes the source from Agency Agents. The original folder and installed skills will not be deleted.</p>
+</DestructiveConfirm>
 
 <style>
   .workspace {
@@ -234,6 +269,10 @@
     align-items: center;
     justify-content: space-between;
     gap: var(--space-3);
+  }
+  .source-actions {
+    display: flex;
+    gap: var(--space-2);
   }
   .identity {
     min-width: 0;
