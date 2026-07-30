@@ -14,6 +14,7 @@
   import EmptyState from "$lib/components/EmptyState.svelte";
   import Input from "$lib/components/Input.svelte";
   import LoadingState from "$lib/components/LoadingState.svelte";
+  import Modal from "$lib/components/Modal.svelte";
   import { projects } from "$lib/stores/projects.svelte";
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
@@ -24,6 +25,9 @@
   type SortOrder = "name" | "type" | "source";
   type PackageView = { pkg: SkillPackageResult; source: SkillSource };
   type SkillGroupNode = { key: string; label: string; children: SkillGroupNode[]; packages: PackageView[] };
+  type PersonalFolderNode = { path: string; label: string; children: PersonalFolderNode[] };
+
+  const PERSONAL_FOLDERS_KEY = "agency-agents:skill-folders:v1";
 
   let localPath = $state("");
   let announcement = $state("");
@@ -43,6 +47,12 @@
   let uninstallCandidate: InstalledSkill | null = $state(null);
   let rejectDraftCandidate: SkillDraft | null = $state(null);
   let trustCandidate: PackageView | null = $state(null);
+  let personalFolders: string[] = $state([]);
+  let folderAssignments: Record<string, string> = $state({});
+  let folderModalOpen = $state(false);
+  let folderName = $state("");
+  let folderParent = $state("");
+  let folderError = $state("");
 
   const packages = $derived.by<PackageView[]>(() =>
     Object.values(skillSources.results).flatMap((result) =>
@@ -58,6 +68,11 @@
       if (libraryFilter === "installed" && !isInstalled(pkg)) return false;
       if (libraryFilter === "trusted" && !trustedScripts(pkg)) return false;
       if (libraryFilter === "review" && pkg.installable && !requiresTrust(pkg)) return false;
+      if (libraryFilter.startsWith("personal:")) {
+        const folder = libraryFilter.slice("personal:".length);
+        const assigned = folderAssignments[skillSources.packageKey(pkg)];
+        if (assigned !== folder && !assigned?.startsWith(`${folder}/`)) return false;
+      }
       if (libraryFilter.startsWith("taxonomy:")) {
         const path = libraryFilter.slice("taxonomy:".length).split("/");
         if (pkg.skillType !== path[0]) return false;
@@ -123,6 +138,24 @@
       ? null
       : packages.find(({ pkg }) => skillSources.packageKey(pkg) === selectedKey) ?? null,
   );
+  const personalFolderTree = $derived.by<PersonalFolderNode[]>(() => {
+    const roots: PersonalFolderNode[] = [];
+    for (const path of personalFolders) {
+      let nodes = roots;
+      let current = "";
+      for (const label of path.split("/")) {
+        current = current ? `${current}/${label}` : label;
+        let node = nodes.find((candidate) => candidate.path === current);
+        if (!node) {
+          node = { path: current, label, children: [] };
+          nodes.push(node);
+          nodes.sort((left, right) => left.label.localeCompare(right.label));
+        }
+        nodes = node.children;
+      }
+    }
+    return roots;
+  });
   const deploymentColumns: DeploymentColumn[] = [
     { id: "claudeCode", label: "Claude Code", supportsUser: true, supportsProject: true },
     { id: "codex", label: "Codex", supportsUser: true, supportsProject: true },
@@ -150,6 +183,9 @@
     if (libraryFilter === "installed") return i18n.t("skills.installed");
     if (libraryFilter === "trusted") return i18n.t("skills.trustedScripts");
     if (libraryFilter === "review") return i18n.t("skills.needsReview");
+    if (libraryFilter.startsWith("personal:")) {
+      return libraryFilter.slice("personal:".length).split("/").at(-1) ?? i18n.t("skills.allSkills");
+    }
     if (libraryFilter.startsWith("taxonomy:")) {
       const node = findGroup(grouped, libraryFilter.slice("taxonomy:".length));
       return node?.label ?? i18n.t("skills.allSkills");
@@ -165,6 +201,7 @@
 
   onMount(() => {
     projects.hydrate();
+    hydratePersonalFolders();
     const focusSearch = (event: KeyboardEvent): void => {
       const target = event.target as HTMLElement | null;
       if (event.key !== "/" || target?.matches("input, textarea, select, [contenteditable='true']")) return;
@@ -216,6 +253,75 @@
       if (child) return child;
     }
     return undefined;
+  }
+
+  function hydratePersonalFolders(): void {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(PERSONAL_FOLDERS_KEY) ?? "{}") as {
+        folders?: unknown;
+        assignments?: unknown;
+      };
+      personalFolders = Array.isArray(parsed.folders)
+        ? parsed.folders.filter((value): value is string => typeof value === "string" && value.length > 0)
+        : [];
+      folderAssignments = parsed.assignments && typeof parsed.assignments === "object"
+        ? Object.fromEntries(Object.entries(parsed.assignments).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+        : {};
+    } catch {
+      personalFolders = [];
+      folderAssignments = {};
+    }
+  }
+
+  function persistPersonalFolders(folders: string[], assignments: Record<string, string>): boolean {
+    try {
+      localStorage.setItem(PERSONAL_FOLDERS_KEY, JSON.stringify({ folders, assignments }));
+      return true;
+    } catch {
+      folderError = i18n.t("skills.folderSaveError");
+      return false;
+    }
+  }
+
+  function openFolderModal(parent = ""): void {
+    folderParent = parent;
+    folderName = "";
+    folderError = "";
+    folderModalOpen = true;
+  }
+
+  function createPersonalFolder(): void {
+    const name = folderName.trim();
+    if (!name || name.includes("/") || name.length > 64) {
+      folderError = i18n.t("skills.folderNameError");
+      return;
+    }
+    const path = folderParent ? `${folderParent}/${name}` : name;
+    if (personalFolders.some((folder) => folder.toLocaleLowerCase() === path.toLocaleLowerCase())) {
+      folderError = i18n.t("skills.folderExists");
+      return;
+    }
+    const folders = [...personalFolders, path];
+    if (!persistPersonalFolders(folders, folderAssignments)) return;
+    personalFolders = folders;
+    libraryFilter = `personal:${path}`;
+    folderModalOpen = false;
+  }
+
+  function assignSelectedFolder(folder: string): void {
+    if (!selected) return;
+    const key = skillSources.packageKey(selected.pkg);
+    const { [key]: _removed, ...remaining } = folderAssignments;
+    const assignments = folder ? { ...remaining, [key]: folder } : remaining;
+    if (!persistPersonalFolders(personalFolders, assignments)) return;
+    folderAssignments = assignments;
+  }
+
+  function personalFolderCount(path: string): number {
+    return packages.filter(({ pkg }) => {
+      const assigned = folderAssignments[skillSources.packageKey(pkg)];
+      return assigned === path || assigned?.startsWith(`${path}/`);
+    }).length;
   }
 
   function isInstalled(pkg: SkillPackageResult): boolean {
@@ -458,6 +564,27 @@
   </li>
 {/snippet}
 
+{#snippet personalFolderNode(node: PersonalFolderNode, depth: number)}
+  <li class="personal-folder">
+    <button
+      class:active={libraryFilter === `personal:${node.path}`}
+      aria-pressed={libraryFilter === `personal:${node.path}`}
+      style:--tree-depth={depth}
+      onclick={() => (libraryFilter = `personal:${node.path}`)}
+    >
+      <span>{node.label}</span>
+      <span>{personalFolderCount(node.path)}</span>
+    </button>
+    {#if node.children.length > 0}
+      <ul>
+        {#each node.children as child (child.path)}
+          {@render personalFolderNode(child, depth + 1)}
+        {/each}
+      </ul>
+    {/if}
+  </li>
+{/snippet}
+
 <div class="workspace">
   <header>
     <div>
@@ -620,6 +747,21 @@
             </button>
           {/each}
         </div>
+        <div class="tree-heading folder-heading">
+          <span>{i18n.t("skills.myFolders")}</span>
+          <button class="add-folder" aria-label={i18n.t("skills.newFolder")} onclick={() => openFolderModal()}>
+            <FolderPlus size={15} />
+          </button>
+        </div>
+        {#if personalFolderTree.length === 0}
+          <button class="empty-folder-action" onclick={() => openFolderModal()}>{i18n.t("skills.createFolder")}</button>
+        {:else}
+          <ul class="personal-folder-tree">
+            {#each personalFolderTree as node (node.path)}
+              {@render personalFolderNode(node, 0)}
+            {/each}
+          </ul>
+        {/if}
         <div class="tree-heading">{i18n.t("skills.typesAndFolders")}</div>
         <ul class="taxonomy-tree">
           {#each grouped as node (node.key)}
@@ -698,6 +840,27 @@
             </div>
 
             {#if detailTab === "overview"}
+            <section class="detail-section folder-assignment">
+              <div class="section-title-row">
+                <h4>{i18n.t("skills.myFolder")}</h4>
+                <Button size="sm" onclick={() => openFolderModal(folderAssignments[skillSources.packageKey(selected.pkg)] ?? "")}>
+                  {i18n.t("skills.newFolder")}
+                </Button>
+              </div>
+              <select
+                aria-label={i18n.t("skills.assignFolder")}
+                value={folderAssignments[skillSources.packageKey(selected.pkg)] ?? ""}
+                onchange={(event) => assignSelectedFolder(event.currentTarget.value)}
+              >
+                <option value="">{i18n.t("skills.noFolder")}</option>
+                {#each personalFolders.toSorted((left, right) => left.localeCompare(right)) as folder (folder)}
+                  <option value={folder}>{folder}</option>
+                {/each}
+              </select>
+              {#if folderError === i18n.t("skills.folderSaveError")}
+                <p class="alert" role="alert">{folderError}</p>
+              {/if}
+            </section>
             <section class="detail-section">
               <h4>{i18n.t("skills.provenance")}</h4>
               <dl>
@@ -833,6 +996,44 @@
   {/if}
 </div>
 
+{#if folderModalOpen}
+  <Modal open title={i18n.t("skills.newFolder")} defaultFocus="first" onClose={() => (folderModalOpen = false)}>
+    <form
+      class="folder-form"
+      onsubmit={(event) => {
+        event.preventDefault();
+        createPersonalFolder();
+      }}
+    >
+      <label>
+        <span>{i18n.t("skills.folderName")}</span>
+        <Input
+          bind:value={folderName}
+          placeholder={i18n.t("skills.folderNamePlaceholder")}
+          ariaLabel={i18n.t("skills.folderName")}
+          ariaDescribedby="folder-error"
+          invalid={folderError.length > 0}
+        />
+      </label>
+      <label>
+        <span>{i18n.t("skills.parentFolder")}</span>
+        <select bind:value={folderParent} aria-label={i18n.t("skills.parentFolder")}>
+          <option value="">{i18n.t("skills.folderRoot")}</option>
+          {#each personalFolders.toSorted((left, right) => left.localeCompare(right)) as folder (folder)}
+            <option value={folder}>{folder}</option>
+          {/each}
+        </select>
+      </label>
+      {#if folderError}<p id="folder-error" class="alert" role="alert">{folderError}</p>{/if}
+      <button class="form-submit" type="submit" tabindex="-1" aria-hidden="true"></button>
+    </form>
+    {#snippet actions()}
+      <Button variant="secondary" modalAction="cancel" onclick={() => (folderModalOpen = false)}>{i18n.t("common.cancel")}</Button>
+      <Button variant="primary" modalAction="confirm" onclick={createPersonalFolder}>{i18n.t("skills.createFolder")}</Button>
+    {/snippet}
+  </Modal>
+{/if}
+
 <DestructiveConfirm
   open={removeCandidate !== null}
   title={i18n.t("skills.removeSourceTitle")}
@@ -937,6 +1138,15 @@
   .quick-filters button.active { background: color-mix(in srgb, var(--color-brand) 14%, transparent); color: var(--color-text-primary); }
   .quick-filters button span:last-child { color: var(--color-text-muted); font-size: var(--text-caption); font-variant-numeric: tabular-nums; }
   .tree-heading { padding: var(--space-3) var(--space-3) var(--space-1); color: var(--color-text-muted); font-size: var(--text-caption); font-weight: var(--fw-semibold); text-transform: uppercase; }
+  .folder-heading { display: flex; align-items: center; justify-content: space-between; }
+  .add-folder { display: inline-flex; padding: var(--space-1); border-radius: var(--radius-sm); color: var(--color-text-muted); }
+  .add-folder:hover { background: var(--color-surface-raised); color: var(--color-text-primary); }
+  .empty-folder-action { margin: var(--space-1) var(--space-3) var(--space-2); color: var(--color-brand); font-size: var(--text-body-sm); text-align: left; }
+  .personal-folder-tree { padding-bottom: var(--space-2); }
+  .personal-folder button { display: flex; justify-content: space-between; width: 100%; padding: var(--space-2) var(--space-3); padding-left: calc(var(--space-3) + var(--tree-depth) * 14px); color: var(--color-text-secondary); font-size: var(--text-body-sm); text-align: left; }
+  .personal-folder button:hover { background: var(--color-surface-raised); color: var(--color-text-primary); }
+  .personal-folder button.active { background: color-mix(in srgb, var(--color-brand) 14%, transparent); color: var(--color-text-primary); }
+  .personal-folder button span:last-child { color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
   .taxonomy-tree { padding-bottom: var(--space-3); }
   .filters { display: grid; gap: var(--space-2); padding: var(--space-3); border-bottom: 1px solid var(--color-border); }
   .search { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-text-muted); background: var(--color-surface-raised); }
@@ -975,6 +1185,12 @@
   .detail-section { display: grid; gap: var(--space-3); padding: var(--space-4) 0; border-top: 1px solid var(--color-border); }
   .detail-section h4 { color: var(--color-text-primary); font-size: var(--text-body); font-weight: var(--fw-semibold); }
   .detail-section h4 span { color: var(--color-text-muted); font-weight: var(--fw-normal); }
+  .section-title-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+  .folder-assignment select { max-width: 100%; width: min(360px, 100%); }
+  .folder-form { display: grid; gap: var(--space-3); }
+  .folder-form label { display: grid; gap: var(--space-1); color: var(--color-text-secondary); font-size: var(--text-body-sm); }
+  .folder-form select { width: 100%; max-width: none; min-height: 30px; }
+  .form-submit { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
   dl { display: grid; gap: var(--space-2); }
   dl div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: var(--space-3); }
   dt { color: var(--color-text-muted); font-size: var(--text-body-sm); }
