@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "experts": [
+    {
+      "id": "frontend-design",
+      "name": "Frontend Design Expert",
+      "summary": "Design and ship polished, accessible frontend experiences.",
+      "category": "Design",
+      "tags": ["frontend", "ui", "accessibility"],
+      "version": 1,
+      "leadAgent": "design-ui-designer",
+      "supportingAgents": ["engineering-frontend-developer", "design-ui-finish-gate-reviewer"],
+      "requiredSkills": ["frontend-design"],
+      "optionalSkills": [],
+      "runbook": null,
+      "preferredClient": "claudeCode",
+      "starterPrompt": "Use the activated {{expert}} workspace for {{project}}. Lead the work with {{leadAgent}}, coordinate the supporting roster, and verify accessibility and visual quality before completion.",
+      "source": "curated"
+    },
+    {
+      "id": "secure-api",
+      "name": "Secure API Expert",
+      "summary": "Design and validate secure, maintainable APIs.",
+      "category": "Engineering",
+      "tags": ["api", "security"],
+      "version": 1,
+      "leadAgent": "engineering-api-platform-engineer",
+      "supportingAgents": ["security-appsec-engineer", "testing-api-tester"],
+      "requiredSkills": ["api-design-principles", "api-security-best-practices"],
+      "optionalSkills": [],
+      "runbook": null,
+      "preferredClient": "codex",
+      "starterPrompt": "Use the activated {{expert}} workspace for {{project}}. Design the API with explicit trust boundaries, test its contract, and report security findings before completion.",
+      "source": "curated"
+    },
+    {
+      "id": "incident-response",
+      "name": "Incident Response Expert",
+      "summary": "Coordinate investigation, containment, recovery, and evidence capture.",
+      "category": "Security",
+      "tags": ["incident", "operations"],
+      "version": 1,
+      "leadAgent": "engineering-incident-response-commander",
+      "supportingAgents": ["security-incident-responder", "security-senior-secops"],
+      "requiredSkills": ["incident-response-incident-response", "incident-runbook-templates"],
+      "optionalSkills": [],
+      "runbook": "scenario-incident-response",
+      "preferredClient": "claudeCode",
+      "starterPrompt": "Activate {{expert}} for {{project}}. Establish incident command, preserve evidence, contain impact, and follow the attached runbook with explicit verification at each transition.",
+      "source": "curated"
+    }
+  ]
+}

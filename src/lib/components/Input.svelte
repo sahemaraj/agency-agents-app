@@ -16,6 +16,7 @@
     disabled?: boolean;
     invalid?: boolean;
     ariaLabel?: string;
+    ariaDescribedby?: string;
     onInput?: (v: string) => void;
     onKeydown?: (e: KeyboardEvent) => void;
     leading?: Snippet;
@@ -31,6 +32,7 @@
     disabled = false,
     invalid = false,
     ariaLabel,
+    ariaDescribedby,
     onInput,
     onKeydown,
     leading,
@@ -62,6 +64,8 @@
     {disabled}
     {value}
     aria-label={ariaLabel}
+    aria-describedby={ariaDescribedby}
+    aria-invalid={invalid}
     oninput={handleInput}
     onkeydown={onKeydown}
   />

@@ -58,7 +58,37 @@ export interface Settings {
       user-scope installs + detection resolve against it instead of the OS home
       (e.g. pointing Claude Code at a WSL home). Absent/empty = OS home. */
   toolPaths: Record<string, string>;
+  /** MCP mutations are opt-in by class; read tools remain available. */
+  mcpSourceAccess: boolean;
+  mcpInstallAccess: boolean;
+  mcpDestructiveAccess: boolean;
+  /** Exact canonical project roots MCP mutations may target. */
+  mcpProjectAllowlist: string[];
+  mcpClientPolicies: Partial<Record<McpClient, McpClientPolicy>>;
 }
+
+export interface McpClientPolicy {
+  sourceAccess: boolean;
+  installAccess: boolean;
+  destructiveAccess: boolean;
+}
+
+export type GeneralSettingsPatch = Partial<
+  Pick<
+    Settings,
+    | "paranoidMode"
+    | "catalogStaleBannerDays"
+    | "caskIconMode"
+    | "trendingTtlMinutes"
+    | "githubEnabled"
+    | "aiFeaturesEnabled"
+    | "updateAutoCheck"
+    | "enhancedTrendingEnabled"
+    | "vulnerabilityScanningEnabled"
+    | "liveEnrichmentEnabled"
+    | "toolPaths"
+  >
+>;
 
 /** Defaults matching the Rust `Settings::default()`. Used when seeding
     the settings store before the first `settingsGet` resolves so the UI
@@ -86,6 +116,11 @@ export const SETTINGS_DEFAULTS: Settings = {
   liveEnrichmentEnabled: false,
   // Per-tool custom install base paths. Empty by default (all tools use ~).
   toolPaths: {},
+  mcpSourceAccess: false,
+  mcpInstallAccess: false,
+  mcpDestructiveAccess: false,
+  mcpProjectAllowlist: [],
+  mcpClientPolicies: {},
 };
 
 // =========================================================
@@ -310,6 +345,287 @@ export type Tool = string;
     project-scoped tools install into a tracked `projectPath`. */
 export type Scope = "user" | "project";
 
+export type SkillSourceKind =
+  | { kind: "local"; root: string }
+  | {
+      kind: "github";
+      repository: string;
+      gitRef: string | null;
+      subdirectory: string | null;
+      activeCheckout: string | null;
+    };
+
+export interface SkillSource {
+  id: string;
+  kind: SkillSourceKind;
+}
+
+export interface SkillPackageFile {
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface SkillTrustedExecutable {
+  relativePath: string;
+  sha256: string;
+  executable: boolean;
+}
+
+export interface SkillTrustFingerprint {
+  treeHash: string;
+  executables: SkillTrustedExecutable[];
+}
+
+export type SkillType =
+  | "design"
+  | "development"
+  | "testing"
+  | "devops"
+  | "security"
+  | "data"
+  | "ai"
+  | "productivity"
+  | "other";
+
+export type SkillValidationCode = "invalidMetadata" | "trustRequired" | "unsafeEntry" | "io";
+
+export interface SkillValidationError {
+  code: SkillValidationCode;
+  path: string;
+  message: string;
+}
+
+export interface SkillPackageResult {
+  sourceId: string;
+  relativePath: string;
+  name: string | null;
+  description: string | null;
+  skillType: SkillType;
+  group: string[];
+  tags: string[];
+  dependencies: string[];
+  recommendedSkills: string[];
+  version: string | null;
+  channel: "stable" | "beta";
+  changelog: string | null;
+  publisher: string | null;
+  publisherKey: string | null;
+  publisherVerified: boolean;
+  validationResults: string[];
+  permissions: string[];
+  qualityScore: number;
+  qualityChecks: string[];
+  files: SkillPackageFile[];
+  trustFingerprint: SkillTrustFingerprint | null;
+  errors: SkillValidationError[];
+  installable: boolean;
+}
+
+export interface SkillFolderAssignment {
+  sourceId: string;
+  relativePath: string;
+  folderPath: string;
+}
+
+export interface SkillReference {
+  sourceId: string;
+  relativePath: string;
+}
+
+export interface SkillRecent {
+  skill: SkillReference;
+  viewedAt: string;
+}
+
+export interface SkillCollection {
+  name: string;
+  skills: SkillReference[];
+}
+
+export interface SkillSmartFolderRule {
+  query: string | null;
+  skillType: SkillType | null;
+  tag: string | null;
+  sourceId: string | null;
+  installable: boolean | null;
+  favorite: boolean | null;
+}
+
+export interface SkillSmartFolder {
+  name: string;
+  rule: SkillSmartFolderRule;
+}
+
+export interface SkillWorkspaceProfile {
+  name: string;
+  folders: string[];
+  collections: string[];
+  runtime: string | null;
+  projectPath: string | null;
+}
+
+export type SkillUpdatePolicy = "notify" | "autoTrusted" | "pin" | "reviewScripts";
+
+export interface SkillUpdatePolicyRecord {
+  skill: SkillReference;
+  policy: SkillUpdatePolicy;
+}
+
+export interface SkillPublisherTrust {
+  name: string;
+  publicKey: string;
+  trusted: boolean;
+  revoked: boolean;
+}
+
+export interface SkillPreferredSource {
+  skillName: string;
+  sourceId: string;
+}
+
+export interface SkillUsage {
+  skill: SkillReference;
+  fetches: number;
+  installs: number;
+  rejections: number;
+  lastUsedAt: string;
+}
+
+export type SkillApprovalAction =
+  | { action: "folderCreate"; path: string }
+  | { action: "folderRename"; path: string; newName: string }
+  | { action: "folderMove"; path: string; newParent: string | null }
+  | { action: "folderDelete"; path: string; recursive: boolean }
+  | { action: "folderAssign"; sourceId: string; relativePath: string; folderPath: string | null }
+  | { action: "install"; sourceId: string; relativePath: string; runtime: string; projectPath: string | null }
+  | { action: "collectionDelete"; name: string }
+  | { action: "smartFolderDelete"; name: string }
+  | { action: "profileDelete"; name: string }
+  | { action: "updatePolicySet"; sourceId: string; relativePath: string; policy: SkillUpdatePolicy }
+  | { action: "rollback"; sourceId: string; relativePath: string; runtime: string; projectPath: string | null; snapshotPath: string }
+  | { action: "publisherTrustSet"; name: string; publicKey: string; trusted: boolean; revoked: boolean }
+  | { action: "batchCollection"; collectionName: string; operation: string; runtime: string; projectPath: string | null };
+
+export interface SkillApproval {
+  id: string;
+  submittedAt: string;
+  state: "pending" | "running" | "approved" | "rejected";
+  requestedBy: string;
+  request: SkillApprovalAction;
+  result: string | null;
+}
+
+export interface SkillFolderState {
+  folders: string[];
+  assignments: SkillFolderAssignment[];
+  favorites: SkillReference[];
+  recent: SkillRecent[];
+  collections: SkillCollection[];
+  smartFolders: SkillSmartFolder[];
+  profiles: SkillWorkspaceProfile[];
+  updatePolicies: SkillUpdatePolicyRecord[];
+  publisherTrust: SkillPublisherTrust[];
+  preferredSources: SkillPreferredSource[];
+  usage: SkillUsage[];
+  approvals: SkillApproval[];
+}
+
+export type SkillDraftState = "pending" | "published" | "rejected";
+
+export interface SkillDraftFile {
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface SkillDraft {
+  id: string;
+  submittedAt: string;
+  state: SkillDraftState;
+  treeHash: string;
+  files: SkillDraftFile[];
+  validation: SkillPackageResult;
+  publishedSourceId: string | null;
+}
+
+export interface SkillSourceResult {
+  source: SkillSource;
+  packages: SkillPackageResult[];
+  errors: SkillValidationError[];
+}
+
+export interface SkillDestinationPresence {
+  runtime: "claudeCode" | "codex";
+  scope: "user" | "project";
+  projectPath: string | null;
+  path: string;
+  present: boolean;
+}
+
+export interface SkillVersionSnapshot {
+  path: string;
+  createdAt: string;
+}
+
+export interface SkillPlanPackage {
+  sourceId: string;
+  relativePath: string;
+  name: string;
+  dependency: boolean;
+  destination: string;
+  fileCount: number;
+  permissions: string[];
+}
+
+export interface SkillMutationPlan {
+  operation: string;
+  runtime: string;
+  projectPath: string | null;
+  packages: SkillPlanPackage[];
+  warnings: string[];
+  blockers: string[];
+  rollbackAvailable: boolean;
+}
+
+export interface SkillBatchResult {
+  operation: string;
+  completed: string[];
+  rolledBack: boolean;
+}
+
+export type SkillInstallState =
+  | "current"
+  | "outdated"
+  | "modified"
+  | "missing"
+  | "foreign"
+  | "disabled"
+  | "sourceUnavailable";
+
+export interface InstalledSkill {
+  sourceId: string;
+  relativePath: string;
+  name: string;
+  runtime: "claudeCode" | "codex";
+  scope: "user" | "project";
+  projectPath: string | null;
+  path: string;
+  state: SkillInstallState;
+  tracked: boolean;
+}
+
+export interface McpAuditEntry {
+  id: string;
+  timestamp: string;
+  client: string | null;
+  tool: string;
+  action: "read" | "source" | "install" | "destructive" | "unknown";
+  phase: "attempt" | "terminal";
+  success: boolean;
+  projectPath: string | null;
+}
+
 /**
  * An agent as parsed from a single corpus `.md` file. `body` is the
  * markdown persona — empty in list views (`corpusList`) to keep payloads
@@ -410,6 +726,121 @@ export interface Runbook {
   summary: string;
   doc: string;
   roster: RunbookGroup[];
+}
+
+export type ExpertClient = "claudeCode" | "codex";
+
+export interface ExpertDefinition {
+  id: string;
+  name: string;
+  summary: string;
+  category: string;
+  tags: string[];
+  version: number;
+  leadAgent: string;
+  supportingAgents: string[];
+  requiredSkills: string[];
+  optionalSkills: string[];
+  runbook: string | null;
+  preferredClient: ExpertClient | null;
+  starterPrompt: string;
+  source: "curated" | "custom";
+}
+
+export interface ExpertProposalInput {
+  name: string;
+  summary: string;
+  category: string;
+  tags: string[];
+  leadAgent: string;
+  supportingAgents: string[];
+  requiredSkills: string[];
+  optionalSkills: string[];
+  runbook: string | null;
+  preferredClient: ExpertClient | null;
+  starterPrompt: string;
+}
+
+export interface ExpertLinkedSkillDraft {
+  skillName: string;
+  draftId: string;
+}
+
+export interface ExpertAgentSubstitution {
+  neededCapability: string;
+  selectedCatalogSlug: string;
+  rationale: string;
+}
+
+export interface ExpertLinkedSkillState extends ExpertLinkedSkillDraft {
+  state: SkillDraftState | null;
+}
+
+export interface ExpertCreationRequest extends ExpertProposalRequestFields {
+  id: string;
+  readiness: "waitingForSkills" | "ready" | "blocked";
+  linkedSkillStates: ExpertLinkedSkillState[];
+  blockers: string[];
+  warnings: string[];
+}
+
+interface ExpertProposalRequestFields {
+  clientRequestId: string;
+  outcome: string;
+  projectPath: string;
+  requestedBy: string;
+  requestedAt: string;
+  proposal: ExpertProposalInput;
+  linkedSkillDrafts: ExpertLinkedSkillDraft[];
+  agentSubstitutions: ExpertAgentSubstitution[];
+  state: "pending" | "approved" | "rejected";
+  savedExpertId: string | null;
+}
+
+export interface ExpertResolved extends ExpertDefinition {
+  unresolvedAgents: string[];
+  unresolvedSkills: string[];
+  unresolvedRunbook: boolean;
+}
+
+export interface ExpertAgentAction {
+  slug: string;
+  status: string;
+  destination: string | null;
+}
+
+export interface ExpertActivationPlan {
+  expert: ExpertResolved;
+  projectPath: string;
+  client: ExpertClient;
+  agents: ExpertAgentAction[];
+  skills: SkillMutationPlan[];
+  existing: string[];
+  warnings: string[];
+  blockers: string[];
+  promptPreview: string;
+  rollbackScope: string[];
+}
+
+export interface ExpertActivationRecord {
+  id: string;
+  expertId: string;
+  expertVersion: number;
+  projectPath: string;
+  client: ExpertClient;
+  activatedAt: string;
+  installedAgents: string[];
+  installedSkills: string[];
+}
+
+export interface ExpertActivationRequest {
+  id: string;
+  expertId: string;
+  projectPath: string;
+  client: ExpertClient | null;
+  requestedBy: string;
+  requestedAt: string;
+  state: "pending" | "approved" | "rejected";
 }
 
 export interface CatalogUpdateCheck {
@@ -559,6 +990,17 @@ export interface ProjectInfo {
   installedCount: number;
 }
 
+export type McpClient = "claude" | "codex";
+export type McpClientState = "missing" | "exact" | "conflict" | "unavailable";
+
+export interface McpClientStatus {
+  client: McpClient;
+  installed: boolean;
+  state: McpClientState;
+  command: string;
+  detail: string;
+}
+
 // =========================================================
 // UI-only types (frontend stores, command palette, etc.)
 // =========================================================
@@ -566,10 +1008,11 @@ export interface ProjectInfo {
 export type SidebarSection =
   | "dashboard"
   | "personas"
+  | "skills"
   | "tools"
   | "teams"
   | "projects"
-  | "runbooks"
+  | "experts"
   | "activity";
 
 export type ThemePreference = "light" | "dark" | "system";
@@ -580,6 +1023,7 @@ export type ThemePreference = "light" | "dark" | "system";
 export type SettingsSection =
   | "appearance"
   | "catalog"
+  | "mcp"
   | "network"
   | "github"
   | "activity"

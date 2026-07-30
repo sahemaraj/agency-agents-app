@@ -5,6 +5,535 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpClient {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpClientState {
+    Missing,
+    Exact,
+    Conflict,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpClientStatus {
+    pub client: McpClient,
+    pub installed: bool,
+    pub state: McpClientState,
+    pub command: String,
+    pub detail: String,
+}
+
+// =========================================================
+// Agent Skills — trusted source subsystem
+// =========================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SkillSourceKind {
+    Local {
+        root: String,
+    },
+    Github {
+        repository: String,
+        git_ref: Option<String>,
+        subdirectory: Option<String>,
+        active_checkout: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSource {
+    pub id: String,
+    pub kind: SkillSourceKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPackageFile {
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillTrustedExecutable {
+    pub relative_path: String,
+    pub sha256: String,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillTrustFingerprint {
+    pub tree_hash: String,
+    pub executables: Vec<SkillTrustedExecutable>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillType {
+    Design,
+    Development,
+    Testing,
+    Devops,
+    Security,
+    Data,
+    Ai,
+    Productivity,
+    #[default]
+    Other,
+}
+
+impl SkillType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Design => "design",
+            Self::Development => "development",
+            Self::Testing => "testing",
+            Self::Devops => "devops",
+            Self::Security => "security",
+            Self::Data => "data",
+            Self::Ai => "ai",
+            Self::Productivity => "productivity",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFileContent {
+    pub relative_path: String,
+    pub mime_type: String,
+    pub text: Option<String>,
+    pub base64: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillValidationCode {
+    InvalidMetadata,
+    TrustRequired,
+    UnsafeEntry,
+    Io,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillValidationError {
+    pub code: SkillValidationCode,
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPackageResult {
+    pub source_id: String,
+    pub relative_path: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub skill_type: SkillType,
+    pub group: Vec<String>,
+    pub tags: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub recommended_skills: Vec<String>,
+    pub version: Option<String>,
+    pub channel: String,
+    pub changelog: Option<String>,
+    pub publisher: Option<String>,
+    pub publisher_key: Option<String>,
+    pub publisher_verified: bool,
+    pub validation_results: Vec<String>,
+    pub permissions: Vec<String>,
+    pub quality_score: u8,
+    pub quality_checks: Vec<String>,
+    pub files: Vec<SkillPackageFile>,
+    pub trust_fingerprint: Option<SkillTrustFingerprint>,
+    pub errors: Vec<SkillValidationError>,
+    pub installable: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillDraftState {
+    Pending,
+    Published,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDraftFile {
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDraft {
+    pub id: String,
+    pub submitted_at: String,
+    pub state: SkillDraftState,
+    pub tree_hash: String,
+    pub files: Vec<SkillDraftFile>,
+    pub validation: SkillPackageResult,
+    pub published_source_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSourceResult {
+    pub source: SkillSource,
+    pub packages: Vec<SkillPackageResult>,
+    pub errors: Vec<SkillValidationError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFolderAssignment {
+    pub source_id: String,
+    pub relative_path: String,
+    pub folder_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillReference {
+    pub source_id: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRecent {
+    pub skill: SkillReference,
+    pub viewed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillCollection {
+    pub name: String,
+    #[serde(default)]
+    pub skills: Vec<SkillReference>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSmartFolderRule {
+    pub query: Option<String>,
+    pub skill_type: Option<SkillType>,
+    pub tag: Option<String>,
+    pub source_id: Option<String>,
+    pub installable: Option<bool>,
+    pub favorite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSmartFolder {
+    pub name: String,
+    pub rule: SkillSmartFolderRule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillWorkspaceProfile {
+    pub name: String,
+    #[serde(default)]
+    pub folders: Vec<String>,
+    #[serde(default)]
+    pub collections: Vec<String>,
+    pub runtime: Option<String>,
+    pub project_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillUpdatePolicy {
+    Notify,
+    AutoTrusted,
+    Pin,
+    ReviewScripts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUpdatePolicyRecord {
+    pub skill: SkillReference,
+    pub policy: SkillUpdatePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPublisherTrust {
+    pub name: String,
+    pub public_key: String,
+    pub trusted: bool,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPreferredSource {
+    pub skill_name: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUsage {
+    pub skill: SkillReference,
+    pub fetches: u64,
+    pub installs: u64,
+    pub rejections: u64,
+    pub last_used_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SkillApprovalAction {
+    FolderCreate {
+        path: String,
+    },
+    FolderRename {
+        path: String,
+        new_name: String,
+    },
+    FolderMove {
+        path: String,
+        new_parent: Option<String>,
+    },
+    FolderDelete {
+        path: String,
+        recursive: bool,
+    },
+    FolderAssign {
+        source_id: String,
+        relative_path: String,
+        folder_path: Option<String>,
+    },
+    Install {
+        source_id: String,
+        relative_path: String,
+        runtime: String,
+        project_path: Option<String>,
+    },
+    CollectionDelete {
+        name: String,
+    },
+    SmartFolderDelete {
+        name: String,
+    },
+    ProfileDelete {
+        name: String,
+    },
+    UpdatePolicySet {
+        source_id: String,
+        relative_path: String,
+        policy: SkillUpdatePolicy,
+    },
+    Rollback {
+        source_id: String,
+        relative_path: String,
+        runtime: String,
+        project_path: Option<String>,
+        snapshot_path: String,
+    },
+    PublisherTrustSet {
+        name: String,
+        public_key: String,
+        trusted: bool,
+        revoked: bool,
+    },
+    BatchCollection {
+        collection_name: String,
+        operation: String,
+        runtime: String,
+        project_path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillApprovalState {
+    Pending,
+    Running,
+    Approved,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillApproval {
+    pub id: String,
+    pub submitted_at: String,
+    pub state: SkillApprovalState,
+    pub requested_by: String,
+    pub request: SkillApprovalAction,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFolderState {
+    #[serde(default)]
+    pub folders: Vec<String>,
+    #[serde(default)]
+    pub assignments: Vec<SkillFolderAssignment>,
+    #[serde(default)]
+    pub favorites: Vec<SkillReference>,
+    #[serde(default)]
+    pub recent: Vec<SkillRecent>,
+    #[serde(default)]
+    pub collections: Vec<SkillCollection>,
+    #[serde(default)]
+    pub smart_folders: Vec<SkillSmartFolder>,
+    #[serde(default)]
+    pub profiles: Vec<SkillWorkspaceProfile>,
+    #[serde(default)]
+    pub update_policies: Vec<SkillUpdatePolicyRecord>,
+    #[serde(default)]
+    pub publisher_trust: Vec<SkillPublisherTrust>,
+    #[serde(default)]
+    pub preferred_sources: Vec<SkillPreferredSource>,
+    #[serde(default)]
+    pub usage: Vec<SkillUsage>,
+    #[serde(default)]
+    pub approvals: Vec<SkillApproval>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDestinationPresence {
+    pub runtime: String,
+    pub scope: String,
+    pub project_path: Option<String>,
+    pub path: String,
+    pub present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillVersionSnapshot {
+    pub path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPlanPackage {
+    pub source_id: String,
+    pub relative_path: String,
+    pub name: String,
+    pub dependency: bool,
+    pub destination: String,
+    pub file_count: u32,
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillMutationPlan {
+    pub operation: String,
+    pub runtime: String,
+    pub project_path: Option<String>,
+    pub packages: Vec<SkillPlanPackage>,
+    pub warnings: Vec<String>,
+    pub blockers: Vec<String>,
+    pub rollback_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillBatchResult {
+    pub operation: String,
+    pub completed: Vec<String>,
+    pub rolled_back: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInstallRecord {
+    pub source_id: String,
+    pub relative_path: String,
+    pub name: String,
+    pub runtime: String,
+    pub scope: String,
+    pub project_path: Option<String>,
+    pub dest: String,
+    pub source_hash: String,
+    pub installed_hash: String,
+    pub installed_at: String,
+    #[serde(default)]
+    pub disabled_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillInstallState {
+    Current,
+    Outdated,
+    Modified,
+    Missing,
+    Foreign,
+    Disabled,
+    SourceUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledSkill {
+    pub source_id: String,
+    pub relative_path: String,
+    pub name: String,
+    pub runtime: String,
+    pub scope: String,
+    pub project_path: Option<String>,
+    pub path: String,
+    pub state: SkillInstallState,
+    pub tracked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAuditEntry {
+    pub id: String,
+    pub timestamp: String,
+    #[serde(default)]
+    pub client: Option<String>,
+    pub tool: String,
+    pub action: String,
+    #[serde(default = "default_mcp_audit_phase")]
+    pub phase: String,
+    pub success: bool,
+    pub project_path: Option<String>,
+}
+
+fn default_mcp_audit_phase() -> String {
+    "terminal".into()
+}
+
 // =========================================================
 // Agency Agents — corpus subsystem (contracts.md §A)
 // =========================================================
@@ -392,10 +921,18 @@ mod tests {
             "state",
             "updateKind",
         ] {
-            assert!(v.get(k).is_some(), "InstalledAgent must have wire field {:?}", k);
+            assert!(
+                v.get(k).is_some(),
+                "InstalledAgent must have wire field {:?}",
+                k
+            );
         }
         for snake in ["project_path", "update_kind"] {
-            assert!(v.get(snake).is_none(), "snake key {:?} must not leak", snake);
+            assert!(
+                v.get(snake).is_none(),
+                "snake key {:?} must not leak",
+                snake
+            );
         }
         assert_eq!(v["tool"], "claudeCode");
         assert_eq!(v["state"], "outdated");
@@ -418,10 +955,18 @@ mod tests {
         };
         let v = serde_json::to_value(&e).unwrap();
         for k in ["sourceHash", "frontmatterHash", "bodyHash"] {
-            assert!(v.get(k).is_some(), "CorpusEntry must have wire field {:?}", k);
+            assert!(
+                v.get(k).is_some(),
+                "CorpusEntry must have wire field {:?}",
+                k
+            );
         }
         for snake in ["source_hash", "frontmatter_hash", "body_hash"] {
-            assert!(v.get(snake).is_none(), "snake key {:?} must not leak", snake);
+            assert!(
+                v.get(snake).is_none(),
+                "snake key {:?} must not leak",
+                snake
+            );
         }
     }
 }

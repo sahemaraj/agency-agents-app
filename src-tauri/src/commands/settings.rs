@@ -28,10 +28,11 @@
 //! - **Numeric clamps.** [`Settings::clamp`] re-applies the ranges
 //!   declared in the type docs after every load and write so a manual
 //!   edit (`settings.json` is plain JSON the user can poke at) can't
-//!   smuggle an out-of-range value.
+//!   smuggle an out-of-range value. MCP project paths are canonicalized
+//!   only on explicit save; reload preserves their immutable identity.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -140,6 +141,78 @@ pub struct Settings {
     /// unaffected (they resolve against the chosen project root).
     #[serde(default)]
     pub tool_paths: HashMap<String, String>,
+
+    /// Allow MCP clients to add or refresh registered skill sources.
+    /// Off by default; reads remain available independently.
+    #[serde(default)]
+    pub mcp_source_access: bool,
+
+    /// Allow MCP clients to install, update, or enable managed skills.
+    /// Off by default.
+    #[serde(default)]
+    pub mcp_install_access: bool,
+
+    /// Allow MCP clients to disable or uninstall managed skills.
+    /// Off by default.
+    #[serde(default)]
+    pub mcp_destructive_access: bool,
+
+    /// Exact canonical project roots MCP mutations may target. User-scope
+    /// mutations do not consult this list.
+    #[serde(default)]
+    pub mcp_project_allowlist: Vec<String>,
+
+    /// Optional per-client overrides. Missing clients inherit the global
+    /// mutation policy above.
+    #[serde(default)]
+    pub mcp_client_policies: HashMap<String, McpClientPolicy>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpClientPolicy {
+    pub source_access: bool,
+    pub install_access: bool,
+    pub destructive_access: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GeneralSettingsPatch {
+    pub paranoid_mode: Option<bool>,
+    pub catalog_stale_banner_days: Option<u32>,
+    pub cask_icon_mode: Option<CaskIconMode>,
+    pub trending_ttl_minutes: Option<u32>,
+    pub github_enabled: Option<bool>,
+    pub ai_features_enabled: Option<bool>,
+    pub update_auto_check: Option<bool>,
+    pub enhanced_trending_enabled: Option<bool>,
+    pub vulnerability_scanning_enabled: Option<bool>,
+    pub live_enrichment_enabled: Option<bool>,
+    pub tool_paths: Option<HashMap<String, String>>,
+}
+
+impl GeneralSettingsPatch {
+    fn apply(self, settings: &mut Settings) {
+        macro_rules! apply {
+            ($field:ident) => {
+                if let Some(value) = self.$field {
+                    settings.$field = value;
+                }
+            };
+        }
+        apply!(paranoid_mode);
+        apply!(catalog_stale_banner_days);
+        apply!(cask_icon_mode);
+        apply!(trending_ttl_minutes);
+        apply!(github_enabled);
+        apply!(ai_features_enabled);
+        apply!(update_auto_check);
+        apply!(enhanced_trending_enabled);
+        apply!(vulnerability_scanning_enabled);
+        apply!(live_enrichment_enabled);
+        apply!(tool_paths);
+    }
 }
 
 /// Default factory for [`Settings::ai_features_enabled`] — separated
@@ -180,6 +253,11 @@ impl Default for Settings {
             // Empty by default — user opts a tool into a custom base path
             // (e.g. a WSL home) from the Tools panel.
             tool_paths: HashMap::new(),
+            mcp_source_access: false,
+            mcp_install_access: false,
+            mcp_destructive_access: false,
+            mcp_project_allowlist: Vec::new(),
+            mcp_client_policies: HashMap::new(),
         }
     }
 }
@@ -197,6 +275,8 @@ impl Settings {
     /// Push beyond this evicts the oldest entry (FIFO) so the list
     /// can't grow without bound across decades of releases.
     pub const SKIPPED_UPDATE_VERSIONS_CAP: usize = 10;
+    pub const MCP_PROJECT_ALLOWLIST_CAP: usize = 64;
+    pub const MCP_PROJECT_PATH_CHARS_CAP: usize = 4096;
 
     /// Apply the numeric clamps declared in the field docs. Idempotent;
     /// safe to call on already-clamped values.
@@ -207,6 +287,8 @@ impl Settings {
         self.trending_ttl_minutes = self
             .trending_ttl_minutes
             .clamp(Self::TRENDING_TTL_MIN, Self::TRENDING_TTL_MAX);
+        self.mcp_client_policies
+            .retain(|client, _| matches!(client.as_str(), "claude" | "codex"));
         // Enforce the cap on every load/save in addition to the push
         // helper so a hand-edited settings.json with 50 skip entries
         // gets pruned on read.
@@ -214,6 +296,34 @@ impl Settings {
             let excess = self.skipped_update_versions.len() - Self::SKIPPED_UPDATE_VERSIONS_CAP;
             self.skipped_update_versions.drain(..excess);
         }
+        let mut seen = HashSet::new();
+        self.mcp_project_allowlist = self
+            .mcp_project_allowlist
+            .drain(..)
+            .filter(|path| path.chars().count() <= Self::MCP_PROJECT_PATH_CHARS_CAP)
+            .filter(|path| seen.insert(path.clone()))
+            .take(Self::MCP_PROJECT_ALLOWLIST_CAP)
+            .collect();
+    }
+
+    fn canonicalize_new_mcp_project_allowlist(&mut self, existing: &[String]) {
+        let mut seen = HashSet::new();
+        self.mcp_project_allowlist = self
+            .mcp_project_allowlist
+            .drain(..)
+            .filter(|path| path.chars().count() <= Self::MCP_PROJECT_PATH_CHARS_CAP)
+            .filter_map(|path| {
+                if existing.iter().any(|saved| saved == &path) {
+                    Some(path)
+                } else {
+                    canonical_mcp_project_path(path.trim())
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned())
+                }
+            })
+            .filter(|path| seen.insert(path.clone()))
+            .take(Self::MCP_PROJECT_ALLOWLIST_CAP)
+            .collect();
     }
 
     /// Phase 15 — push `version` onto [`Self::skipped_update_versions`]
@@ -243,6 +353,37 @@ impl Settings {
         }
         true
     }
+}
+
+pub(crate) fn canonical_mcp_project_path(path: &str) -> Result<PathBuf, AppError> {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "MCP project path must be absolute and normalized".into(),
+        });
+    }
+    path.ancestors()
+        .find_map(|ancestor| {
+            std::fs::canonicalize(ancestor)
+                .ok()
+                .map(|base| (ancestor, base))
+        })
+        .and_then(|(ancestor, base)| {
+            path.strip_prefix(ancestor).ok().map(|suffix| {
+                if suffix.as_os_str().is_empty() {
+                    base
+                } else {
+                    base.join(suffix)
+                }
+            })
+        })
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "MCP project path has no resolvable absolute ancestor".into(),
+        })
 }
 
 /// Cask icon fetching mode. `All` preserves the current behaviour from
@@ -376,8 +517,7 @@ pub fn load_at_startup(app_data_dir: &Path) -> SettingsLoadState {
 /// Async loader, identical semantics to [`load_at_startup`] but
 /// non-blocking. Used by tests and any future callers that need to
 /// re-read from disk without blocking the runtime.
-#[cfg_attr(not(test), allow(dead_code))]
-async fn load_async(app_data_dir: &Path) -> SettingsLoadState {
+pub(crate) async fn load_async(app_data_dir: &Path) -> SettingsLoadState {
     let path = settings_path(app_data_dir);
 
     let meta = match tokio::fs::metadata(&path).await {
@@ -429,7 +569,15 @@ async fn load_async(app_data_dir: &Path) -> SettingsLoadState {
 /// to bytes, (3) reject if the byte length exceeds the cap, (4)
 /// `atomic_write` into place, (5) return the clamped struct so callers
 /// can re-broadcast the canonicalized values.
-pub(crate) async fn persist(app_data_dir: &Path, mut settings: Settings) -> Result<Settings, AppError> {
+pub(crate) async fn persist(
+    app_data_dir: &Path,
+    mut settings: Settings,
+) -> Result<Settings, AppError> {
+    let existing_allowlist = match load_async(app_data_dir).await {
+        SettingsLoadState::Loaded(existing) => existing.mcp_project_allowlist,
+        SettingsLoadState::FirstLaunch | SettingsLoadState::Corrupt { .. } => Vec::new(),
+    };
+    settings.canonicalize_new_mcp_project_allowlist(&existing_allowlist);
     settings.clamp();
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| AppError::Internal {
         message: format!("serialize settings: {e}"),
@@ -448,14 +596,11 @@ pub(crate) async fn persist(app_data_dir: &Path, mut settings: Settings) -> Resu
     // already mkdir_p'd it, but a fresh checkout of the app on a system
     // that's never run Agency Agents could plausibly hit this otherwise.
     if !app_data_dir.exists() {
-        tokio::fs::create_dir_all(app_data_dir).await.map_err(|e| {
-            AppError::Io {
-                message: format!(
-                    "create settings parent {}: {e}",
-                    app_data_dir.display()
-                ),
-            }
-        })?;
+        tokio::fs::create_dir_all(app_data_dir)
+            .await
+            .map_err(|e| AppError::Io {
+                message: format!("create settings parent {}: {e}", app_data_dir.display()),
+            })?;
     }
 
     let path = settings_path(app_data_dir);
@@ -464,6 +609,62 @@ pub(crate) async fn persist(app_data_dir: &Path, mut settings: Settings) -> Resu
 }
 
 // ---------- Commands ----------
+
+pub(crate) async fn settings_set_inner(
+    state: &AppState,
+    patch: GeneralSettingsPatch,
+) -> Result<Settings, AppError> {
+    let mut cache = state.settings.write().await;
+    if let SettingsLoadState::Corrupt { message } = &*cache {
+        return Err(AppError::Internal {
+            message: format!("settings file is unreadable: {message}"),
+        });
+    }
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            });
+        }
+    };
+    patch.apply(&mut latest);
+    let clamped = persist(&state.app_data_dir, latest).await?;
+    *cache = SettingsLoadState::Loaded(clamped.clone());
+    Ok(clamped)
+}
+
+pub(crate) async fn mcp_policy_set_inner(
+    state: &AppState,
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+    project_allowlist: Vec<String>,
+) -> Result<Settings, AppError> {
+    let mut cache = state.settings.write().await;
+    if let SettingsLoadState::Corrupt { message } = &*cache {
+        return Err(AppError::Internal {
+            message: format!("settings file is unreadable: {message}"),
+        });
+    }
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            });
+        }
+    };
+    latest.mcp_source_access = source_access;
+    latest.mcp_install_access = install_access;
+    latest.mcp_destructive_access = destructive_access;
+    latest.mcp_project_allowlist = project_allowlist;
+    let clamped = persist(&state.app_data_dir, latest).await?;
+    *cache = SettingsLoadState::Loaded(clamped.clone());
+    Ok(clamped)
+}
 
 /// Read the current settings.
 ///
@@ -486,20 +687,69 @@ pub async fn settings_get(state: State<'_, AppState>) -> Result<Settings, AppErr
     }
 }
 
-/// Write a complete settings struct to disk and update the in-memory
-/// cache. The frontend always sends a complete object (merging with
-/// existing values is the caller's responsibility, not ours).
+/// Write general settings and update the in-memory cache. MCP security policy
+/// is preserved from the latest disk state and can only be changed through
+/// `mcp_policy_set`, preventing stale renderer snapshots from resurrecting it.
 #[tauri::command]
 pub async fn settings_set(
-    settings: Settings,
+    patch: GeneralSettingsPatch,
     state: State<'_, AppState>,
 ) -> Result<Settings, AppError> {
-    let clamped = persist(&state.app_data_dir, settings).await?;
-    {
-        let mut guard = state.settings.write().await;
-        *guard = SettingsLoadState::Loaded(clamped.clone());
+    settings_set_inner(&state, patch).await
+}
+
+#[tauri::command]
+pub async fn mcp_policy_set(
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+    project_allowlist: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Settings, AppError> {
+    mcp_policy_set_inner(
+        &state,
+        source_access,
+        install_access,
+        destructive_access,
+        project_allowlist,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mcp_client_policy_set(
+    client: String,
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+    state: State<'_, AppState>,
+) -> Result<Settings, AppError> {
+    if !matches!(client.as_str(), "claude" | "codex") {
+        return Err(AppError::InvalidArgument {
+            message: "MCP client must be claude or codex".into(),
+        });
     }
-    Ok(clamped)
+    let mut cache = state.settings.write().await;
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            })
+        }
+    };
+    latest.mcp_client_policies.insert(
+        client,
+        McpClientPolicy {
+            source_access,
+            install_access,
+            destructive_access,
+        },
+    );
+    let saved = persist(&state.app_data_dir, latest).await?;
+    *cache = SettingsLoadState::Loaded(saved.clone());
+    Ok(saved)
 }
 
 /// Overwrite `settings.json` with the defaults and update the
@@ -507,12 +757,10 @@ pub async fn settings_set(
 /// the file is corrupt or the user just wants to start fresh.
 #[tauri::command]
 pub async fn settings_reset(state: State<'_, AppState>) -> Result<Settings, AppError> {
+    let mut cache = state.settings.write().await;
     let defaults = Settings::default();
     let clamped = persist(&state.app_data_dir, defaults).await?;
-    {
-        let mut guard = state.settings.write().await;
-        *guard = SettingsLoadState::Loaded(clamped.clone());
-    }
+    *cache = SettingsLoadState::Loaded(clamped.clone());
     Ok(clamped)
 }
 
@@ -540,7 +788,9 @@ mod tests {
             other => panic!("expected FirstLaunch, got {other:?}"),
         }
         // Defaults must have paranoid OFF.
-        let effective = state.effective_settings().expect("first launch has defaults");
+        let effective = state
+            .effective_settings()
+            .expect("first launch has defaults");
         assert!(!effective.paranoid_mode);
     }
 
@@ -597,6 +847,11 @@ mod tests {
             vulnerability_scanning_enabled: true,
             live_enrichment_enabled: true,
             tool_paths: HashMap::from([("claudeCode".to_string(), "/wsl/home/me".to_string())]),
+            mcp_source_access: true,
+            mcp_install_access: true,
+            mcp_destructive_access: true,
+            mcp_project_allowlist: vec!["/projects/allowed".into()],
+            mcp_client_policies: HashMap::new(),
         };
         let written = persist(tmp.path(), s.clone()).await.expect("persist");
         assert_eq!(written, s);
@@ -658,9 +913,17 @@ mod tests {
             vulnerability_scanning_enabled: false,
             live_enrichment_enabled: false,
             tool_paths: HashMap::new(),
+            mcp_source_access: false,
+            mcp_install_access: false,
+            mcp_destructive_access: false,
+            mcp_project_allowlist: Vec::new(),
+            mcp_client_policies: HashMap::new(),
         };
         let written = persist(tmp.path(), s).await.expect("persist");
-        assert_eq!(written.catalog_stale_banner_days, Settings::CATALOG_STALE_DAYS_MAX);
+        assert_eq!(
+            written.catalog_stale_banner_days,
+            Settings::CATALOG_STALE_DAYS_MAX
+        );
         assert_eq!(written.trending_ttl_minutes, Settings::TRENDING_TTL_MIN);
     }
 
@@ -682,7 +945,10 @@ mod tests {
         let state = load_at_startup(tmp.path());
         match state {
             SettingsLoadState::Loaded(s) => {
-                assert_eq!(s.catalog_stale_banner_days, Settings::CATALOG_STALE_DAYS_MAX);
+                assert_eq!(
+                    s.catalog_stale_banner_days,
+                    Settings::CATALOG_STALE_DAYS_MAX
+                );
                 assert_eq!(s.trending_ttl_minutes, Settings::TRENDING_TTL_MIN);
             }
             other => panic!("expected Loaded, got {other:?}"),
@@ -758,6 +1024,37 @@ mod tests {
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_mutation_permissions_default_off_and_allowlist_is_bounded_and_deduped() {
+        let mut settings = Settings::default();
+        assert!(!settings.mcp_source_access);
+        assert!(!settings.mcp_install_access);
+        assert!(!settings.mcp_destructive_access);
+        assert!(settings.mcp_project_allowlist.is_empty());
+
+        let project = tempfile::tempdir().expect("project");
+        let canonical = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        settings.mcp_project_allowlist = (0..80)
+            .map(|index| format!("{canonical}/project-{index}"))
+            .chain(std::iter::once(format!("{canonical}/project-0")))
+            .chain(std::iter::once(String::new()))
+            .collect();
+        settings.clamp();
+
+        assert_eq!(settings.mcp_project_allowlist.len(), 64);
+        assert_eq!(
+            settings.mcp_project_allowlist[0],
+            format!("{canonical}/project-0")
+        );
+        assert_eq!(
+            settings.mcp_project_allowlist[63],
+            format!("{canonical}/project-63")
+        );
     }
 
     // ---------- Phase 15 — skip-list cap + helpers ----------
@@ -840,8 +1137,7 @@ mod tests {
         );
         // The most-recent half is retained; the oldest two-thirds are dropped.
         assert!(
-            !s.skipped_update_versions
-                .contains(&"v0".to_string()),
+            !s.skipped_update_versions.contains(&"v0".to_string()),
             "oldest entries should have been dropped"
         );
     }
@@ -889,7 +1185,10 @@ mod tests {
     #[test]
     fn ai_features_enabled_defaults_to_true() {
         let s = Settings::default();
-        assert!(s.ai_features_enabled, "AI features ON by default per Phase 13 plan");
+        assert!(
+            s.ai_features_enabled,
+            "AI features ON by default per Phase 13 plan"
+        );
     }
 
     /// Phase 13 — `ai_features_enabled` round-trips on the wire as
@@ -1111,7 +1410,9 @@ mod tests {
         assert!(matches!(state_before, SettingsLoadState::Corrupt { .. }));
 
         // Write defaults via persist (what settings_reset uses).
-        let written = persist(tmp.path(), Settings::default()).await.expect("reset");
+        let written = persist(tmp.path(), Settings::default())
+            .await
+            .expect("reset");
         assert_eq!(written, Settings::default());
 
         // Reload — must now be Loaded(defaults).
@@ -1126,7 +1427,9 @@ mod tests {
     #[test]
     fn effective_settings_first_launch_returns_defaults() {
         let state = SettingsLoadState::FirstLaunch;
-        let s = state.effective_settings().expect("first launch yields defaults");
+        let s = state
+            .effective_settings()
+            .expect("first launch yields defaults");
         assert_eq!(s, Settings::default());
         assert!(!s.paranoid_mode);
     }

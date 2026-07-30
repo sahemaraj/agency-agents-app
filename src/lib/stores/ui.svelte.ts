@@ -63,9 +63,11 @@ export type VibrancyMaterial = (typeof VIBRANCY_MATERIALS)[number];
 const DEFAULT_SECTION_VALUES = [
   "dashboard",
   "personas",
+  "skills",
   "tools",
   "teams",
   "projects",
+  "experts",
   "activity",
 ] as const;
 
@@ -357,7 +359,8 @@ class UiStore {
       enum on read per Phase 12 security review § 12b. */
   loadDefaultSectionFromStorage() {
     try {
-      const v = localStorage.getItem(DEFAULT_SECTION_KEY);
+      const stored = localStorage.getItem(DEFAULT_SECTION_KEY);
+      const v = stored === "runbooks" ? "experts" : stored;
       if (v !== null && (DEFAULT_SECTION_VALUES as readonly string[]).includes(v)) {
         const validated = v as SidebarSection;
         this.defaultSection = validated;

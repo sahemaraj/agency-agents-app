@@ -1,6 +1,7 @@
 <script lang="ts">
   import LayoutDashboard from "@lucide/svelte/icons/layout-dashboard";
   import Bot from "@lucide/svelte/icons/bot";
+  import BookOpenCheck from "@lucide/svelte/icons/book-open-check";
   import Wrench from "@lucide/svelte/icons/wrench";
   import Users from "@lucide/svelte/icons/users";
   import FolderGit2 from "@lucide/svelte/icons/folder-git-2";
@@ -27,20 +28,22 @@
   const nav: NavItem[] = [
     { id: "dashboard", shortcut: shortcut("0"), icon: LayoutDashboard },
     { id: "personas",  shortcut: shortcut("1"), icon: Bot },
-    { id: "tools",     shortcut: shortcut("2"), icon: Wrench },
-    { id: "teams",     shortcut: shortcut("3"), icon: Users },
-    { id: "projects",  shortcut: shortcut("4"), icon: FolderGit2 },
-    { id: "runbooks",  shortcut: shortcut("5"), icon: Rocket },
-    { id: "activity",  shortcut: shortcut("6"), icon: Activity },
+    { id: "skills",    shortcut: shortcut("2"), icon: BookOpenCheck },
+    { id: "tools",     shortcut: shortcut("3"), icon: Wrench },
+    { id: "teams",     shortcut: shortcut("4"), icon: Users },
+    { id: "projects",  shortcut: shortcut("5"), icon: FolderGit2 },
+    { id: "experts",   shortcut: shortcut("6"), icon: Rocket },
+    { id: "activity",  shortcut: shortcut("7"), icon: Activity },
   ];
 
   function label(id: SidebarSection): string {
     if (id === "dashboard") return i18n.t("nav.dashboard");
     if (id === "personas") return i18n.t("nav.agents");
+    if (id === "skills") return "Skills";
     if (id === "tools") return i18n.t("nav.tools");
     if (id === "teams") return i18n.t("nav.teams");
     if (id === "projects") return i18n.t("nav.projects");
-    if (id === "runbooks") return i18n.t("nav.runbooks");
+    if (id === "experts") return i18n.t("nav.experts");
     return i18n.t("nav.activity");
   }
 

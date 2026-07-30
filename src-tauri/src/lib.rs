@@ -7,15 +7,25 @@
 mod commands;
 mod corpus;
 mod error;
+mod experts;
 mod github;
 mod install;
 mod registry;
 mod render;
+mod skills;
 mod state;
 mod types;
 mod util;
 
 use commands::*;
+
+pub async fn run_mcp(client: String) -> Result<(), String> {
+    skills::mcp::serve(client).await
+}
+
+pub async fn run_mcp_http(bind: std::net::SocketAddr, token: String) -> Result<(), String> {
+    skills::mcp::serve_http(bind, token).await
+}
 
 // =============================================================
 // Phase 15 — Updater minisign public key
@@ -136,7 +146,14 @@ pub fn run() {
             app_version,
             settings_get,
             settings_set,
+            mcp_policy_set,
+            mcp_client_policy_set,
+            mcp_clients_status,
+            mcp_client_connect,
+            mcp_client_disconnect,
+            mcp_client_repair,
             settings_reset,
+            state::mcp_audit_list,
             github_repo_stats,
             github_status,
             github_signin_start,
@@ -169,6 +186,71 @@ pub fn run() {
             corpus::catalog_status,
             corpus::catalog_check_updates,
             corpus::runbooks_list,
+            experts::experts_list,
+            experts::experts_get,
+            experts::expert_save,
+            experts::expert_delete,
+            experts::expert_import,
+            experts::expert_export,
+            experts::expert_plan_activation,
+            experts::expert_activate,
+            experts::expert_activation_history,
+            experts::expert_activation_requests,
+            experts::expert_activation_request_resolve,
+            experts::expert_creation_requests,
+            experts::expert_creation_request_get,
+            experts::expert_creation_request_approve,
+            experts::expert_creation_request_reject,
+            skills::skill_sources_list,
+            skills::skill_sources_inspect,
+            skills::skill_trust_grant,
+            skills::skill_trust_revoke,
+            skills::skill_package_destinations,
+            skills::skill_install,
+            skills::skill_update,
+            skills::skill_disable,
+            skills::skill_enable,
+            skills::skill_uninstall,
+            skills::skill_backups_list,
+            skills::skill_version_history_list,
+            skills::skill_install_plan,
+            skills::skill_install_with_dependencies,
+            skills::skill_collection_batch,
+            skills::skill_version_rollback,
+            skills::skill_installs_reconcile,
+            skills::skill_source_add_local,
+            skills::skill_source_add_github,
+            skills::skill_source_refresh,
+            skills::skill_source_remove,
+            skills::drafts::skill_drafts_list,
+            skills::drafts::skill_draft_publish,
+            skills::drafts::skill_draft_reject,
+            skills::drafts::skill_draft_create,
+            skills::drafts::skill_draft_edit,
+            skills::drafts::skill_text_read,
+            skills::organize::skill_folders_list,
+            skills::organize::skill_folder_create,
+            skills::organize::skill_folder_rename,
+            skills::organize::skill_folder_move,
+            skills::organize::skill_folder_delete,
+            skills::organize::skill_folder_assign,
+            skills::organize::skill_folders_import,
+            skills::organize::skill_favorite_set,
+            skills::organize::skill_recent_touch,
+            skills::organize::skill_collection_save,
+            skills::organize::skill_collection_delete,
+            skills::organize::skill_smart_folder_save,
+            skills::organize::skill_smart_folder_delete,
+            skills::organize::skill_profile_save,
+            skills::organize::skill_profile_delete,
+            skills::organize::skill_library_replace,
+            skills::organize::skill_library_export,
+            skills::organize::skill_library_import,
+            skills::organize::skill_update_policy_set,
+            skills::organize::skill_publisher_trust_set,
+            skills::organize::skill_preferred_source_set,
+            skills::organize::skill_approval_approve,
+            skills::organize::skill_approval_reject,
             // Phase 2 — install + reconcile (contracts.md §C). The cross-tool
             // agent state layer: render/ledger/reconcile/tools/projects.
             install::install_agent,
@@ -182,6 +264,8 @@ pub fn run() {
             install::tools_list,
             install::tool_versions,
             install::reveal_path,
+            install::project_register,
+            install::project_unregister,
             install::projects_list,
             install::loadout_export,
             install::loadout_import,

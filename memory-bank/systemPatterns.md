@@ -34,6 +34,25 @@ scope), `dest` (absolute path written), `source_hash` (corpus version installed 
 `rendered_hash` (SHA-256 of exact bytes written after conversion), `installed_at`,
 `corpus_version`.
 
+### skill-installs.json — exact multi-file skill ledger
+
+Skill packages use a separate ledger because one install owns a directory tree rather than one
+rendered agent file. Each record stores source identity, package-relative path, runtime, scope,
+canonical project path, exact destination, source-tree hash, installed-tree hash, timestamp, and
+an optional disabled path reserved for Phase 4.
+
+Installation revalidates the source package, rejects links and special entries, copies into a
+same-parent staging directory, verifies its deterministic tree hash, backs up managed content,
+then publishes by rename. Foreign or locally modified destinations are never replaced.
+Reconciliation classifies Current, Outdated, Modified, Missing, Foreign, Disabled, and
+SourceUnavailable without mutating destination content.
+
+Lifecycle mutations remain ledger-driven. Update reuses the validated installation transaction;
+Disable moves a byte-identical tracked directory to a hidden sibling and records `disabledPath`;
+Enable refuses any occupied destination before moving it back. Uninstall removes only a matching
+tracked row and exact directory, copying modified trees to `skill-backups/` first. Source removal
+only unregisters the source, so installed content survives as SourceUnavailable.
+
 ## 3. Deterministic renderer (Plan B — load-bearing)
 
 Install = **transform frontmatter + write file**, done natively in Rust (no shell/python

@@ -1,5 +1,60 @@
 # Active Context — Agency Agents
 
+## ✅ MCP Skills Platform (2026-07-30)
+
+The `feat/skills-library` branch now exposes the validated Skills library to Claude Code and Codex
+through 22 MCP tools and package resources. Read operations are available by default; source,
+install, and destructive mutations require explicit settings policy and exact canonical project
+allowlisting. Both stdio and bearer-authenticated loopback HTTP reuse one server, lifecycle core,
+durable audit boundary, and capability-relative project filesystem operations. Managed drafts
+require desktop approval to publish. Verified: Rust 379 library + 2 CLI passed, live stdio/HTTP
+exposed 22 tools, unauthorized HTTP returned 401, Svelte check 0 errors, production build green,
+and independent spec/quality/security audit passed. User approved the implementation.
+Task: `tasks/2026-07/260730_mcp-skills-platform.md`.
+
+## ✅ Skills Phase 5 — Project and App Integration (2026-07-30)
+
+The `feat/skills-library` branch now completes the five-phase Skills Library milestone. Project
+cleanup removes only tracked project-scoped skills and leaves user-scope installs untouched.
+Source, install, update, disable, enable, uninstall, and failure outcomes are recorded in Activity.
+Skills workspace copy is routed through the existing English baseline plus partial-locale fallback
+catalog, and the content scan found no remaining embedded Skills UI labels. Verified: Rust 305
+passed / 1 ignored, Svelte check 0 errors, production build green, native Tauri debug bundle
+created, and diff audit clean. User approved the implementation.
+Task: `tasks/2026-07/260730_phase5-project-app-integration.md`.
+
+## ✅ Skills Phase 4 — Managed Skill Lifecycle (2026-07-30)
+
+The `feat/skills-library` branch now completes the tracked skill lifecycle: Update repairs Missing
+or advances Outdated installs; Disable/Enable use reversible same-filesystem directory moves;
+Uninstall confirms intent and preserves modified content under `skill-backups/`. Removing a source
+does not touch installed directories or ledger rows—affected installs remain visible as
+SourceUnavailable. Backup paths are visible in the Skills workspace, foreign destinations remain
+immutable, and lifecycle hashing rejects linked/reparse-point roots. Verified: Rust 305 passed /
+1 ignored, Svelte check 0 errors, production build green. User approved the implementation.
+Task: `tasks/2026-07/260730_phase4-skill-lifecycle.md`.
+
+## ✅ Skills Phase 3 — Transactional Skill Installation (2026-07-30)
+
+The `feat/skills-library` branch installs exact validated multi-file skills into Claude Code and
+Codex user or project destinations. A dedicated atomic ledger reconciles Current, Outdated,
+Modified, Missing, Foreign, Disabled, and SourceUnavailable. Installation rejects linked paths,
+never overwrites foreign or modified content, and uses staging, backup-first managed replacement,
+atomic publication, and rollback. Agent and skill deployment now reuse one destination grid.
+Phase 4 retains update, disable, enable, uninstall, source lifecycle, and backup-management UI.
+Verified: Rust 301 passed / 1 ignored, Svelte check 0 errors, production build green. User approved
+the implementation. Task: `tasks/2026-07/260730_phase3-transactional-skill-installation.md`.
+
+## ✅ Skills Phase 2 — Inspectable Skills Workspace (2026-07-29)
+
+The `feat/skills-library` branch now provides a browse-first, read-only Skills workspace:
+search plus Ready/Rejected/source filters, persistent package detail, provenance, validation
+diagnostics, exact file inventory, and coarse Claude Code/Codex destination presence. Workspace
+loading reads registered local folders and active Git checkouts without network refresh. Install
+and lifecycle actions remain Phase 3/4. Verified: Rust 294 passed / 1 ignored, Svelte check 0
+errors, production build green, native Tauri launch successful. User approved the implementation.
+Task: `tasks/2026-07/260729_phase2-inspectable-skills-workspace.md`.
+
 **State**: 🚀 **v0.2.0 SHIPPED (2026-06-23)** — `main` @ `16182e5`. First feature release since the v0.1.0
 launch (the internally-tracked "0.1.1"/"0.1.2" milestones were never cut separately — they ship here), and
 **auto-update is now LIVE** at [`agencyagents.app/updater.json`](https://agencyagents.app/updater.json) for

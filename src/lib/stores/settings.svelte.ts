@@ -13,7 +13,12 @@
  * authoritative; localStorage was only ever a 12b-era stopgap.
  */
 
-import { isAppError, SETTINGS_DEFAULTS, type Settings } from "$lib/types";
+import {
+  isAppError,
+  SETTINGS_DEFAULTS,
+  type GeneralSettingsPatch,
+  type Settings,
+} from "$lib/types";
 import { settingsGet, settingsReset, settingsSet } from "$lib/api";
 
 class SettingsStore {
@@ -67,7 +72,7 @@ class SettingsStore {
       back into `data` so subsequent reads see the authoritative values
       — important when the user types e.g. `9999` into a number input
       that gets clamped to `365`. */
-  async save(partial: Partial<Settings>): Promise<void> {
+  async save(partial: GeneralSettingsPatch): Promise<void> {
     const base: Settings = this.data ?? { ...SETTINGS_DEFAULTS };
     const next: Settings = { ...base, ...partial };
 
@@ -76,7 +81,7 @@ class SettingsStore {
     this.loading = true;
     this.error = null;
     try {
-      const written = await settingsSet(next);
+      const written = await settingsSet(partial);
       this.data = written;
       this.corruptOnDisk = false;
     } catch (e) {
