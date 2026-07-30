@@ -1505,6 +1505,7 @@ mod tests {
             name: Some(name.into()),
             description: Some(description.into()),
             files: Vec::new(),
+            trust_fingerprint: None,
             errors: Vec::new(),
             installable,
         }
@@ -2950,7 +2951,7 @@ mod tests {
             "---\nname: root-skill\ndescription: Reads root resources\n---\n# Root Skill\n",
         )
         .expect("root skill markdown");
-        std::fs::write(source.join("blob.bin"), [0, 159, 146, 150]).expect("binary file");
+        std::fs::write(source.join("blob.png"), [0, 159, 146, 150]).expect("binary file");
         let nested = source.join("nested/reviewer");
         std::fs::create_dir_all(nested.join("references")).expect("nested package");
         std::fs::write(
@@ -3109,7 +3110,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 6,
             "method": "resources/read",
-            "params": {"uri": package_resource_uri(&registered.id, ".", "blob.bin")},
+            "params": {"uri": package_resource_uri(&registered.id, ".", "blob.png")},
         });
         write
             .write_all(request.to_string().as_bytes())

@@ -358,7 +358,18 @@ export interface SkillPackageFile {
   sha256: string;
 }
 
-export type SkillValidationCode = "invalidMetadata" | "unsafeEntry" | "io";
+export interface SkillTrustedExecutable {
+  relativePath: string;
+  sha256: string;
+  executable: boolean;
+}
+
+export interface SkillTrustFingerprint {
+  treeHash: string;
+  executables: SkillTrustedExecutable[];
+}
+
+export type SkillValidationCode = "invalidMetadata" | "trustRequired" | "unsafeEntry" | "io";
 
 export interface SkillValidationError {
   code: SkillValidationCode;
@@ -372,6 +383,7 @@ export interface SkillPackageResult {
   name: string | null;
   description: string | null;
   files: SkillPackageFile[];
+  trustFingerprint: SkillTrustFingerprint | null;
   errors: SkillValidationError[];
   installable: boolean;
 }

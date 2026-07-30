@@ -22,6 +22,7 @@ import type {
   RepoStats,
   Settings,
   SkillDraft,
+  SkillPackageResult,
   SkillSource,
   SkillDestinationPresence,
   InstalledSkill,
@@ -124,6 +125,17 @@ export function skillSourcesList(): Promise<SkillSource[]> {
 
 export function skillSourcesInspect(): Promise<SkillSourceResult[]> {
   return invoke<SkillSourceResult[]>("skill_sources_inspect");
+}
+
+export function skillTrustGrant(
+  sourceId: string,
+  relativePath: string,
+): Promise<SkillPackageResult> {
+  return invoke<SkillPackageResult>("skill_trust_grant", { sourceId, relativePath });
+}
+
+export function skillTrustRevoke(sourceId: string, relativePath: string): Promise<boolean> {
+  return invoke<boolean>("skill_trust_revoke", { sourceId, relativePath });
 }
 
 export function skillPackageDestinations(

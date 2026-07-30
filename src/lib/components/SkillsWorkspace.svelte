@@ -35,6 +35,7 @@
   let selectedKey: string | null = $state(null);
   let uninstallCandidate: InstalledSkill | null = $state(null);
   let rejectDraftCandidate: SkillDraft | null = $state(null);
+  let trustCandidate: PackageView | null = $state(null);
 
   const packages = $derived.by<PackageView[]>(() =>
     Object.values(skillSources.results).flatMap((result) =>
@@ -118,6 +119,42 @@
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  }
+
+  function scriptFiles(pkg: SkillPackageResult) {
+    return pkg.files.filter((file) => file.relativePath.toLowerCase().startsWith("scripts/"));
+  }
+
+  function requiresTrust(pkg: SkillPackageResult): boolean {
+    return pkg.errors.some((error) => error.code === "trustRequired");
+  }
+
+  function trustedScripts(pkg: SkillPackageResult): boolean {
+    return pkg.installable && scriptFiles(pkg).length > 0;
+  }
+
+  function packageStatus(pkg: SkillPackageResult): string {
+    if (requiresTrust(pkg)) return i18n.t("skills.trustRequired");
+    if (trustedScripts(pkg)) return i18n.t("skills.trusted");
+    return pkg.installable ? i18n.t("skills.ready") : i18n.t("skills.rejected");
+  }
+
+  async function grantTrust(): Promise<void> {
+    if (!trustCandidate) return;
+    const name = trustCandidate.pkg.name ?? trustCandidate.pkg.relativePath;
+    const succeeded = await skillSources.grantTrust(trustCandidate.pkg);
+    announcement = succeeded
+      ? i18n.t("skills.trustSucceeded", { name })
+      : skillSources.addError ?? i18n.t("skills.trustFailed");
+    if (succeeded) trustCandidate = null;
+  }
+
+  async function revokeTrust(pkg: SkillPackageResult): Promise<void> {
+    const name = pkg.name ?? pkg.relativePath;
+    const succeeded = await skillSources.revokeTrust(pkg);
+    announcement = succeeded
+      ? i18n.t("skills.trustRevoked", { name })
+      : skillSources.addError ?? i18n.t("skills.trustFailed");
   }
 
   function selectPackage(view: PackageView): void {
@@ -446,7 +483,7 @@
                   <span class="row-top">
                     <strong>{view.pkg.name ?? view.pkg.relativePath}</strong>
                     <span class:ready={view.pkg.installable} class:rejected={!view.pkg.installable} class="status-badge">
-                      {view.pkg.installable ? i18n.t("skills.ready") : i18n.t("skills.rejected")}
+                      {packageStatus(view.pkg)}
                     </span>
                   </span>
                   <span class="description">{view.pkg.description ?? i18n.t("skills.packageValidationFailed")}</span>
@@ -495,6 +532,22 @@
                     <li><code>{error.code}</code> · {error.path || "."}: {error.message}</li>
                   {/each}
                 </ul>
+              {/if}
+              {#if requiresTrust(selected.pkg)}
+                <Button
+                  size="sm"
+                  loading={skillSources.trusting[skillSources.packageKey(selected.pkg)] === true}
+                  ariaLabel={`${i18n.t("skills.trustExactVersion")} ${selected.pkg.name ?? selected.pkg.relativePath}`}
+                  onclick={() => (trustCandidate = selected)}
+                >{i18n.t("skills.trustExactVersion")}</Button>
+              {:else if trustedScripts(selected.pkg)}
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  loading={skillSources.trusting[skillSources.packageKey(selected.pkg)] === true}
+                  ariaLabel={`${i18n.t("skills.revokeTrust")} ${selected.pkg.name ?? selected.pkg.relativePath}`}
+                  onclick={() => void revokeTrust(selected.pkg)}
+                >{i18n.t("skills.revokeTrust")}</Button>
               {/if}
             </section>
 
@@ -590,6 +643,34 @@
   onCancel={() => (removeCandidate = null)}
 >
   <p>{i18n.t("skills.removeSourceBody")}</p>
+</DestructiveConfirm>
+
+<DestructiveConfirm
+  open={trustCandidate !== null}
+  title={i18n.t("skills.trustTitle")}
+  confirmLabel={i18n.t("skills.trustExactVersion")}
+  confirmVariant="primary"
+  confirmDisabled={trustCandidate ? skillSources.trusting[skillSources.packageKey(trustCandidate.pkg)] === true : false}
+  onConfirm={() => void grantTrust()}
+  onCancel={() => (trustCandidate = null)}
+>
+  <p>{i18n.t("skills.trustBody")}</p>
+  {#if trustCandidate}
+    <dl class="trust-fingerprint">
+      <div><dt>{i18n.t("skills.trustSource")}</dt><dd><code>{trustCandidate.pkg.sourceId}</code></dd></div>
+      <div><dt>{i18n.t("skills.trustPackage")}</dt><dd><code>{trustCandidate.pkg.relativePath}</code></dd></div>
+      <div><dt>{i18n.t("skills.trustTreeHash")}</dt><dd><code>{trustCandidate.pkg.trustFingerprint?.treeHash ?? "—"}</code></dd></div>
+    </dl>
+    <h4>{i18n.t("skills.trustScripts")}</h4>
+    <ul class="files">
+      {#each trustCandidate.pkg.trustFingerprint?.executables ?? [] as file (file.relativePath)}
+        <li>
+          <div><code>{file.relativePath}</code><span>{file.executable ? i18n.t("skills.executable") : i18n.t("skills.notExecutable")}</span></div>
+          <code class="hash" title={file.sha256}>{file.sha256}</code>
+        </li>
+      {/each}
+    </ul>
+  {/if}
 </DestructiveConfirm>
 
 <DestructiveConfirm

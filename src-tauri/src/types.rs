@@ -70,6 +70,21 @@ pub struct SkillPackageFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct SkillTrustedExecutable {
+    pub relative_path: String,
+    pub sha256: String,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillTrustFingerprint {
+    pub tree_hash: String,
+    pub executables: Vec<SkillTrustedExecutable>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SkillFileContent {
     pub relative_path: String,
     pub mime_type: String,
@@ -81,6 +96,7 @@ pub struct SkillFileContent {
 #[serde(rename_all = "camelCase")]
 pub enum SkillValidationCode {
     InvalidMetadata,
+    TrustRequired,
     UnsafeEntry,
     Io,
 }
@@ -101,6 +117,7 @@ pub struct SkillPackageResult {
     pub name: Option<String>,
     pub description: Option<String>,
     pub files: Vec<SkillPackageFile>,
+    pub trust_fingerprint: Option<SkillTrustFingerprint>,
     pub errors: Vec<SkillValidationError>,
     pub installable: bool,
 }

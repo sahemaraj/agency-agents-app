@@ -186,6 +186,8 @@ pub fn run() {
             corpus::runbooks_list,
             skills::skill_sources_list,
             skills::skill_sources_inspect,
+            skills::skill_trust_grant,
+            skills::skill_trust_revoke,
             skills::skill_package_destinations,
             skills::skill_install,
             skills::skill_update,

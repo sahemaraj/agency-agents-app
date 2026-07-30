@@ -4,19 +4,22 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
-use serde::Deserialize;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::State;
 use uuid::Uuid;
 
 use crate::corpus::state_dir;
 use crate::error::AppError;
+use crate::github::auth::{KeychainSlot, SystemKeychain};
 use crate::github::url::parse_github_url;
 use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
     InstalledSkill, SkillDestinationPresence, SkillFileContent, SkillInstallRecord,
     SkillInstallState, SkillPackageFile, SkillPackageResult, SkillSource, SkillSourceKind,
-    SkillSourceResult, SkillValidationCode, SkillValidationError,
+    SkillSourceResult, SkillTrustFingerprint, SkillTrustedExecutable, SkillValidationCode,
+    SkillValidationError,
 };
 use crate::util::fs::atomic_write;
 
@@ -27,6 +30,30 @@ pub mod mcp;
 pub const MAX_SKILL_FILES: usize = 512;
 pub const MAX_SKILL_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_SKILL_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const SKILL_TRUST_KEY_ACCOUNT: &str = "skill-trust-hmac-v1";
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SkillTrustRecord {
+    source_id: String,
+    relative_path: String,
+    tree_hash: String,
+    executables: Vec<SkillTrustedExecutable>,
+    granted_at: String,
+    signature: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnsignedSkillTrustRecord<'a> {
+    source_id: &'a str,
+    relative_path: &'a str,
+    tree_hash: &'a str,
+    executables: &'a [SkillTrustedExecutable],
+    granted_at: &'a str,
+}
 
 #[cfg(test)]
 type RefreshFsProbe = Vec<(&'static str, std::thread::ThreadId)>;
@@ -131,6 +158,121 @@ fn take_refresh_fs_probe() -> RefreshFsProbe {
 
 pub(crate) fn skill_sources_path(app_data_dir: &Path) -> PathBuf {
     state_dir(app_data_dir).join("skill-sources.json")
+}
+
+fn skill_trust_path(app_data_dir: &Path) -> PathBuf {
+    state_dir(app_data_dir).join("skill-trust.json")
+}
+
+async fn load_skill_trust(app_data_dir: &Path) -> Result<Vec<SkillTrustRecord>, AppError> {
+    let path = skill_trust_path(app_data_dir);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| AppError::JsonParse {
+            command: "skill_trust_list".into(),
+            message: error.to_string(),
+            raw_excerpt: String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).into_owned(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(AppError::Io {
+            message: format!("read {}: {error}", path.display()),
+        }),
+    }
+}
+
+async fn save_skill_trust(
+    app_data_dir: &Path,
+    records: &[SkillTrustRecord],
+) -> Result<(), AppError> {
+    let directory = state_dir(app_data_dir);
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| AppError::Io {
+            message: format!("create state dir {}: {error}", directory.display()),
+        })?;
+    let bytes = serde_json::to_vec_pretty(records).map_err(|error| AppError::Internal {
+        message: format!("serialize skill-trust.json: {error}"),
+    })?;
+    atomic_write(&skill_trust_path(app_data_dir), &bytes).await
+}
+
+fn decode_trust_key(value: &str) -> Result<Vec<u8>, AppError> {
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|error| AppError::KeychainUnavailable {
+            message: format!("decode {SKILL_TRUST_KEY_ACCOUNT}: {error}"),
+        })?;
+    if key.len() != 32 {
+        return Err(AppError::KeychainUnavailable {
+            message: format!("{SKILL_TRUST_KEY_ACCOUNT} has an invalid length"),
+        });
+    }
+    Ok(key)
+}
+
+fn read_trust_key_with(keychain: &dyn KeychainSlot) -> Result<Option<Vec<u8>>, AppError> {
+    keychain
+        .read(SKILL_TRUST_KEY_ACCOUNT)?
+        .map(|value| decode_trust_key(&value))
+        .transpose()
+}
+
+fn load_or_create_trust_key_with(
+    keychain: &dyn KeychainSlot,
+    has_existing_records: bool,
+) -> Result<Vec<u8>, AppError> {
+    if let Some(key) = read_trust_key_with(keychain)? {
+        return Ok(key);
+    }
+    if has_existing_records {
+        return Err(AppError::KeychainUnavailable {
+            message: "skill trust key is missing; revoke existing trust records before granting new trust"
+                .into(),
+        });
+    }
+    let mut key = [0_u8; 32];
+    getrandom::fill(&mut key).map_err(|error| AppError::KeychainUnavailable {
+        message: format!("generate {SKILL_TRUST_KEY_ACCOUNT}: {error}"),
+    })?;
+    keychain.write(
+        SKILL_TRUST_KEY_ACCOUNT,
+        &base64::engine::general_purpose::STANDARD.encode(key),
+    )?;
+    Ok(key.to_vec())
+}
+
+fn trust_payload(record: &SkillTrustRecord) -> Result<Vec<u8>, AppError> {
+    serde_json::to_vec(&UnsignedSkillTrustRecord {
+        source_id: &record.source_id,
+        relative_path: &record.relative_path,
+        tree_hash: &record.tree_hash,
+        executables: &record.executables,
+        granted_at: &record.granted_at,
+    })
+    .map_err(|error| AppError::Internal {
+        message: format!("serialize skill trust payload: {error}"),
+    })
+}
+
+fn sign_trust_record(record: &SkillTrustRecord, key: &[u8]) -> Result<String, AppError> {
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|error| AppError::Internal {
+        message: format!("initialize skill trust HMAC: {error}"),
+    })?;
+    mac.update(&trust_payload(record)?);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_trust_record(record: &SkillTrustRecord, key: &[u8]) -> bool {
+    let Ok(signature) = hex::decode(&record.signature) else {
+        return false;
+    };
+    let Ok(payload) = trust_payload(record) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        return false;
+    };
+    mac.update(&payload);
+    mac.verify_slice(&signature).is_ok()
 }
 
 fn lock_skill_sources(app_data_dir: &Path) -> Result<File, AppError> {
@@ -651,6 +793,30 @@ pub(crate) async fn discover_source(source: SkillSource) -> Result<SkillSourceRe
         })?
 }
 
+async fn persisted_trust_key() -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(|| read_trust_key_with(&SystemKeychain))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+}
+
+async fn apply_persisted_trust(
+    state: &AppState,
+    result: &mut SkillSourceResult,
+) -> Result<(), AppError> {
+    let Ok(records) = load_skill_trust(&state.app_data_dir).await else {
+        return Ok(());
+    };
+    if records.is_empty() {
+        return Ok(());
+    }
+    let key = persisted_trust_key().await;
+    let source_root = canonical_skill_source_root(&result.source)?;
+    apply_skill_trust(&source_root, result, &records, key.as_deref());
+    Ok(())
+}
+
 pub(crate) async fn inspect_skill_sources(
     state: &AppState,
 ) -> Result<Vec<SkillSourceResult>, AppError> {
@@ -658,7 +824,10 @@ pub(crate) async fn inspect_skill_sources(
     let mut results = Vec::with_capacity(sources.len());
     for source in sources {
         match discover_source(source.clone()).await {
-            Ok(result) => results.push(result),
+            Ok(mut result) => {
+                apply_persisted_trust(state, &mut result).await?;
+                results.push(result);
+            }
             Err(error) => results.push(SkillSourceResult {
                 source,
                 packages: Vec::new(),
@@ -684,10 +853,12 @@ pub(crate) async fn refresh_skill_source(
         .ok_or_else(|| AppError::InvalidArgument {
             message: format!("unknown skill source id: {source_id}"),
         })?;
-    match source.kind {
+    let mut result = match source.kind {
         SkillSourceKind::Local { .. } => discover_source(source).await,
         SkillSourceKind::Github { .. } => refresh_git_source(state, source_id).await,
-    }
+    }?;
+    apply_persisted_trust(state, &mut result).await?;
+    Ok(result)
 }
 
 pub(crate) async fn refresh_all_skill_sources(
@@ -935,8 +1106,9 @@ pub(crate) async fn resolve_skill_package(
         .ok_or_else(|| AppError::InvalidArgument {
             message: format!("unknown skill source id: {source_id}"),
         })?;
-    let package = discover_source(source.clone())
-        .await?
+    let mut result = discover_source(source.clone()).await?;
+    apply_persisted_trust(state, &mut result).await?;
+    let package = result
         .packages
         .into_iter()
         .find(|package| package.relative_path == relative_path && package.installable)
@@ -1214,6 +1386,7 @@ pub(crate) fn validate_package(
         name: None,
         description: None,
         files: Vec::new(),
+        trust_fingerprint: None,
         errors: Vec::new(),
         installable: false,
     };
@@ -1276,6 +1449,22 @@ pub(crate) fn validate_package(
         }
     }
 
+    if result
+        .errors
+        .iter()
+        .any(|error| error.code == SkillValidationCode::TrustRequired)
+        && result
+            .errors
+            .iter()
+            .all(|error| error.code == SkillValidationCode::TrustRequired)
+    {
+        if let Ok((tree_hash, executables)) = trust_fingerprint(package_root, &result) {
+            result.trust_fingerprint = Some(SkillTrustFingerprint {
+                tree_hash,
+                executables,
+            });
+        }
+    }
     sort_validation_errors(&mut result.errors);
     result.installable = result.errors.is_empty();
     result
@@ -1288,6 +1477,7 @@ fn invalid_package_root(source_id: &str, relative_path: &str, message: &str) -> 
         name: None,
         description: None,
         files: Vec::new(),
+        trust_fingerprint: None,
         errors: vec![unsafe_entry_error(
             ".".into(),
             &format!("{message} Keep the package inside its registered source."),
@@ -1339,10 +1529,10 @@ fn inventory_package(
                         relative,
                         "Executable and script file types are not allowed in skill packages. Remove the entry and refresh.",
                     ));
-                } else if has_reserved_surface(&path) {
+                } else if has_prohibited_surface(&relative) {
                     errors.push(unsafe_entry_error(
                         relative,
-                        "Scripts, hooks, MCP, and plugin surfaces are not allowed in skill packages. Remove the entry and refresh.",
+                        "Hooks, MCP, and plugin surfaces are not allowed in skill packages. Remove the entry and refresh.",
                     ));
                 } else {
                     directories.push_back(path);
@@ -1358,6 +1548,7 @@ fn inventory_package(
             }
             file_count += 1;
             let mut rejected = false;
+            let script_candidate = is_scripts_path(&relative);
             if file_count > MAX_SKILL_FILES {
                 errors.push(SkillValidationError {
                     code: SkillValidationCode::UnsafeEntry,
@@ -1368,24 +1559,24 @@ fn inventory_package(
                 });
                 rejected = true;
             }
-            if has_executable_suffix(&path) {
+            if !script_candidate && !is_passive_skill_file(&path) {
                 errors.push(unsafe_entry_error(
                     relative.clone(),
-                    "Executable and script file types are not allowed in skill packages. Remove the entry and refresh.",
+                    "Only documentation and passive resources are allowed outside scripts/. Move executable or support code into scripts/ for explicit trust.",
                 ));
                 rejected = true;
             }
-            if has_reserved_surface(&path) {
+            if has_prohibited_surface(&relative) {
                 errors.push(unsafe_entry_error(
                     relative.clone(),
-                    "Scripts, hooks, MCP, and plugin surfaces are not allowed in skill packages. Remove the entry and refresh.",
+                    "Hooks, MCP, and plugin surfaces are not allowed in skill packages. Remove the entry and refresh.",
                 ));
                 rejected = true;
             }
-            if metadata_is_executable(&metadata) {
+            if metadata_is_executable(&metadata) && !script_candidate {
                 errors.push(unsafe_entry_error(
                     relative.clone(),
-                    "Executable permission bits are not allowed in skill packages. Remove execute permissions and refresh.",
+                    "Executable permission bits are allowed only inside scripts/. Remove execute permissions or move the entry.",
                 ));
                 rejected = true;
             }
@@ -1425,6 +1616,19 @@ fn inventory_package(
                 continue;
             }
             total_bytes = next_total;
+            if script_candidate
+                && !errors
+                    .iter()
+                    .any(|error| error.code == SkillValidationCode::TrustRequired)
+            {
+                errors.push(SkillValidationError {
+                    code: SkillValidationCode::TrustRequired,
+                    path: "scripts".into(),
+                    message:
+                        "This package contains scripts. Review and trust this exact version before installing."
+                            .into(),
+                });
+            }
             files.push(SkillPackageFile {
                 relative_path: relative,
                 size_bytes: bytes.len() as u64,
@@ -1518,15 +1722,30 @@ fn valid_skill_name(name: &str) -> bool {
 }
 
 fn has_executable_suffix(path: &Path) -> bool {
-    const SUFFIXES: [&str; 13] = [
+    const SUFFIXES: [&str; 16] = [
         ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd", ".com", ".exe", ".dll", ".dylib",
-        ".so", ".app",
+        ".so", ".app", ".py", ".rb", ".pl",
     ];
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
     let lower = name.to_ascii_lowercase();
     SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+}
+
+fn is_passive_skill_file(path: &Path) -> bool {
+    const EXTENSIONS: [&str; 26] = [
+        "md", "markdown", "txt", "json", "jsonl", "yaml", "yml", "toml", "csv", "tsv", "xml",
+        "css", "png", "jpg", "jpeg", "gif", "webp", "avif", "svg", "pdf", "ico", "woff", "woff2",
+        "ttf", "otf", "lock",
+    ];
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            EXTENSIONS
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+        })
 }
 
 fn has_reserved_surface(path: &Path) -> bool {
@@ -1543,6 +1762,95 @@ fn has_reserved_surface(path: &Path) -> bool {
                     .strip_prefix(surface)
                     .is_some_and(|suffix| suffix.starts_with('.'))
         })
+}
+
+fn is_scripts_path(relative: &str) -> bool {
+    relative
+        .split('/')
+        .next()
+        .is_some_and(|component| component.eq_ignore_ascii_case("scripts"))
+}
+
+fn has_prohibited_surface(relative: &str) -> bool {
+    relative.split('/').enumerate().any(|(index, component)| {
+        !(index == 0 && component.eq_ignore_ascii_case("scripts"))
+            && has_reserved_surface(Path::new(component))
+    })
+}
+
+fn trust_fingerprint(
+    package_root: &Path,
+    package: &SkillPackageResult,
+) -> Result<(String, Vec<SkillTrustedExecutable>), AppError> {
+    let tree_hash = install::validated_tree_hash(package_root, &package.files)?;
+    let mut executables = Vec::new();
+    for file in package
+        .files
+        .iter()
+        .filter(|file| is_scripts_path(&file.relative_path))
+    {
+        let path = package_root.join(normalized_requested_file_path(&file.relative_path)?);
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| AppError::Io {
+            message: format!("inspect trusted script {}: {error}", path.display()),
+        })?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata_is_reparse_point(&metadata)
+        {
+            return Err(AppError::InvalidArgument {
+                message: format!(
+                    "trusted script inventory entry is not a regular file: {}",
+                    file.relative_path
+                ),
+            });
+        }
+        executables.push(SkillTrustedExecutable {
+            relative_path: file.relative_path.clone(),
+            sha256: file.sha256.clone(),
+            executable: metadata_is_executable(&metadata),
+        });
+    }
+    executables.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok((tree_hash, executables))
+}
+
+fn apply_skill_trust(
+    source_root: &Path,
+    result: &mut SkillSourceResult,
+    records: &[SkillTrustRecord],
+    key: Option<&[u8]>,
+) {
+    let Some(key) = key else {
+        return;
+    };
+    for package in &mut result.packages {
+        if !package
+            .errors
+            .iter()
+            .any(|error| error.code == SkillValidationCode::TrustRequired)
+        {
+            continue;
+        }
+        let Some(record) = records.iter().find(|record| {
+            record.source_id == package.source_id
+                && record.relative_path == package.relative_path
+                && verify_trust_record(record, key)
+        }) else {
+            continue;
+        };
+        let Ok((tree_hash, executables)) =
+            trust_fingerprint(&source_root.join(&package.relative_path), package)
+        else {
+            continue;
+        };
+        if record.tree_hash != tree_hash || record.executables != executables {
+            continue;
+        }
+        package
+            .errors
+            .retain(|error| error.code != SkillValidationCode::TrustRequired);
+        package.installable = package.errors.is_empty();
+    }
 }
 
 fn normalized_relative_path(root: &Path, path: &Path) -> Result<String, SkillValidationError> {
@@ -1587,8 +1895,9 @@ fn sort_validation_errors(errors: &mut [SkillValidationError]) {
 fn validation_code_rank(code: SkillValidationCode) -> u8 {
     match code {
         SkillValidationCode::InvalidMetadata => 0,
-        SkillValidationCode::UnsafeEntry => 1,
-        SkillValidationCode::Io => 2,
+        SkillValidationCode::TrustRequired => 1,
+        SkillValidationCode::UnsafeEntry => 2,
+        SkillValidationCode::Io => 3,
     }
 }
 
@@ -1649,12 +1958,13 @@ pub async fn skill_sources_inspect(
 }
 
 #[tauri::command]
-pub async fn skill_package_destinations(
+pub async fn skill_trust_grant(
     state: State<'_, AppState>,
     source_id: String,
     relative_path: String,
-    project_paths: Vec<String>,
-) -> Result<Vec<SkillDestinationPresence>, AppError> {
+) -> Result<SkillPackageResult, AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
     let source = load_skill_sources(&state.app_data_dir)
         .await?
         .into_iter()
@@ -1662,17 +1972,99 @@ pub async fn skill_package_destinations(
         .ok_or_else(|| AppError::InvalidArgument {
             message: format!("unknown skill source id: {source_id}"),
         })?;
-    let result = discover_source(source).await?;
+    let source_root = canonical_skill_source_root(&source)?;
+    let mut result = discover_source(source).await?;
     let package = result
         .packages
-        .into_iter()
-        .find(|package| package.relative_path == relative_path && package.installable)
+        .iter()
+        .find(|package| package.relative_path == relative_path)
         .ok_or_else(|| AppError::InvalidArgument {
-            message: format!("unknown installable skill package: {relative_path}"),
+            message: format!("unknown skill package: {relative_path}"),
         })?;
-    let name = package.name.ok_or_else(|| AppError::InvalidArgument {
-        message: format!("installable skill package has no name: {relative_path}"),
-    })?;
+    if !package
+        .errors
+        .iter()
+        .any(|error| error.code == SkillValidationCode::TrustRequired)
+        || package
+            .errors
+            .iter()
+            .any(|error| error.code != SkillValidationCode::TrustRequired)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "only otherwise-valid packages containing scripts can be trusted".into(),
+        });
+    }
+    let (tree_hash, executables) = trust_fingerprint(&source_root.join(&relative_path), package)?;
+    let mut records = load_skill_trust(&state.app_data_dir).await?;
+    let has_existing_records = !records.is_empty();
+    let key = tokio::task::spawn_blocking(move || {
+        load_or_create_trust_key_with(&SystemKeychain, has_existing_records)
+    })
+    .await
+    .map_err(|error| AppError::Internal {
+        message: format!("skill trust key task failed: {error}"),
+    })??;
+    let mut record = SkillTrustRecord {
+        source_id: source_id.clone(),
+        relative_path: relative_path.clone(),
+        tree_hash,
+        executables,
+        granted_at: chrono::Utc::now().to_rfc3339(),
+        signature: String::new(),
+    };
+    record.signature = sign_trust_record(&record, &key)?;
+    records.retain(|existing| {
+        existing.source_id != source_id || existing.relative_path != relative_path
+    });
+    records.push(record);
+    records.sort_by(|left, right| {
+        left.source_id
+            .cmp(&right.source_id)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    save_skill_trust(&state.app_data_dir, &records).await?;
+    apply_skill_trust(&source_root, &mut result, &records, Some(&key));
+    result
+        .packages
+        .into_iter()
+        .find(|package| package.relative_path == relative_path)
+        .ok_or_else(|| AppError::Internal {
+            message: "trusted skill package disappeared during validation".into(),
+        })
+}
+
+#[tauri::command]
+pub async fn skill_trust_revoke(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+) -> Result<bool, AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
+    let mut records = load_skill_trust(&state.app_data_dir).await?;
+    let before = records.len();
+    records.retain(|record| record.source_id != source_id || record.relative_path != relative_path);
+    if records.len() == before {
+        return Ok(false);
+    }
+    save_skill_trust(&state.app_data_dir, &records).await?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn skill_package_destinations(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    project_paths: Vec<String>,
+) -> Result<Vec<SkillDestinationPresence>, AppError> {
+    let package = resolve_skill_package(&state, &source_id, &relative_path).await?;
+    let name = package
+        .name()
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("installable skill package has no name: {relative_path}"),
+        })?;
     let home = dirs::home_dir().ok_or_else(|| AppError::Io {
         message: "could not resolve home directory".into(),
     })?;
@@ -2810,11 +3202,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        add_github_source, add_local_source, discover_source, ensure_local_source,
-        inspect_skill_sources, is_windows_reparse_point, load_skill_sources, read_skill_file,
-        refresh_git_source_from, remove_skill_source, reset_refresh_fs_probe,
-        resolve_skill_package, skill_destination_presence, skill_sources_path,
-        take_refresh_fs_probe, validate_package, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
+        add_github_source, add_local_source, apply_skill_trust, discover_source,
+        discover_source_blocking, ensure_local_source, inspect_skill_sources,
+        is_windows_reparse_point, load_or_create_trust_key_with, load_skill_sources,
+        read_skill_file, refresh_git_source_from, remove_skill_source, reset_refresh_fs_probe,
+        resolve_skill_package, sign_trust_record, skill_destination_presence, skill_sources_path,
+        take_refresh_fs_probe, trust_fingerprint, validate_package, SkillTrustRecord,
+        MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
     };
 
     #[test]
@@ -2836,6 +3230,7 @@ mod tests {
     }
     use crate::commands::settings::{Settings, SettingsLoadState};
     use crate::error::AppError;
+    use crate::github::auth::KeychainSlot;
     use crate::state::AppState;
     use crate::types::{SkillInstallState, SkillSource, SkillSourceKind, SkillValidationCode};
 
@@ -2942,7 +3337,7 @@ mod tests {
         std::fs::create_dir_all(package.join("references")).expect("reference directory");
         std::fs::write(package.join("references/checklist.md"), b"# Checklist\n")
             .expect("reference file");
-        std::fs::write(package.join("assets.bin"), [0, 159, 146, 150]).expect("binary file");
+        std::fs::write(package.join("assets.png"), [0, 159, 146, 150]).expect("binary file");
         let state = test_state(app.path());
         let registered = add_local_source(&state, source.path())
             .await
@@ -2957,7 +3352,7 @@ mod tests {
                 .iter()
                 .map(|file| file.relative_path.as_str())
                 .collect::<Vec<_>>(),
-            ["SKILL.md", "assets.bin", "references/checklist.md"]
+            ["SKILL.md", "assets.png", "references/checklist.md"]
         );
 
         let text = read_skill_file(
@@ -2972,7 +3367,7 @@ mod tests {
         assert_eq!(text.text.as_deref(), Some("# Checklist\n"));
         assert!(text.base64.is_none());
 
-        let binary = read_skill_file(&state, &registered.id, "reviewer", "assets.bin")
+        let binary = read_skill_file(&state, &registered.id, "reviewer", "assets.png")
             .await
             .expect("read listed binary file");
         assert_eq!(binary.mime_type, "application/octet-stream");
@@ -3763,7 +4158,7 @@ mod tests {
         write_skill(&inert, "", "inert-files", "Inert content");
         let fixtures = [
             ("references/guide.md", b"# Guide\n".as_slice()),
-            ("assets/image.bin", &[0, 1, 2, 3]),
+            ("assets/image.png", &[0, 1, 2, 3]),
             ("templates/example.txt", b"{{ exact }}\n".as_slice()),
         ];
         for (relative, bytes) in fixtures {
@@ -3797,6 +4192,8 @@ mod tests {
             "nested/run.zsh",
             "nested/run.fish",
             "nested/run.ps1",
+            "nested/run.py",
+            "nested/payload.js",
             "nested/run.bat",
             "nested/run.cmd",
             "nested/run.com",
@@ -3842,6 +4239,7 @@ mod tests {
             "HOOKS",
             "mcp.json",
             "nested/Bundle.APP",
+            "nested/payload.js",
             "nested/run.sh",
             "plugin.yaml",
             "scripts",
@@ -3878,6 +4276,127 @@ mod tests {
     }
 
     #[test]
+    fn scripts_are_bounded_trust_candidates_but_other_capability_surfaces_remain_unsafe() {
+        let source = tempdir().expect("source");
+        let package = source.path().join("trusted-scripts");
+        write_skill(&package, "", "trusted-scripts", "Script-bearing skill");
+        std::fs::create_dir_all(package.join("scripts")).expect("scripts");
+        std::fs::write(package.join("scripts/run.py"), b"print('ok')\n").expect("python script");
+        std::fs::write(package.join("scripts/run.sh"), b"#!/bin/sh\nexit 0\n")
+            .expect("shell script");
+        std::fs::create_dir_all(package.join("scripts/mcp")).expect("nested mcp");
+        std::fs::write(package.join("scripts/mcp/server.py"), b"print('never')\n")
+            .expect("nested mcp server");
+        std::fs::create_dir_all(package.join("hooks")).expect("hooks");
+        std::fs::write(package.join("hooks/preinstall.txt"), b"never").expect("hook");
+
+        let result = validate_fixture(source.path(), "trusted-scripts");
+
+        assert!(!result.installable);
+        assert!(result
+            .files
+            .iter()
+            .any(|file| file.relative_path == "scripts/run.py"));
+        assert!(result
+            .files
+            .iter()
+            .any(|file| file.relative_path == "scripts/run.sh"));
+        assert!(result.errors.iter().any(|error| {
+            error.code == SkillValidationCode::TrustRequired && error.path == "scripts"
+        }));
+        assert!(result.errors.iter().any(|error| {
+            error.code == SkillValidationCode::UnsafeEntry && error.path == "hooks"
+        }));
+        assert!(result.errors.iter().any(|error| {
+            error.code == SkillValidationCode::UnsafeEntry && error.path == "scripts/mcp"
+        }));
+    }
+
+    #[test]
+    fn exact_version_trust_is_signed_and_invalidated_by_script_changes() {
+        let source = tempdir().expect("source");
+        let package = source.path().join("skill-with-scripts");
+        write_skill(&package, "", "skill-with-scripts", "Script-bearing skill");
+        std::fs::create_dir_all(package.join("scripts")).expect("scripts");
+        std::fs::write(package.join("scripts/run.py"), b"print('v1')\n").expect("script");
+        let skill_source = SkillSource {
+            id: "source-id".into(),
+            kind: SkillSourceKind::Local {
+                root: source.path().to_string_lossy().into_owned(),
+            },
+        };
+        let mut result = discover_source_blocking(skill_source).expect("discover");
+        let candidate = result.packages[0].clone();
+        let (tree_hash, executables) =
+            trust_fingerprint(&package, &candidate).expect("fingerprint");
+        let key = [7_u8; 32];
+        let mut record = SkillTrustRecord {
+            source_id: "source-id".into(),
+            relative_path: "skill-with-scripts".into(),
+            tree_hash,
+            executables,
+            granted_at: "2026-07-30T00:00:00Z".into(),
+            signature: String::new(),
+        };
+        record.signature = sign_trust_record(&record, &key).expect("sign");
+
+        apply_skill_trust(source.path(), &mut result, &[record.clone()], Some(&key));
+        assert!(result.packages[0].installable);
+
+        std::fs::write(package.join("scripts/run.py"), b"print('v2')\n").expect("mutate");
+        let mut changed = discover_source_blocking(result.source.clone()).expect("rediscover");
+        apply_skill_trust(source.path(), &mut changed, &[record.clone()], Some(&key));
+        assert!(!changed.packages[0].installable);
+        assert!(changed.packages[0]
+            .errors
+            .iter()
+            .any(|error| error.code == SkillValidationCode::TrustRequired));
+
+        std::fs::write(package.join("scripts/run.py"), b"print('v1')\n").expect("restore");
+        let mut forged = record;
+        forged.signature.replace_range(..2, "00");
+        let mut original = discover_source_blocking(result.source).expect("rediscover original");
+        apply_skill_trust(source.path(), &mut original, &[forged], Some(&key));
+        assert!(!original.packages[0].installable);
+    }
+
+    #[test]
+    fn missing_key_never_silently_rekeys_existing_trust_records() {
+        #[derive(Default)]
+        struct MemoryKeychain(std::sync::Mutex<std::collections::HashMap<String, String>>);
+        impl KeychainSlot for MemoryKeychain {
+            fn read(&self, account: &str) -> Result<Option<String>, AppError> {
+                Ok(self.0.lock().expect("keychain").get(account).cloned())
+            }
+            fn write(&self, account: &str, value: &str) -> Result<(), AppError> {
+                self.0
+                    .lock()
+                    .expect("keychain")
+                    .insert(account.into(), value.into());
+                Ok(())
+            }
+            fn delete(&self, account: &str) -> Result<(), AppError> {
+                self.0.lock().expect("keychain").remove(account);
+                Ok(())
+            }
+        }
+
+        let keychain = MemoryKeychain::default();
+        let key = load_or_create_trust_key_with(&keychain, false).expect("create key");
+        assert_eq!(key.len(), 32);
+        assert_eq!(
+            load_or_create_trust_key_with(&keychain, true).expect("reuse key"),
+            key
+        );
+
+        let missing = MemoryKeychain::default();
+        assert!(matches!(
+            load_or_create_trust_key_with(&missing, true),
+            Err(AppError::KeychainUnavailable { .. })
+        ));
+    }
+
+    #[test]
     fn package_bounds_are_inclusive() {
         let source = tempdir().expect("source");
 
@@ -3906,7 +4425,7 @@ mod tests {
         let file_limit = source.path().join("file-limit");
         write_skill(&file_limit, "", "file-limit", "File limit");
         std::fs::write(
-            file_limit.join("exact.bin"),
+            file_limit.join("exact.png"),
             vec![0_u8; MAX_SKILL_FILE_BYTES as usize],
         )
         .expect("write exact-size file");
@@ -3915,7 +4434,7 @@ mod tests {
             "exact per-file limit should be valid"
         );
         std::fs::write(
-            file_limit.join("too-large.bin"),
+            file_limit.join("too-large.png"),
             vec![0_u8; MAX_SKILL_FILE_BYTES as usize + 1],
         )
         .expect("write oversize file");
@@ -3931,13 +4450,13 @@ mod tests {
             .len();
         for index in 0..7 {
             std::fs::write(
-                total_limit.join(format!("part-{index}.bin")),
+                total_limit.join(format!("part-{index}.png")),
                 vec![0_u8; MAX_SKILL_FILE_BYTES as usize],
             )
             .expect("write total-limit part");
         }
         std::fs::write(
-            total_limit.join("part-7.bin"),
+            total_limit.join("part-7.png"),
             vec![0_u8; (MAX_SKILL_FILE_BYTES - skill_size) as usize],
         )
         .expect("write total-limit remainder");
@@ -3945,7 +4464,7 @@ mod tests {
             validate_fixture(source.path(), "total-limit").installable,
             "exact total byte limit should be valid"
         );
-        std::fs::write(total_limit.join("zz-extra.bin"), b"x").expect("write aggregate overflow");
+        std::fs::write(total_limit.join("zz-extra.png"), b"x").expect("write aggregate overflow");
         assert!(
             !validate_fixture(source.path(), "total-limit").installable,
             "first byte beyond total limit should be rejected"

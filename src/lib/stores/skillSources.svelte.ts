@@ -15,6 +15,8 @@ import {
   skillDraftPublish,
   skillDraftReject,
   skillDraftsList,
+  skillTrustGrant,
+  skillTrustRevoke,
 } from "$lib/api";
 import {
   appErrorMessage,
@@ -60,6 +62,7 @@ class SkillSourcesStore {
   removing: Record<string, boolean> = $state({});
   loadingDestinations: Record<string, boolean> = $state({});
   installing: Record<string, boolean> = $state({});
+  trusting: Record<string, boolean> = $state({});
 
   async load(): Promise<void> {
     if (this.loading) return;
@@ -130,6 +133,55 @@ class SkillSourcesStore {
 
   packageKey(pkg: SkillPackageResult): string {
     return `${pkg.sourceId}\0${pkg.relativePath}`;
+  }
+
+  private replacePackage(pkg: SkillPackageResult): void {
+    const result = this.results[pkg.sourceId];
+    if (!result) return;
+    this.results = {
+      ...this.results,
+      [pkg.sourceId]: {
+        ...result,
+        packages: result.packages.map((current) =>
+          current.relativePath === pkg.relativePath ? pkg : current
+        ),
+      },
+    };
+  }
+
+  async grantTrust(pkg: SkillPackageResult): Promise<boolean> {
+    const key = this.packageKey(pkg);
+    if (this.trusting[key]) return false;
+    this.trusting = { ...this.trusting, [key]: true };
+    try {
+      this.replacePackage(await skillTrustGrant(pkg.sourceId, pkg.relativePath));
+      this.addError = null;
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    } finally {
+      const { [key]: _cleared, ...trusting } = this.trusting;
+      this.trusting = trusting;
+    }
+  }
+
+  async revokeTrust(pkg: SkillPackageResult): Promise<boolean> {
+    const key = this.packageKey(pkg);
+    if (this.trusting[key]) return false;
+    this.trusting = { ...this.trusting, [key]: true };
+    try {
+      await skillTrustRevoke(pkg.sourceId, pkg.relativePath);
+      await this.load();
+      this.addError = null;
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    } finally {
+      const { [key]: _cleared, ...trusting } = this.trusting;
+      this.trusting = trusting;
+    }
   }
 
   installKey(pkg: SkillPackageResult, runtime: string, projectPath: string | null): string {
