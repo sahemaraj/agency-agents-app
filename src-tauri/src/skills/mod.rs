@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,10 +17,11 @@ use crate::github::auth::{KeychainSlot, SystemKeychain};
 use crate::github::url::parse_github_url;
 use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
-    InstalledSkill, SkillDestinationPresence, SkillFileContent, SkillInstallRecord,
-    SkillInstallState, SkillPackageFile, SkillPackageResult, SkillSource, SkillSourceKind,
-    SkillSourceResult, SkillTrustFingerprint, SkillTrustedExecutable, SkillType,
-    SkillValidationCode, SkillValidationError, SkillVersionSnapshot,
+    InstalledSkill, SkillBatchResult, SkillDestinationPresence, SkillFileContent,
+    SkillInstallRecord, SkillInstallState, SkillMutationPlan, SkillPackageFile, SkillPackageResult,
+    SkillPlanPackage, SkillSource, SkillSourceKind, SkillSourceResult, SkillTrustFingerprint,
+    SkillTrustedExecutable, SkillType, SkillValidationCode, SkillValidationError,
+    SkillVersionSnapshot,
 };
 use crate::util::fs::atomic_write;
 
@@ -1395,6 +1397,13 @@ pub(crate) fn validate_package(
         tags: Vec::new(),
         dependencies: Vec::new(),
         recommended_skills: Vec::new(),
+        version: None,
+        channel: "stable".into(),
+        changelog: None,
+        publisher: None,
+        publisher_key: None,
+        publisher_verified: false,
+        validation_results: Vec::new(),
         permissions: Vec::new(),
         quality_score: 0,
         quality_checks: Vec::new(),
@@ -1433,33 +1442,72 @@ pub(crate) fn validate_package(
         Ok(bytes) => {
             skill_text = String::from_utf8(bytes.clone()).ok();
             match parse_skill_metadata(&bytes) {
-            Ok(metadata) => {
-                result.name = Some(metadata.name.clone());
-                result.description = Some(metadata.description);
-                result.skill_type = metadata.skill_type;
-                result.group = metadata.group;
-                result.tags = metadata.tags;
-                result.dependencies = metadata.dependencies;
-                result.recommended_skills = metadata.recommended_skills;
-                let directory_name = package_root.file_name().and_then(|name| name.to_str());
-                if directory_name != Some(metadata.name.as_str()) {
-                    result.errors.push(SkillValidationError {
-                        code: SkillValidationCode::InvalidMetadata,
-                        path: "SKILL.md".into(),
-                        message: format!(
-                            "Skill name '{}' must match directory '{}'.",
-                            metadata.name,
-                            directory_name.unwrap_or_default()
-                        ),
-                    });
+                Ok(metadata) => {
+                    result.name = Some(metadata.name.clone());
+                    result.description = Some(metadata.description);
+                    result.skill_type = metadata.skill_type;
+                    result.group = metadata.group;
+                    result.tags = metadata.tags;
+                    result.dependencies = metadata.dependencies;
+                    result.recommended_skills = metadata.recommended_skills;
+                    result.version = metadata.version;
+                    result.channel = metadata.channel;
+                    result.changelog = metadata.changelog;
+                    for required in &metadata.validation {
+                        if result
+                            .files
+                            .iter()
+                            .any(|file| file.relative_path == *required)
+                        {
+                            result
+                                .validation_results
+                                .push(format!("PASS required file: {required}"));
+                        } else {
+                            result.errors.push(SkillValidationError {
+                                code: SkillValidationCode::InvalidMetadata,
+                                path: "SKILL.md".into(),
+                                message: format!("Required validation file is missing: {required}"),
+                            });
+                        }
+                    }
+                    if let Some(publisher) = metadata.publisher {
+                        result.publisher = Some(publisher.name.clone());
+                        result.publisher_key = Some(publisher.public_key.clone());
+                        result.publisher_verified = verify_publisher(
+                            &publisher,
+                            result.name.as_deref().unwrap_or_default(),
+                            result.version.as_deref().unwrap_or("0.0.0"),
+                            &result.channel,
+                            skill_text.as_deref().unwrap_or_default(),
+                            &result.files,
+                        );
+                        if !result.publisher_verified {
+                            result.errors.push(SkillValidationError {
+                                code: SkillValidationCode::InvalidMetadata,
+                                path: "SKILL.md".into(),
+                                message: "Publisher signature verification failed.".into(),
+                            });
+                        }
+                    }
+                    let directory_name = package_root.file_name().and_then(|name| name.to_str());
+                    if directory_name != Some(metadata.name.as_str()) {
+                        result.errors.push(SkillValidationError {
+                            code: SkillValidationCode::InvalidMetadata,
+                            path: "SKILL.md".into(),
+                            message: format!(
+                                "Skill name '{}' must match directory '{}'.",
+                                metadata.name,
+                                directory_name.unwrap_or_default()
+                            ),
+                        });
+                    }
                 }
+                Err(message) => result.errors.push(SkillValidationError {
+                    code: SkillValidationCode::InvalidMetadata,
+                    path: "SKILL.md".into(),
+                    message,
+                }),
             }
-            Err(message) => result.errors.push(SkillValidationError {
-                code: SkillValidationCode::InvalidMetadata,
-                path: "SKILL.md".into(),
-                message,
-            }),
-        }
         }
         Err(error) => {
             let code = error.code();
@@ -1504,6 +1552,13 @@ fn invalid_package_root(source_id: &str, relative_path: &str, message: &str) -> 
         tags: Vec::new(),
         dependencies: Vec::new(),
         recommended_skills: Vec::new(),
+        version: None,
+        channel: "stable".into(),
+        changelog: None,
+        publisher: None,
+        publisher_key: None,
+        publisher_verified: false,
+        validation_results: Vec::new(),
         permissions: Vec::new(),
         quality_score: 0,
         quality_checks: Vec::new(),
@@ -1519,11 +1574,11 @@ fn invalid_package_root(source_id: &str, relative_path: &str, message: &str) -> 
 
 fn analyze_package(result: &mut SkillPackageResult, skill_text: &str) {
     let lower = skill_text.to_ascii_lowercase();
-    if result
-        .files
-        .iter()
-        .any(|file| file.relative_path.to_ascii_lowercase().starts_with("scripts/"))
-    {
+    if result.files.iter().any(|file| {
+        file.relative_path
+            .to_ascii_lowercase()
+            .starts_with("scripts/")
+    }) {
         result.permissions.push("execute-scripts".into());
     }
     if ["https://", "http://", "curl ", "wget ", "fetch("]
@@ -1564,7 +1619,9 @@ fn analyze_package(result: &mut SkillPackageResult, skill_text: &str) {
     }
     if !result.group.is_empty() || !result.tags.is_empty() {
         score += 20;
-        result.quality_checks.push("Discoverability metadata".into());
+        result
+            .quality_checks
+            .push("Discoverability metadata".into());
     }
     if lower.contains("```")
         || lower.contains("example")
@@ -1787,6 +1844,25 @@ struct SkillMetadata {
     dependencies: Vec<String>,
     #[serde(default, rename = "recommended-skills")]
     recommended_skills: Vec<String>,
+    version: Option<String>,
+    #[serde(default = "default_skill_channel")]
+    channel: String,
+    changelog: Option<String>,
+    publisher: Option<SkillPublisherMetadata>,
+    #[serde(default)]
+    validation: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct SkillPublisherMetadata {
+    name: String,
+    public_key: String,
+    signature: String,
+}
+
+fn default_skill_channel() -> String {
+    "stable".into()
 }
 
 fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
@@ -1828,6 +1904,33 @@ fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
         ));
     }
     if metadata
+        .version
+        .as_deref()
+        .is_some_and(|version| !valid_semver(version))
+    {
+        return Err("SKILL.md version must be MAJOR.MINOR.PATCH.".into());
+    }
+    if !matches!(metadata.channel.as_str(), "stable" | "beta") {
+        return Err("SKILL.md channel must be stable or beta.".into());
+    }
+    if metadata
+        .changelog
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 4096)
+    {
+        return Err("SKILL.md changelog must contain 1-4096 characters.".into());
+    }
+    if metadata.validation.len() > 32
+        || metadata
+            .validation
+            .iter()
+            .any(|path| normalized_requested_file_path(path).is_err())
+    {
+        return Err(
+            "SKILL.md validation must contain at most 32 normalized package file paths.".into(),
+        );
+    }
+    if metadata
         .group
         .iter()
         .chain(metadata.tags.iter())
@@ -1863,6 +1966,66 @@ fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
         return Err("SKILL.md dependency lists must not contain duplicates.".into());
     }
     Ok(metadata)
+}
+
+fn valid_semver(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn verify_publisher(
+    publisher: &SkillPublisherMetadata,
+    name: &str,
+    version: &str,
+    channel: &str,
+    skill_text: &str,
+    files: &[SkillPackageFile],
+) -> bool {
+    if publisher.name.trim().is_empty() || publisher.name.chars().count() > 128 {
+        return false;
+    }
+    let Ok(public_key) = base64::engine::general_purpose::STANDARD.decode(&publisher.public_key)
+    else {
+        return false;
+    };
+    let Ok(signature) = base64::engine::general_purpose::STANDARD.decode(&publisher.signature)
+    else {
+        return false;
+    };
+    let Ok(public_key) = <[u8; 32]>::try_from(public_key) else {
+        return false;
+    };
+    let Ok(signature) = <[u8; 64]>::try_from(signature) else {
+        return false;
+    };
+    let Ok(key) = VerifyingKey::from_bytes(&public_key) else {
+        return false;
+    };
+    let body = skill_text
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---").map(|end| &rest[end + 4..]))
+        .unwrap_or(skill_text);
+    let mut hasher = Sha256::new();
+    hasher.update(publisher.name.as_bytes());
+    hasher.update([0]);
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(version.as_bytes());
+    hasher.update([0]);
+    hasher.update(channel.as_bytes());
+    hasher.update([0]);
+    hasher.update(body.as_bytes());
+    for file in files.iter().filter(|file| file.relative_path != "SKILL.md") {
+        hasher.update([0]);
+        hasher.update(file.relative_path.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.sha256.as_bytes());
+    }
+    key.verify(&hasher.finalize(), &Signature::from_bytes(&signature))
+        .is_ok()
 }
 
 fn valid_taxonomy_segment(value: &str) -> bool {
@@ -2245,6 +2408,340 @@ pub(crate) async fn install_skill(
     project_path: Option<&str>,
 ) -> Result<InstalledSkill, AppError> {
     install_skill_authorized(state, source_id, relative_path, runtime, project_path, None).await
+}
+
+pub(crate) async fn plan_skill_install(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<SkillMutationPlan, AppError> {
+    let sources = inspect_skill_sources(state).await?;
+    let packages = sources
+        .iter()
+        .flat_map(|source| source.packages.iter())
+        .filter(|package| package.installable)
+        .collect::<Vec<_>>();
+    let root = packages
+        .iter()
+        .copied()
+        .find(|package| package.source_id == source_id && package.relative_path == relative_path)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "skill package does not exist or is not installable".into(),
+        })?;
+
+    fn visit<'a>(
+        package: &'a SkillPackageResult,
+        packages: &[&'a SkillPackageResult],
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+        ordered: &mut Vec<&'a SkillPackageResult>,
+        blockers: &mut Vec<String>,
+        preferred_sources: &HashMap<String, String>,
+    ) {
+        let Some(name) = package.name.as_ref() else {
+            blockers.push(format!("{} has no package name", package.relative_path));
+            return;
+        };
+        if visited.contains(name) {
+            return;
+        }
+        if !visiting.insert(name.clone()) {
+            blockers.push(format!("dependency cycle detected at {name}"));
+            return;
+        }
+        for dependency in &package.dependencies {
+            let matches = packages
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.name.as_deref() == Some(dependency))
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [candidate] => visit(
+                    candidate,
+                    packages,
+                    visiting,
+                    visited,
+                    ordered,
+                    blockers,
+                    preferred_sources,
+                ),
+                [] => blockers.push(format!("missing dependency: {dependency}")),
+                _ => {
+                    let preferred = preferred_sources.get(dependency).and_then(|source_id| {
+                        matches
+                            .iter()
+                            .copied()
+                            .find(|candidate| &candidate.source_id == source_id)
+                    });
+                    if let Some(candidate) = preferred {
+                        visit(
+                            candidate,
+                            packages,
+                            visiting,
+                            visited,
+                            ordered,
+                            blockers,
+                            preferred_sources,
+                        );
+                    } else {
+                        blockers.push(format!("ambiguous dependency: {dependency}"));
+                    }
+                }
+            }
+        }
+        visiting.remove(name);
+        if visited.insert(name.clone()) {
+            ordered.push(package);
+        }
+    }
+
+    let mut blockers = Vec::new();
+    let mut ordered = Vec::new();
+    let preferred_sources = organize::list(state)
+        .await?
+        .preferred_sources
+        .into_iter()
+        .map(|preference| (preference.skill_name, preference.source_id))
+        .collect::<HashMap<_, _>>();
+    visit(
+        root,
+        &packages,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        &mut ordered,
+        &mut blockers,
+        &preferred_sources,
+    );
+
+    let home = dirs::home_dir().ok_or_else(|| AppError::Io {
+        message: "could not resolve home directory".into(),
+    })?;
+    let project = project_path
+        .map(|path| canonical_project_string(Some(path)))
+        .transpose()?
+        .flatten()
+        .map(PathBuf::from);
+    let base = project.as_deref().unwrap_or(&home);
+    let records = install::load_ledger(&state.app_data_dir).await?;
+    let mut planned = Vec::new();
+    for package in ordered {
+        let name = package.name.clone().unwrap_or_default();
+        let destination = install::target_path(base, project.as_deref(), runtime, &name)?;
+        if destination.exists()
+            && !records.iter().any(|record| {
+                record.dest == destination.to_string_lossy()
+                    && record.source_id == package.source_id
+                    && record.relative_path == package.relative_path
+            })
+        {
+            blockers.push(format!(
+                "destination is occupied by unmanaged content: {}",
+                destination.display()
+            ));
+        }
+        planned.push(SkillPlanPackage {
+            source_id: package.source_id.clone(),
+            relative_path: package.relative_path.clone(),
+            name,
+            dependency: package.source_id != source_id || package.relative_path != relative_path,
+            destination: destination.to_string_lossy().into_owned(),
+            file_count: package.files.len() as u32,
+            permissions: package.permissions.clone(),
+        });
+    }
+    Ok(SkillMutationPlan {
+        operation: "install".into(),
+        runtime: runtime.into(),
+        project_path: project.map(|path| path.to_string_lossy().into_owned()),
+        rollback_available: planned
+            .iter()
+            .any(|item| Path::new(&item.destination).exists()),
+        packages: planned,
+        warnings: Vec::new(),
+        blockers,
+    })
+}
+
+pub(crate) async fn install_skill_with_dependencies(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<Vec<InstalledSkill>, AppError> {
+    install_skill_with_dependencies_authorized(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        project_path,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn install_skill_with_dependencies_authorized(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<Vec<InstalledSkill>, AppError> {
+    let plan = plan_skill_install(state, source_id, relative_path, runtime, project_path).await?;
+    if !plan.blockers.is_empty() {
+        return Err(AppError::InvalidArgument {
+            message: plan.blockers.join("; "),
+        });
+    }
+    let before = install::load_ledger(&state.app_data_dir).await?;
+    let mut installed = Vec::new();
+    let mut created = Vec::new();
+    for package in &plan.packages {
+        let already_managed = before.iter().any(|record| {
+            record.source_id == package.source_id
+                && record.relative_path == package.relative_path
+                && record.runtime == runtime
+                && record.project_path == plan.project_path
+        });
+        if package.dependency && already_managed {
+            continue;
+        }
+        match install_skill_authorized(
+            state,
+            &package.source_id,
+            &package.relative_path,
+            runtime,
+            project_path,
+            project_authorization,
+        )
+        .await
+        {
+            Ok(result) => {
+                if !already_managed {
+                    created.push(package.clone());
+                }
+                installed.push(result);
+            }
+            Err(error) => {
+                for created in created.iter().rev() {
+                    let _ = uninstall_skill_authorized(
+                        state,
+                        &created.source_id,
+                        &created.relative_path,
+                        runtime,
+                        project_path,
+                        project_authorization,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(installed)
+}
+
+pub(crate) async fn batch_collection(
+    state: &AppState,
+    collection_name: &str,
+    operation: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<SkillBatchResult, AppError> {
+    if !matches!(operation, "install" | "update" | "uninstall") {
+        return Err(AppError::InvalidArgument {
+            message: "batch operation must be install, update, or uninstall".into(),
+        });
+    }
+    let library = organize::list(state).await?;
+    let collection = library
+        .collections
+        .iter()
+        .find(|collection| collection.name == collection_name)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("collection does not exist: {collection_name}"),
+        })?;
+    for skill in &collection.skills {
+        resolve_skill_package(state, &skill.source_id, &skill.relative_path).await?;
+    }
+    let mut completed = Vec::new();
+    for skill in &collection.skills {
+        let result = match operation {
+            "install" => install_skill_with_dependencies(
+                state,
+                &skill.source_id,
+                &skill.relative_path,
+                runtime,
+                project_path,
+            )
+            .await
+            .map(|_| ()),
+            "update" => update_skill(
+                state,
+                &skill.source_id,
+                &skill.relative_path,
+                runtime,
+                project_path,
+            )
+            .await
+            .map(|_| ()),
+            "uninstall" => uninstall_skill(
+                state,
+                &skill.source_id,
+                &skill.relative_path,
+                runtime,
+                project_path,
+            )
+            .await
+            .map(|_| ()),
+            _ => unreachable!(),
+        };
+        if let Err(error) = result {
+            for completed_skill in collection.skills.iter().take(completed.len()).rev() {
+                match operation {
+                    "install" => {
+                        let _ = uninstall_skill(
+                            state,
+                            &completed_skill.source_id,
+                            &completed_skill.relative_path,
+                            runtime,
+                            project_path,
+                        )
+                        .await;
+                    }
+                    "uninstall" => {
+                        let _ = install_skill(
+                            state,
+                            &completed_skill.source_id,
+                            &completed_skill.relative_path,
+                            runtime,
+                            project_path,
+                        )
+                        .await;
+                    }
+                    // Each update already keeps a recoverable version. Automatic
+                    // rollback needs the exact snapshot selected by the user.
+                    "update" => {}
+                    _ => unreachable!(),
+                }
+            }
+            return Err(AppError::InvalidArgument {
+                message: format!(
+                    "batch {operation} failed after {} item(s): {error}",
+                    completed.len()
+                ),
+            });
+        }
+        completed.push(format!("{}/{}", skill.source_id, skill.relative_path));
+    }
+    Ok(SkillBatchResult {
+        operation: operation.into(),
+        completed,
+        rolled_back: false,
+    })
 }
 
 pub(crate) async fn install_skill_authorized(
@@ -3115,13 +3612,8 @@ pub(crate) async fn skill_version_history(
 ) -> Result<Vec<SkillVersionSnapshot>, AppError> {
     let project = canonical_project_string(project_path)?;
     let records = install::load_ledger(&state.app_data_dir).await?;
-    let record = &records[skill_record_index(
-        &records,
-        source_id,
-        relative_path,
-        runtime,
-        &project,
-    )?];
+    let record =
+        &records[skill_record_index(&records, source_id, relative_path, runtime, &project)?];
     let directory = state.app_data_dir.join("skill-backups");
     let prefix = format!("{}-", record.name);
     let mut snapshots = match std::fs::read_dir(&directory) {
@@ -3165,13 +3657,7 @@ pub(crate) async fn rollback_skill_authorized(
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
     let project = canonical_project_string_authorized(project_path, project_authorization)?;
     let mut records = install::load_ledger(&state.app_data_dir).await?;
-    let index = skill_record_index(
-        &records,
-        source_id,
-        relative_path,
-        runtime,
-        &project,
-    )?;
+    let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
     let old_records = records.clone();
     let record = records[index].clone();
     record_destination_authorized(&record, project_authorization)?;
@@ -3234,6 +3720,60 @@ pub(crate) async fn rollback_skill_authorized(
         };
     }
     Ok(installed_view(&records[index], SkillInstallState::Current))
+}
+
+#[tauri::command]
+pub async fn skill_install_plan(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<SkillMutationPlan, AppError> {
+    plan_skill_install(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_install_with_dependencies(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<Vec<InstalledSkill>, AppError> {
+    install_skill_with_dependencies(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_collection_batch(
+    state: State<'_, AppState>,
+    collection_name: String,
+    operation: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<SkillBatchResult, AppError> {
+    batch_collection(
+        &state,
+        &collection_name,
+        &operation,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -3524,6 +4064,8 @@ pub async fn skill_source_remove(
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{
@@ -3544,9 +4086,45 @@ mod tests {
         is_windows_reparse_point, load_or_create_trust_key_with, load_skill_sources,
         read_skill_file, refresh_git_source_from, remove_skill_source, reset_refresh_fs_probe,
         resolve_skill_package, sign_trust_record, skill_destination_presence, skill_sources_path,
-        take_refresh_fs_probe, trust_fingerprint, validate_package, SkillTrustRecord,
-        MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
+        take_refresh_fs_probe, trust_fingerprint, validate_package, verify_publisher,
+        SkillPublisherMetadata, SkillTrustRecord, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
     };
+
+    #[test]
+    fn publisher_signature_covers_identity_version_channel_and_skill_body() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let mut payload = sha2::Sha256::new();
+        for part in ["Acme", "reviewer", "1.2.3", "stable", "\nInstructions\n"] {
+            payload.update(part.as_bytes());
+            if part != "\nInstructions\n" {
+                payload.update([0]);
+            }
+        }
+        let publisher = SkillPublisherMetadata {
+            name: "Acme".into(),
+            public_key: base64::engine::general_purpose::STANDARD
+                .encode(signing_key.verifying_key().to_bytes()),
+            signature: base64::engine::general_purpose::STANDARD
+                .encode(signing_key.sign(&payload.finalize()).to_bytes()),
+        };
+        let skill = "---\nname: reviewer\n---\nInstructions\n";
+        assert!(verify_publisher(
+            &publisher,
+            "reviewer",
+            "1.2.3",
+            "stable",
+            skill,
+            &[]
+        ));
+        assert!(!verify_publisher(
+            &publisher,
+            "reviewer",
+            "1.2.4",
+            "stable",
+            skill,
+            &[]
+        ));
+    }
 
     #[test]
     fn source_state_lock_serializes_independent_writers() {
@@ -4914,6 +5492,46 @@ mod tests {
             }),
             "{:?}",
             package.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn install_plan_orders_dependencies_before_the_requested_skill() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(
+            source.path(),
+            "foundation",
+            "foundation",
+            "Shared foundation",
+        );
+        write_skill_md(
+            &source.path().join("frontend"),
+            "name: frontend\ndescription: Frontend workflow\ndependencies:\n  - foundation\n",
+        );
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+
+        let plan = super::plan_skill_install(
+            &state,
+            &registered.id,
+            "frontend",
+            "codex",
+            Some(&project.path().to_string_lossy()),
+        )
+        .await
+        .expect("build install plan");
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(
+            plan.packages
+                .iter()
+                .map(|package| (package.name.as_str(), package.dependency))
+                .collect::<Vec<_>>(),
+            vec![("foundation", true), ("frontend", false)]
         );
     }
 

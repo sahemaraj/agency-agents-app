@@ -161,6 +161,19 @@ pub struct Settings {
     /// mutations do not consult this list.
     #[serde(default)]
     pub mcp_project_allowlist: Vec<String>,
+
+    /// Optional per-client overrides. Missing clients inherit the global
+    /// mutation policy above.
+    #[serde(default)]
+    pub mcp_client_policies: HashMap<String, McpClientPolicy>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpClientPolicy {
+    pub source_access: bool,
+    pub install_access: bool,
+    pub destructive_access: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -244,6 +257,7 @@ impl Default for Settings {
             mcp_install_access: false,
             mcp_destructive_access: false,
             mcp_project_allowlist: Vec::new(),
+            mcp_client_policies: HashMap::new(),
         }
     }
 }
@@ -273,6 +287,8 @@ impl Settings {
         self.trending_ttl_minutes = self
             .trending_ttl_minutes
             .clamp(Self::TRENDING_TTL_MIN, Self::TRENDING_TTL_MAX);
+        self.mcp_client_policies
+            .retain(|client, _| matches!(client.as_str(), "claude" | "codex"));
         // Enforce the cap on every load/save in addition to the push
         // helper so a hand-edited settings.json with 50 skip entries
         // gets pruned on read.
@@ -700,6 +716,42 @@ pub async fn mcp_policy_set(
     .await
 }
 
+#[tauri::command]
+pub async fn mcp_client_policy_set(
+    client: String,
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+    state: State<'_, AppState>,
+) -> Result<Settings, AppError> {
+    if !matches!(client.as_str(), "claude" | "codex") {
+        return Err(AppError::InvalidArgument {
+            message: "MCP client must be claude or codex".into(),
+        });
+    }
+    let mut cache = state.settings.write().await;
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            })
+        }
+    };
+    latest.mcp_client_policies.insert(
+        client,
+        McpClientPolicy {
+            source_access,
+            install_access,
+            destructive_access,
+        },
+    );
+    let saved = persist(&state.app_data_dir, latest).await?;
+    *cache = SettingsLoadState::Loaded(saved.clone());
+    Ok(saved)
+}
+
 /// Overwrite `settings.json` with the defaults and update the
 /// in-memory cache. Used by the UI's "Reset to defaults" button when
 /// the file is corrupt or the user just wants to start fresh.
@@ -799,6 +851,7 @@ mod tests {
             mcp_install_access: true,
             mcp_destructive_access: true,
             mcp_project_allowlist: vec!["/projects/allowed".into()],
+            mcp_client_policies: HashMap::new(),
         };
         let written = persist(tmp.path(), s.clone()).await.expect("persist");
         assert_eq!(written, s);
@@ -864,6 +917,7 @@ mod tests {
             mcp_install_access: false,
             mcp_destructive_access: false,
             mcp_project_allowlist: Vec::new(),
+            mcp_client_policies: HashMap::new(),
         };
         let written = persist(tmp.path(), s).await.expect("persist");
         assert_eq!(

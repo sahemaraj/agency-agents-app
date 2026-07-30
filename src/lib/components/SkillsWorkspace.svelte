@@ -20,7 +20,8 @@
   import { projects } from "$lib/stores/projects.svelte";
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { InstalledSkill, SkillApprovalAction, SkillDraft, SkillPackageResult, SkillSmartFolderRule, SkillSource, SkillSourceResult, SkillType, SkillUpdatePolicy, SkillVersionSnapshot } from "$lib/types";
+  import { skillCollectionBatch, skillInstallPlan } from "$lib/api";
+  import type { InstalledSkill, SkillApprovalAction, SkillDraft, SkillMutationPlan, SkillPackageResult, SkillSmartFolderRule, SkillSource, SkillSourceResult, SkillType, SkillUpdatePolicy, SkillVersionSnapshot } from "$lib/types";
 
   type StatusFilter = "all" | "ready" | "rejected";
   type DetailTab = "overview" | "files" | "security";
@@ -62,6 +63,7 @@
   let collectionInstallOpen = $state(false);
   let collectionRuntime: "claudeCode" | "codex" = $state("codex");
   let collectionProject = $state("");
+  let collectionOperation: "install" | "update" | "uninstall" = $state("install");
   let creatorOpen = $state(false);
   let creatorName = $state("");
   let creatorDescription = $state("");
@@ -72,6 +74,8 @@
   let editorOpen = $state(false);
   let editorText = $state("");
   let editorLoading = $state(false);
+  let installPlan: SkillMutationPlan | null = $state(null);
+  let plannedInstall: { pkg: SkillPackageResult; runtime: "claudeCode" | "codex"; projectPath: string | null; destination: string } | null = $state(null);
 
   const packages = $derived.by<PackageView[]>(() =>
     Object.values(skillSources.results).flatMap((result) =>
@@ -89,6 +93,13 @@
       if (libraryFilter === "trusted" && !trustedScripts(pkg)) return false;
       if (libraryFilter === "review" && pkg.installable && !requiresTrust(pkg)) return false;
       if (libraryFilter === "favorites" && !skillSources.isFavorite(pkg)) return false;
+      if (libraryFilter === "recommendations" && (isInstalled(pkg) || pkg.qualityScore < 60)) return false;
+      if (libraryFilter === "duplicates" && packageConflicts(pkg).length === 0) return false;
+      if (libraryFilter === "cleanup" && (!isInstalled(pkg) || skillSources.folderState.usage.some((usage) =>
+        usage.skill.sourceId === pkg.sourceId
+        && usage.skill.relativePath === pkg.relativePath
+        && (usage.fetches > 0 || usage.installs > 0)
+      ))) return false;
       if (libraryFilter === "recent" && !skillSources.folderState.recent.some((recent) =>
         recent.skill.sourceId === pkg.sourceId && recent.skill.relativePath === pkg.relativePath
       )) return false;
@@ -226,12 +237,24 @@
   const installedCount = $derived(packages.filter(({ pkg }) => isInstalled(pkg)).length);
   const trustedCount = $derived(packages.filter(({ pkg }) => trustedScripts(pkg)).length);
   const reviewCount = $derived(packages.filter(({ pkg }) => !pkg.installable || requiresTrust(pkg)).length);
+  const recommendationCount = $derived(packages.filter(({ pkg }) => !isInstalled(pkg) && pkg.qualityScore >= 60).length);
+  const duplicateCount = $derived(packages.filter(({ pkg }) => packageConflicts(pkg).length > 0).length);
+  const cleanupCount = $derived(packages.filter(({ pkg }) =>
+    isInstalled(pkg) && !skillSources.folderState.usage.some((usage) =>
+      usage.skill.sourceId === pkg.sourceId
+      && usage.skill.relativePath === pkg.relativePath
+      && (usage.fetches > 0 || usage.installs > 0)
+    )
+  ).length);
   const libraryTitle = $derived.by(() => {
     if (libraryFilter === "installed") return i18n.t("skills.installed");
     if (libraryFilter === "trusted") return i18n.t("skills.trustedScripts");
     if (libraryFilter === "review") return i18n.t("skills.needsReview");
     if (libraryFilter === "favorites") return i18n.t("skills.favorites");
     if (libraryFilter === "recent") return i18n.t("skills.recent");
+    if (libraryFilter === "recommendations") return "Recommendations";
+    if (libraryFilter === "duplicates") return "Duplicates";
+    if (libraryFilter === "cleanup") return "Cleanup suggestions";
     if (libraryFilter.startsWith("collection:") || libraryFilter.startsWith("smart:")) {
       return libraryFilter.slice(libraryFilter.indexOf(":") + 1);
     }
@@ -353,6 +376,9 @@
         smartFolders: [],
         profiles: [],
         updatePolicies: [],
+        publisherTrust: [],
+        preferredSources: [],
+        usage: [],
         approvals: [],
       })) {
         localStorage.removeItem(PERSONAL_FOLDERS_KEY);
@@ -516,17 +542,22 @@
   }
 
   async function installCurrentCollection(): Promise<void> {
-    let installed = 0;
-    for (const { pkg } of filtered) {
-      if (await skillSources.installPackage(
-        pkg,
+    const collectionName = libraryFilter.startsWith("collection:")
+      ? libraryFilter.slice("collection:".length)
+      : "";
+    try {
+      const result = await skillCollectionBatch(
+        collectionName,
+        collectionOperation,
         collectionRuntime,
         collectionProject || null,
-        projects.list.map((project) => project.path),
-      )) installed += 1;
+      );
+      await skillSources.reconcileInstalls(projects.list.map((project) => project.path));
+      announcement = `${collectionOperation} completed for ${result.completed.length} skill(s).`;
+      collectionInstallOpen = false;
+    } catch (error) {
+      announcement = String(error);
     }
-    collectionInstallOpen = false;
-    announcement = i18n.t("skills.collectionInstalled", { installed, total: filtered.length });
   }
 
   async function createSkillDraft(): Promise<void> {
@@ -613,6 +644,8 @@
     if (action.action === "smartFolderDelete") return `Delete smart folder ${action.name}`;
     if (action.action === "profileDelete") return `Delete profile ${action.name}`;
     if (action.action === "updatePolicySet") return `Set ${action.relativePath} policy to ${action.policy}`;
+    if (action.action === "publisherTrustSet") return `${action.revoked ? "Revoke" : "Trust"} publisher ${action.name}`;
+    if (action.action === "batchCollection") return `${action.operation} collection ${action.collectionName} in ${action.runtime}`;
     return `Roll back ${action.relativePath} in ${action.runtime}`;
   }
 
@@ -673,15 +706,30 @@
     if (!selected) return;
     const projectPath = row.kind === "global" ? null : row.path;
     const runtime = column.id as "claudeCode" | "codex";
+    try {
+      installPlan = await skillInstallPlan(selected.pkg.sourceId, selected.pkg.relativePath, runtime, projectPath);
+      plannedInstall = { pkg: selected.pkg, runtime, projectPath, destination: column.label };
+    } catch (error) {
+      announcement = String(error);
+    }
+  }
+
+  async function confirmPlannedInstall(): Promise<void> {
+    if (!plannedInstall || !installPlan || installPlan.blockers.length > 0) return;
+    const target = plannedInstall;
     const succeeded = await skillSources.installPackage(
-      selected.pkg,
-      runtime,
-      projectPath,
+      target.pkg,
+      target.runtime,
+      target.projectPath,
       projects.list.map((project) => project.path),
     );
     announcement = succeeded
-      ? i18n.t("skills.installSucceeded", { name: selected.pkg.name ?? selected.pkg.relativePath, destination: column.label })
-      : skillSources.installErrors[skillSources.installKey(selected.pkg, runtime, projectPath)] ?? i18n.t("skills.installFailed");
+      ? i18n.t("skills.installSucceeded", { name: target.pkg.name ?? target.pkg.relativePath, destination: target.destination })
+      : skillSources.installErrors[skillSources.installKey(target.pkg, target.runtime, target.projectPath)] ?? i18n.t("skills.installFailed");
+    if (succeeded) {
+      installPlan = null;
+      plannedInstall = null;
+    }
   }
 
   function lifecycleKey(installed: InstalledSkill): string {
@@ -1019,6 +1067,9 @@
             ["review", i18n.t("skills.needsReview"), reviewCount],
             ["favorites", i18n.t("skills.favorites"), skillSources.folderState.favorites.length],
             ["recent", i18n.t("skills.recent"), skillSources.folderState.recent.length],
+            ["recommendations", "Recommendations", recommendationCount],
+            ["duplicates", "Duplicates", duplicateCount],
+            ["cleanup", "Cleanup", cleanupCount],
           ] as item}
             <button
               class:active={libraryFilter === item[0]}
@@ -1086,7 +1137,7 @@
           <span class="pane-tools">
             <span>{filtered.length}</span>
             {#if libraryFilter.startsWith("collection:") && filtered.length > 0}
-              <Button size="sm" onclick={() => (collectionInstallOpen = true)}>{i18n.t("skills.installCollection")}</Button>
+              <Button size="sm" onclick={() => (collectionInstallOpen = true)}>{i18n.t("skills.manageCollection")}</Button>
             {/if}
           </span>
         </div>
@@ -1225,7 +1276,15 @@
                   <div><dt>{i18n.t("skills.subdirectoryLabel")}</dt><dd>{selected.source.kind.subdirectory ?? i18n.t("skills.repositoryRoot")}</dd></div>
                 {/if}
                 <div><dt>{i18n.t("skills.packagePath")}</dt><dd>{selected.pkg.relativePath || "."}</dd></div>
+                <div><dt>{i18n.t("skills.version")}</dt><dd>{selected.pkg.version ?? i18n.t("skills.unversioned")} · {selected.pkg.channel}</dd></div>
+                {#if selected.pkg.publisher}
+                  <div><dt>{i18n.t("skills.publisher")}</dt><dd>{selected.pkg.publisher} · {selected.pkg.publisherVerified ? i18n.t("skills.signatureVerified") : i18n.t("skills.signatureInvalid")}</dd></div>
+                {/if}
               </dl>
+              {#if selected.pkg.changelog}<p class="section-help">{selected.pkg.changelog}</p>{/if}
+              {#if packageConflicts(selected.pkg).length > 0}
+                <Button size="sm" onclick={() => void skillSources.setPreferredSource(selected.pkg)}>{i18n.t("skills.preferSource")}</Button>
+              {/if}
             </section>
             {/if}
 
@@ -1240,6 +1299,21 @@
                     <li><code>{error.code}</code> · {error.path || "."}: {error.message}</li>
                   {/each}
                 </ul>
+              {/if}
+              {#if selected.pkg.validationResults.length > 0}
+                <ul class="quality-list">
+                  {#each selected.pkg.validationResults as result (result)}<li>{result}</li>{/each}
+                </ul>
+              {/if}
+              {#if selected.pkg.publisher && selected.pkg.publisherKey && selected.pkg.publisherVerified}
+                {@const publisherTrust = skillSources.folderState.publisherTrust.find((trust) => trust.publicKey === selected.pkg.publisherKey)}
+                <p class:healthy={publisherTrust?.trusted} class:warning={publisherTrust?.revoked}>
+                  {publisherTrust?.revoked ? i18n.t("skills.publisherRevoked") : publisherTrust?.trusted ? i18n.t("skills.publisherTrusted") : i18n.t("skills.publisherVerifiedUntrusted")}
+                </p>
+                <div class="button-row">
+                  <Button size="sm" onclick={() => void skillSources.setPublisherTrust({ name: selected.pkg.publisher!, publicKey: selected.pkg.publisherKey!, trusted: true, revoked: false })}>{i18n.t("skills.trustPublisher")}</Button>
+                  <Button size="sm" variant="danger" onclick={() => void skillSources.setPublisherTrust({ name: selected.pkg.publisher!, publicKey: selected.pkg.publisherKey!, trusted: false, revoked: true })}>{i18n.t("skills.revokePublisher")}</Button>
+                </div>
               {/if}
               {#if requiresTrust(selected.pkg)}
                 <Button
@@ -1525,8 +1599,16 @@
 {/if}
 
 {#if collectionInstallOpen}
-  <Modal open title={i18n.t("skills.installCollection")} onClose={() => (collectionInstallOpen = false)}>
+  <Modal open title={i18n.t("skills.manageCollection")} onClose={() => (collectionInstallOpen = false)}>
     <div class="folder-form">
+      <label>
+        <span>{i18n.t("skills.operation")}</span>
+        <select bind:value={collectionOperation}>
+          <option value="install">{i18n.t("common.install")}</option>
+          <option value="update">{i18n.t("common.update")}</option>
+          <option value="uninstall">{i18n.t("common.uninstall")}</option>
+        </select>
+      </label>
       <label>
         <span>{i18n.t("skills.runtime")}</span>
         <select bind:value={collectionRuntime}>
@@ -1543,11 +1625,36 @@
           {/each}
         </select>
       </label>
-      <p class="quiet">{i18n.t("skills.installCollectionHelp", { count: filtered.length })}</p>
+      <p class="quiet">{i18n.t("skills.manageCollectionHelp", { operation: collectionOperation, count: filtered.length })}</p>
     </div>
     {#snippet actions()}
       <Button variant="secondary" modalAction="cancel" onclick={() => (collectionInstallOpen = false)}>{i18n.t("common.cancel")}</Button>
-      <Button variant="primary" modalAction="confirm" onclick={() => void installCurrentCollection()}>{i18n.t("skills.installCollection")}</Button>
+      <Button variant="primary" modalAction="confirm" onclick={() => void installCurrentCollection()}>{i18n.t("skills.applyCollectionOperation")}</Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+{#if installPlan && plannedInstall}
+  {@const plan = installPlan}
+  <Modal open title={i18n.t("skills.installPlan")} size="wide" onClose={() => { installPlan = null; plannedInstall = null; }}>
+    <div class="plan">
+      <p>{i18n.t("skills.installPlanHelp", { count: installPlan.packages.length })}</p>
+      <ul class="files">
+        {#each installPlan.packages as item (`${item.sourceId}:${item.relativePath}`)}
+          <li>
+            <div><strong>{item.name}</strong><span>{item.dependency ? i18n.t("skills.dependency") : i18n.t("skills.requestedSkill")}</span></div>
+            <code>{item.destination}</code>
+            {#if item.permissions.length > 0}<span>{item.permissions.join(", ")}</span>{/if}
+          </li>
+        {/each}
+      </ul>
+      {#each installPlan.warnings as warning}<p class="warning">{warning}</p>{/each}
+      {#each installPlan.blockers as blocker}<p class="alert" role="alert">{blocker}</p>{/each}
+      <p class="quiet">{installPlan.rollbackAvailable ? i18n.t("skills.rollbackAvailable") : i18n.t("skills.newInstallPlan")}</p>
+    </div>
+    {#snippet actions()}
+      <Button variant="secondary" modalAction="cancel" onclick={() => { installPlan = null; plannedInstall = null; }}>{i18n.t("common.cancel")}</Button>
+      <Button variant="primary" modalAction="confirm" disabled={plan.blockers.length > 0} onclick={() => void confirmPlannedInstall()}>{i18n.t("common.install")}</Button>
     {/snippet}
   </Modal>
 {/if}

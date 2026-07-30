@@ -68,6 +68,7 @@ hmac = "0.12"
 getrandom = "0.3"
 hex = "0.4"
 subtle = "2"
+ed25519-dalek = "2"
 
 # Gzip codec for the bundled catalog (Phase 12a). Used both for
 # decompressing the bundled `formula.json.gz` / `cask.json.gz` and for

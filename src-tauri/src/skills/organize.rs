@@ -7,8 +7,9 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::types::{
     SkillApproval, SkillApprovalAction, SkillApprovalState, SkillCollection, SkillFolderAssignment,
-    SkillFolderState, SkillRecent, SkillReference, SkillSmartFolder, SkillUpdatePolicy,
-    SkillUpdatePolicyRecord, SkillWorkspaceProfile,
+    SkillFolderState, SkillPreferredSource, SkillPublisherTrust, SkillRecent, SkillReference,
+    SkillSmartFolder, SkillUpdatePolicy, SkillUpdatePolicyRecord, SkillUsage,
+    SkillWorkspaceProfile,
 };
 use crate::util::fs::atomic_write;
 
@@ -88,6 +89,9 @@ fn validate_state(value: &SkillFolderState) -> Result<(), AppError> {
         || value.smart_folders.len() > MAX_NAMED_ITEMS
         || value.profiles.len() > MAX_NAMED_ITEMS
         || value.approvals.len() > MAX_NAMED_ITEMS
+        || value.publisher_trust.len() > MAX_NAMED_ITEMS
+        || value.preferred_sources.len() > MAX_NAMED_ITEMS
+        || value.usage.len() > MAX_FOLDERS
     {
         return Err(invalid(format!(
             "at most {MAX_NAMED_ITEMS} collections, smart folders, and profiles are allowed"
@@ -104,6 +108,7 @@ fn validate_state(value: &SkillFolderState) -> Result<(), AppError> {
                 .flat_map(|collection| collection.skills.iter()),
         )
         .chain(value.update_policies.iter().map(|record| &record.skill))
+        .chain(value.usage.iter().map(|record| &record.skill))
     {
         validate_reference(reference)?;
     }
@@ -160,6 +165,21 @@ fn validate_state(value: &SkillFolderState) -> Result<(), AppError> {
             return Err(invalid("approval identity fields are invalid"));
         }
         validate_approval_action(&approval.request)?;
+    }
+    for trust in &value.publisher_trust {
+        validate_name(&trust.name)?;
+        if trust.public_key.trim().is_empty()
+            || trust.public_key.len() > 256
+            || (trust.trusted && trust.revoked)
+        {
+            return Err(invalid("publisher trust record is invalid"));
+        }
+    }
+    for preference in &value.preferred_sources {
+        validate_name(&preference.skill_name)?;
+        if preference.source_id.trim().is_empty() || preference.source_id.len() > 128 {
+            return Err(invalid("preferred source record is invalid"));
+        }
     }
     Ok(())
 }
@@ -243,6 +263,35 @@ fn validate_approval_action(action: &SkillApprovalAction) -> Result<(), AppError
             }
             if snapshot_path.trim().is_empty() {
                 return Err(invalid("snapshot_path is required"));
+            }
+            Ok(())
+        }
+        SkillApprovalAction::PublisherTrustSet {
+            name,
+            public_key,
+            trusted,
+            revoked,
+        } => {
+            validate_name(name)?;
+            if public_key.trim().is_empty() || public_key.len() > 256 || (*trusted && *revoked) {
+                return Err(invalid("publisher trust request is invalid"));
+            }
+            Ok(())
+        }
+        SkillApprovalAction::BatchCollection {
+            collection_name,
+            operation,
+            runtime,
+            project_path,
+        } => {
+            validate_name(collection_name)?;
+            if !matches!(operation.as_str(), "install" | "update" | "uninstall")
+                || !matches!(runtime.as_str(), "claudeCode" | "codex")
+                || project_path
+                    .as_deref()
+                    .is_some_and(|path| !Path::new(path).is_absolute())
+            {
+                return Err(invalid("batch collection request is invalid"));
             }
             Ok(())
         }
@@ -722,6 +771,81 @@ pub async fn set_update_policy(
     Ok(library)
 }
 
+pub async fn set_publisher_trust(
+    state: &AppState,
+    trust: SkillPublisherTrust,
+) -> Result<SkillFolderState, AppError> {
+    validate_name(&trust.name)?;
+    if trust.public_key.trim().is_empty() || trust.public_key.len() > 256 {
+        return Err(invalid(
+            "publisher public key must contain 1-256 characters",
+        ));
+    }
+    if trust.trusted && trust.revoked {
+        return Err(invalid("a publisher key cannot be trusted and revoked"));
+    }
+    let _guard = state.skill_folders_write_lock.lock().await;
+    let mut library = load(&state.app_data_dir).await?;
+    library
+        .publisher_trust
+        .retain(|current| current.public_key != trust.public_key);
+    library.publisher_trust.push(trust);
+    save(&state.app_data_dir, &library).await?;
+    Ok(library)
+}
+
+pub async fn set_preferred_source(
+    state: &AppState,
+    preference: SkillPreferredSource,
+) -> Result<SkillFolderState, AppError> {
+    validate_name(&preference.skill_name)?;
+    if preference.source_id.trim().is_empty() || preference.source_id.len() > 128 {
+        return Err(invalid("source_id must contain 1-128 characters"));
+    }
+    let _guard = state.skill_folders_write_lock.lock().await;
+    let mut library = load(&state.app_data_dir).await?;
+    library
+        .preferred_sources
+        .retain(|current| current.skill_name != preference.skill_name);
+    library.preferred_sources.push(preference);
+    save(&state.app_data_dir, &library).await?;
+    Ok(library)
+}
+
+pub async fn record_usage(
+    state: &AppState,
+    skill: SkillReference,
+    event: &str,
+) -> Result<SkillFolderState, AppError> {
+    validate_reference(&skill)?;
+    if !matches!(event, "fetch" | "install" | "reject") {
+        return Err(invalid("usage event must be fetch, install, or reject"));
+    }
+    let _guard = state.skill_folders_write_lock.lock().await;
+    let mut library = load(&state.app_data_dir).await?;
+    let usage = if let Some(usage) = library.usage.iter_mut().find(|item| item.skill == skill) {
+        usage
+    } else {
+        library.usage.push(SkillUsage {
+            skill,
+            fetches: 0,
+            installs: 0,
+            rejections: 0,
+            last_used_at: String::new(),
+        });
+        library.usage.last_mut().expect("usage was inserted")
+    };
+    match event {
+        "fetch" => usage.fetches = usage.fetches.saturating_add(1),
+        "install" => usage.installs = usage.installs.saturating_add(1),
+        "reject" => usage.rejections = usage.rejections.saturating_add(1),
+        _ => unreachable!(),
+    }
+    usage.last_used_at = chrono::Utc::now().to_rfc3339();
+    save(&state.app_data_dir, &library).await?;
+    Ok(library)
+}
+
 pub async fn export_library(state: &AppState, path: String) -> Result<u32, AppError> {
     let library = load(&state.app_data_dir).await?;
     let bytes = serde_json::to_vec_pretty(&library).map_err(|error| AppError::Internal {
@@ -873,6 +997,36 @@ pub async fn approve(state: &AppState, id: String) -> Result<SkillApproval, AppE
             project_path.as_deref(),
             &snapshot_path,
             None,
+        )
+        .await
+        .map(|_| ()),
+        SkillApprovalAction::PublisherTrustSet {
+            name,
+            public_key,
+            trusted,
+            revoked,
+        } => set_publisher_trust(
+            state,
+            SkillPublisherTrust {
+                name,
+                public_key,
+                trusted,
+                revoked,
+            },
+        )
+        .await
+        .map(|_| ()),
+        SkillApprovalAction::BatchCollection {
+            collection_name,
+            operation,
+            runtime,
+            project_path,
+        } => super::batch_collection(
+            state,
+            &collection_name,
+            &operation,
+            &runtime,
+            project_path.as_deref(),
         )
         .await
         .map(|_| ()),
@@ -1075,6 +1229,22 @@ pub async fn skill_update_policy_set(
 }
 
 #[tauri::command]
+pub async fn skill_publisher_trust_set(
+    state: State<'_, AppState>,
+    trust: SkillPublisherTrust,
+) -> Result<SkillFolderState, AppError> {
+    set_publisher_trust(&state, trust).await
+}
+
+#[tauri::command]
+pub async fn skill_preferred_source_set(
+    state: State<'_, AppState>,
+    preference: SkillPreferredSource,
+) -> Result<SkillFolderState, AppError> {
+    set_preferred_source(&state, preference).await
+}
+
+#[tauri::command]
 pub async fn skill_approval_approve(
     state: State<'_, AppState>,
     id: String,
@@ -1161,6 +1331,19 @@ mod tests {
         assert!(validate_state(&folders).is_err());
     }
 
+    #[test]
+    fn batch_approval_rejects_unknown_operations() {
+        assert!(
+            validate_approval_action(&SkillApprovalAction::BatchCollection {
+                collection_name: "Review set".into(),
+                operation: "erase".into(),
+                runtime: "codex".into(),
+                project_path: None,
+            })
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn mutations_persist_and_non_recursive_delete_is_safe() {
         let root = tempfile::tempdir().unwrap();
@@ -1186,5 +1369,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(list(&app).await.unwrap(), SkillFolderState::default());
+    }
+
+    #[tokio::test]
+    async fn trust_preferences_and_usage_are_validated_and_persisted() {
+        let root = tempfile::tempdir().unwrap();
+        let app = app_state(root.path());
+        set_publisher_trust(
+            &app,
+            SkillPublisherTrust {
+                name: "Acme".into(),
+                public_key: "public-key".into(),
+                trusted: true,
+                revoked: false,
+            },
+        )
+        .await
+        .unwrap();
+        set_preferred_source(
+            &app,
+            SkillPreferredSource {
+                skill_name: "reviewer".into(),
+                source_id: "source".into(),
+            },
+        )
+        .await
+        .unwrap();
+        record_usage(
+            &app,
+            SkillReference {
+                source_id: "source".into(),
+                relative_path: "reviewer".into(),
+            },
+            "fetch",
+        )
+        .await
+        .unwrap();
+
+        let saved = list(&app).await.unwrap();
+        assert_eq!(saved.publisher_trust.len(), 1);
+        assert_eq!(saved.preferred_sources.len(), 1);
+        assert_eq!(saved.usage[0].fetches, 1);
+        assert!(set_publisher_trust(
+            &app,
+            SkillPublisherTrust {
+                name: "Acme".into(),
+                public_key: "public-key".into(),
+                trusted: true,
+                revoked: true,
+            },
+        )
+        .await
+        .is_err());
     }
 }

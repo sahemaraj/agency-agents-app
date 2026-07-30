@@ -152,6 +152,13 @@ pub struct SkillPackageResult {
     pub tags: Vec<String>,
     pub dependencies: Vec<String>,
     pub recommended_skills: Vec<String>,
+    pub version: Option<String>,
+    pub channel: String,
+    pub changelog: Option<String>,
+    pub publisher: Option<String>,
+    pub publisher_key: Option<String>,
+    pub publisher_verified: bool,
+    pub validation_results: Vec<String>,
     pub permissions: Vec<String>,
     pub quality_score: u8,
     pub quality_checks: Vec<String>,
@@ -274,6 +281,32 @@ pub struct SkillUpdatePolicyRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPublisherTrust {
+    pub name: String,
+    pub public_key: String,
+    pub trusted: bool,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPreferredSource {
+    pub skill_name: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUsage {
+    pub skill: SkillReference,
+    pub fetches: u64,
+    pub installs: u64,
+    pub rejections: u64,
+    pub last_used_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "action",
     rename_all = "camelCase",
@@ -327,6 +360,18 @@ pub enum SkillApprovalAction {
         project_path: Option<String>,
         snapshot_path: String,
     },
+    PublisherTrustSet {
+        name: String,
+        public_key: String,
+        trusted: bool,
+        revoked: bool,
+    },
+    BatchCollection {
+        collection_name: String,
+        operation: String,
+        runtime: String,
+        project_path: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -369,6 +414,12 @@ pub struct SkillFolderState {
     #[serde(default)]
     pub update_policies: Vec<SkillUpdatePolicyRecord>,
     #[serde(default)]
+    pub publisher_trust: Vec<SkillPublisherTrust>,
+    #[serde(default)]
+    pub preferred_sources: Vec<SkillPreferredSource>,
+    #[serde(default)]
+    pub usage: Vec<SkillUsage>,
+    #[serde(default)]
     pub approvals: Vec<SkillApproval>,
 }
 
@@ -387,6 +438,38 @@ pub struct SkillDestinationPresence {
 pub struct SkillVersionSnapshot {
     pub path: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPlanPackage {
+    pub source_id: String,
+    pub relative_path: String,
+    pub name: String,
+    pub dependency: bool,
+    pub destination: String,
+    pub file_count: u32,
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillMutationPlan {
+    pub operation: String,
+    pub runtime: String,
+    pub project_path: Option<String>,
+    pub packages: Vec<SkillPlanPackage>,
+    pub warnings: Vec<String>,
+    pub blockers: Vec<String>,
+    pub rollback_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillBatchResult {
+    pub operation: String,
+    pub completed: Vec<String>,
+    pub rolled_back: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -437,6 +520,8 @@ pub struct InstalledSkill {
 pub struct McpAuditEntry {
     pub id: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub client: Option<String>,
     pub tool: String,
     pub action: String,
     #[serde(default = "default_mcp_audit_phase")]

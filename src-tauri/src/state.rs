@@ -164,8 +164,19 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     pub async fn authorize_mcp(
         &self,
+        action: McpAction,
+        project_path: Option<&str>,
+    ) -> Result<Option<AuthorizedMcpProject>, AppError> {
+        self.authorize_mcp_client("unknown", action, project_path)
+            .await
+    }
+
+    pub async fn authorize_mcp_client(
+        &self,
+        client: &str,
         action: McpAction,
         project_path: Option<&str>,
     ) -> Result<Option<AuthorizedMcpProject>, AppError> {
@@ -178,10 +189,15 @@ impl AppState {
             *guard = loaded.clone();
         }
         let identity = match &loaded {
-            SettingsLoadState::Loaded(policy) => authorize_mcp(policy, action, project_path),
-            SettingsLoadState::FirstLaunch => {
-                authorize_mcp(&settings::Settings::default(), action, project_path)
+            SettingsLoadState::Loaded(policy) => {
+                authorize_mcp_for_client(policy, client, action, project_path)
             }
+            SettingsLoadState::FirstLaunch => authorize_mcp_for_client(
+                &settings::Settings::default(),
+                client,
+                action,
+                project_path,
+            ),
             SettingsLoadState::Corrupt { .. } => Err(mcp_denied(action)),
         }?;
         identity.map(open_authorized_mcp_project).transpose()
@@ -248,8 +264,18 @@ impl McpAction {
     }
 }
 
+#[cfg(test)]
 pub fn authorize_mcp(
     policy: &settings::Settings,
+    action: McpAction,
+    project_path: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    authorize_mcp_for_client(policy, "unknown", action, project_path)
+}
+
+pub fn authorize_mcp_for_client(
+    policy: &settings::Settings,
+    client: &str,
     action: McpAction,
     project_path: Option<&str>,
 ) -> Result<Option<String>, AppError> {
@@ -258,11 +284,18 @@ pub fn authorize_mcp(
             feature: format!("mcp_{}", action.as_str()),
         });
     }
+    let client_policy = policy.mcp_client_policies.get(client);
     let enabled = match action {
         McpAction::Read => true,
-        McpAction::Source => policy.mcp_source_access,
-        McpAction::Install => policy.mcp_install_access,
-        McpAction::Destructive => policy.mcp_destructive_access,
+        McpAction::Source => client_policy
+            .map(|value| value.source_access)
+            .unwrap_or(policy.mcp_source_access),
+        McpAction::Install => client_policy
+            .map(|value| value.install_access)
+            .unwrap_or(policy.mcp_install_access),
+        McpAction::Destructive => client_policy
+            .map(|value| value.destructive_access)
+            .unwrap_or(policy.mcp_destructive_access),
     };
     if !enabled {
         return Err(mcp_denied(action));
@@ -840,6 +873,26 @@ mod tests {
     }
 
     #[test]
+    fn mcp_client_policy_overrides_global_policy_without_affecting_other_clients() {
+        let mut policy = Settings {
+            mcp_source_access: true,
+            ..Settings::default()
+        };
+        policy.mcp_client_policies.insert(
+            "claude".into(),
+            crate::commands::settings::McpClientPolicy {
+                source_access: false,
+                install_access: true,
+                destructive_access: false,
+            },
+        );
+
+        assert!(authorize_mcp_for_client(&policy, "claude", McpAction::Source, None).is_err());
+        assert!(authorize_mcp_for_client(&policy, "claude", McpAction::Install, None).is_ok());
+        assert!(authorize_mcp_for_client(&policy, "codex", McpAction::Source, None).is_ok());
+    }
+
+    #[test]
     fn mcp_project_mutations_require_an_exact_allowlisted_canonical_path() {
         let allowed = tempfile::tempdir().expect("allowed project");
         let denied = tempfile::tempdir().expect("denied project");
@@ -1182,6 +1235,7 @@ mod tests {
                 McpAuditEntry {
                     id: "bounded-lock".into(),
                     timestamp: "2026-07-30T00:00:00Z".into(),
+                    client: None,
                     tool: "skills_search".into(),
                     action: "read".into(),
                     phase: "terminal".into(),
@@ -1230,6 +1284,7 @@ mod tests {
                     McpAuditEntry {
                         id: format!("entry-{index}"),
                         timestamp: "2026-07-30T00:00:00Z".into(),
+                        client: None,
                         tool: if index == 0 {
                             "skills_search\nAuthorization: Bearer top-secret".into()
                         } else {
@@ -1286,6 +1341,7 @@ mod tests {
                 McpAuditEntry {
                     id: "fresh-entry".into(),
                     timestamp: "2026-07-30T00:00:00Z".into(),
+                    client: None,
                     tool: "skills_search".into(),
                     action: "read".into(),
                     phase: "terminal".into(),

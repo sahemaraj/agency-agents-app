@@ -10,6 +10,7 @@
     mcpClientConnect,
     mcpClientDisconnect,
     mcpClientRepair,
+    mcpClientPolicySet,
     mcpClientsStatus,
     mcpPolicySet,
   } from "$lib/api";
@@ -98,6 +99,32 @@
     }
   }
 
+  async function saveClientPolicy(
+    client: McpClient,
+    next: Partial<{ sourceAccess: boolean; installAccess: boolean; destructiveAccess: boolean }>,
+  ) {
+    const global = settings.effective;
+    const current = global.mcpClientPolicies[client] ?? {
+      sourceAccess: global.mcpSourceAccess,
+      installAccess: global.mcpInstallAccess,
+      destructiveAccess: global.mcpDestructiveAccess,
+    };
+    policySaving = true;
+    error = "";
+    try {
+      settings.data = await mcpClientPolicySet(
+        client,
+        next.sourceAccess ?? current.sourceAccess,
+        next.installAccess ?? current.installAccess,
+        next.destructiveAccess ?? current.destructiveAccess,
+      );
+    } catch (cause) {
+      error = isAppError(cause) ? appErrorMessage(cause) : i18n.t("settings.mcp.policyFailed");
+    } finally {
+      policySaving = false;
+    }
+  }
+
   async function addProject() {
     const selected = await openDialog({ directory: true, multiple: false });
     if (typeof selected !== "string") return;
@@ -126,6 +153,11 @@
 
   <div class="cards" aria-live="polite" aria-busy={loading}>
     {#each statuses as status (status.client)}
+      {@const clientPolicy = settings.effective.mcpClientPolicies[status.client] ?? {
+        sourceAccess: settings.effective.mcpSourceAccess,
+        installAccess: settings.effective.mcpInstallAccess,
+        destructiveAccess: settings.effective.mcpDestructiveAccess,
+      }}
       <article class="card">
         <div class="card-head">
           <strong>{clientLabel(status.client)}</strong>
@@ -143,6 +175,12 @@
             <button type="button" class="primary" disabled={loading} onclick={() => mutate(status, "repair")}>{i18n.t("settings.mcp.repair")}</button>
           {/if}
         </div>
+        <fieldset class="client-policy" disabled={policySaving || settings.loading}>
+          <legend>Client permissions</legend>
+          <label><input type="checkbox" checked={clientPolicy.sourceAccess} onchange={(event) => saveClientPolicy(status.client, { sourceAccess: event.currentTarget.checked })} /> Sources and organization</label>
+          <label><input type="checkbox" checked={clientPolicy.installAccess} onchange={(event) => saveClientPolicy(status.client, { installAccess: event.currentTarget.checked })} /> Install and update</label>
+          <label><input type="checkbox" checked={clientPolicy.destructiveAccess} onchange={(event) => saveClientPolicy(status.client, { destructiveAccess: event.currentTarget.checked })} /> Destructive actions</label>
+        </fieldset>
         {#if status.command}
           <details>
             <summary>{i18n.t("settings.mcp.manual")}</summary>
@@ -226,6 +264,9 @@
   .card-head span.ok { color: var(--color-success); }
   .card-head span.warn, .error { color: var(--color-danger); }
   .actions { gap: var(--space-2); }
+  .client-policy { display: grid; gap: var(--space-2); margin: 0; padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); }
+  .client-policy legend { padding: 0 var(--space-1); color: var(--color-text-secondary); font-size: var(--text-caption); }
+  .client-policy label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); }
   button { min-height: 32px; padding: 0 var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-primary); cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   button.primary { background: var(--color-accent); color: white; border-color: var(--color-accent); }

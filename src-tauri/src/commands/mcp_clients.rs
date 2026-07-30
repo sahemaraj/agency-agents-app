@@ -60,7 +60,7 @@ fn invalid(message: impl Into<String>) -> AppError {
     }
 }
 
-fn app_command(executable: &Path) -> Result<(String, Vec<String>), AppError> {
+fn app_command(executable: &Path, client: McpClient) -> Result<(String, Vec<String>), AppError> {
     let executable = executable
         .canonicalize()
         .map_err(|e| invalid(format!("cannot resolve the app executable: {e}")))?;
@@ -74,7 +74,15 @@ fn app_command(executable: &Path) -> Result<(String, Vec<String>), AppError> {
     }
     Ok((
         executable.to_string_lossy().into_owned(),
-        vec!["--mcp".to_string()],
+        vec![
+            "--mcp".to_string(),
+            "--client".to_string(),
+            match client {
+                McpClient::Claude => "claude",
+                McpClient::Codex => "codex",
+            }
+            .to_string(),
+        ],
     ))
 }
 
@@ -480,7 +488,7 @@ fn classify(
 }
 
 async fn status_for(client: McpClient, app_exe: &Path) -> Result<McpClientStatus, AppError> {
-    let (command, args) = app_command(app_exe)?;
+    let (command, args) = app_command(app_exe, client)?;
     let client_path = find_client(client);
     match client_path {
         Some(path) => inspect_at(client, &path, &command, &args)
@@ -592,42 +600,23 @@ pub async fn mcp_clients_status() -> Result<Vec<McpClientStatus>, AppError> {
 }
 
 async fn statuses_for_app(app_exe: &Path) -> Result<Vec<McpClientStatus>, AppError> {
-    let (command, args) = match app_command(app_exe) {
-        Ok(command) => command,
-        Err(error) => {
-            let detail = error.to_string();
-            return Ok([McpClient::Claude, McpClient::Codex]
-                .into_iter()
-                .map(|client| McpClientStatus {
-                    client,
-                    installed: false,
-                    state: McpClientState::Unavailable,
-                    command: String::new(),
-                    detail: detail.clone(),
-                })
-                .collect());
-        }
-    };
-    async fn isolated(
-        client: McpClient,
-        app_exe: &Path,
-        command: &str,
-        args: &[String],
-    ) -> McpClientStatus {
+    async fn isolated(client: McpClient, app_exe: &Path) -> McpClientStatus {
         match status_for(client, app_exe).await {
             Ok(status) => status,
             Err(error) => McpClientStatus {
                 client,
                 installed: false,
                 state: McpClientState::Unavailable,
-                command: manual_connect_command(client, command, args),
+                command: app_command(app_exe, client)
+                    .map(|(command, args)| manual_connect_command(client, &command, &args))
+                    .unwrap_or_default(),
                 detail: error.to_string(),
             },
         }
     }
     Ok(vec![
-        isolated(McpClient::Claude, app_exe, &command, &args).await,
-        isolated(McpClient::Codex, app_exe, &command, &args).await,
+        isolated(McpClient::Claude, app_exe).await,
+        isolated(McpClient::Codex, app_exe).await,
     ])
 }
 
@@ -636,7 +625,7 @@ pub async fn mcp_client_connect(client: McpClient) -> Result<McpClientStatus, Ap
     let app_exe = env::current_exe().map_err(AppError::from)?;
     let client_path = find_client(client)
         .ok_or_else(|| invalid(format!("{} CLI was not found", client.label())))?;
-    let (command, args) = app_command(&app_exe)?;
+    let (command, args) = app_command(&app_exe, client)?;
     connect_transaction_at(client, &client_path, &command, &args).await
 }
 
@@ -689,7 +678,7 @@ pub async fn mcp_client_disconnect(client: McpClient) -> Result<McpClientStatus,
     let app_exe = env::current_exe().map_err(AppError::from)?;
     let client_path = find_client(client)
         .ok_or_else(|| invalid(format!("{} CLI was not found", client.label())))?;
-    let (command, args) = app_command(&app_exe)?;
+    let (command, args) = app_command(&app_exe, client)?;
     disconnect_at(client, &client_path, &command, &args).await
 }
 
@@ -733,7 +722,7 @@ pub async fn mcp_client_repair(client: McpClient) -> Result<McpClientStatus, App
     let app_exe = env::current_exe().map_err(AppError::from)?;
     let client_path = find_client(client)
         .ok_or_else(|| invalid(format!("{} CLI was not found", client.label())))?;
-    let (command, args) = app_command(&app_exe)?;
+    let (command, args) = app_command(&app_exe, client)?;
     repair_at(client, &client_path, &command, &args).await
 }
 
@@ -991,7 +980,7 @@ mod tests {
     fn rejects_ephemeral_app_executable() {
         let temp = std::env::temp_dir().join(format!("ephemeral-app-{}", uuid::Uuid::new_v4()));
         std::fs::write(&temp, b"app").unwrap();
-        let error = app_command(&temp).unwrap_err();
+        let error = app_command(&temp, McpClient::Codex).unwrap_err();
         assert!(error.to_string().contains("Applications"));
         std::fs::remove_file(temp).unwrap();
     }
@@ -1000,7 +989,7 @@ mod tests {
     fn rejects_development_build_executable() {
         let current = std::env::current_exe().unwrap();
         assert!(current.to_string_lossy().contains("/target/debug/"));
-        assert!(app_command(&current).is_err());
+        assert!(app_command(&current, McpClient::Codex).is_err());
         assert!(is_ephemeral_executable(Path::new(
             "/work/project/target/debug/app"
         )));

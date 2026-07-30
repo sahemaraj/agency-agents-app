@@ -38,8 +38,48 @@ import type {
   McpClientStatus,
   SkillSourceResult,
   SkillVersionSnapshot,
+  SkillMutationPlan,
+  SkillPublisherTrust,
+  SkillPreferredSource,
+  SkillBatchResult,
   UpdateCheckOutcome,
 } from "./types";
+
+export function skillInstallPlan(
+  sourceId: string,
+  relativePath: string,
+  runtime: "claudeCode" | "codex",
+  projectPath: string | null,
+): Promise<SkillMutationPlan> {
+  return invoke<SkillMutationPlan>("skill_install_plan", {
+    sourceId,
+    relativePath,
+    runtime,
+    projectPath,
+  });
+}
+
+export function skillPublisherTrustSet(trust: SkillPublisherTrust): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_publisher_trust_set", { trust });
+}
+
+export function skillPreferredSourceSet(preference: SkillPreferredSource): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_preferred_source_set", { preference });
+}
+
+export function skillCollectionBatch(
+  collectionName: string,
+  operation: "install" | "update" | "uninstall",
+  runtime: "claudeCode" | "codex",
+  projectPath: string | null,
+): Promise<SkillBatchResult> {
+  return invoke<SkillBatchResult>("skill_collection_batch", {
+    collectionName,
+    operation,
+    runtime,
+    projectPath,
+  });
+}
 
 // ============================================================
 // App version (from tauri::App::package_info)
@@ -91,6 +131,20 @@ export function mcpPolicySet(
     installAccess,
     destructiveAccess,
     projectAllowlist,
+  });
+}
+
+export function mcpClientPolicySet(
+  client: McpClient,
+  sourceAccess: boolean,
+  installAccess: boolean,
+  destructiveAccess: boolean,
+): Promise<Settings> {
+  return invoke<Settings>("mcp_client_policy_set", {
+    client,
+    sourceAccess,
+    installAccess,
+    destructiveAccess,
   });
 }
 
@@ -165,6 +219,20 @@ export function skillInstall(
   projectPath: string | null,
 ): Promise<InstalledSkill> {
   return invoke<InstalledSkill>("skill_install", {
+    sourceId,
+    relativePath,
+    runtime,
+    projectPath,
+  });
+}
+
+export function skillInstallWithDependencies(
+  sourceId: string,
+  relativePath: string,
+  runtime: "claudeCode" | "codex",
+  projectPath: string | null,
+): Promise<InstalledSkill[]> {
+  return invoke<InstalledSkill[]>("skill_install_with_dependencies", {
     sourceId,
     relativePath,
     runtime,

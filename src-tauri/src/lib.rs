@@ -18,8 +18,8 @@ mod util;
 
 use commands::*;
 
-pub async fn run_mcp() -> Result<(), String> {
-    skills::mcp::serve().await
+pub async fn run_mcp(client: String) -> Result<(), String> {
+    skills::mcp::serve(client).await
 }
 
 pub async fn run_mcp_http(bind: std::net::SocketAddr, token: String) -> Result<(), String> {
@@ -146,6 +146,7 @@ pub fn run() {
             settings_get,
             settings_set,
             mcp_policy_set,
+            mcp_client_policy_set,
             mcp_clients_status,
             mcp_client_connect,
             mcp_client_disconnect,
@@ -196,6 +197,9 @@ pub fn run() {
             skills::skill_uninstall,
             skills::skill_backups_list,
             skills::skill_version_history_list,
+            skills::skill_install_plan,
+            skills::skill_install_with_dependencies,
+            skills::skill_collection_batch,
             skills::skill_version_rollback,
             skills::skill_installs_reconcile,
             skills::skill_source_add_local,
@@ -227,6 +231,8 @@ pub fn run() {
             skills::organize::skill_library_export,
             skills::organize::skill_library_import,
             skills::organize::skill_update_policy_set,
+            skills::organize::skill_publisher_trust_set,
+            skills::organize::skill_preferred_source_set,
             skills::organize::skill_approval_approve,
             skills::organize::skill_approval_reject,
             // Phase 2 — install + reconcile (contracts.md §C). The cross-tool

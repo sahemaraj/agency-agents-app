@@ -8,7 +8,7 @@ const DEFAULT_MCP_HTTP_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::L
 #[derive(Debug, PartialEq)]
 enum Mode {
     App,
-    Stdio,
+    Stdio(String),
     Http(SocketAddr),
 }
 
@@ -26,7 +26,15 @@ where
         return Ok(Mode::App);
     }
     if args == ["--mcp"] {
-        return Ok(Mode::Stdio);
+        return Ok(Mode::Stdio("unknown".into()));
+    }
+    if let [flag, client_flag, client] = args.as_slice() {
+        if flag == "--mcp"
+            && client_flag == "--client"
+            && matches!(client.as_str(), "claude" | "codex")
+        {
+            return Ok(Mode::Stdio(client.clone()));
+        }
     }
     if args.first().map(String::as_str) != Some("--mcp-http") {
         return Err("expected --mcp or --mcp-http [--bind LOOPBACK:PORT]".into());
@@ -51,7 +59,7 @@ async fn main() {
             agency_agents_lib::run();
             return;
         }
-        Ok(Mode::Stdio) => agency_agents_lib::run_mcp().await,
+        Ok(Mode::Stdio(client)) => agency_agents_lib::run_mcp(client).await,
         Ok(Mode::Http(bind)) => match std::env::var("AGENCY_AGENTS_MCP_TOKEN") {
             Ok(token) => agency_agents_lib::run_mcp_http(bind, token).await,
             Err(_) => Err("AGENCY_AGENTS_MCP_TOKEN is required".into()),
@@ -72,7 +80,11 @@ mod tests {
     fn parses_mcp_modes() {
         assert_eq!(
             parse_mode(["agency-agents-app", "--mcp"]).unwrap(),
-            Mode::Stdio
+            Mode::Stdio("unknown".into())
+        );
+        assert_eq!(
+            parse_mode(["agency-agents-app", "--mcp", "--client", "codex"]).unwrap(),
+            Mode::Stdio("codex".into())
         );
         assert_eq!(
             parse_mode(["agency-agents-app", "--mcp-http"]).unwrap(),

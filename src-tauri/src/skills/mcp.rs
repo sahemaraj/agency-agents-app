@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -5,9 +6,9 @@ use std::sync::Arc;
 use crate::{
     state::{append_mcp_audit, AppState, McpAction, McpProjectAuthorization},
     types::{
-        McpAuditEntry, SkillApprovalAction, SkillCollection, SkillPackageResult, SkillReference,
-        SkillSmartFolder, SkillSmartFolderRule, SkillSourceResult, SkillType, SkillUpdatePolicy,
-        SkillWorkspaceProfile,
+        McpAuditEntry, SkillApprovalAction, SkillCollection, SkillPackageResult,
+        SkillPreferredSource, SkillReference, SkillSmartFolder, SkillSmartFolderRule,
+        SkillSourceResult, SkillType, SkillUpdatePolicy, SkillWorkspaceProfile,
     },
 };
 use axum::{
@@ -300,6 +301,30 @@ struct RollbackApprovalRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PublisherTrustApprovalRequest {
+    name: String,
+    public_key: String,
+    trusted: bool,
+    revoked: bool,
+    requested_by: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PreferredSourceRequest {
+    skill_name: String,
+    source_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BatchApprovalRequest {
+    collection_name: String,
+    operation: String,
+    runtime: String,
+    project_path: Option<String>,
+    requested_by: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SubmitApprovalRequest {
     requested_by: String,
     request: ApprovalActionRequest,
@@ -358,6 +383,18 @@ enum ApprovalActionRequest {
         runtime: String,
         project_path: Option<String>,
         snapshot_path: String,
+    },
+    PublisherTrustSet {
+        name: String,
+        public_key: String,
+        trusted: bool,
+        revoked: bool,
+    },
+    BatchCollection {
+        collection_name: String,
+        operation: String,
+        runtime: String,
+        project_path: Option<String>,
     },
 }
 
@@ -421,6 +458,28 @@ impl TryFrom<ApprovalActionRequest> for SkillApprovalAction {
                 project_path,
                 snapshot_path,
             },
+            ApprovalActionRequest::PublisherTrustSet {
+                name,
+                public_key,
+                trusted,
+                revoked,
+            } => Self::PublisherTrustSet {
+                name,
+                public_key,
+                trusted,
+                revoked,
+            },
+            ApprovalActionRequest::BatchCollection {
+                collection_name,
+                operation,
+                runtime,
+                project_path,
+            } => Self::BatchCollection {
+                collection_name,
+                operation,
+                runtime,
+                project_path,
+            },
         })
     }
 }
@@ -452,6 +511,7 @@ struct RecommendRequest {
     #[serde(default)]
     languages: Vec<String>,
     limit: Option<usize>,
+    project_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -479,14 +539,21 @@ struct RemoveSourceResponse {
 #[derive(Clone)]
 pub struct SkillMcpServer {
     state: Arc<AppState>,
+    client_identity: String,
     #[allow(dead_code, reason = "tool_handler macro reads the generated router")]
     tool_router: ToolRouter<Self>,
 }
 
 impl SkillMcpServer {
+    #[cfg(test)]
     fn new(state: Arc<AppState>) -> Self {
+        Self::new_with_client(state, "unknown")
+    }
+
+    fn new_with_client(state: Arc<AppState>, client_identity: impl Into<String>) -> Self {
         Self {
             state,
+            client_identity: client_identity.into(),
             tool_router: Self::tool_router(),
         }
     }
@@ -529,6 +596,7 @@ impl SkillMcpServer {
             McpAuditEntry {
                 id: id.into(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                client: Some(self.client_identity.clone()),
                 tool: tool.into(),
                 action: action.into(),
                 phase: phase.into(),
@@ -554,10 +622,12 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "skills_list_drafts"
         | "skills_get_draft"
         | "skills_get_library"
+        | "skills_get_insights"
         | "skills_list_folders"
         | "skills_list_approvals"
         | "skills_source_status"
         | "skills_recommend"
+        | "skills_plan_install"
         | "skills_version_history" => Some(McpAction::Read),
         "skills_add_local_source"
         | "skills_add_github_source"
@@ -579,10 +649,14 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "skills_delete_profile"
         | "skills_set_update_policy"
         | "skills_request_rollback" => Some(McpAction::Source),
+        "skills_set_preferred_source"
+        | "skills_request_publisher_trust"
+        | "skills_request_batch_collection" => Some(McpAction::Source),
         "skills_submit_approval" => Some(McpAction::Source),
         "skills_install" | "skills_find_and_install" | "skills_update" | "skills_enable" => {
             Some(McpAction::Install)
         }
+        "skills_install_with_dependencies" => Some(McpAction::Install),
         "skills_disable" | "skills_uninstall" | "skills_remove_source" | "skills_delete_folder" => {
             Some(McpAction::Destructive)
         }
@@ -628,6 +702,15 @@ impl SkillMcpServer {
                 super::read_skill_file(&self.state, &source_id, &relative_path, "SKILL.md")
                     .await
                     .map_err(|error| error.to_string())?;
+            let _ = super::organize::record_usage(
+                &self.state,
+                SkillReference {
+                    source_id: source_id.clone(),
+                    relative_path: relative_path.clone(),
+                },
+                "fetch",
+            )
+            .await;
             content.text.ok_or_else(|| "SKILL.md must be UTF-8".into())
         })
         .await
@@ -686,6 +769,38 @@ impl SkillMcpServer {
         .await
     }
 
+    #[tool(
+        description = "Preview dependencies, destinations, permissions, conflicts, and rollback scope before installing a skill"
+    )]
+    async fn skills_plan_install(
+        &self,
+        Parameters(SkillLifecycleRequest {
+            source_id,
+            relative_path,
+            runtime,
+            project_path,
+        }): Parameters<SkillLifecycleRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_plan_install",
+            McpAction::Read,
+            project_path.clone(),
+            async {
+                let plan = super::plan_skill_install(
+                    &self.state,
+                    &source_id,
+                    &relative_path,
+                    runtime.as_str(),
+                    project_path.as_deref(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&plan).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
     #[tool(description = "Install a validated skill for a runtime and optional project path")]
     async fn skills_install(
         &self,
@@ -703,6 +818,49 @@ impl SkillMcpServer {
             project_path.clone(),
             async {
                 let installed = super::install_skill_authorized(
+                    &self.state,
+                    &source_id,
+                    &relative_path,
+                    runtime.as_str(),
+                    project_path.as_deref(),
+                    project_authorization.0.as_ref(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                let _ = super::organize::record_usage(
+                    &self.state,
+                    SkillReference {
+                        source_id: source_id.clone(),
+                        relative_path: relative_path.clone(),
+                    },
+                    "install",
+                )
+                .await;
+                serde_json::to_string_pretty(&installed).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Install a skill and its unambiguous dependency graph as one rollback-aware operation"
+    )]
+    async fn skills_install_with_dependencies(
+        &self,
+        Parameters(SkillLifecycleRequest {
+            source_id,
+            relative_path,
+            runtime,
+            project_path,
+        }): Parameters<SkillLifecycleRequest>,
+        Extension(project_authorization): Extension<McpProjectAuthorization>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_install_with_dependencies",
+            McpAction::Install,
+            project_path.clone(),
+            async {
+                let installed = super::install_skill_with_dependencies_authorized(
                     &self.state,
                     &source_id,
                     &relative_path,
@@ -1038,23 +1196,34 @@ impl SkillMcpServer {
         &self,
         Parameters(RecommendRequest {
             task,
-            languages,
+            mut languages,
             limit,
+            project_path,
         }): Parameters<RecommendRequest>,
     ) -> Result<String, String> {
-        self.run_tool("skills_recommend", McpAction::Read, None, async {
-            validate_recommend_request(&task, &languages)?;
-            let sources = super::inspect_skill_sources(&self.state)
-                .await
-                .map_err(|error| error.to_string())?;
-            serde_json::to_string_pretty(&recommend_skills(
-                &sources,
-                &task,
-                &languages,
-                limit.unwrap_or(10).clamp(1, 50),
-            ))
-            .map_err(|error| error.to_string())
-        })
+        self.run_tool(
+            "skills_recommend",
+            McpAction::Read,
+            project_path.clone(),
+            async {
+                if let Some(project_path) = project_path.as_deref() {
+                    languages.extend(detect_project_languages(project_path)?);
+                    languages.sort();
+                    languages.dedup();
+                }
+                validate_recommend_request(&task, &languages)?;
+                let sources = super::inspect_skill_sources(&self.state)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&recommend_skills(
+                    &sources,
+                    &task,
+                    &languages,
+                    limit.unwrap_or(10).clamp(1, 50),
+                ))
+                .map_err(|error| error.to_string())
+            },
+        )
         .await
     }
 
@@ -1153,6 +1322,40 @@ impl SkillMcpServer {
                 .await
                 .map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&library).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Summarize duplicate skill names, preferred sources, and local-only usage counters"
+    )]
+    async fn skills_get_insights(&self) -> Result<String, String> {
+        self.run_tool("skills_get_insights", McpAction::Read, None, async {
+            let catalog = super::inspect_skill_sources(&self.state)
+                .await
+                .map_err(|error| error.to_string())?;
+            let library = super::organize::list(&self.state)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut names = HashMap::<String, Vec<SkillReference>>::new();
+            for package in catalog.iter().flat_map(|source| source.packages.iter()) {
+                if let Some(name) = &package.name {
+                    names.entry(name.clone()).or_default().push(SkillReference {
+                        source_id: package.source_id.clone(),
+                        relative_path: package.relative_path.clone(),
+                    });
+                }
+            }
+            let duplicates = names
+                .into_iter()
+                .filter(|(_, packages)| packages.len() > 1)
+                .collect::<HashMap<_, _>>();
+            serde_json::to_string_pretty(&serde_json::json!({
+                "duplicates": duplicates,
+                "preferredSources": library.preferred_sources,
+                "usage": library.usage,
+            }))
+            .map_err(|error| error.to_string())
         })
         .await
     }
@@ -1480,6 +1683,85 @@ impl SkillMcpServer {
         .await
     }
 
+    #[tool(
+        description = "Set the preferred source for duplicate packages with the same skill name"
+    )]
+    async fn skills_set_preferred_source(
+        &self,
+        Parameters(request): Parameters<PreferredSourceRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_set_preferred_source",
+            McpAction::Source,
+            None,
+            async {
+                let library = super::organize::set_preferred_source(
+                    &self.state,
+                    SkillPreferredSource {
+                        skill_name: request.skill_name,
+                        source_id: request.source_id,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&library).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Request desktop approval to trust or revoke a verified publisher key")]
+    async fn skills_request_publisher_trust(
+        &self,
+        Parameters(request): Parameters<PublisherTrustApprovalRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_request_publisher_trust",
+            McpAction::Source,
+            None,
+            async {
+                self.submit_approval_json(
+                    request.requested_by,
+                    SkillApprovalAction::PublisherTrustSet {
+                        name: request.name,
+                        public_key: request.public_key,
+                        trusted: request.trusted,
+                        revoked: request.revoked,
+                    },
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Request desktop approval to install, update, or uninstall an entire collection"
+    )]
+    async fn skills_request_batch_collection(
+        &self,
+        Parameters(request): Parameters<BatchApprovalRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_request_batch_collection",
+            McpAction::Source,
+            request.project_path.clone(),
+            async {
+                self.submit_approval_json(
+                    request.requested_by,
+                    SkillApprovalAction::BatchCollection {
+                        collection_name: request.collection_name,
+                        operation: request.operation,
+                        runtime: request.runtime,
+                        project_path: request.project_path,
+                    },
+                )
+                .await
+            },
+        )
+        .await
+    }
+
     #[tool(description = "Submit a bounded skill or folder mutation for desktop approval")]
     async fn skills_submit_approval(
         &self,
@@ -1505,6 +1787,35 @@ impl SkillMcpServer {
         })
         .await
     }
+}
+
+fn detect_project_languages(project_path: &str) -> Result<Vec<String>, String> {
+    let root = std::fs::canonicalize(project_path)
+        .map_err(|error| format!("open recommendation project: {error}"))?;
+    if !root.is_dir() {
+        return Err("recommendation project must be a directory".into());
+    }
+    let names = std::fs::read_dir(&root)
+        .map_err(|error| format!("read recommendation project: {error}"))?
+        .take(256)
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect::<HashSet<_>>();
+    let mut languages = Vec::new();
+    for (manifest, detected) in [
+        ("package.json", "typescript"),
+        ("Cargo.toml", "rust"),
+        ("pyproject.toml", "python"),
+        ("requirements.txt", "python"),
+        ("go.mod", "go"),
+        ("pom.xml", "java"),
+        ("build.gradle", "java"),
+    ] {
+        if names.contains(manifest) {
+            languages.push(detected.into());
+        }
+    }
+    Ok(languages)
 }
 
 #[rmcp::tool_handler(router = self.tool_router)]
@@ -1552,7 +1863,7 @@ impl ServerHandler for SkillMcpServer {
             .and_then(serde_json::Value::as_str);
         let authorization = self
             .state
-            .authorize_mcp(action, requested_project)
+            .authorize_mcp_client(&self.client_identity, action, requested_project)
             .await
             .map_err(|error| error.to_string());
         let project_authorization = match authorization {
@@ -1737,9 +2048,9 @@ impl ServerHandler for SkillMcpServer {
     }
 }
 
-pub async fn serve() -> Result<(), String> {
+pub async fn serve(client_identity: String) -> Result<(), String> {
     let state = Arc::new(AppState::build().map_err(|error| error.to_string())?);
-    SkillMcpServer::new(state)
+    SkillMcpServer::new_with_client(state, client_identity)
         .serve(rmcp::transport::stdio())
         .await
         .map_err(|error| error.to_string())?
@@ -1755,7 +2066,7 @@ fn http_router(
     address: SocketAddr,
     config: StreamableHttpServerConfig,
 ) -> Router {
-    let server = SkillMcpServer::new(state);
+    let server = SkillMcpServer::new_with_client(state, "http");
     let authority = address.to_string();
     let origin_host = match address.ip() {
         std::net::IpAddr::V4(ip) => ip.to_string(),
@@ -2210,10 +2521,11 @@ mod tests {
     use tokio::sync::{oneshot, Mutex, RwLock};
 
     use super::{
-        action_for_tool, catalog_revision, package_resource_uri, parse_package_resource_uri,
-        parse_skill_type, parse_update_policy, recommend_skills, resource_list_changed,
-        search_packages, validate_recommend_request, FindAndInstallRequest, HttpAuth,
-        NamedApprovalRequest, RecommendRequest, SkillMcpServer, SkillRuntime, SourceRequest,
+        action_for_tool, catalog_revision, detect_project_languages, package_resource_uri,
+        parse_package_resource_uri, parse_skill_type, parse_update_policy, recommend_skills,
+        resource_list_changed, search_packages, validate_recommend_request, FindAndInstallRequest,
+        HttpAuth, NamedApprovalRequest, RecommendRequest, SkillMcpServer, SkillRuntime,
+        SourceRequest,
     };
 
     fn package(name: &str, description: &str, installable: bool) -> SkillPackageResult {
@@ -2227,6 +2539,13 @@ mod tests {
             tags: Vec::new(),
             dependencies: Vec::new(),
             recommended_skills: Vec::new(),
+            version: None,
+            channel: "stable".into(),
+            changelog: None,
+            publisher: None,
+            publisher_key: None,
+            publisher_verified: false,
+            validation_results: Vec::new(),
             permissions: Vec::new(),
             quality_score: 0,
             quality_checks: Vec::new(),
@@ -2691,6 +3010,7 @@ mod tests {
                     task: "review".into(),
                     languages: vec!["rust".into()],
                     limit: Some(5),
+                    project_path: None,
                 }))
                 .await
                 .expect("recommend"),
@@ -3229,8 +3549,10 @@ mod tests {
                 "skills_get",
                 "skills_get_draft",
                 "skills_get_file",
+                "skills_get_insights",
                 "skills_get_library",
                 "skills_install",
+                "skills_install_with_dependencies",
                 "skills_installed",
                 "skills_list_approvals",
                 "skills_list_drafts",
@@ -3238,17 +3560,21 @@ mod tests {
                 "skills_list_folders",
                 "skills_list_sources",
                 "skills_move_folder",
+                "skills_plan_install",
                 "skills_recommend",
                 "skills_refresh_all",
                 "skills_refresh_source",
                 "skills_remove_source",
                 "skills_rename_folder",
+                "skills_request_batch_collection",
+                "skills_request_publisher_trust",
                 "skills_request_rollback",
                 "skills_save_collection",
                 "skills_save_profile",
                 "skills_save_smart_folder",
                 "skills_search",
                 "skills_set_favorite",
+                "skills_set_preferred_source",
                 "skills_set_update_policy",
                 "skills_source_status",
                 "skills_submit_approval",
@@ -3294,6 +3620,17 @@ mod tests {
     fn mcp_rejects_unknown_creator_types_and_update_policies() {
         assert!(parse_skill_type("unknown").is_err());
         assert!(parse_update_policy("always").is_err());
+    }
+
+    #[test]
+    fn project_recommendations_detect_bounded_root_manifests() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        assert_eq!(
+            detect_project_languages(project.path().to_str().unwrap()).unwrap(),
+            ["typescript", "rust"]
+        );
     }
 
     #[tokio::test]

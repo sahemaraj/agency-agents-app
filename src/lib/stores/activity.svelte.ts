@@ -203,7 +203,7 @@ class ActivityStore {
       subjectName: entry.tool,
       projectPath: entry.projectPath ?? undefined,
       outcome: entry.phase === "attempt" ? "pending" : entry.success ? "ok" : "error",
-      detail: entry.action,
+      detail: `${entry.client ?? "unknown client"} · ${entry.action}`,
     };
   }
 

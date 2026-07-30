@@ -64,6 +64,13 @@ export interface Settings {
   mcpDestructiveAccess: boolean;
   /** Exact canonical project roots MCP mutations may target. */
   mcpProjectAllowlist: string[];
+  mcpClientPolicies: Partial<Record<McpClient, McpClientPolicy>>;
+}
+
+export interface McpClientPolicy {
+  sourceAccess: boolean;
+  installAccess: boolean;
+  destructiveAccess: boolean;
 }
 
 export type GeneralSettingsPatch = Partial<
@@ -113,6 +120,7 @@ export const SETTINGS_DEFAULTS: Settings = {
   mcpInstallAccess: false,
   mcpDestructiveAccess: false,
   mcpProjectAllowlist: [],
+  mcpClientPolicies: {},
 };
 
 // =========================================================
@@ -398,6 +406,13 @@ export interface SkillPackageResult {
   tags: string[];
   dependencies: string[];
   recommendedSkills: string[];
+  version: string | null;
+  channel: "stable" | "beta";
+  changelog: string | null;
+  publisher: string | null;
+  publisherKey: string | null;
+  publisherVerified: boolean;
+  validationResults: string[];
   permissions: string[];
   qualityScore: number;
   qualityChecks: string[];
@@ -457,6 +472,26 @@ export interface SkillUpdatePolicyRecord {
   policy: SkillUpdatePolicy;
 }
 
+export interface SkillPublisherTrust {
+  name: string;
+  publicKey: string;
+  trusted: boolean;
+  revoked: boolean;
+}
+
+export interface SkillPreferredSource {
+  skillName: string;
+  sourceId: string;
+}
+
+export interface SkillUsage {
+  skill: SkillReference;
+  fetches: number;
+  installs: number;
+  rejections: number;
+  lastUsedAt: string;
+}
+
 export type SkillApprovalAction =
   | { action: "folderCreate"; path: string }
   | { action: "folderRename"; path: string; newName: string }
@@ -468,7 +503,9 @@ export type SkillApprovalAction =
   | { action: "smartFolderDelete"; name: string }
   | { action: "profileDelete"; name: string }
   | { action: "updatePolicySet"; sourceId: string; relativePath: string; policy: SkillUpdatePolicy }
-  | { action: "rollback"; sourceId: string; relativePath: string; runtime: string; projectPath: string | null; snapshotPath: string };
+  | { action: "rollback"; sourceId: string; relativePath: string; runtime: string; projectPath: string | null; snapshotPath: string }
+  | { action: "publisherTrustSet"; name: string; publicKey: string; trusted: boolean; revoked: boolean }
+  | { action: "batchCollection"; collectionName: string; operation: string; runtime: string; projectPath: string | null };
 
 export interface SkillApproval {
   id: string;
@@ -488,6 +525,9 @@ export interface SkillFolderState {
   smartFolders: SkillSmartFolder[];
   profiles: SkillWorkspaceProfile[];
   updatePolicies: SkillUpdatePolicyRecord[];
+  publisherTrust: SkillPublisherTrust[];
+  preferredSources: SkillPreferredSource[];
+  usage: SkillUsage[];
   approvals: SkillApproval[];
 }
 
@@ -528,6 +568,32 @@ export interface SkillVersionSnapshot {
   createdAt: string;
 }
 
+export interface SkillPlanPackage {
+  sourceId: string;
+  relativePath: string;
+  name: string;
+  dependency: boolean;
+  destination: string;
+  fileCount: number;
+  permissions: string[];
+}
+
+export interface SkillMutationPlan {
+  operation: string;
+  runtime: string;
+  projectPath: string | null;
+  packages: SkillPlanPackage[];
+  warnings: string[];
+  blockers: string[];
+  rollbackAvailable: boolean;
+}
+
+export interface SkillBatchResult {
+  operation: string;
+  completed: string[];
+  rolledBack: boolean;
+}
+
 export type SkillInstallState =
   | "current"
   | "outdated"
@@ -552,6 +618,7 @@ export interface InstalledSkill {
 export interface McpAuditEntry {
   id: string;
   timestamp: string;
+  client: string | null;
   tool: string;
   action: "read" | "source" | "install" | "destructive" | "unknown";
   phase: "attempt" | "terminal";

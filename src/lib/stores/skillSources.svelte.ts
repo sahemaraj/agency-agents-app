@@ -1,6 +1,7 @@
 import {
   skillPackageDestinations,
   skillInstall,
+  skillInstallWithDependencies,
   skillInstallsReconcile,
   skillBackupsList,
   skillVersionHistory,
@@ -39,6 +40,8 @@ import {
   skillLibraryExport,
   skillLibraryImport,
   skillUpdatePolicySet,
+  skillPublisherTrustSet,
+  skillPreferredSourceSet,
   skillApprovalApprove,
   skillApprovalReject,
   skillTrustGrant,
@@ -56,6 +59,7 @@ import {
   type SkillWorkspaceProfile,
   type SkillUpdatePolicy,
   type SkillVersionSnapshot,
+  type SkillPublisherTrust,
   type SkillDestinationPresence,
   type SkillPackageResult,
   type SkillSource,
@@ -93,6 +97,9 @@ class SkillSourcesStore {
     smartFolders: [],
     profiles: [],
     updatePolicies: [],
+    publisherTrust: [],
+    preferredSources: [],
+    usage: [],
     approvals: [],
   });
   installErrors: Record<string, string> = $state({});
@@ -238,6 +245,30 @@ class SkillSourcesStore {
   async setUpdatePolicy(pkg: SkillPackageResult, policy: SkillUpdatePolicy): Promise<boolean> {
     try {
       this.folderState = await skillUpdatePolicySet(this.reference(pkg), policy);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async setPublisherTrust(trust: SkillPublisherTrust): Promise<boolean> {
+    try {
+      this.folderState = await skillPublisherTrustSet(trust);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async setPreferredSource(pkg: SkillPackageResult): Promise<boolean> {
+    if (!pkg.name) return false;
+    try {
+      this.folderState = await skillPreferredSourceSet({
+        skillName: pkg.name,
+        sourceId: pkg.sourceId,
+      });
       return true;
     } catch (error) {
       this.addError = errorMessage(error);
@@ -568,7 +599,7 @@ class SkillSourcesStore {
     if (!pkg.installable || this.installing[key]) return false;
     this.installing = { ...this.installing, [key]: true };
     try {
-      await skillInstall(pkg.sourceId, pkg.relativePath, runtime, projectPath);
+      await skillInstallWithDependencies(pkg.sourceId, pkg.relativePath, runtime, projectPath);
       const { [key]: _cleared, ...errors } = this.installErrors;
       this.installErrors = errors;
       await this.reconcileInstalls(projectPaths);
