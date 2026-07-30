@@ -14,14 +14,52 @@
 name: Windows Build
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     tags:
       - "v*"
   workflow_dispatch:
 
 jobs:
+  verify:
+    name: Verify Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Check frontend
+        run: npm run check
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
   build:
     name: Build Windows installers (x64 + arm64, unsigned)
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
 
     steps:

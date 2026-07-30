@@ -2,20 +2,26 @@
   import { onMount } from "svelte";
   import Check from "@lucide/svelte/icons/check";
   import Copy from "@lucide/svelte/icons/copy";
+  import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
+  import X from "@lucide/svelte/icons/x";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     mcpClientConnect,
     mcpClientDisconnect,
     mcpClientRepair,
     mcpClientsStatus,
+    mcpPolicySet,
   } from "$lib/api";
   import { i18n } from "$lib/stores/i18n.svelte";
+  import { settings } from "$lib/stores/settings.svelte";
   import { appErrorMessage, isAppError, type McpClient, type McpClientStatus } from "$lib/types";
 
   let statuses: McpClientStatus[] = $state([]);
   let loading = $state(false);
   let error = $state("");
   let copied: McpClient | null = $state(null);
+  let policySaving = $state(false);
 
   function clientId(status: McpClientStatus): McpClient {
     return status.client;
@@ -69,7 +75,40 @@
     }
   }
 
-  onMount(() => void refresh());
+  async function savePolicy(next: {
+    source?: boolean;
+    install?: boolean;
+    destructive?: boolean;
+    projects?: string[];
+  }) {
+    const current = settings.effective;
+    policySaving = true;
+    error = "";
+    try {
+      settings.data = await mcpPolicySet(
+        next.source ?? current.mcpSourceAccess,
+        next.install ?? current.mcpInstallAccess,
+        next.destructive ?? current.mcpDestructiveAccess,
+        next.projects ?? current.mcpProjectAllowlist,
+      );
+    } catch (cause) {
+      error = isAppError(cause) ? appErrorMessage(cause) : i18n.t("settings.mcp.policyFailed");
+    } finally {
+      policySaving = false;
+    }
+  }
+
+  async function addProject() {
+    const selected = await openDialog({ directory: true, multiple: false });
+    if (typeof selected !== "string") return;
+    const projects = [...new Set([...settings.effective.mcpProjectAllowlist, selected])];
+    await savePolicy({ projects });
+  }
+
+  onMount(() => {
+    void refresh();
+    if (!settings.data) void settings.load();
+  });
 </script>
 
 <section class="section" aria-labelledby="mcp-title">
@@ -104,17 +143,63 @@
             <button type="button" class="primary" disabled={loading} onclick={() => mutate(status, "repair")}>{i18n.t("settings.mcp.repair")}</button>
           {/if}
         </div>
-        <details>
-          <summary>{i18n.t("settings.mcp.manual")}</summary>
-          <div class="command">
-            <code>{status.command}</code>
-            <button type="button" onclick={() => copyCommand(status)} aria-label={`${i18n.t("settings.mcp.copy")} ${clientLabel(status.client)}`}>
-              {#if copied === status.client}<Check size={14} />{:else}<Copy size={14} />{/if}
-            </button>
-          </div>
-        </details>
+        {#if status.command}
+          <details>
+            <summary>{i18n.t("settings.mcp.manual")}</summary>
+            <div class="command">
+              <code>{status.command}</code>
+              <button type="button" onclick={() => copyCommand(status)} aria-label={`${i18n.t("settings.mcp.copy")} ${clientLabel(status.client)}`}>
+                {#if copied === status.client}<Check size={14} />{:else}<Copy size={14} />{/if}
+              </button>
+            </div>
+          </details>
+        {/if}
       </article>
     {/each}
+  </div>
+
+  <div class="policy" aria-busy={policySaving || settings.loading}>
+    <div>
+      <h3>{i18n.t("settings.mcp.policy.title")}</h3>
+      <p>{i18n.t("settings.mcp.policy.help")}</p>
+    </div>
+    <label>
+      <input type="checkbox" checked={settings.effective.mcpSourceAccess} disabled={policySaving || settings.loading} onchange={(event) => savePolicy({ source: event.currentTarget.checked })} />
+      <span>{i18n.t("settings.mcp.policy.sources")}</span>
+    </label>
+    <label>
+      <input type="checkbox" checked={settings.effective.mcpInstallAccess} disabled={policySaving || settings.loading} onchange={(event) => savePolicy({ install: event.currentTarget.checked })} />
+      <span>{i18n.t("settings.mcp.policy.installs")}</span>
+    </label>
+    <label>
+      <input type="checkbox" checked={settings.effective.mcpDestructiveAccess} disabled={policySaving || settings.loading} onchange={(event) => savePolicy({ destructive: event.currentTarget.checked })} />
+      <span>{i18n.t("settings.mcp.policy.destructive")}</span>
+    </label>
+    <div class="allowlist">
+      <div class="allowlist-head">
+        <strong>{i18n.t("settings.mcp.policy.projects")}</strong>
+        <button type="button" disabled={policySaving || settings.loading} onclick={addProject}>
+          <FolderPlus size={14} /> {i18n.t("settings.mcp.policy.addProject")}
+        </button>
+      </div>
+      {#if settings.effective.mcpProjectAllowlist.length === 0}
+        <p>{i18n.t("settings.mcp.policy.noProjects")}</p>
+      {:else}
+        <ul>
+          {#each settings.effective.mcpProjectAllowlist as project (project)}
+            <li>
+              <code>{project}</code>
+              <button
+                type="button"
+                disabled={policySaving || settings.loading}
+                aria-label={`${i18n.t("settings.mcp.policy.removeProject")} ${project}`}
+                onclick={() => savePolicy({ projects: settings.effective.mcpProjectAllowlist.filter((item) => item !== project) })}
+              ><X size={14} /></button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
   </div>
   <span class="sr-only" aria-live="polite">
     {copied ? `${clientLabel(copied)} ${i18n.t("settings.mcp.copied")}` : ""}
@@ -123,12 +208,20 @@
 
 <style>
   .section { display: flex; flex-direction: column; gap: var(--space-4); max-width: 650px; }
-  .heading, .card-head, .actions, .command { display: flex; align-items: center; }
+  .heading, .card-head, .actions, .command, .allowlist-head, .allowlist li { display: flex; align-items: center; }
   .heading, .card-head { justify-content: space-between; gap: var(--space-3); }
   h2 { margin: 0 0 var(--space-1); font-size: var(--text-h1); }
   p { margin: 0; color: var(--color-text-muted); font-size: var(--text-body-sm); }
   .cards { display: grid; gap: var(--space-3); }
   .card { padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); display: grid; gap: var(--space-3); }
+  .policy { padding-top: var(--space-4); border-top: 1px solid var(--color-border); display: grid; gap: var(--space-3); }
+  .policy h3 { margin: 0 0 var(--space-1); font-size: var(--text-body); }
+  .policy > label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); }
+  .allowlist { display: grid; gap: var(--space-2); }
+  .allowlist-head { justify-content: space-between; gap: var(--space-3); }
+  .allowlist ul { list-style: none; display: grid; gap: var(--space-2); margin: 0; padding: 0; }
+  .allowlist li { gap: var(--space-2); }
+  .allowlist li code { flex: 1; }
   .card-head span { font-size: var(--text-caption); color: var(--color-text-muted); }
   .card-head span.ok { color: var(--color-success); }
   .card-head span.warn, .error { color: var(--color-danger); }

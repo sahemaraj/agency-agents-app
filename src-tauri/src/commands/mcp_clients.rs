@@ -588,7 +588,26 @@ fn mutation_failed(client: McpClient, action: &str, restored: bool) -> AppError 
 #[tauri::command]
 pub async fn mcp_clients_status() -> Result<Vec<McpClientStatus>, AppError> {
     let app_exe = env::current_exe().map_err(AppError::from)?;
-    let (command, args) = app_command(&app_exe)?;
+    statuses_for_app(&app_exe).await
+}
+
+async fn statuses_for_app(app_exe: &Path) -> Result<Vec<McpClientStatus>, AppError> {
+    let (command, args) = match app_command(app_exe) {
+        Ok(command) => command,
+        Err(error) => {
+            let detail = error.to_string();
+            return Ok([McpClient::Claude, McpClient::Codex]
+                .into_iter()
+                .map(|client| McpClientStatus {
+                    client,
+                    installed: false,
+                    state: McpClientState::Unavailable,
+                    command: String::new(),
+                    detail: detail.clone(),
+                })
+                .collect());
+        }
+    };
     async fn isolated(
         client: McpClient,
         app_exe: &Path,
@@ -607,8 +626,8 @@ pub async fn mcp_clients_status() -> Result<Vec<McpClientStatus>, AppError> {
         }
     }
     Ok(vec![
-        isolated(McpClient::Claude, &app_exe, &command, &args).await,
-        isolated(McpClient::Codex, &app_exe, &command, &args).await,
+        isolated(McpClient::Claude, app_exe, &command, &args).await,
+        isolated(McpClient::Codex, app_exe, &command, &args).await,
     ])
 }
 
@@ -989,6 +1008,22 @@ mod tests {
         assert!(!is_ephemeral_executable(Path::new(
             "/Applications/Agency Agents.app/Contents/MacOS/app"
         )));
+    }
+
+    #[tokio::test]
+    async fn development_status_returns_unavailable_cards_instead_of_a_global_error() {
+        let current = std::env::current_exe().unwrap();
+        assert!(is_ephemeral_executable(&current));
+
+        let statuses = statuses_for_app(&current).await.unwrap();
+
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses
+            .iter()
+            .all(|status| status.state == McpClientState::Unavailable));
+        assert!(statuses
+            .iter()
+            .all(|status| status.detail.contains("Applications")));
     }
 
     #[tokio::test]

@@ -22,10 +22,12 @@ pub struct DraftInputFile {
     pub base64: Option<String>,
 }
 
+#[cfg(test)]
 fn drafts_root(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("skills").join("drafts")
 }
 
+#[cfg(test)]
 fn published_root(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("skills").join("published")
 }
@@ -269,7 +271,6 @@ fn validate_claim(root: &Path, claim: &Path) -> Result<(), AppError> {
 }
 
 struct EvictionGuard {
-    root: PathBuf,
     original: PathBuf,
     quarantine: Option<PathBuf>,
     committed: bool,
@@ -289,7 +290,6 @@ impl EvictionGuard {
             Err(error) => return Err(io("inspect evicted draft directory")(error)),
         };
         Ok(Self {
-            root: root.to_path_buf(),
             original,
             quarantine,
             committed: false,
@@ -301,7 +301,11 @@ impl EvictionGuard {
         if cleanup_failures()
             .lock()
             .expect("eviction cleanup failure probe")
-            .remove(&self.root)
+            .remove(
+                self.original
+                    .parent()
+                    .expect("evicted draft original always has a parent"),
+            )
         {
             return Err(AppError::Io {
                 message: "injected eviction cleanup failure".into(),

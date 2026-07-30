@@ -856,6 +856,7 @@ pub fn install_validated_directory(
     Ok(installed_hash)
 }
 
+#[cfg(test)]
 pub fn install_directory(
     source: &Path,
     destination: &Path,
@@ -952,6 +953,7 @@ pub fn disable_directory(source: &Path, disabled: &Path) -> Result<(), AppError>
     })
 }
 
+#[cfg(test)]
 pub fn enable_directory(disabled: &Path, destination: &Path) -> Result<(), AppError> {
     if fs::symlink_metadata(destination).is_ok() {
         return Err(AppError::InvalidArgument {
