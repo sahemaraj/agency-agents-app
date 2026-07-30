@@ -1252,6 +1252,16 @@ pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
     })
 }
 
+pub(crate) async fn active_catalog_root(app: &AppHandle) -> Result<PathBuf, AppError> {
+    let adir = app_data_dir(app)?;
+    Ok(active_catalog_root_at(&adir).await)
+}
+
+pub(crate) async fn active_catalog_root_at(adir: &Path) -> PathBuf {
+    let source = load_catalog_source(&adir).await;
+    catalog_root(adir, &source)
+}
+
 /// Read the raw, byte-exact `.md` source of a seeded agent from the working
 /// corpus copy (`<app_data>/corpus/<category>/<slug>.md`). Identity-tool
 /// installs (claude-code, copilot) ship this verbatim, and provenance

@@ -10,7 +10,7 @@
   import SkillsWorkspace from "$lib/components/SkillsWorkspace.svelte";
   import ToolsView from "$lib/components/ToolsView.svelte";
   import ActivityHistory from "$lib/components/ActivityHistory.svelte";
-  import Runbooks from "$lib/components/Runbooks.svelte";
+  import Experts from "$lib/components/Experts.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import Settings from "$lib/components/Settings.svelte";
   import AboutModal from "$lib/components/AboutModal.svelte";
@@ -46,7 +46,7 @@
     if (s === "tools") return i18n.t("nav.tools");
     if (s === "teams") return i18n.t("nav.teams");
     if (s === "projects") return i18n.t("nav.projects");
-    if (s === "runbooks") return i18n.t("nav.runbooks");
+    if (s === "experts") return i18n.t("nav.experts");
     return i18n.t("nav.activity");
   }
 
@@ -103,7 +103,7 @@
         "3": "tools",
         "4": "teams",
         "5": "projects",
-        "6": "runbooks",
+        "6": "experts",
         "7": "activity",
       };
       ui.setSection(map[e.key]);
@@ -236,8 +236,8 @@
             <Projects />
           {:else if ui.section === "personas"}
             <AgentsWorkspace />
-          {:else if ui.section === "runbooks"}
-            <Runbooks />
+          {:else if ui.section === "experts"}
+            <Experts />
           {:else if ui.section === "activity"}
             <ActivityHistory />
           {/if}

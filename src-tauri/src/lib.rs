@@ -7,6 +7,7 @@
 mod commands;
 mod corpus;
 mod error;
+mod experts;
 mod github;
 mod install;
 mod registry;
@@ -185,6 +186,21 @@ pub fn run() {
             corpus::catalog_status,
             corpus::catalog_check_updates,
             corpus::runbooks_list,
+            experts::experts_list,
+            experts::experts_get,
+            experts::expert_save,
+            experts::expert_delete,
+            experts::expert_import,
+            experts::expert_export,
+            experts::expert_plan_activation,
+            experts::expert_activate,
+            experts::expert_activation_history,
+            experts::expert_activation_requests,
+            experts::expert_activation_request_resolve,
+            experts::expert_creation_requests,
+            experts::expert_creation_request_get,
+            experts::expert_creation_request_approve,
+            experts::expert_creation_request_reject,
             skills::skill_sources_list,
             skills::skill_sources_inspect,
             skills::skill_trust_grant,
@@ -248,6 +264,8 @@ pub fn run() {
             install::tools_list,
             install::tool_versions,
             install::reveal_path,
+            install::project_register,
+            install::project_unregister,
             install::projects_list,
             install::loadout_export,
             install::loadout_import,

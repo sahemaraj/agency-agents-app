@@ -147,7 +147,7 @@
     deleteBusy = true;
     try {
       await install.forgetProject(path, label);
-      projects.unregister(path);
+      await projects.unregister(path);
       finishRemove(path);
     } catch (e) {
       toast.error(i18n.t("common.actionFailed"), String(e));
@@ -173,7 +173,7 @@
         );
         if (!removed) throw new Error(`Could not uninstall skill ${skill.name}`);
       }
-      projects.unregister(path);
+      await projects.unregister(path);
       finishRemove(path);
     } catch (e) {
       toast.error(i18n.t("common.actionFailed"), String(e));

@@ -11,6 +11,7 @@
 //! slug for its tool (the deterministic `render/` layer makes that reproducible).
 
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -29,6 +30,8 @@ use crate::util::fs::{atomic_write, read_capped};
 
 /// Cap on an installed agent file we read back during reconciliation.
 const MAX_INSTALLED_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REGISTERED_PROJECTS: usize = 200;
+const MAX_PROJECT_REGISTRY_BYTES: u64 = 64 * 1024;
 
 // ---------- Ledger persistence ----------
 
@@ -37,7 +40,7 @@ fn ledger_path(app: &AppHandle) -> Result<PathBuf, AppError> {
     Ok(corpus::state_dir(&adir).join("installs.json"))
 }
 
-async fn load_ledger(app: &AppHandle) -> Result<Vec<InstallRecord>, AppError> {
+pub(crate) async fn load_ledger(app: &AppHandle) -> Result<Vec<InstallRecord>, AppError> {
     let path = ledger_path(app)?;
     match tokio::fs::read(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| AppError::Io {
@@ -73,7 +76,7 @@ fn home() -> Result<PathBuf, AppError> {
 /// OS home. Project-scope installs ignore this — they resolve against the
 /// chosen project root. Because the ledger stores the resolved `dest`, reconcile
 /// stays correct with no per-tool logic of its own.
-async fn tool_home(state: &AppState, tool: &str) -> Result<PathBuf, AppError> {
+pub(crate) async fn tool_home(state: &AppState, tool: &str) -> Result<PathBuf, AppError> {
     let os_home = home()?;
     let base = state
         .settings
@@ -185,7 +188,7 @@ async fn backup_if_differs(
 
 // ---------- Install / update (shared core) ----------
 
-async fn do_install(
+pub(crate) async fn do_install(
     app: &AppHandle,
     state: &AppState,
     slug: String,
@@ -650,14 +653,24 @@ pub async fn uninstall_agent(
     tool: Tool,
     project_path: Option<String>,
 ) -> Result<(), AppError> {
-    let corpus = corpus::ensure_corpus(&app, &state).await?;
+    do_uninstall(&app, &state, slug, tool, project_path).await
+}
+
+pub(crate) async fn do_uninstall(
+    app: &AppHandle,
+    state: &AppState,
+    slug: String,
+    tool: Tool,
+    project_path: Option<String>,
+) -> Result<(), AppError> {
+    let corpus = corpus::ensure_corpus(app, state).await?;
     let agent = corpus.get(&slug).ok_or_else(|| AppError::Io {
         message: format!("unknown agent: {slug}"),
     })?;
-    let raw = corpus::read_source(&app, &agent.category, &slug).await?;
-    let home = tool_home(&state, &tool).await?;
+    let raw = corpus::read_source(app, &agent.category, &slug).await?;
+    let home = tool_home(state, &tool).await?;
     let proot = project_path.as_ref().map(PathBuf::from);
-    let mut ledger = load_ledger(&app).await?;
+    let mut ledger = load_ledger(app).await?;
     let ledger_dest = ledger
         .iter()
         .find(|r| r.slug == slug && r.tool == tool && r.project_path == project_path)
@@ -669,12 +682,12 @@ pub async fn uninstall_agent(
         &home,
         proot.as_deref(),
         ledger_dest.as_deref(),
-        &backups_dir(&app)?,
+        &backups_dir(app)?,
         &now_iso(),
     )
     .await?;
     ledger.retain(|r| !(r.slug == slug && r.tool == tool && r.project_path == project_path));
-    save_ledger(&app, &ledger).await?;
+    save_ledger(app, &ledger).await?;
     Ok(())
 }
 
@@ -705,8 +718,14 @@ fn prune_project_rows(records: &mut Vec<InstallRecord>, project_path: &str) {
 pub async fn installs_reconcile(
     app: AppHandle,
     state: State<'_, AppState>,
-    project_roots: Vec<String>,
+    mut project_roots: Vec<String>,
 ) -> Result<Vec<InstalledAgent>, AppError> {
+    project_roots.extend(
+        registered_projects(&state.app_data_dir)
+            .await?
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
     let corpus = corpus::ensure_corpus(&app, &state).await?;
     let mut ledger = load_ledger(&app).await?;
     let mut out = Vec::with_capacity(ledger.len());
@@ -999,6 +1018,11 @@ pub async fn tools_list(
     Ok(out)
 }
 
+pub(crate) async fn tool_detected(state: &AppState, tool: &str) -> Result<bool, AppError> {
+    let base = tool_home(state, tool).await?;
+    Ok(detect(tool, &base).0)
+}
+
 /// Open a path in the OS file manager (Finder / Explorer / xdg-open).
 /// Best-effort: returns an error the UI can toast if the path is missing or no
 /// opener is available. Used by the Tools panel's "Reveal" affordance.
@@ -1076,11 +1100,157 @@ pub async fn tool_versions() -> Result<Vec<ToolVersion>, AppError> {
     Ok(out)
 }
 
-/// Project directories we've installed project-scoped agents into.
+fn project_registry_path(app_data_dir: &Path) -> PathBuf {
+    corpus::state_dir(app_data_dir).join("projects.json")
+}
+
+fn lock_project_registry(app_data_dir: &Path) -> Result<std::fs::File, AppError> {
+    let directory = corpus::state_dir(app_data_dir);
+    std::fs::create_dir_all(&directory).map_err(|error| AppError::Io {
+        message: format!("create project registry directory: {error}"),
+    })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(directory.join("projects.lock"))
+        .map_err(|error| AppError::Io {
+            message: format!("open project registry lock: {error}"),
+        })?;
+    file.lock().map_err(|error| AppError::Io {
+        message: format!("lock project registry: {error}"),
+    })?;
+    Ok(file)
+}
+
+pub(crate) async fn registered_projects(app_data_dir: &Path) -> Result<Vec<PathBuf>, AppError> {
+    let path = project_registry_path(app_data_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = read_capped(&path, MAX_PROJECT_REGISTRY_BYTES).await?;
+    let paths: Vec<String> = serde_json::from_slice(&raw).map_err(|error| AppError::Io {
+        message: format!("parse projects.json: {error}"),
+    })?;
+    if paths.len() > MAX_REGISTERED_PROJECTS {
+        return Err(AppError::InvalidArgument {
+            message: "project registry exceeds limit".into(),
+        });
+    }
+    Ok(paths.into_iter().map(PathBuf::from).collect())
+}
+
+async fn save_registered_projects(
+    app_data_dir: &Path,
+    projects: &[PathBuf],
+) -> Result<(), AppError> {
+    let bytes = serde_json::to_vec_pretty(
+        &projects
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| AppError::Internal {
+        message: format!("serialize projects.json: {error}"),
+    })?;
+    atomic_write(&project_registry_path(app_data_dir), &bytes).await
+}
+
+async fn register_project(app_data_dir: &Path, path: &str) -> Result<PathBuf, AppError> {
+    let supplied = Path::new(path);
+    if !supplied.is_absolute()
+        || supplied.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(AppError::InvalidArgument {
+            message: "project path must be absolute and normalized".into(),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(supplied).map_err(|error| AppError::Io {
+        message: format!("inspect project path: {error}"),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::InvalidArgument {
+            message: "project path must be a real directory, not a link".into(),
+        });
+    }
+    let canonical = std::fs::canonicalize(supplied).map_err(|error| AppError::Io {
+        message: format!("canonicalize project path: {error}"),
+    })?;
+    let _lock = lock_project_registry(app_data_dir)?;
+    let mut projects = registered_projects(app_data_dir).await?;
+    if !projects.contains(&canonical) {
+        if projects.len() >= MAX_REGISTERED_PROJECTS {
+            return Err(AppError::InvalidArgument {
+                message: "project registry is full".into(),
+            });
+        }
+        projects.push(canonical.clone());
+        projects.sort();
+        save_registered_projects(app_data_dir, &projects).await?;
+    }
+    Ok(canonical)
+}
+
+async fn unregister_project(app_data_dir: &Path, path: &str) -> Result<bool, AppError> {
+    let canonical = PathBuf::from(path);
+    let _lock = lock_project_registry(app_data_dir)?;
+    let mut projects = registered_projects(app_data_dir).await?;
+    let before = projects.len();
+    projects.retain(|project| project != &canonical);
+    if projects.len() == before {
+        return Ok(false);
+    }
+    save_registered_projects(app_data_dir, &projects).await?;
+    Ok(true)
+}
+
+pub(crate) async fn project_is_registered(
+    app_data_dir: &Path,
+    path: &Path,
+) -> Result<bool, AppError> {
+    Ok(registered_projects(app_data_dir)
+        .await?
+        .iter()
+        .any(|project| project == path))
+}
+
 #[tauri::command]
-pub async fn projects_list(app: AppHandle) -> Result<Vec<ProjectInfo>, AppError> {
+pub async fn project_register(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<String, AppError> {
+    Ok(register_project(&state.app_data_dir, &path)
+        .await?
+        .to_string_lossy()
+        .into_owned())
+}
+
+#[tauri::command]
+pub async fn project_unregister(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<bool, AppError> {
+    unregister_project(&state.app_data_dir, &path).await
+}
+
+/// Registered project roots union project-scoped agent ledger entries.
+#[tauri::command]
+pub async fn projects_list(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProjectInfo>, AppError> {
     let ledger = load_ledger(&app).await?;
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    for path in registered_projects(&state.app_data_dir).await? {
+        counts
+            .entry(path.to_string_lossy().into_owned())
+            .or_default();
+    }
     for r in &ledger {
         if let Some(p) = &r.project_path {
             *counts.entry(p.clone()).or_default() += 1;
@@ -1866,5 +2036,46 @@ mod tests {
         let back: Vec<InstallRecord> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].tool, "cursor");
+    }
+
+    #[tokio::test]
+    async fn project_registry_canonicalizes_deduplicates_and_unregisters() {
+        let app = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(project.path()).unwrap();
+
+        assert_eq!(
+            register_project(app.path(), project.path().to_str().unwrap())
+                .await
+                .unwrap(),
+            canonical
+        );
+        register_project(app.path(), project.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            registered_projects(app.path()).await.unwrap(),
+            vec![canonical.clone()]
+        );
+        assert!(unregister_project(app.path(), canonical.to_str().unwrap())
+            .await
+            .unwrap());
+        assert!(registered_projects(app.path()).await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_registry_rejects_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let app = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let linked = parent.path().join("project-link");
+        symlink(project.path(), &linked).unwrap();
+
+        assert!(register_project(app.path(), linked.to_str().unwrap())
+            .await
+            .is_err());
     }
 }

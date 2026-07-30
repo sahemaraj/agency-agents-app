@@ -514,6 +514,49 @@ struct RecommendRequest {
     project_path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertGetRequest {
+    id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertPlanRequest {
+    id: String,
+    project_path: String,
+    client: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertActivationRequest {
+    id: String,
+    project_path: String,
+    client: Option<String>,
+    requested_by: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertCreationContextRequest {
+    outcome: String,
+    project_path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertCreationSubmitRequest {
+    client_request_id: String,
+    outcome: String,
+    project_path: String,
+    proposal: serde_json::Value,
+    #[serde(default)]
+    linked_skill_drafts: Vec<serde_json::Value>,
+    #[serde(default)]
+    agent_substitutions: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertCreationGetRequest {
+    id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SkillRecommendation {
@@ -629,6 +672,12 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "skills_recommend"
         | "skills_plan_install"
         | "skills_version_history" => Some(McpAction::Read),
+        "experts_list"
+        | "experts_get"
+        | "experts_plan_activation"
+        | "experts_creation_context"
+        | "experts_list_creation_requests"
+        | "experts_get_creation_request" => Some(McpAction::Read),
         "skills_add_local_source"
         | "skills_add_github_source"
         | "skills_refresh_source"
@@ -652,6 +701,8 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         "skills_set_preferred_source"
         | "skills_request_publisher_trust"
         | "skills_request_batch_collection" => Some(McpAction::Source),
+        "experts_request_creation" => Some(McpAction::Source),
+        "experts_request_activation" => Some(McpAction::Install),
         "skills_submit_approval" => Some(McpAction::Source),
         "skills_install" | "skills_find_and_install" | "skills_update" | "skills_enable" => {
             Some(McpAction::Install)
@@ -1785,6 +1836,214 @@ impl SkillMcpServer {
                 .map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&library.approvals).map_err(|error| error.to_string())
         })
+        .await
+    }
+
+    #[tool(description = "List reusable Expert workspace definitions")]
+    async fn experts_list(&self) -> Result<String, String> {
+        self.run_tool("experts_list", McpAction::Read, None, async {
+            let experts = crate::experts::mcp_definitions(&self.state)
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&experts).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Inspect one reusable Expert workspace definition")]
+    async fn experts_get(
+        &self,
+        Parameters(ExpertGetRequest { id }): Parameters<ExpertGetRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("experts_get", McpAction::Read, None, async {
+            let expert = crate::experts::mcp_definitions(&self.state)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|expert| expert.id == id)
+                .ok_or_else(|| "unknown expert".to_string())?;
+            serde_json::to_string_pretty(&expert).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read bounded root metadata for an exactly canonical, registered, allowlisted project before proposing an Expert"
+    )]
+    async fn experts_creation_context(
+        &self,
+        Parameters(ExpertCreationContextRequest {
+            outcome,
+            project_path,
+        }): Parameters<ExpertCreationContextRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_creation_context",
+            McpAction::Read,
+            Some(project_path.clone()),
+            async {
+                let context =
+                    crate::experts::mcp_creation_context(&self.state, &outcome, &project_path)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                let languages = detect_project_languages(&project_path)?;
+                validate_recommend_request(&outcome, &languages)?;
+                let sources = super::inspect_skill_sources(&self.state)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let recommendations = recommend_skills(&sources, &outcome, &languages, 10);
+                let mut value = serde_json::to_value(context).map_err(|error| error.to_string())?;
+                value["skillRecommendations"] =
+                    serde_json::to_value(recommendations).map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Submit a portable Expert proposal for desktop review; never saves or activates it"
+    )]
+    async fn experts_request_creation(
+        &self,
+        Parameters(ExpertCreationSubmitRequest {
+            client_request_id,
+            outcome,
+            project_path,
+            proposal,
+            linked_skill_drafts,
+            agent_substitutions,
+        }): Parameters<ExpertCreationSubmitRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_request_creation",
+            McpAction::Source,
+            Some(project_path.clone()),
+            async {
+                let proposal = serde_json::from_value(proposal)
+                    .map_err(|error| format!("invalid Expert proposal: {error}"))?;
+                let linked_skill_drafts = linked_skill_drafts
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("invalid linked skill draft: {error}"))?;
+                let agent_substitutions = agent_substitutions
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("invalid agent substitution: {error}"))?;
+                let request = crate::experts::mcp_request_creation(
+                    &self.state,
+                    client_request_id,
+                    outcome,
+                    project_path,
+                    proposal,
+                    linked_skill_drafts,
+                    agent_substitutions,
+                    self.client_identity.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&request).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "List only this MCP client's Expert creation requests")]
+    async fn experts_list_creation_requests(&self) -> Result<String, String> {
+        self.run_tool(
+            "experts_list_creation_requests",
+            McpAction::Read,
+            None,
+            async {
+                let requests =
+                    crate::experts::mcp_list_creation_requests(&self.state, &self.client_identity)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&requests).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Read one of this MCP client's Expert creation requests and live readiness"
+    )]
+    async fn experts_get_creation_request(
+        &self,
+        Parameters(ExpertCreationGetRequest { id }): Parameters<ExpertCreationGetRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_get_creation_request",
+            McpAction::Read,
+            None,
+            async {
+                let request = crate::experts::mcp_get_creation_request(
+                    &self.state,
+                    &id,
+                    &self.client_identity,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&request).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Prepare an Expert activation request for a canonical local project")]
+    async fn experts_plan_activation(
+        &self,
+        Parameters(ExpertPlanRequest {
+            id,
+            project_path,
+            client,
+        }): Parameters<ExpertPlanRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_plan_activation",
+            McpAction::Read,
+            Some(project_path.clone()),
+            async {
+                let plan = crate::experts::mcp_plan(&self.state, &id, &project_path, client)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&plan).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Request Expert activation through the desktop approval inbox; never activates directly"
+    )]
+    async fn experts_request_activation(
+        &self,
+        Parameters(ExpertActivationRequest {
+            id,
+            project_path,
+            client,
+            requested_by,
+        }): Parameters<ExpertActivationRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_request_activation",
+            McpAction::Install,
+            Some(project_path.clone()),
+            async {
+                let request = crate::experts::mcp_request(
+                    &self.state,
+                    id,
+                    project_path,
+                    client,
+                    requested_by,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&request).map_err(|error| error.to_string())
+            },
+        )
         .await
     }
 }
@@ -2970,6 +3229,18 @@ mod tests {
             action_for_tool("skills_remove_source"),
             Some(crate::state::McpAction::Destructive)
         );
+        assert_eq!(
+            action_for_tool("experts_creation_context"),
+            Some(crate::state::McpAction::Read)
+        );
+        assert_eq!(
+            action_for_tool("experts_request_creation"),
+            Some(crate::state::McpAction::Source)
+        );
+        assert_eq!(
+            action_for_tool("experts_get_creation_request"),
+            Some(crate::state::McpAction::Read)
+        );
     }
 
     #[tokio::test]
@@ -3533,6 +3804,14 @@ mod tests {
         assert_eq!(
             names,
             [
+                "experts_creation_context",
+                "experts_get",
+                "experts_get_creation_request",
+                "experts_list",
+                "experts_list_creation_requests",
+                "experts_plan_activation",
+                "experts_request_activation",
+                "experts_request_creation",
                 "skills_add_github_source",
                 "skills_add_local_source",
                 "skills_assign_folder",
@@ -3746,7 +4025,7 @@ mod tests {
                     "source_id": registered.id,
                     "relative_path": "reviewer",
                     "runtime": "codex",
-                    "project_path": project.path(),
+                    "project_path": canonical_project.clone(),
                 }
             }
         });
@@ -3780,7 +4059,7 @@ mod tests {
                     "source_id": registered.id,
                     "relative_path": "reviewer",
                     "runtime": "codex",
-                    "project_path": project.path(),
+                    "project_path": canonical_project.clone(),
                 }),
             ),
             (
@@ -3790,7 +4069,7 @@ mod tests {
                     "source_id": registered.id,
                     "relative_path": "reviewer",
                     "runtime": "codex",
-                    "project_path": project.path(),
+                    "project_path": canonical_project.clone(),
                 }),
             ),
             (
@@ -3800,7 +4079,7 @@ mod tests {
                     "source_id": registered.id,
                     "relative_path": "reviewer",
                     "runtime": "codex",
-                    "project_path": project.path(),
+                    "project_path": canonical_project.clone(),
                 }),
             ),
             (
@@ -3810,7 +4089,7 @@ mod tests {
                     "source_id": registered.id,
                     "relative_path": "reviewer",
                     "runtime": "codex",
-                    "project_path": project.path(),
+                    "project_path": canonical_project.clone(),
                 }),
             ),
         ] {
@@ -3861,7 +4140,7 @@ mod tests {
                 "source_id": registered.id,
                 "relative_path": "reviewer",
                 "runtime": "codex",
-                "project_path": project.path(),
+                "project_path": canonical_project,
             }},
         });
         write

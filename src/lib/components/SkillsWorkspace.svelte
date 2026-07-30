@@ -275,7 +275,6 @@
   });
 
   onMount(() => {
-    projects.hydrate();
     const focusSearch = (event: KeyboardEvent): void => {
       const target = event.target as HTMLElement | null;
       if (event.key !== "/" || target?.matches("input, textarea, select, [contenteditable='true']")) return;
@@ -284,6 +283,7 @@
     };
     document.addEventListener("keydown", focusSearch);
     void (async () => {
+      await projects.refresh();
       await skillSources.load();
       await migratePersonalFolders();
       await skillSources.reconcileInstalls(projects.list.map((project) => project.path));

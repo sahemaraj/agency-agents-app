@@ -180,7 +180,7 @@ impl AppState {
         action: McpAction,
         project_path: Option<&str>,
     ) -> Result<Option<AuthorizedMcpProject>, AppError> {
-        if action == McpAction::Read {
+        if action == McpAction::Read && project_path.is_none() {
             return Ok(None);
         }
         let loaded = settings::load_async(&self.app_data_dir).await;
@@ -303,7 +303,13 @@ pub fn authorize_mcp_for_client(
     let Some(project_path) = project_path else {
         return Ok(None);
     };
+    let supplied_project = PathBuf::from(project_path);
     let project_path = settings::canonical_mcp_project_path(project_path)?;
+    if supplied_project != project_path {
+        return Err(AppError::InvalidArgument {
+            message: "MCP project path must match its exact canonical identity".into(),
+        });
+    }
     let allowed = policy.mcp_project_allowlist.iter().find_map(|allowed| {
         let identity = PathBuf::from(allowed);
         settings::canonical_mcp_project_path(allowed)
@@ -922,6 +928,80 @@ mod tests {
             Some(&format!("{allowed}/nested"))
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_project_authorization_rejects_a_symlink_alias_of_an_allowlisted_project() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let project = root.path().join("project");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&project).expect("project");
+        symlink(&project, &alias).expect("alias");
+        let canonical = std::fs::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let policy = Settings {
+            mcp_install_access: true,
+            mcp_project_allowlist: vec![canonical],
+            ..Settings::default()
+        };
+
+        assert!(authorize_mcp(&policy, McpAction::Install, Some(alias.to_str().unwrap())).is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_reads_with_project_paths_require_the_exact_canonical_allowlist_identity() {
+        let app = tempfile::tempdir().expect("app data");
+        let allowed = tempfile::tempdir().expect("allowed project");
+        let denied = tempfile::tempdir().expect("denied project");
+        let allowed = std::fs::canonicalize(allowed.path())
+            .expect("canonical allowed project")
+            .to_string_lossy()
+            .into_owned();
+        let denied = std::fs::canonicalize(denied.path())
+            .expect("canonical denied project")
+            .to_string_lossy()
+            .into_owned();
+        settings::persist(
+            app.path(),
+            Settings {
+                mcp_project_allowlist: vec![allowed.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist allowlist");
+        let state = AppState {
+            app_data_dir: app.path().to_path_buf(),
+            corpus_cache: Arc::new(Mutex::new(None)),
+            corpus_refresh_in_flight: Arc::new(Mutex::new(())),
+            skill_sources_write_lock: Arc::new(Mutex::new(())),
+            skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
+            settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
+            updater_state: crate::commands::updater::empty_state(),
+        };
+
+        assert!(state
+            .authorize_mcp_client("claude", McpAction::Read, None)
+            .await
+            .is_ok());
+        assert_eq!(
+            state
+                .authorize_mcp_client("claude", McpAction::Read, Some(&allowed))
+                .await
+                .expect("allowlisted read")
+                .map(|project| project.identity().to_owned()),
+            Some(allowed)
+        );
+        assert!(state
+            .authorize_mcp_client("claude", McpAction::Read, Some(&denied))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

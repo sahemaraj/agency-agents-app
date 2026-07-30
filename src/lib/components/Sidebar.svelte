@@ -32,7 +32,7 @@
     { id: "tools",     shortcut: shortcut("3"), icon: Wrench },
     { id: "teams",     shortcut: shortcut("4"), icon: Users },
     { id: "projects",  shortcut: shortcut("5"), icon: FolderGit2 },
-    { id: "runbooks",  shortcut: shortcut("6"), icon: Rocket },
+    { id: "experts",   shortcut: shortcut("6"), icon: Rocket },
     { id: "activity",  shortcut: shortcut("7"), icon: Activity },
   ];
 
@@ -43,7 +43,7 @@
     if (id === "tools") return i18n.t("nav.tools");
     if (id === "teams") return i18n.t("nav.teams");
     if (id === "projects") return i18n.t("nav.projects");
-    if (id === "runbooks") return i18n.t("nav.runbooks");
+    if (id === "experts") return i18n.t("nav.experts");
     return i18n.t("nav.activity");
   }
 

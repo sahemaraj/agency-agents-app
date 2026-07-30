@@ -728,6 +728,121 @@ export interface Runbook {
   roster: RunbookGroup[];
 }
 
+export type ExpertClient = "claudeCode" | "codex";
+
+export interface ExpertDefinition {
+  id: string;
+  name: string;
+  summary: string;
+  category: string;
+  tags: string[];
+  version: number;
+  leadAgent: string;
+  supportingAgents: string[];
+  requiredSkills: string[];
+  optionalSkills: string[];
+  runbook: string | null;
+  preferredClient: ExpertClient | null;
+  starterPrompt: string;
+  source: "curated" | "custom";
+}
+
+export interface ExpertProposalInput {
+  name: string;
+  summary: string;
+  category: string;
+  tags: string[];
+  leadAgent: string;
+  supportingAgents: string[];
+  requiredSkills: string[];
+  optionalSkills: string[];
+  runbook: string | null;
+  preferredClient: ExpertClient | null;
+  starterPrompt: string;
+}
+
+export interface ExpertLinkedSkillDraft {
+  skillName: string;
+  draftId: string;
+}
+
+export interface ExpertAgentSubstitution {
+  neededCapability: string;
+  selectedCatalogSlug: string;
+  rationale: string;
+}
+
+export interface ExpertLinkedSkillState extends ExpertLinkedSkillDraft {
+  state: SkillDraftState | null;
+}
+
+export interface ExpertCreationRequest extends ExpertProposalRequestFields {
+  id: string;
+  readiness: "waitingForSkills" | "ready" | "blocked";
+  linkedSkillStates: ExpertLinkedSkillState[];
+  blockers: string[];
+  warnings: string[];
+}
+
+interface ExpertProposalRequestFields {
+  clientRequestId: string;
+  outcome: string;
+  projectPath: string;
+  requestedBy: string;
+  requestedAt: string;
+  proposal: ExpertProposalInput;
+  linkedSkillDrafts: ExpertLinkedSkillDraft[];
+  agentSubstitutions: ExpertAgentSubstitution[];
+  state: "pending" | "approved" | "rejected";
+  savedExpertId: string | null;
+}
+
+export interface ExpertResolved extends ExpertDefinition {
+  unresolvedAgents: string[];
+  unresolvedSkills: string[];
+  unresolvedRunbook: boolean;
+}
+
+export interface ExpertAgentAction {
+  slug: string;
+  status: string;
+  destination: string | null;
+}
+
+export interface ExpertActivationPlan {
+  expert: ExpertResolved;
+  projectPath: string;
+  client: ExpertClient;
+  agents: ExpertAgentAction[];
+  skills: SkillMutationPlan[];
+  existing: string[];
+  warnings: string[];
+  blockers: string[];
+  promptPreview: string;
+  rollbackScope: string[];
+}
+
+export interface ExpertActivationRecord {
+  id: string;
+  expertId: string;
+  expertVersion: number;
+  projectPath: string;
+  client: ExpertClient;
+  activatedAt: string;
+  installedAgents: string[];
+  installedSkills: string[];
+}
+
+export interface ExpertActivationRequest {
+  id: string;
+  expertId: string;
+  projectPath: string;
+  client: ExpertClient | null;
+  requestedBy: string;
+  requestedAt: string;
+  state: "pending" | "approved" | "rejected";
+}
+
 export interface CatalogUpdateCheck {
   isGit: boolean;
   behind: number;
@@ -897,7 +1012,7 @@ export type SidebarSection =
   | "tools"
   | "teams"
   | "projects"
-  | "runbooks"
+  | "experts"
   | "activity";
 
 export type ThemePreference = "light" | "dark" | "system";
