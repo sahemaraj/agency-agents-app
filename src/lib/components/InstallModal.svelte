@@ -16,10 +16,14 @@
   import { onMount } from "svelte";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import FolderIcon from "@lucide/svelte/icons/folder";
-  import GlobeIcon from "@lucide/svelte/icons/globe";
   import Modal from "./Modal.svelte";
   import Button from "./Button.svelte";
   import DestructiveConfirm from "./DestructiveConfirm.svelte";
+  import DeploymentTargetGrid, {
+    type DeploymentCell,
+    type DeploymentColumn,
+    type DeploymentRow,
+  } from "./DeploymentTargetGrid.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
   import { install, SUPPORTED_TOOLS, type ToolDef } from "$lib/stores/install.svelte";
   import { projects } from "$lib/stores/projects.svelte";
@@ -66,10 +70,6 @@
   function targetOf(row: Row): string | null {
     return row.kind === "global" ? null : row.path;
   }
-  function applicable(row: Row, t: ToolDef): boolean {
-    return row.kind === "global" ? t.supportsUser : t.supportsProject;
-  }
-
   // Tools in this grid that ONLY install per-project (no global scope) — e.g.
   // Cursor, whose "global" rules are a UI setting, not a writable file. With no
   // projects registered their only cell is the Global-row "—", a dead end (#40),
@@ -82,6 +82,23 @@
     return row.kind === "global"
       ? i18n.t("install.naProjectOnly", { tool: t.label })
       : i18n.t("install.naUserOnly", { tool: t.label });
+  }
+
+  function gridCell(column: DeploymentColumn, row: DeploymentRow): DeploymentCell {
+    const t = column as ToolDef;
+    const destination = targetOf(row);
+    const cov = cover(t.id, destination);
+    const isBusy = busy === cellKey(t.id, destination);
+    return {
+      state: cov.all ? "on" : cov.some ? "partial" : "off",
+      busy: isBusy,
+      disabled: total === 0,
+      title: i18n.t("install.cellTitle", { tool: t.label, target: row.kind === "global" ? i18n.t("common.global") : row.label }),
+      ariaLabel: i18n.t(cov.all ? "install.removeFromAria" : "install.installIntoAria", {
+        tool: t.label,
+        target: row.kind === "global" ? i18n.t("install.globally") : i18n.t("install.inProject", { project: row.label }),
+      }),
+    };
   }
 
   // Coverage of the set in one (tool, target) cell.
@@ -197,49 +214,15 @@
   {#if cols.length === 0}
     <p class="no-tools">{i18n.t("install.noTools")}</p>
   {:else}
-  <div class="grid-wrap">
-  <div class="grid" style="--cols: {cols.length}">
-    <!-- header row -->
-    <div class="cell head corner"></div>
-    {#each cols as t (t.id)}
-      <div class="cell head tool" title={t.label}>{t.label}</div>
-    {/each}
-
-    {#each rows as row (row.kind === "global" ? "global" : row.path)}
-      <div class="cell dest" class:flash={flashPath !== null && targetOf(row) === flashPath} use:regDest={targetOf(row)}>
-        {#if row.kind === "global"}
-          <span class="d-ic"><GlobeIcon size={15} /></span>
-          <span class="d-body"><span class="d-label">{i18n.t("common.global")}</span><span class="d-path">{i18n.t("common.everyMachine")}</span></span>
-        {:else}
-          <span class="d-ic"><FolderIcon size={15} /></span>
-          <span class="d-body"><span class="d-label">{row.label}</span><span class="d-path" title={row.path}>{row.path}</span></span>
-        {/if}
-      </div>
-      {#each cols as t (t.id)}
-        {#if applicable(row, t)}
-          {@const cov = cover(t.id, targetOf(row))}
-          {@const isBusy = busy === cellKey(t.id, targetOf(row))}
-          <button
-            class="cell toggle"
-            class:on={cov.all}
-            class:partial={cov.some}
-            disabled={isBusy || total === 0}
-            title={i18n.t("install.cellTitle", { tool: t.label, target: row.kind === "global" ? i18n.t("common.global") : row.label })}
-            aria-label={i18n.t(cov.all ? "install.removeFromAria" : "install.installIntoAria", { tool: t.label, target: row.kind === "global" ? i18n.t("install.globally") : i18n.t("install.inProject", { project: row.label }) })}
-            onclick={() => toggle(t.id, targetOf(row))}
-          >
-            {#if isBusy}<span class="dot busy"></span>
-            {:else if cov.all}<span class="dot full"></span>
-            {:else if cov.some}<span class="dot half"></span>
-            {:else}<span class="dot"></span>{/if}
-          </button>
-        {:else}
-          <div class="cell na" title={naReason(row, t)} aria-label={naReason(row, t)}>—</div>
-        {/if}
-      {/each}
-    {/each}
-  </div>
-  </div>
+    <DeploymentTargetGrid
+      columns={cols}
+      {rows}
+      cell={gridCell}
+      onToggle={(column, row) => void toggle(column.id, targetOf(row))}
+      notApplicable={(column, row) => naReason(row, column as ToolDef)}
+      {flashPath}
+      registerDestination={regDest}
+    />
   {/if}
 
   {#if cols.length > 0 && projectOnlyCols.length > 0 && noProjects}
@@ -303,35 +286,6 @@
   .sub { font-size: var(--text-body-sm); color: var(--color-text-muted); margin-bottom: var(--space-3); }
   .no-tools { font-size: var(--text-body-sm); color: var(--color-text-muted); }
 
-  /* Horizontal scroll guards against a very wide tool set (≫ the modal width). */
-  .grid-wrap { overflow-x: auto; border: 1px solid var(--color-border); border-radius: var(--radius-md); }
-  .grid {
-    display: grid;
-    grid-template-columns: minmax(180px, 1fr) repeat(var(--cols), 68px);
-    width: max-content; min-width: 100%;
-    align-items: stretch;
-  }
-  .cell { display: flex; align-items: center; justify-content: center; padding: var(--space-2); border-bottom: 1px solid var(--color-border); }
-  .head { background: var(--color-surface-sunken); font-size: var(--text-caption); color: var(--color-text-muted); font-weight: var(--fw-semibold); min-height: 34px; }
-  .head.tool { writing-mode: horizontal-tb; text-align: center; padding: var(--space-2) 8px; line-height: 1.15; }
-  .corner { background: var(--color-surface-sunken); }
-
-  .dest { justify-content: flex-start; gap: var(--space-2); min-width: 0; }
-  .d-ic { flex: none; display: inline-flex; color: var(--color-text-secondary); }
-  .d-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0; }
-  .d-label { font-size: var(--text-body-sm); font-weight: var(--fw-medium); color: var(--color-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .d-path { font-size: var(--text-caption); color: var(--color-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-  .toggle { background: transparent; cursor: pointer; }
-  .toggle:hover:not(:disabled) { background: var(--color-surface-sunken); }
-  .toggle:disabled { cursor: default; }
-  .na { color: var(--color-text-muted); opacity: 0.4; }
-
-  .dot { width: 16px; height: 16px; border-radius: 999px; border: 1.5px solid var(--color-border-strong, var(--color-text-muted)); box-sizing: border-box; }
-  .dot.full { background: var(--color-brand); border-color: var(--color-brand); }
-  .dot.half { border-color: var(--color-brand); background: linear-gradient(90deg, var(--color-brand) 50%, transparent 50%); }
-  .dot.busy { border-color: var(--color-text-muted); border-top-color: transparent; animation: spin 0.6s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
 
   .scope-hint {
     display: flex; align-items: center; gap: 7px;
@@ -377,12 +331,9 @@
   .add-path { font-size: var(--text-caption); color: var(--color-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .add-div { height: 1px; margin: 4px 0; background: var(--color-border); }
 
-  .dest.flash { animation: destFlash 1.2s var(--motion-ease-out, ease-out); }
-  @keyframes destFlash {
-    0%, 100% { background: transparent; }
-    25% { background: var(--color-brand-subtle, color-mix(in srgb, var(--color-brand) 16%, transparent)); }
-  }
-
   .legend { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; font-size: var(--text-caption); color: var(--color-text-muted); }
+  .dot { width: 16px; height: 16px; border: 1.5px solid var(--color-border-strong, var(--color-text-muted)); border-radius: 999px; box-sizing: border-box; }
+  .dot.full { border-color: var(--color-brand); background: var(--color-brand); }
+  .dot.half { border-color: var(--color-brand); background: linear-gradient(90deg, var(--color-brand) 50%, transparent 50%); }
   .legend .dot { width: 13px; height: 13px; }
 </style>

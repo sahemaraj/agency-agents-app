@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import ActivityIcon from "@lucide/svelte/icons/activity";
   import DownloadIcon from "@lucide/svelte/icons/download";
   import Trash2 from "@lucide/svelte/icons/trash-2";
@@ -14,22 +15,37 @@
   import { install } from "$lib/stores/install.svelte";
   import type { MessageKey } from "$lib/i18n/messages";
 
+  onMount(() => {
+    void activity.refreshMcpAudit();
+  });
+
   /** Lucide icon per journal action. */
   const ACTION_ICON = {
     install: DownloadIcon,
     uninstall: Trash2,
     update: RefreshIcon,
+    disable: ToggleRightIcon,
+    enable: ToggleRightIcon,
+    sourceAdd: PlusIcon,
+    sourceRefresh: RefreshIcon,
+    sourceRemove: Trash2,
     track: PlusIcon,
     switch: ToggleRightIcon,
     sync: RefreshIcon,
     bulk: LayersIcon,
+    mcp: ActivityIcon,
   } as const;
 
   /** Sentence-case verb shown at the head of each row. */
-  const ACTION_VERB: Record<JournalEntry["action"], MessageKey> = {
+  const ACTION_VERB: Record<Exclude<JournalEntry["action"], "mcp">, MessageKey> = {
     install: "activity.action.install",
     uninstall: "activity.action.uninstall",
     update: "activity.action.update",
+    disable: "activity.action.disable",
+    enable: "activity.action.enable",
+    sourceAdd: "activity.action.sourceAdd",
+    sourceRefresh: "activity.action.sourceRefresh",
+    sourceRemove: "activity.action.sourceRemove",
     track: "activity.action.track",
     switch: "activity.action.switch",
     sync: "activity.action.sync",
@@ -46,6 +62,9 @@
       naturally instead of "Verb + sentence-fragment". */
   function rowText(e: JournalEntry): string {
     const tool = e.tool ? install.toolLabel(e.tool) : "";
+    if (e.action === "mcp") {
+      return `${e.subjectName ?? "MCP"} · ${e.detail ?? "read"}`;
+    }
     // Default-target toggle: the tool IS the subject, detail is the descriptor.
     if (e.action === "switch") {
       return tool ? `${tool} · ${e.detail ?? i18n.t("common.defaultTargetChanged")}` : (e.detail ?? i18n.t("common.defaultTargetChanged"));
@@ -55,7 +74,7 @@
       return e.detail ?? i18n.t(ACTION_VERB[e.action]);
     }
     // Single-agent ops: "Verb agent → Tool · project".
-    let s = `${i18n.t(ACTION_VERB[e.action])} ${e.agentName ?? e.agentSlug ?? ""}`.trim();
+    let s = `${i18n.t(ACTION_VERB[e.action])} ${e.subjectName ?? e.agentName ?? e.agentSlug ?? ""}`.trim();
     if (tool) s += ` → ${tool}`;
     if (e.scope === "project" && e.projectPath) s += ` · ${basename(e.projectPath)}`;
     return s;
@@ -110,12 +129,12 @@
 </script>
 
 <section class="hist">
-  {#if activity.entries.length > 0}
+  {#if activity.hasLocalEntries}
     <header class="panel-head" data-tauri-drag-region>
       <span class="action-wrap" data-tauri-drag-region="false">
         <Button size="sm" variant="ghost" onclick={() => activity.clear()}>
           {#snippet icon()}<Trash2 size={14} />{/snippet}
-          {i18n.t("common.clear")}
+          {i18n.t("activity.clearLocal")}
         </Button>
       </span>
     </header>
@@ -145,8 +164,16 @@
                 class="status-dot"
                 class:ok={e.outcome === "ok"}
                 class:fail={e.outcome === "error"}
-                aria-label={e.outcome === "error" ? i18n.t("common.failed") : i18n.t("common.succeeded")}
-                title={e.outcome === "error" ? (e.detail ?? i18n.t("common.failed")) : i18n.t("common.succeeded")}
+                aria-label={e.outcome === "pending"
+                  ? i18n.t("activity.pending")
+                  : e.outcome === "error"
+                    ? i18n.t("common.failed")
+                    : i18n.t("common.succeeded")}
+                title={e.outcome === "pending"
+                  ? i18n.t("activity.pending")
+                  : e.outcome === "error"
+                    ? (e.detail ?? i18n.t("common.failed"))
+                    : i18n.t("common.succeeded")}
               ></span>
             </li>
           {/each}

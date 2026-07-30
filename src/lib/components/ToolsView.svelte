@@ -320,7 +320,7 @@
       const next = { ...(s.toolPaths ?? {}) };
       if (path) next[tool] = path;
       else delete next[tool];
-      await settingsSet({ ...s, toolPaths: next });
+      await settingsSet({ toolPaths: next });
       await install.loadTools(); // re-detect against the new base
     } catch (e) {
       toast.error("Could not save install location", String(e));

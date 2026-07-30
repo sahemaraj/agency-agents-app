@@ -32,6 +32,7 @@
   import { install } from "$lib/stores/install.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
   import { projects } from "$lib/stores/projects.svelte";
+  import { skillSources } from "$lib/stores/skillSources.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { toast } from "$lib/stores/toast.svelte";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
@@ -40,7 +41,10 @@
 
   onMount(() => {
     corpus.ensureLoaded();
-    projects.refresh();
+    void (async () => {
+      await projects.refresh();
+      await skillSources.reconcileInstalls(projects.list.map((project) => project.path));
+    })();
   });
 
   // ── Per-project roster: rows we (or anyone) deployed into that exact path. ──
@@ -60,6 +64,12 @@
 
   function rosterFor(path: string): InstalledAgent[] {
     return rowsByProject.get(path) ?? [];
+  }
+
+  function skillsFor(path: string) {
+    return skillSources.installed.filter(
+      (installed) => installed.tracked && installed.projectPath === path,
+    );
   }
 
   // ── Selected project (detail pane). Resolve against the live list so a stale
@@ -122,7 +132,7 @@
   // ── Remove a project: a confirm dialog with two choices (#44). ──
   // Snapshot label/count at open time so they stay stable across the async op
   // (reconcile mutates projects.list mid-flight).
-  let confirm = $state<{ path: string; label: string; count: number } | null>(null);
+  let confirm = $state<{ path: string; label: string; agentCount: number; skillCount: number } | null>(null);
   let deleteBusy = $state(false);
 
   function finishRemove(path: string) {
@@ -155,6 +165,14 @@
     try {
       const targets = rosterFor(path).map((r) => ({ slug: r.slug, tool: r.tool, projectPath: path }));
       if (targets.length > 0) await install.bulk("uninstall", targets);
+      for (const skill of skillsFor(path)) {
+        const removed = await skillSources.lifecycle(
+          "uninstall",
+          skill,
+          projects.list.map((project) => project.path),
+        );
+        if (!removed) throw new Error(`Could not uninstall skill ${skill.name}`);
+      }
       projects.unregister(path);
       finishRemove(path);
     } catch (e) {
@@ -191,7 +209,7 @@
       <span class="dh-count">{i18n.count(selected.installedCount, "common.agent.one", "common.agent.many")}</span>
       <button class="btn" onclick={() => reveal(selected.path)}><FolderOpen size={15} /><span>{i18n.t("common.reveal")}</span></button>
       <button class="btn primary" onclick={() => (browseFor = selected.path)}>{i18n.t("teams.deploy")}</button>
-      <button class="btn danger-ic" title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, count: selected.installedCount })}><Trash2 size={15} /></button>
+      <button class="btn danger-ic" title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: selected.installedCount, skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
     </header>
 
     <div class="scroll">
@@ -282,20 +300,20 @@
 {#if confirm}
   <Modal open title={i18n.t("projects.deleteTitle", { project: confirm.label })} defaultFocus="cancel" onClose={() => (confirm = null)}>
     <p class="del-body">
-      {#if (confirm?.count ?? 0) > 0}
-        {i18n.t("projects.deleteBody", { project: confirm.label, count: confirm.count })}
+      {#if (confirm?.agentCount ?? 0) + (confirm?.skillCount ?? 0) > 0}
+        {i18n.t("projects.deleteBodyWithSkills", { project: confirm.label, agents: confirm.agentCount, skills: confirm.skillCount })}
       {:else}
         {i18n.t("projects.deleteEmptyBody", { project: confirm.label })}
       {/if}
     </p>
-    {#if (confirm?.count ?? 0) > 0}
+    {#if (confirm?.agentCount ?? 0) + (confirm?.skillCount ?? 0) > 0}
       <p class="del-note">{i18n.t("projects.deleteExplain")}</p>
     {/if}
     {#snippet actions()}
       <Button variant="secondary" modalAction="cancel" onclick={() => (confirm = null)}>{i18n.t("common.cancel")}</Button>
-      {#if (confirm?.count ?? 0) > 0}
+      {#if (confirm?.agentCount ?? 0) + (confirm?.skillCount ?? 0) > 0}
         <Button variant="danger" disabled={deleteBusy} onclick={uninstallAndRemove}>
-          {i18n.t("projects.deleteUninstall", { count: confirm?.count ?? 0 })}
+          {i18n.t("projects.deleteUninstall", { count: (confirm?.agentCount ?? 0) + (confirm?.skillCount ?? 0) })}
         </Button>
       {/if}
       <Button variant="primary" modalAction="confirm" disabled={deleteBusy} onclick={forgetProject}>{i18n.t("projects.deleteKeep")}</Button>

@@ -18,6 +18,14 @@ mod util;
 
 use commands::*;
 
+pub async fn run_mcp() -> Result<(), String> {
+    skills::mcp::serve().await
+}
+
+pub async fn run_mcp_http(bind: std::net::SocketAddr, token: String) -> Result<(), String> {
+    skills::mcp::serve_http(bind, token).await
+}
+
 // =============================================================
 // Phase 15 — Updater minisign public key
 // =============================================================
@@ -137,7 +145,13 @@ pub fn run() {
             app_version,
             settings_get,
             settings_set,
+            mcp_policy_set,
+            mcp_clients_status,
+            mcp_client_connect,
+            mcp_client_disconnect,
+            mcp_client_repair,
             settings_reset,
+            state::mcp_audit_list,
             github_repo_stats,
             github_status,
             github_signin_start,
@@ -171,10 +185,22 @@ pub fn run() {
             corpus::catalog_check_updates,
             corpus::runbooks_list,
             skills::skill_sources_list,
+            skills::skill_sources_inspect,
+            skills::skill_package_destinations,
+            skills::skill_install,
+            skills::skill_update,
+            skills::skill_disable,
+            skills::skill_enable,
+            skills::skill_uninstall,
+            skills::skill_backups_list,
+            skills::skill_installs_reconcile,
             skills::skill_source_add_local,
             skills::skill_source_add_github,
             skills::skill_source_refresh,
             skills::skill_source_remove,
+            skills::drafts::skill_drafts_list,
+            skills::drafts::skill_draft_publish,
+            skills::drafts::skill_draft_reject,
             // Phase 2 — install + reconcile (contracts.md §C). The cross-tool
             // agent state layer: render/ledger/reconcile/tools/projects.
             install::install_agent,

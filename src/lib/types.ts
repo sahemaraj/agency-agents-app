@@ -58,7 +58,30 @@ export interface Settings {
       user-scope installs + detection resolve against it instead of the OS home
       (e.g. pointing Claude Code at a WSL home). Absent/empty = OS home. */
   toolPaths: Record<string, string>;
+  /** MCP mutations are opt-in by class; read tools remain available. */
+  mcpSourceAccess: boolean;
+  mcpInstallAccess: boolean;
+  mcpDestructiveAccess: boolean;
+  /** Exact canonical project roots MCP mutations may target. */
+  mcpProjectAllowlist: string[];
 }
+
+export type GeneralSettingsPatch = Partial<
+  Pick<
+    Settings,
+    | "paranoidMode"
+    | "catalogStaleBannerDays"
+    | "caskIconMode"
+    | "trendingTtlMinutes"
+    | "githubEnabled"
+    | "aiFeaturesEnabled"
+    | "updateAutoCheck"
+    | "enhancedTrendingEnabled"
+    | "vulnerabilityScanningEnabled"
+    | "liveEnrichmentEnabled"
+    | "toolPaths"
+  >
+>;
 
 /** Defaults matching the Rust `Settings::default()`. Used when seeding
     the settings store before the first `settingsGet` resolves so the UI
@@ -86,6 +109,10 @@ export const SETTINGS_DEFAULTS: Settings = {
   liveEnrichmentEnabled: false,
   // Per-tool custom install base paths. Empty by default (all tools use ~).
   toolPaths: {},
+  mcpSourceAccess: false,
+  mcpInstallAccess: false,
+  mcpDestructiveAccess: false,
+  mcpProjectAllowlist: [],
 };
 
 // =========================================================
@@ -349,10 +376,67 @@ export interface SkillPackageResult {
   installable: boolean;
 }
 
+export type SkillDraftState = "pending" | "published" | "rejected";
+
+export interface SkillDraftFile {
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface SkillDraft {
+  id: string;
+  submittedAt: string;
+  state: SkillDraftState;
+  treeHash: string;
+  files: SkillDraftFile[];
+  validation: SkillPackageResult;
+  publishedSourceId: string | null;
+}
+
 export interface SkillSourceResult {
   source: SkillSource;
   packages: SkillPackageResult[];
   errors: SkillValidationError[];
+}
+
+export interface SkillDestinationPresence {
+  runtime: "claudeCode" | "codex";
+  scope: "user" | "project";
+  projectPath: string | null;
+  path: string;
+  present: boolean;
+}
+
+export type SkillInstallState =
+  | "current"
+  | "outdated"
+  | "modified"
+  | "missing"
+  | "foreign"
+  | "disabled"
+  | "sourceUnavailable";
+
+export interface InstalledSkill {
+  sourceId: string;
+  relativePath: string;
+  name: string;
+  runtime: "claudeCode" | "codex";
+  scope: "user" | "project";
+  projectPath: string | null;
+  path: string;
+  state: SkillInstallState;
+  tracked: boolean;
+}
+
+export interface McpAuditEntry {
+  id: string;
+  timestamp: string;
+  tool: string;
+  action: "read" | "source" | "install" | "destructive" | "unknown";
+  phase: "attempt" | "terminal";
+  success: boolean;
+  projectPath: string | null;
 }
 
 /**
@@ -604,6 +688,17 @@ export interface ProjectInfo {
   installedCount: number;
 }
 
+export type McpClient = "claude" | "codex";
+export type McpClientState = "missing" | "exact" | "conflict" | "unavailable";
+
+export interface McpClientStatus {
+  client: McpClient;
+  installed: boolean;
+  state: McpClientState;
+  command: string;
+  detail: string;
+}
+
 // =========================================================
 // UI-only types (frontend stores, command palette, etc.)
 // =========================================================
@@ -626,6 +721,7 @@ export type ThemePreference = "light" | "dark" | "system";
 export type SettingsSection =
   | "appearance"
   | "catalog"
+  | "mcp"
   | "network"
   | "github"
   | "activity"

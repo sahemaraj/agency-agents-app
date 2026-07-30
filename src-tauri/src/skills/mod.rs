@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
-use std::fs::{File, Metadata};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tauri::State;
@@ -11,12 +12,17 @@ use uuid::Uuid;
 use crate::corpus::state_dir;
 use crate::error::AppError;
 use crate::github::url::parse_github_url;
-use crate::state::AppState;
+use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
-    SkillPackageFile, SkillPackageResult, SkillSource, SkillSourceKind, SkillSourceResult,
-    SkillValidationCode, SkillValidationError,
+    InstalledSkill, SkillDestinationPresence, SkillFileContent, SkillInstallRecord,
+    SkillInstallState, SkillPackageFile, SkillPackageResult, SkillSource, SkillSourceKind,
+    SkillSourceResult, SkillValidationCode, SkillValidationError,
 };
 use crate::util::fs::atomic_write;
+
+pub mod drafts;
+mod install;
+pub mod mcp;
 
 pub const MAX_SKILL_FILES: usize = 512;
 pub const MAX_SKILL_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -44,6 +50,73 @@ fn record_refresh_fs(event: &'static str) {
 fn record_refresh_fs(_: &'static str) {}
 
 #[cfg(test)]
+type UninstallMissingProbe = Box<dyn FnOnce(&Path) + Send>;
+
+#[cfg(test)]
+fn uninstall_missing_probes() -> &'static std::sync::Mutex<HashMap<PathBuf, UninstallMissingProbe>>
+{
+    static PROBES: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, UninstallMissingProbe>>> =
+        std::sync::OnceLock::new();
+    PROBES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_uninstall_missing_probe(target: PathBuf, probe: UninstallMissingProbe) {
+    uninstall_missing_probes()
+        .lock()
+        .expect("uninstall missing probes")
+        .insert(target, probe);
+}
+
+#[cfg(test)]
+fn after_missing_uninstall_validation(target: &Path) {
+    if let Some(probe) = uninstall_missing_probes()
+        .lock()
+        .expect("uninstall missing probes")
+        .remove(target)
+    {
+        probe(target);
+    }
+}
+
+#[cfg(not(test))]
+fn after_missing_uninstall_validation(_: &Path) {}
+
+#[cfg(test)]
+type UninstallBeforeQuarantineProbe = Box<dyn FnOnce(&Path) + Send>;
+
+#[cfg(test)]
+fn uninstall_before_quarantine_probes(
+) -> &'static std::sync::Mutex<HashMap<PathBuf, UninstallBeforeQuarantineProbe>> {
+    static PROBES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, UninstallBeforeQuarantineProbe>>,
+    > = std::sync::OnceLock::new();
+    PROBES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_uninstall_before_quarantine_probe(target: PathBuf, probe: UninstallBeforeQuarantineProbe) {
+    uninstall_before_quarantine_probes()
+        .lock()
+        .expect("uninstall before quarantine probes")
+        .insert(target, probe);
+}
+
+#[cfg(test)]
+fn before_uninstall_quarantine(target: &Path) {
+    if let Some(probe) = uninstall_before_quarantine_probes()
+        .lock()
+        .expect("uninstall before quarantine probes")
+        .remove(target)
+    {
+        probe(target);
+    }
+}
+
+#[cfg(not(test))]
+fn before_uninstall_quarantine(_: &Path) {}
+
+#[cfg(test)]
 fn reset_refresh_fs_probe() {
     refresh_fs_probe()
         .lock()
@@ -58,6 +131,62 @@ fn take_refresh_fs_probe() -> RefreshFsProbe {
 
 pub(crate) fn skill_sources_path(app_data_dir: &Path) -> PathBuf {
     state_dir(app_data_dir).join("skill-sources.json")
+}
+
+fn lock_skill_sources(app_data_dir: &Path) -> Result<File, AppError> {
+    let directory = state_dir(app_data_dir);
+    std::fs::create_dir_all(&directory).map_err(|error| AppError::Io {
+        message: format!("create state dir {}: {error}", directory.display()),
+    })?;
+    let path = directory.join("skill-sources.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .map_err(|error| AppError::Io {
+            message: format!("open skill source lock {}: {error}", path.display()),
+        })?;
+    file.lock().map_err(|error| AppError::Io {
+        message: format!("lock skill source state {}: {error}", path.display()),
+    })?;
+    Ok(file)
+}
+
+fn lock_skill_installs(app_data_dir: &Path) -> Result<File, AppError> {
+    let directory = state_dir(app_data_dir);
+    std::fs::create_dir_all(&directory).map_err(|error| AppError::Io {
+        message: format!("create state dir {}: {error}", directory.display()),
+    })?;
+    let path = directory.join("skill-installs.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .map_err(|error| AppError::Io {
+            message: format!("open skill install lock {}: {error}", path.display()),
+        })?;
+    file.lock().map_err(|error| AppError::Io {
+        message: format!("lock skill install state {}: {error}", path.display()),
+    })?;
+    Ok(file)
+}
+
+async fn lock_skill_sources_async(app_data_dir: PathBuf) -> Result<File, AppError> {
+    tokio::task::spawn_blocking(move || lock_skill_sources(&app_data_dir))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("skill source lock task failed: {error}"),
+        })?
+}
+
+async fn lock_skill_installs_async(app_data_dir: PathBuf) -> Result<File, AppError> {
+    tokio::task::spawn_blocking(move || lock_skill_installs(&app_data_dir))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("skill install lock task failed: {error}"),
+        })?
 }
 
 pub(crate) async fn load_skill_sources(app_data_dir: &Path) -> Result<Vec<SkillSource>, AppError> {
@@ -92,6 +221,15 @@ pub(crate) async fn add_local_source(
     state: &AppState,
     root: &Path,
 ) -> Result<SkillSource, AppError> {
+    ensure_local_source(state, root)
+        .await
+        .map(|(source, _)| source)
+}
+
+pub(crate) async fn ensure_local_source(
+    state: &AppState,
+    root: &Path,
+) -> Result<(SkillSource, bool), AppError> {
     if !root.is_absolute() {
         return Err(AppError::InvalidArgument {
             message: "local skill source root must be absolute".into(),
@@ -121,11 +259,12 @@ pub(crate) async fn add_local_source(
     let root_string = canonical_root.to_string_lossy().into_owned();
 
     let _guard = state.skill_sources_write_lock.lock().await;
+    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
     let mut sources = load_skill_sources(&state.app_data_dir).await?;
     if let Some(existing) = sources.iter().find(
         |source| matches!(&source.kind, SkillSourceKind::Local { root } if root == &root_string),
     ) {
-        return Ok(existing.clone());
+        return Ok((existing.clone(), false));
     }
 
     let source = SkillSource {
@@ -134,7 +273,7 @@ pub(crate) async fn add_local_source(
     };
     sources.push(source.clone());
     save_skill_sources(&state.app_data_dir, &sources).await?;
-    Ok(source)
+    Ok((source, true))
 }
 
 pub(crate) async fn remove_skill_source(
@@ -142,6 +281,7 @@ pub(crate) async fn remove_skill_source(
     source_id: &str,
 ) -> Result<bool, AppError> {
     let _guard = state.skill_sources_write_lock.lock().await;
+    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
     let mut sources = load_skill_sources(&state.app_data_dir).await?;
     let original_len = sources.len();
     sources.retain(|source| source.id != source_id);
@@ -230,6 +370,7 @@ pub(crate) async fn add_github_source(
     let subdirectory = validated_subdirectory(subdirectory)?;
 
     let _guard = state.skill_sources_write_lock.lock().await;
+    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
     let mut sources = load_skill_sources(&state.app_data_dir).await?;
     if let Some(existing) = sources.iter().find(|source| {
         matches!(
@@ -319,6 +460,7 @@ async fn refresh_git_source_from(
 ) -> Result<SkillSourceResult, AppError> {
     state.require_network("skill_source_refresh").await?;
     let _guard = state.skill_sources_write_lock.lock().await;
+    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
     let mut sources = load_skill_sources(&state.app_data_dir).await?;
     let source_index = sources
         .iter()
@@ -509,6 +651,118 @@ pub(crate) async fn discover_source(source: SkillSource) -> Result<SkillSourceRe
         })?
 }
 
+pub(crate) async fn inspect_skill_sources(
+    state: &AppState,
+) -> Result<Vec<SkillSourceResult>, AppError> {
+    let sources = load_skill_sources(&state.app_data_dir).await?;
+    let mut results = Vec::with_capacity(sources.len());
+    for source in sources {
+        match discover_source(source.clone()).await {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(SkillSourceResult {
+                source,
+                packages: Vec::new(),
+                errors: vec![SkillValidationError {
+                    code: SkillValidationCode::Io,
+                    path: ".".into(),
+                    message: error.to_string(),
+                }],
+            }),
+        }
+    }
+    Ok(results)
+}
+
+pub(crate) async fn refresh_skill_source(
+    state: &AppState,
+    source_id: &str,
+) -> Result<SkillSourceResult, AppError> {
+    let source = load_skill_sources(&state.app_data_dir)
+        .await?
+        .into_iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("unknown skill source id: {source_id}"),
+        })?;
+    match source.kind {
+        SkillSourceKind::Local { .. } => discover_source(source).await,
+        SkillSourceKind::Github { .. } => refresh_git_source(state, source_id).await,
+    }
+}
+
+pub(crate) async fn refresh_all_skill_sources(
+    state: &AppState,
+) -> Result<Vec<SkillSourceResult>, AppError> {
+    let sources = load_skill_sources(&state.app_data_dir).await?;
+    let mut results = Vec::with_capacity(sources.len());
+    for source in sources {
+        match refresh_skill_source(state, &source.id).await {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(SkillSourceResult {
+                source,
+                packages: Vec::new(),
+                errors: vec![SkillValidationError {
+                    code: SkillValidationCode::Io,
+                    path: ".".into(),
+                    message: error.to_string(),
+                }],
+            }),
+        }
+    }
+    Ok(results)
+}
+
+fn destination(
+    root: &Path,
+    runtime: &str,
+    scope: &str,
+    project_path: Option<String>,
+    name: &str,
+) -> SkillDestinationPresence {
+    let path = root.join(if runtime == "claudeCode" {
+        ".claude/skills"
+    } else {
+        ".agents/skills"
+    });
+    let path = path.join(name);
+    SkillDestinationPresence {
+        runtime: runtime.into(),
+        scope: scope.into(),
+        project_path,
+        present: std::fs::symlink_metadata(&path).is_ok(),
+        path: path.to_string_lossy().into_owned(),
+    }
+}
+
+pub(crate) fn skill_destination_presence(
+    home: &Path,
+    project_paths: &[String],
+    name: &str,
+) -> Vec<SkillDestinationPresence> {
+    let mut destinations = vec![
+        destination(home, "claudeCode", "user", None, name),
+        destination(home, "codex", "user", None, name),
+    ];
+    for project_path in project_paths {
+        let root = Path::new(project_path);
+        destinations.push(destination(
+            root,
+            "claudeCode",
+            "project",
+            Some(project_path.clone()),
+            name,
+        ));
+        destinations.push(destination(
+            root,
+            "codex",
+            "project",
+            Some(project_path.clone()),
+            name,
+        ));
+    }
+    destinations
+}
+
 fn discover_source_blocking(source: SkillSource) -> Result<SkillSourceResult, AppError> {
     let root = match &source.kind {
         SkillSourceKind::Local { root } => PathBuf::from(root),
@@ -637,6 +891,292 @@ fn discover_source_blocking(source: SkillSource) -> Result<SkillSourceResult, Ap
     })
 }
 
+fn resolved_source_root(source: &SkillSource) -> Result<PathBuf, AppError> {
+    match &source.kind {
+        SkillSourceKind::Local { root } => Ok(PathBuf::from(root)),
+        SkillSourceKind::Github {
+            active_checkout: Some(root),
+            ..
+        } => Ok(PathBuf::from(root)),
+        SkillSourceKind::Github { .. } => Err(AppError::InvalidArgument {
+            message: "GitHub source has no active checkout".into(),
+        }),
+    }
+}
+
+pub(crate) struct ResolvedSkillPackage {
+    root: PathBuf,
+    package: SkillPackageResult,
+}
+
+impl ResolvedSkillPackage {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn files(&self) -> &[SkillPackageFile] {
+        &self.package.files
+    }
+
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.package.name.as_deref()
+    }
+}
+
+pub(crate) async fn resolve_skill_package(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+) -> Result<ResolvedSkillPackage, AppError> {
+    let source = load_skill_sources(&state.app_data_dir)
+        .await?
+        .into_iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("unknown skill source id: {source_id}"),
+        })?;
+    let package = discover_source(source.clone())
+        .await?
+        .packages
+        .into_iter()
+        .find(|package| package.relative_path == relative_path && package.installable)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("unknown installable skill package: {relative_path}"),
+        })?;
+    let source_root = canonical_skill_source_root(&source)?;
+    let root =
+        std::fs::canonicalize(source_root.join(&package.relative_path)).map_err(|error| {
+            AppError::InvalidArgument {
+                message: format!(
+                    "could not resolve skill package {}: {error}",
+                    package.relative_path
+                ),
+            }
+        })?;
+    let metadata = std::fs::symlink_metadata(&root).map_err(|error| AppError::Io {
+        message: format!("inspect skill package {}: {error}", root.display()),
+    })?;
+    if !root.starts_with(&source_root)
+        || !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "skill package escaped or is not a real directory".into(),
+        });
+    }
+    Ok(ResolvedSkillPackage { root, package })
+}
+
+pub(crate) async fn list_skill_files(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+) -> Result<Vec<SkillPackageFile>, AppError> {
+    Ok(resolve_skill_package(state, source_id, relative_path)
+        .await?
+        .package
+        .files)
+}
+
+pub(crate) async fn read_skill_file(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    file_path: &str,
+) -> Result<SkillFileContent, AppError> {
+    let package = resolve_skill_package(state, source_id, relative_path).await?;
+    let file_path = normalized_requested_file_path(file_path)?;
+    let file = package
+        .package
+        .files
+        .iter()
+        .find(|file| file.relative_path == file_path)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("skill file is not in the validated inventory: {file_path}"),
+        })?;
+    let path = package.root.join(&file.relative_path);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| AppError::Io {
+        message: format!("inspect skill file {}: {error}", path.display()),
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "skill file is not a real regular file".into(),
+        });
+    }
+    let path = std::fs::canonicalize(&path).map_err(|error| AppError::Io {
+        message: format!("resolve skill file {}: {error}", path.display()),
+    })?;
+    if !path.starts_with(&package.root) {
+        return Err(AppError::InvalidArgument {
+            message: "skill file escaped its validated package".into(),
+        });
+    }
+    let bytes =
+        read_bounded(&path, MAX_SKILL_FILE_BYTES).map_err(|error| AppError::InvalidArgument {
+            message: error.message(),
+        })?;
+    if bytes.len() as u64 != file.size_bytes
+        || format!("{:x}", Sha256::digest(&bytes)) != file.sha256
+    {
+        return Err(AppError::InvalidArgument {
+            message: "skill file changed since validation; refresh the source before reading"
+                .into(),
+        });
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(SkillFileContent {
+            relative_path: file.relative_path.clone(),
+            mime_type: "text/plain".into(),
+            text: Some(text),
+            base64: None,
+        }),
+        Err(error) => Ok(SkillFileContent {
+            relative_path: file.relative_path.clone(),
+            mime_type: "application/octet-stream".into(),
+            text: None,
+            base64: Some(base64::engine::general_purpose::STANDARD.encode(error.into_bytes())),
+        }),
+    }
+}
+
+fn canonical_skill_source_root(source: &SkillSource) -> Result<PathBuf, AppError> {
+    let root = resolved_source_root(source)?;
+    let metadata = std::fs::symlink_metadata(&root).map_err(|error| AppError::InvalidArgument {
+        message: format!("could not inspect skill source {}: {error}", root.display()),
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "skill source root must be a real directory".into(),
+        });
+    }
+    std::fs::canonicalize(&root).map_err(|error| AppError::InvalidArgument {
+        message: format!("could not resolve skill source {}: {error}", root.display()),
+    })
+}
+
+fn normalized_requested_file_path(file_path: &str) -> Result<String, AppError> {
+    if file_path.is_empty() || file_path.contains('\\') {
+        return Err(AppError::InvalidArgument {
+            message: "skill file path must be a normalized relative path".into(),
+        });
+    }
+    let parts = Path::new(file_path)
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_str().ok_or_else(|| AppError::InvalidArgument {
+                message: "skill file path must be valid UTF-8".into(),
+            }),
+            _ => Err(AppError::InvalidArgument {
+                message: "skill file path must be a normalized relative path".into(),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let normalized = parts.join("/");
+    if normalized.is_empty() || normalized != file_path {
+        return Err(AppError::InvalidArgument {
+            message: "skill file path must be a normalized relative path".into(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn canonical_target_base(path: &Path) -> Result<PathBuf, AppError> {
+    if !path.is_absolute() {
+        return Err(AppError::InvalidArgument {
+            message: "skill target root must be absolute".into(),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| AppError::InvalidArgument {
+        message: format!(
+            "could not inspect skill target root {}: {error}",
+            path.display()
+        ),
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "skill target root must be a real directory: {}",
+                path.display()
+            ),
+        });
+    }
+    std::fs::canonicalize(path).map_err(|error| AppError::InvalidArgument {
+        message: format!(
+            "could not resolve skill target root {}: {error}",
+            path.display()
+        ),
+    })
+}
+
+fn reject_linked_destination_ancestors(base: &Path, destination: &Path) -> Result<(), AppError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "skill destination has no parent".into(),
+        })?;
+    let relative = parent
+        .strip_prefix(base)
+        .map_err(|_| AppError::InvalidArgument {
+            message: "skill destination escaped its target root".into(),
+        })?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) =>
+            {
+                return Err(AppError::InvalidArgument {
+                    message: format!(
+                        "skill destination contains a linked ancestor: {}",
+                        current.display()
+                    ),
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(AppError::InvalidArgument {
+                    message: format!(
+                        "skill destination ancestor is not a directory: {}",
+                        current.display()
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect skill destination {}: {error}", current.display()),
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+fn installed_view(record: &SkillInstallRecord, state: SkillInstallState) -> InstalledSkill {
+    InstalledSkill {
+        source_id: record.source_id.clone(),
+        relative_path: record.relative_path.clone(),
+        name: record.name.clone(),
+        runtime: record.runtime.clone(),
+        scope: record.scope.clone(),
+        project_path: record.project_path.clone(),
+        path: record.dest.clone(),
+        state,
+        tracked: true,
+    }
+}
+
 fn read_directory_sorted(directory: &Path) -> Result<Vec<(PathBuf, Metadata)>, AppError> {
     let mut entries = std::fs::read_dir(directory)
         .map_err(|error| AppError::Io {
@@ -657,7 +1197,7 @@ fn read_directory_sorted(directory: &Path) -> Result<Vec<(PathBuf, Metadata)>, A
     Ok(entries)
 }
 
-fn validate_package(
+pub(crate) fn validate_package(
     source_id: &str,
     source_root: &Path,
     package_root: &Path,
@@ -1075,13 +1615,13 @@ pub(crate) fn is_windows_reparse_point(attributes: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
+pub(crate) fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     is_windows_reparse_point(metadata.file_attributes())
 }
 
 #[cfg(not(windows))]
-fn metadata_is_reparse_point(_: &Metadata) -> bool {
+pub(crate) fn metadata_is_reparse_point(_: &Metadata) -> bool {
     false
 }
 
@@ -1099,6 +1639,1120 @@ fn metadata_is_executable(_: &Metadata) -> bool {
 #[tauri::command]
 pub async fn skill_sources_list(state: State<'_, AppState>) -> Result<Vec<SkillSource>, AppError> {
     load_skill_sources(&state.app_data_dir).await
+}
+
+#[tauri::command]
+pub async fn skill_sources_inspect(
+    state: State<'_, AppState>,
+) -> Result<Vec<SkillSourceResult>, AppError> {
+    inspect_skill_sources(&state).await
+}
+
+#[tauri::command]
+pub async fn skill_package_destinations(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    project_paths: Vec<String>,
+) -> Result<Vec<SkillDestinationPresence>, AppError> {
+    let source = load_skill_sources(&state.app_data_dir)
+        .await?
+        .into_iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("unknown skill source id: {source_id}"),
+        })?;
+    let result = discover_source(source).await?;
+    let package = result
+        .packages
+        .into_iter()
+        .find(|package| package.relative_path == relative_path && package.installable)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("unknown installable skill package: {relative_path}"),
+        })?;
+    let name = package.name.ok_or_else(|| AppError::InvalidArgument {
+        message: format!("installable skill package has no name: {relative_path}"),
+    })?;
+    let home = dirs::home_dir().ok_or_else(|| AppError::Io {
+        message: "could not resolve home directory".into(),
+    })?;
+    Ok(skill_destination_presence(&home, &project_paths, &name))
+}
+
+pub(crate) async fn install_skill(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<InstalledSkill, AppError> {
+    install_skill_authorized(state, source_id, relative_path, runtime, project_path, None).await
+}
+
+pub(crate) async fn install_skill_authorized(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<InstalledSkill, AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
+    let package = resolve_skill_package(state, source_id, relative_path).await?;
+    let name = package
+        .name()
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: format!("installable skill package has no name: {relative_path}"),
+        })?;
+
+    let home = dirs::home_dir().ok_or_else(|| AppError::Io {
+        message: "could not resolve home directory".into(),
+    })?;
+    let project = authorized_project_base(project_path, project_authorization)?;
+    let base = match project.as_deref() {
+        Some(project) => project.to_path_buf(),
+        None => canonical_target_base(&home)?,
+    };
+    let destination = install::target_path(&base, project.as_deref(), &runtime, &name)?;
+    if project_authorization.is_none() {
+        reject_linked_destination_ancestors(&base, &destination)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
+            if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+                return Err(AppError::InvalidArgument {
+                    message: format!("skill destination is a link: {}", destination.display()),
+                });
+            }
+        }
+    }
+
+    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let old_records = records.clone();
+    let project_string = project
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let existing_index = records.iter().position(|record| {
+        record.source_id == source_id
+            && record.relative_path == relative_path
+            && record.runtime == runtime
+            && record.project_path == project_string
+    });
+    let source_hash = install::validated_tree_hash(package.root(), package.files())?;
+    let replace_managed = if let Some(index) = existing_index {
+        let record = &records[index];
+        let (_, recorded_destination) =
+            record_destination_authorized(record, project_authorization)?;
+        if recorded_destination != destination {
+            return Err(AppError::InvalidArgument {
+                message: "tracked skill destination does not match the requested target".into(),
+            });
+        }
+        if record.disabled_path.is_some() {
+            return Err(AppError::InvalidArgument {
+                message: "disabled skills are managed in Phase 4".into(),
+            });
+        }
+        match mutation_tree_hash(project_authorization, &destination)? {
+            Some(disk_hash) if disk_hash != record.installed_hash => {
+                return Err(AppError::InvalidArgument {
+                    message: "skill destination has local modifications".into(),
+                })
+            }
+            Some(_) if record.source_hash == source_hash => {
+                return Ok(installed_view(record, SkillInstallState::Current))
+            }
+            Some(_) => true,
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    let installed_hash = source_hash.clone();
+    let record = SkillInstallRecord {
+        source_id: source_id.into(),
+        relative_path: relative_path.into(),
+        name,
+        runtime: runtime.into(),
+        scope: if project.is_some() { "project" } else { "user" }.into(),
+        project_path: project_string,
+        dest: destination.to_string_lossy().into_owned(),
+        source_hash,
+        installed_hash,
+        installed_at: chrono::Utc::now().to_rfc3339(),
+        disabled_path: None,
+    };
+    if let Some(index) = existing_index {
+        records[index] = record.clone();
+    } else {
+        records.push(record.clone());
+    }
+
+    install::save_ledger(&state.app_data_dir, &records).await?;
+    let backups = state.app_data_dir.join("skill-backups");
+    let install_result = match project_authorization {
+        Some(authorization) => install::install_validated_directory_in_project(
+            authorization.root(),
+            package.root(),
+            package.files(),
+            &install::project_target_path(runtime, &record.name)?,
+            &backups,
+            replace_managed,
+        ),
+        None => install::install_validated_directory(
+            package.root(),
+            package.files(),
+            &destination,
+            &backups,
+            replace_managed,
+        ),
+    };
+    if let Err(error) = install_result {
+        return match install::save_ledger(&state.app_data_dir, &old_records).await {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error("install skill", error, rollback)),
+        };
+    }
+    Ok(installed_view(&record, SkillInstallState::Current))
+}
+
+fn skill_record_index(
+    records: &[SkillInstallRecord],
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: &Option<String>,
+) -> Result<usize, AppError> {
+    records
+        .iter()
+        .position(|record| {
+            record.source_id == source_id
+                && record.relative_path == relative_path
+                && record.runtime == runtime
+                && &record.project_path == project_path
+        })
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "unknown tracked skill installation".into(),
+        })
+}
+
+fn authorized_project_base(
+    project_path: Option<&str>,
+    authorization: Option<&AuthorizedMcpProject>,
+) -> Result<Option<PathBuf>, AppError> {
+    match authorization {
+        Some(authorization) => {
+            if project_path != Some(authorization.identity()) {
+                return Err(AppError::InvalidArgument {
+                    message: "MCP project capability does not match the requested project".into(),
+                });
+            }
+            Ok(Some(PathBuf::from(authorization.identity())))
+        }
+        None => project_path
+            .map(|path| canonical_target_base(Path::new(path)))
+            .transpose(),
+    }
+}
+
+fn canonical_project_string_authorized(
+    project_path: Option<&str>,
+    authorization: Option<&AuthorizedMcpProject>,
+) -> Result<Option<String>, AppError> {
+    match authorization {
+        Some(authorization) => {
+            if project_path != Some(authorization.identity()) {
+                return Err(AppError::InvalidArgument {
+                    message: "MCP project capability does not match the requested project".into(),
+                });
+            }
+            Ok(Some(authorization.identity().to_owned()))
+        }
+        None => canonical_project_string(project_path),
+    }
+}
+
+fn canonical_project_string(project_path: Option<&str>) -> Result<Option<String>, AppError> {
+    project_path
+        .map(|path| stored_project_base(path).map(|path| path.to_string_lossy().into_owned()))
+        .transpose()
+}
+
+fn stored_project_base(path: &str) -> Result<PathBuf, AppError> {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "tracked project path must be an absolute normalized path".into(),
+        });
+    }
+    let canonical = path
+        .ancestors()
+        .find_map(|ancestor| {
+            std::fs::canonicalize(ancestor)
+                .ok()
+                .map(|base| (ancestor, base))
+        })
+        .map(|(ancestor, base)| {
+            path.strip_prefix(ancestor)
+                .map(|suffix| base.join(suffix))
+                .unwrap_or(base)
+        })
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "tracked project path has no resolvable absolute ancestor".into(),
+        })?;
+    match std::fs::symlink_metadata(&canonical) {
+        Ok(_) => canonical_target_base(&canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(canonical),
+        Err(error) => Err(AppError::Io {
+            message: format!(
+                "inspect tracked project path {}: {error}",
+                canonical.display()
+            ),
+        }),
+    }
+}
+
+fn record_destination(record: &SkillInstallRecord) -> Result<(PathBuf, PathBuf), AppError> {
+    let project = record
+        .project_path
+        .as_deref()
+        .map(stored_project_base)
+        .transpose()?;
+    let base = match (&record.scope[..], project.as_deref()) {
+        ("project", Some(project)) => project.to_path_buf(),
+        ("user", None) => {
+            canonical_target_base(&dirs::home_dir().ok_or_else(|| AppError::Io {
+                message: "could not resolve home directory".into(),
+            })?)?
+        }
+        _ => {
+            return Err(AppError::InvalidArgument {
+                message: "tracked skill has inconsistent scope and project path".into(),
+            })
+        }
+    };
+    let destination =
+        install::target_path(&base, project.as_deref(), &record.runtime, &record.name)?;
+    reject_linked_destination_ancestors(&base, &destination)?;
+    if record.dest != destination.to_string_lossy() {
+        return Err(AppError::InvalidArgument {
+            message: "tracked skill destination no longer matches its runtime, scope, and name"
+                .into(),
+        });
+    }
+    Ok((base, destination))
+}
+
+fn record_destination_authorized(
+    record: &SkillInstallRecord,
+    authorization: Option<&AuthorizedMcpProject>,
+) -> Result<(PathBuf, PathBuf), AppError> {
+    let Some(authorization) = authorization else {
+        return record_destination(record);
+    };
+    if record.scope != "project" || record.project_path.as_deref() != Some(authorization.identity())
+    {
+        return Err(AppError::InvalidArgument {
+            message: "tracked skill does not belong to the authorized MCP project".into(),
+        });
+    }
+    let base = PathBuf::from(authorization.identity());
+    let relative = install::project_target_path(&record.runtime, &record.name)?;
+    let destination = base.join(relative);
+    if record.dest != destination.to_string_lossy() {
+        return Err(AppError::InvalidArgument {
+            message: "tracked skill destination no longer matches its runtime, scope, and name"
+                .into(),
+        });
+    }
+    Ok((base, destination))
+}
+
+fn authorized_relative_path(
+    authorization: &AuthorizedMcpProject,
+    path: &Path,
+) -> Result<PathBuf, AppError> {
+    path.strip_prefix(Path::new(authorization.identity()))
+        .map(Path::to_path_buf)
+        .map_err(|_| AppError::InvalidArgument {
+            message: "tracked skill path is outside the authorized MCP project".into(),
+        })
+}
+
+fn mutation_tree_hash(
+    authorization: Option<&AuthorizedMcpProject>,
+    path: &Path,
+) -> Result<Option<String>, AppError> {
+    match authorization {
+        Some(authorization) => install::project_tree_hash(
+            authorization.root(),
+            &authorized_relative_path(authorization, path)?,
+        ),
+        None => skill_tree_hash(path),
+    }
+}
+
+fn mutation_rename(
+    authorization: Option<&AuthorizedMcpProject>,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), AppError> {
+    match authorization {
+        Some(authorization) => install::rename_project_directory(
+            authorization.root(),
+            &authorized_relative_path(authorization, source)?,
+            &authorized_relative_path(authorization, destination)?,
+        ),
+        None => install::disable_directory(source, destination),
+    }
+}
+
+fn mutation_uninstall(
+    authorization: Option<&AuthorizedMcpProject>,
+    destination: &Path,
+    backups: &Path,
+    modified: bool,
+) -> Result<Option<PathBuf>, AppError> {
+    match authorization {
+        Some(authorization) => install::uninstall_project_directory(
+            authorization.root(),
+            &authorized_relative_path(authorization, destination)?,
+            backups,
+            modified,
+        ),
+        None => install::uninstall_directory(destination, backups, modified),
+    }
+}
+
+fn disabled_destination(
+    record: &SkillInstallRecord,
+    base: &Path,
+    destination: &Path,
+) -> Result<PathBuf, AppError> {
+    let disabled = record
+        .disabled_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "skill is not disabled".into(),
+        })?;
+    let expected_parent = destination
+        .parent()
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "skill destination has no parent".into(),
+        })?;
+    if disabled.parent() != Some(expected_parent)
+        || !disabled
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".agency-disabled-"))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "tracked disabled skill path is outside its managed destination".into(),
+        });
+    }
+    reject_linked_destination_ancestors(base, &disabled)?;
+    Ok(disabled)
+}
+
+fn disabled_destination_authorized(
+    record: &SkillInstallRecord,
+    base: &Path,
+    destination: &Path,
+    authorization: Option<&AuthorizedMcpProject>,
+) -> Result<PathBuf, AppError> {
+    let Some(authorization) = authorization else {
+        return disabled_destination(record, base, destination);
+    };
+    if base != Path::new(authorization.identity()) {
+        return Err(AppError::InvalidArgument {
+            message: "tracked disabled skill is outside the authorized MCP project".into(),
+        });
+    }
+    let disabled = record
+        .disabled_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "skill is not disabled".into(),
+        })?;
+    let expected_parent = destination
+        .parent()
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "skill destination has no parent".into(),
+        })?;
+    if disabled.parent() != Some(expected_parent)
+        || !disabled
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".agency-disabled-"))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "tracked disabled skill path is outside its managed destination".into(),
+        });
+    }
+    authorized_relative_path(authorization, &disabled)?;
+    Ok(disabled)
+}
+
+fn skill_directory_present(path: &Path) -> Result<bool, AppError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("inspect skill directory {}: {error}", path.display()),
+            })
+        }
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "skill directory must be a real directory: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(true)
+}
+
+fn skill_tree_hash(path: &Path) -> Result<Option<String>, AppError> {
+    if !skill_directory_present(path)? {
+        return Ok(None);
+    }
+    install::tree_hash(path).map(Some)
+}
+
+fn rollback_error(action: &str, original: AppError, rollback: AppError) -> AppError {
+    AppError::Internal {
+        message: format!("{action} failed: {original}; rollback failed: {rollback}"),
+    }
+}
+
+async fn source_status(state: &AppState, record: &SkillInstallRecord) -> (bool, bool) {
+    match resolve_skill_package(state, &record.source_id, &record.relative_path).await {
+        Ok(package) => match install::validated_tree_hash(package.root(), package.files()) {
+            Ok(hash) => (true, hash == record.source_hash),
+            Err(_) => (false, false),
+        },
+        Err(_) => (false, false),
+    }
+}
+
+pub(crate) async fn update_skill(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<InstalledSkill, AppError> {
+    update_skill_authorized(state, source_id, relative_path, runtime, project_path, None).await
+}
+
+pub(crate) async fn update_skill_authorized(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<InstalledSkill, AppError> {
+    install_skill_authorized(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        project_path,
+        project_authorization,
+    )
+    .await
+}
+
+pub(crate) async fn disable_skill(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<InstalledSkill, AppError> {
+    disable_skill_authorized(state, source_id, relative_path, runtime, project_path, None).await
+}
+
+pub(crate) async fn disable_skill_authorized(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<InstalledSkill, AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
+    let project = canonical_project_string_authorized(project_path, project_authorization)?;
+    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
+    if records[index].disabled_path.is_some() {
+        let (base, destination) =
+            record_destination_authorized(&records[index], project_authorization)?;
+        let disabled = disabled_destination_authorized(
+            &records[index],
+            &base,
+            &destination,
+            project_authorization,
+        )?;
+        let hash = mutation_tree_hash(project_authorization, &disabled)?;
+        return Ok(installed_view(
+            &records[index],
+            install::classify(
+                hash.as_deref(),
+                &records[index].installed_hash,
+                true,
+                true,
+                true,
+            ),
+        ));
+    }
+    let (base, destination) =
+        record_destination_authorized(&records[index], project_authorization)?;
+    let disk_hash = mutation_tree_hash(project_authorization, &destination)?.ok_or_else(|| {
+        AppError::InvalidArgument {
+            message: "missing skills cannot be disabled".into(),
+        }
+    })?;
+    if disk_hash != records[index].installed_hash {
+        return Err(AppError::InvalidArgument {
+            message: "modified skills cannot be disabled".into(),
+        });
+    }
+    let disabled = destination
+        .parent()
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "skill destination has no parent".into(),
+        })?
+        .join(format!(
+            ".agency-disabled-{}-{}",
+            Uuid::new_v4(),
+            records[index].name
+        ));
+    mutation_rename(project_authorization, &destination, &disabled)?;
+    let disabled_hash = match mutation_tree_hash(project_authorization, &disabled)? {
+        Some(hash) => hash,
+        None => {
+            let error = AppError::Internal {
+                message: "disabled skill disappeared during transition".into(),
+            };
+            return match mutation_rename(project_authorization, &disabled, &destination) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("disable skill", error, rollback)),
+            };
+        }
+    };
+    if disabled_hash != records[index].installed_hash {
+        let error = AppError::InvalidArgument {
+            message: "disabled skill changed during transition".into(),
+        };
+        return match mutation_rename(project_authorization, &disabled, &destination) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error("disable skill", error, rollback)),
+        };
+    }
+    if project_authorization.is_none() {
+        reject_linked_destination_ancestors(&base, &disabled)?;
+    }
+    records[index].disabled_path = Some(disabled.to_string_lossy().into_owned());
+    if let Err(error) = install::save_ledger(&state.app_data_dir, &records).await {
+        return match mutation_rename(project_authorization, &disabled, &destination) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error("disable skill", error, rollback)),
+        };
+    }
+    Ok(installed_view(
+        &records[index],
+        install::classify(
+            Some(&disabled_hash),
+            &records[index].installed_hash,
+            true,
+            true,
+            true,
+        ),
+    ))
+}
+
+pub(crate) async fn enable_skill(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<InstalledSkill, AppError> {
+    enable_skill_authorized(state, source_id, relative_path, runtime, project_path, None).await
+}
+
+pub(crate) async fn enable_skill_authorized(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<InstalledSkill, AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
+    let project = canonical_project_string_authorized(project_path, project_authorization)?;
+    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
+    let (base, destination) =
+        record_destination_authorized(&records[index], project_authorization)?;
+    let disabled = disabled_destination_authorized(
+        &records[index],
+        &base,
+        &destination,
+        project_authorization,
+    )?;
+    mutation_tree_hash(project_authorization, &disabled)?.ok_or_else(|| {
+        AppError::InvalidArgument {
+            message: "disabled skill is missing".into(),
+        }
+    })?;
+    mutation_rename(project_authorization, &disabled, &destination)?;
+    let disk_hash = match mutation_tree_hash(project_authorization, &destination)? {
+        Some(hash) => hash,
+        None => {
+            let error = AppError::Internal {
+                message: "enabled skill disappeared during transition".into(),
+            };
+            return match mutation_rename(project_authorization, &destination, &disabled) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("enable skill", error, rollback)),
+            };
+        }
+    };
+    records[index].disabled_path = None;
+    if let Err(error) = install::save_ledger(&state.app_data_dir, &records).await {
+        return match mutation_rename(project_authorization, &destination, &disabled) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error("enable skill", error, rollback)),
+        };
+    }
+    let (source_available, source_current) = source_status(state, &records[index]).await;
+    Ok(installed_view(
+        &records[index],
+        install::classify(
+            Some(&disk_hash),
+            &records[index].installed_hash,
+            source_available,
+            source_current,
+            false,
+        ),
+    ))
+}
+
+pub(crate) async fn uninstall_skill(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<bool, AppError> {
+    uninstall_skill_authorized(state, source_id, relative_path, runtime, project_path, None).await
+}
+
+pub(crate) async fn uninstall_skill_authorized(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<bool, AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
+    let project = canonical_project_string_authorized(project_path, project_authorization)?;
+    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
+    let record = records[index].clone();
+    let (base, destination) = record_destination_authorized(&record, project_authorization)?;
+    let target = if record.disabled_path.is_some() {
+        disabled_destination_authorized(&record, &base, &destination, project_authorization)?
+    } else {
+        destination
+    };
+    let mut project_target = project_authorization
+        .map(|authorization| {
+            install::project_directory_capability(
+                authorization.root(),
+                &authorized_relative_path(authorization, &target)?,
+            )
+        })
+        .transpose()?;
+    let old_records = records.clone();
+    records.remove(index);
+    let target_hash = match project_target.as_ref() {
+        Some(capability) => install::project_capability_tree_hash(capability)?,
+        None => mutation_tree_hash(None, &target)?,
+    };
+    if target_hash.is_none() {
+        after_missing_uninstall_validation(&target);
+        install::save_ledger(&state.app_data_dir, &records).await?;
+        return Ok(true);
+    }
+    let quarantine = target
+        .parent()
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "skill target has no parent".into(),
+        })?
+        .join(format!(
+            ".agency-uninstall-{}-{}",
+            Uuid::new_v4(),
+            record.name
+        ));
+    before_uninstall_quarantine(&target);
+    if let Some(capability) = project_target.as_mut() {
+        install::rename_project_capability(
+            capability,
+            quarantine
+                .file_name()
+                .expect("generated quarantine has a name")
+                .to_os_string(),
+        )?;
+    } else {
+        mutation_rename(None, &target, &quarantine)?;
+    }
+    let disk_hash = match project_target.as_ref() {
+        Some(capability) => install::project_capability_tree_hash(capability),
+        None => mutation_tree_hash(None, &quarantine),
+    };
+    let disk_hash = match disk_hash {
+        Ok(Some(hash)) => hash,
+        Ok(None) => {
+            let error = AppError::Internal {
+                message: "quarantined skill disappeared during uninstall".into(),
+            };
+            let restore = match project_target.as_mut() {
+                Some(capability) => install::rename_project_capability(
+                    capability,
+                    target
+                        .file_name()
+                        .expect("skill target has a name")
+                        .to_os_string(),
+                ),
+                None => mutation_rename(None, &quarantine, &target),
+            };
+            return match restore {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("uninstall skill", error, rollback)),
+            };
+        }
+        Err(error) => {
+            let restore = match project_target.as_mut() {
+                Some(capability) => install::rename_project_capability(
+                    capability,
+                    target
+                        .file_name()
+                        .expect("skill target has a name")
+                        .to_os_string(),
+                ),
+                None => mutation_rename(None, &quarantine, &target),
+            };
+            return match restore {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("uninstall skill", error, rollback)),
+            };
+        }
+    };
+    let modified = disk_hash != record.installed_hash;
+    if let Err(error) = install::save_ledger(&state.app_data_dir, &records).await {
+        let restore = match project_target.as_mut() {
+            Some(capability) => install::rename_project_capability(
+                capability,
+                target
+                    .file_name()
+                    .expect("skill target has a name")
+                    .to_os_string(),
+            ),
+            None => mutation_rename(None, &quarantine, &target),
+        };
+        return match restore {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error("uninstall skill", error, rollback)),
+        };
+    }
+    let removal = match project_target.as_ref() {
+        Some(capability) => install::uninstall_project_capability(
+            capability,
+            &state.app_data_dir.join("skill-backups"),
+            modified,
+        ),
+        None => mutation_uninstall(
+            None,
+            &quarantine,
+            &state.app_data_dir.join("skill-backups"),
+            modified,
+        ),
+    };
+    if let Err(error) = removal {
+        #[cfg(windows)]
+        if project_target.is_some() {
+            return Err(error);
+        }
+        let ledger = install::save_ledger(&state.app_data_dir, &old_records).await;
+        let restore = match project_target.as_mut() {
+            Some(capability) => install::rename_project_capability(
+                capability,
+                target
+                    .file_name()
+                    .expect("skill target has a name")
+                    .to_os_string(),
+            ),
+            None => mutation_rename(None, &quarantine, &target),
+        };
+        return match (ledger, restore) {
+            (Ok(()), Ok(())) => Err(error),
+            (Err(rollback), Ok(())) | (Ok(()), Err(rollback)) => {
+                Err(rollback_error("uninstall skill", error, rollback))
+            }
+            (Err(ledger), Err(restore)) => Err(AppError::Internal {
+                message: format!(
+                    "uninstall skill failed: {error}; ledger rollback failed: {ledger}; target restore failed: {restore}"
+                ),
+            }),
+        };
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn skill_backups_list(state: State<'_, AppState>) -> Result<Vec<String>, AppError> {
+    let directory = state.app_data_dir.join("skill-backups");
+    let mut backups = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("read skill backups {}: {error}", directory.display()),
+            })
+        }
+    };
+    backups.sort();
+    Ok(backups)
+}
+
+pub(crate) async fn reconcile_skill_installs(
+    state: &AppState,
+    project_paths: &[String],
+) -> Result<Vec<InstalledSkill>, AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
+    let sources = inspect_skill_sources(state).await?;
+    let mut packages = HashMap::new();
+    for result in &sources {
+        for package in result.packages.iter().filter(|package| package.installable) {
+            if let Some(name) = &package.name {
+                let root = resolved_source_root(&result.source)?;
+                let hash = install::tree_hash(&root.join(&package.relative_path))?;
+                packages.insert(
+                    (result.source.id.clone(), package.relative_path.clone()),
+                    (name.clone(), hash),
+                );
+            }
+        }
+    }
+
+    let home = dirs::home_dir().ok_or_else(|| AppError::Io {
+        message: "could not resolve home directory".into(),
+    })?;
+    let home = canonical_target_base(&home)?;
+    let projects = project_paths
+        .iter()
+        .map(|path| canonical_target_base(Path::new(path)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let records = install::load_ledger(&state.app_data_dir).await?;
+    let mut output = Vec::new();
+    let mut tracked_destinations = HashSet::new();
+    for record in &records {
+        let (base, destination) = record_destination(record)?;
+        tracked_destinations.insert(destination.to_string_lossy().into_owned());
+        let source = packages.get(&(record.source_id.clone(), record.relative_path.clone()));
+        let disk_hash = if record.disabled_path.is_some() {
+            let disabled = disabled_destination(record, &base, &destination)?;
+            skill_tree_hash(&disabled)?
+        } else if std::fs::symlink_metadata(&record.dest).is_ok() {
+            skill_tree_hash(&destination)?
+        } else {
+            None
+        };
+        let state = install::classify(
+            disk_hash.as_deref(),
+            &record.installed_hash,
+            source.is_some(),
+            source.is_some_and(|(_, hash)| hash == &record.source_hash),
+            record.disabled_path.is_some(),
+        );
+        output.push(installed_view(record, state));
+    }
+
+    for result in sources {
+        for package in result
+            .packages
+            .into_iter()
+            .filter(|package| package.installable)
+        {
+            let Some(name) = package.name else { continue };
+            for runtime in ["claudeCode", "codex"] {
+                let mut targets = vec![(None, home.clone())];
+                targets.extend(
+                    projects
+                        .iter()
+                        .cloned()
+                        .map(|project| (Some(project.to_string_lossy().into_owned()), project)),
+                );
+                for (project_path, base) in targets {
+                    let project = project_path.is_some().then_some(base.as_path());
+                    let destination = install::target_path(&home, project, runtime, &name)?;
+                    let dest = destination.to_string_lossy().into_owned();
+                    if tracked_destinations.contains(&dest)
+                        || std::fs::symlink_metadata(&destination).is_err()
+                    {
+                        continue;
+                    }
+                    tracked_destinations.insert(dest.clone());
+                    output.push(InstalledSkill {
+                        source_id: result.source.id.clone(),
+                        relative_path: package.relative_path.clone(),
+                        name: name.clone(),
+                        runtime: runtime.into(),
+                        scope: if project_path.is_some() {
+                            "project"
+                        } else {
+                            "user"
+                        }
+                        .into(),
+                        project_path,
+                        path: dest,
+                        state: SkillInstallState::Foreign,
+                        tracked: false,
+                    });
+                }
+            }
+        }
+    }
+    output.sort_by(|left, right| {
+        (&left.name, &left.runtime, &left.project_path).cmp(&(
+            &right.name,
+            &right.runtime,
+            &right.project_path,
+        ))
+    });
+    Ok(output)
+}
+
+#[tauri::command]
+pub async fn skill_install(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<InstalledSkill, AppError> {
+    install_skill(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_update(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<InstalledSkill, AppError> {
+    update_skill(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_disable(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<InstalledSkill, AppError> {
+    disable_skill(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_enable(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<InstalledSkill, AppError> {
+    enable_skill(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_uninstall(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<bool, AppError> {
+    uninstall_skill(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_installs_reconcile(
+    state: State<'_, AppState>,
+    project_paths: Vec<String>,
+) -> Result<Vec<InstalledSkill>, AppError> {
+    reconcile_skill_installs(&state, &project_paths).await
 }
 
 #[tauri::command]
@@ -1130,17 +2784,7 @@ pub async fn skill_source_refresh(
     state: State<'_, AppState>,
     source_id: String,
 ) -> Result<SkillSourceResult, AppError> {
-    let source = load_skill_sources(&state.app_data_dir)
-        .await?
-        .into_iter()
-        .find(|source| source.id == source_id)
-        .ok_or_else(|| AppError::InvalidArgument {
-            message: format!("unknown skill source id: {source_id}"),
-        })?;
-    match source.kind {
-        SkillSourceKind::Local { .. } => discover_source(source).await,
-        SkillSourceKind::Github { .. } => refresh_git_source(&state, &source_id).await,
-    }
+    refresh_skill_source(&state, &source_id).await
 }
 
 #[tauri::command]
@@ -1155,22 +2799,45 @@ pub async fn skill_source_remove(
 mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     use serde_json::json;
     use sha2::Digest;
     use tempfile::tempdir;
 
     use super::{
-        add_github_source, add_local_source, discover_source, is_windows_reparse_point,
-        load_skill_sources, refresh_git_source_from, remove_skill_source, reset_refresh_fs_probe,
-        skill_sources_path, take_refresh_fs_probe, validate_package, MAX_SKILL_FILES,
-        MAX_SKILL_FILE_BYTES,
+        add_github_source, add_local_source, discover_source, ensure_local_source,
+        inspect_skill_sources, is_windows_reparse_point, load_skill_sources, read_skill_file,
+        refresh_git_source_from, remove_skill_source, reset_refresh_fs_probe,
+        resolve_skill_package, skill_destination_presence, skill_sources_path,
+        take_refresh_fs_probe, validate_package, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
     };
+
+    #[test]
+    fn source_state_lock_serializes_independent_writers() {
+        let root = tempdir().expect("app data");
+        let first = super::lock_skill_sources(root.path()).expect("first lock");
+        let path = root.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _second = super::lock_skill_sources(&path).expect("second lock");
+            tx.send(()).expect("signal acquired");
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("second writer acquires after release");
+        waiter.join().expect("waiter");
+    }
     use crate::commands::settings::{Settings, SettingsLoadState};
     use crate::error::AppError;
     use crate::state::AppState;
-    use crate::types::{SkillSource, SkillSourceKind, SkillValidationCode};
+    use crate::types::{SkillInstallState, SkillSource, SkillSourceKind, SkillValidationCode};
 
     fn test_state(app_data_dir: &Path) -> AppState {
         let mut state = AppState::build().expect("build app state");
@@ -1240,6 +2907,168 @@ mod tests {
 
     async fn set_settings(state: &AppState, value: SettingsLoadState) {
         *state.settings.write().await = value;
+    }
+
+    #[tokio::test]
+    async fn inspection_reads_registered_sources_without_refreshing_them() {
+        let app = tempdir().expect("app data");
+        let source_root = tempdir().expect("source");
+        let state = test_state(app.path());
+        write_skill(
+            source_root.path(),
+            "skills/reviewer",
+            "reviewer",
+            "Reviews changes",
+        );
+        add_local_source(&state, source_root.path())
+            .await
+            .expect("register source");
+
+        let results = inspect_skill_sources(&state)
+            .await
+            .expect("inspect sources");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].packages.len(), 1);
+        assert_eq!(results[0].packages[0].name.as_deref(), Some("reviewer"));
+    }
+
+    #[tokio::test]
+    async fn package_access_reads_only_the_validated_inventory() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let package = source.path().join("reviewer");
+        write_skill(&package, "", "reviewer", "Reviews changes");
+        std::fs::create_dir_all(package.join("references")).expect("reference directory");
+        std::fs::write(package.join("references/checklist.md"), b"# Checklist\n")
+            .expect("reference file");
+        std::fs::write(package.join("assets.bin"), [0, 159, 146, 150]).expect("binary file");
+        let state = test_state(app.path());
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+
+        let resolved = resolve_skill_package(&state, &registered.id, "reviewer")
+            .await
+            .expect("resolve validated package");
+        assert_eq!(
+            resolved
+                .files()
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["SKILL.md", "assets.bin", "references/checklist.md"]
+        );
+
+        let text = read_skill_file(
+            &state,
+            &registered.id,
+            "reviewer",
+            "references/checklist.md",
+        )
+        .await
+        .expect("read listed text file");
+        assert_eq!(text.mime_type, "text/plain");
+        assert_eq!(text.text.as_deref(), Some("# Checklist\n"));
+        assert!(text.base64.is_none());
+
+        let binary = read_skill_file(&state, &registered.id, "reviewer", "assets.bin")
+            .await
+            .expect("read listed binary file");
+        assert_eq!(binary.mime_type, "application/octet-stream");
+        assert!(binary.text.is_none());
+        assert_eq!(binary.base64.as_deref(), Some("AJ+Slg=="));
+
+        for path in ["unlisted.md", "../Cargo.toml", "references/../../SKILL.md"] {
+            assert!(
+                read_skill_file(&state, &registered.id, "reviewer", path)
+                    .await
+                    .is_err(),
+                "unlisted or traversal path {path:?} was accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn package_access_rejects_invalid_and_oversize_packages() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let invalid = source.path().join("invalid");
+        write_skill(&invalid, "", "invalid", "Invalid package");
+        std::fs::write(invalid.join("run.sh"), b"#!/bin/sh\n").expect("unsafe file");
+        let oversized = source.path().join("oversized");
+        write_skill(&oversized, "", "oversized", "Oversized package");
+        std::fs::write(
+            oversized.join("too-large.bin"),
+            vec![0; MAX_SKILL_FILE_BYTES as usize + 1],
+        )
+        .expect("oversized file");
+        let state = test_state(app.path());
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+
+        for relative_path in ["invalid", "oversized"] {
+            assert!(
+                resolve_skill_package(&state, &registered.id, relative_path)
+                    .await
+                    .is_err(),
+                "invalid package {relative_path:?} was resolved"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn package_access_rejects_linked_entries() {
+        use std::os::unix::fs::symlink;
+
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let package = source.path().join("linked");
+        write_skill(&package, "", "linked", "Linked package");
+        symlink("SKILL.md", package.join("reference.md")).expect("linked file");
+        let state = test_state(app.path());
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+
+        assert!(resolve_skill_package(&state, &registered.id, "linked")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn destination_presence_reports_only_existing_exact_skill_directories() {
+        let home = tempdir().expect("home");
+        let project = tempdir().expect("project");
+        std::fs::create_dir_all(home.path().join(".claude/skills/reviewer"))
+            .expect("create Claude user skill");
+        std::fs::create_dir_all(project.path().join(".agents/skills/reviewer"))
+            .expect("create Codex project skill");
+
+        let destinations = skill_destination_presence(
+            home.path(),
+            &[project.path().to_string_lossy().into_owned()],
+            "reviewer",
+        );
+
+        assert_eq!(destinations.len(), 4);
+        assert!(destinations.iter().any(|destination| {
+            destination.runtime == "claudeCode"
+                && destination.scope == "user"
+                && destination.present
+        }));
+        assert!(destinations.iter().any(|destination| {
+            destination.runtime == "codex" && destination.scope == "project" && destination.present
+        }));
+        assert_eq!(
+            destinations
+                .iter()
+                .filter(|destination| destination.present)
+                .count(),
+            2
+        );
     }
 
     async fn register_test_github(
@@ -1818,6 +3647,27 @@ mod tests {
         assert!(persisted.iter().any(|source| source.id == second_source.id));
     }
 
+    #[tokio::test]
+    async fn concurrent_same_local_source_has_one_atomic_creator() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let state = Arc::new(test_state(app.path()));
+
+        let tasks = (0..2).map(|_| {
+            let state = Arc::clone(&state);
+            let root = source.path().to_path_buf();
+            tokio::spawn(async move { ensure_local_source(&state, &root).await })
+        });
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.expect("join").expect("ensure source"));
+        }
+
+        assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
+        assert_eq!(results[0].0.id, results[1].0.id);
+        assert_eq!(load_skill_sources(app.path()).await.expect("load").len(), 1);
+    }
+
     #[test]
     fn validation_matrix() {
         let source = tempdir().expect("source");
@@ -2180,6 +4030,590 @@ mod tests {
             }),
             "{:?}",
             package.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn core_lifecycle_uses_the_requested_project_runtime_and_states() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        let canonical_project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+
+        let claude = super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "claudeCode",
+            Some(&project_path),
+        )
+        .await
+        .expect("install Claude project skill");
+        assert_eq!(claude.scope, "project");
+        assert_eq!(claude.runtime, "claudeCode");
+        assert_eq!(
+            claude.project_path.as_deref(),
+            Some(canonical_project.as_str())
+        );
+        assert_eq!(
+            Path::new(&claude.path),
+            Path::new(&canonical_project).join(".claude/skills/reviewer")
+        );
+
+        let installed = super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install Codex project skill");
+        assert_eq!(installed.scope, "project");
+        assert_eq!(installed.runtime, "codex");
+        assert_eq!(
+            installed.project_path.as_deref(),
+            Some(canonical_project.as_str())
+        );
+        assert_eq!(
+            Path::new(&installed.path),
+            Path::new(&canonical_project).join(".agents/skills/reviewer")
+        );
+
+        let reconciled = super::reconcile_skill_installs(&state, &[project_path.clone()])
+            .await
+            .expect("reconcile current skill");
+        assert!(reconciled.iter().any(|skill| {
+            skill.path == installed.path && skill.state == SkillInstallState::Current
+        }));
+
+        let disabled = super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("disable skill");
+        assert_eq!(disabled.state, SkillInstallState::Disabled);
+        assert!(!Path::new(&installed.path).exists());
+
+        let enabled = super::enable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("enable skill");
+        assert_eq!(enabled.state, SkillInstallState::Current);
+        assert!(Path::new(&installed.path).is_dir());
+
+        std::fs::write(
+            source.path().join("reviewer/SKILL.md"),
+            "---\nname: reviewer\ndescription: Reviews changes\n---\n# Updated reviewer\n",
+        )
+        .expect("update source");
+        let updated = super::update_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("update skill");
+        assert_eq!(updated.state, SkillInstallState::Current);
+        assert!(
+            std::fs::read_to_string(Path::new(&updated.path).join("SKILL.md"))
+                .expect("read updated skill")
+                .contains("# Updated reviewer")
+        );
+
+        std::fs::write(Path::new(&updated.path).join("LOCAL.md"), b"keep me")
+            .expect("modify installed skill");
+        assert!(super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .is_err());
+        assert!(super::uninstall_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("uninstall modified skill"));
+        assert!(!Path::new(&updated.path).exists());
+        assert!(state.app_data_dir.join("skill-backups").is_dir());
+    }
+
+    #[tokio::test]
+    async fn install_ledger_lock_serializes_independent_app_states() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let first_state = Arc::new(test_state(app.path()));
+        let second_state = Arc::new(test_state(app.path()));
+        let registered = add_local_source(&first_state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        let first = super::lock_skill_installs(app.path()).expect("first process lock");
+        let second = Arc::clone(&second_state);
+        let source_id = registered.id.clone();
+        let mut waiter = tokio::spawn(async move {
+            super::install_skill(
+                &second,
+                &source_id,
+                "reviewer",
+                "codex",
+                Some(&project_path),
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let second_installed = waiter
+            .await
+            .expect("second app state join")
+            .expect("second app state install");
+        assert!(Path::new(&second_installed.path).is_dir());
+        let installed = super::install_skill(
+            &first_state,
+            &registered.id,
+            "reviewer",
+            "claudeCode",
+            Some(project.path().to_string_lossy().as_ref()),
+        )
+        .await
+        .expect("first app state install");
+        assert!(Path::new(&installed.path).is_dir());
+    }
+
+    #[test]
+    fn rollback_errors_include_the_original_and_restore_failures() {
+        let error = super::rollback_error(
+            "disable skill",
+            AppError::Io {
+                message: "save ledger".into(),
+            },
+            AppError::Io {
+                message: "restore directory".into(),
+            },
+        );
+        assert!(error.to_string().contains("save ledger"));
+        assert!(error.to_string().contains("restore directory"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_rejects_renamed_and_replaced_disabled_roots() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        let installed = super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install skill");
+
+        let mut records = super::install::load_ledger(&state.app_data_dir)
+            .await
+            .expect("load ledger");
+        records[0].name = "renamed".into();
+        super::install::save_ledger(&state.app_data_dir, &records)
+            .await
+            .expect("seed renamed record");
+        assert!(super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .is_err());
+        assert!(Path::new(&installed.path).is_dir());
+
+        records[0].name = "reviewer".into();
+        super::install::save_ledger(&state.app_data_dir, &records)
+            .await
+            .expect("restore record");
+        let disabled = super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("disable skill");
+        let disabled_path = super::install::load_ledger(&state.app_data_dir)
+            .await
+            .expect("load disabled ledger")[0]
+            .disabled_path
+            .clone()
+            .expect("disabled path");
+        assert_eq!(disabled.state, SkillInstallState::Disabled);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = tempdir().expect("outside");
+            std::fs::remove_dir_all(&disabled_path).expect("remove disabled root");
+            symlink(outside.path(), &disabled_path).expect("replace disabled root with link");
+            assert!(super::enable_skill(
+                &state,
+                &registered.id,
+                "reviewer",
+                "codex",
+                Some(&project_path),
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_hashes_disabled_roots_before_reporting_disabled() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install skill");
+        super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("disable skill");
+        let disabled_path = super::install::load_ledger(&state.app_data_dir)
+            .await
+            .expect("load disabled ledger")[0]
+            .disabled_path
+            .clone()
+            .expect("disabled path");
+        std::fs::write(Path::new(&disabled_path).join("LOCAL.md"), b"modified")
+            .expect("modify disabled root");
+
+        let reconciled = super::reconcile_skill_installs(&state, &[project_path])
+            .await
+            .expect("reconcile disabled skill");
+        assert_eq!(reconciled[0].state, SkillInstallState::Modified);
+    }
+
+    #[tokio::test]
+    async fn missing_project_root_reconciles_missing_and_uninstalls_ledger_only() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install skill");
+        std::fs::rename(project.path(), app.path().join("unmounted-project"))
+            .expect("move project root away");
+
+        let reconciled = super::reconcile_skill_installs(&state, &[])
+            .await
+            .expect("reconcile missing project");
+        assert_eq!(reconciled[0].state, SkillInstallState::Missing);
+        assert!(super::uninstall_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("remove missing install ledger"));
+        assert!(super::install::load_ledger(&state.app_data_dir)
+            .await
+            .expect("load ledger")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn enable_reports_source_unavailable_after_restoring_the_active_directory() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install skill");
+        super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("disable skill");
+        std::fs::remove_dir_all(source.path().join("reviewer")).expect("remove source package");
+
+        let enabled = super::enable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("enable missing-source skill");
+        assert_eq!(enabled.state, SkillInstallState::SourceUnavailable);
+        assert!(Path::new(&enabled.path).is_dir());
+    }
+
+    #[tokio::test]
+    async fn uninstall_leaves_content_created_after_missing_validation_untouched() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        let installed = super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install skill");
+        std::fs::remove_dir_all(&installed.path).expect("remove validated target");
+        super::set_uninstall_missing_probe(
+            PathBuf::from(&installed.path),
+            Box::new(|target| {
+                std::fs::create_dir_all(target).expect("recreate target");
+                std::fs::write(target.join("LOCAL.md"), b"arrived after validation")
+                    .expect("write replacement content");
+            }),
+        );
+
+        assert!(super::uninstall_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("ledger-only uninstall"));
+        assert_eq!(
+            std::fs::read(Path::new(&installed.path).join("LOCAL.md"))
+                .expect("replacement content remains"),
+            b"arrived after validation"
+        );
+    }
+
+    #[test]
+    fn uninstall_missing_probes_are_isolated_by_target() {
+        let root = tempdir().expect("probe targets");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let first_called = Arc::new(AtomicBool::new(false));
+        let second_called = Arc::new(AtomicBool::new(false));
+        let first_called_by_probe = Arc::clone(&first_called);
+        let second_called_by_probe = Arc::clone(&second_called);
+        let expected_first = first.clone();
+        let expected_second = second.clone();
+        super::set_uninstall_missing_probe(
+            first.clone(),
+            Box::new(move |target| {
+                assert_eq!(target, expected_first);
+                first_called_by_probe.store(true, Ordering::SeqCst);
+            }),
+        );
+        super::set_uninstall_missing_probe(
+            second.clone(),
+            Box::new(move |target| {
+                assert_eq!(target, expected_second);
+                second_called_by_probe.store(true, Ordering::SeqCst);
+            }),
+        );
+
+        let first_thread =
+            std::thread::spawn(move || super::after_missing_uninstall_validation(&first));
+        let second_thread =
+            std::thread::spawn(move || super::after_missing_uninstall_validation(&second));
+        first_thread.join().expect("first probe");
+        second_thread.join().expect("second probe");
+
+        assert!(first_called.load(Ordering::SeqCst));
+        assert!(second_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn uninstall_backs_up_replacement_that_arrives_before_quarantine() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        let installed = super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install skill");
+        let target = PathBuf::from(&installed.path);
+        let displaced = target.with_file_name(".pre-quarantine-original");
+        super::set_uninstall_before_quarantine_probe(
+            target.clone(),
+            Box::new(move |target| {
+                std::fs::rename(target, &displaced).expect("displace original target");
+                std::fs::create_dir(target).expect("create replacement target");
+                std::fs::write(target.join("LOCAL.md"), b"replacement before quarantine")
+                    .expect("write replacement content");
+            }),
+        );
+
+        assert!(super::uninstall_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("uninstall replacement"));
+        let backups = std::fs::read_dir(state.app_data_dir.join("skill-backups"))
+            .expect("replacement backup")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("backup entries");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read(backups[0].path().join("LOCAL.md")).expect("backed-up replacement"),
+            b"replacement before quarantine"
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_restores_quarantined_target_when_ledger_write_fails() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+        let project_path = project.path().to_string_lossy().into_owned();
+        let installed = super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install skill");
+        let before = super::install::load_ledger(&state.app_data_dir)
+            .await
+            .expect("initial ledger");
+        let ledger = super::install::ledger_path(&state.app_data_dir);
+        std::fs::create_dir(ledger.with_extension("json.tmp")).expect("block atomic ledger temp");
+
+        assert!(super::uninstall_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .is_err());
+        assert!(Path::new(&installed.path).is_dir());
+        assert_eq!(
+            super::install::load_ledger(&state.app_data_dir)
+                .await
+                .expect("restored ledger"),
+            before
         );
     }
 }

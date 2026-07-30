@@ -4,7 +4,7 @@
  *
  * Drives the "Activity" view. This is NOT a live stream: each entry is a
  * single, already-resolved record appended after a backend action returns.
- * Entries are clearable.
+ * Local entries are clearable; durable MCP audit entries are not.
  *
  * Persistence: the journal is mirrored to localStorage so the Activity view
  * survives app restarts. The cap keeps the mirror bounded; older entries drop
@@ -14,7 +14,8 @@
  * as "the activity log silently empties."
  */
 
-import type { Tool } from "$lib/types";
+import { mcpAuditList } from "$lib/api";
+import type { McpAuditEntry, Tool } from "$lib/types";
 
 /** Bumped v1 -> v2: the persisted shape changed from streaming jobs to journal
  *  entries. The old v1 store was never populated (no backend emitted stream
@@ -31,13 +32,28 @@ export interface JournalEntry {
   id: string;
   /** ISO timestamp the action resolved. */
   ts: string;
-  action: "install" | "uninstall" | "update" | "track" | "switch" | "sync" | "bulk";
+  action:
+    | "install"
+    | "uninstall"
+    | "update"
+    | "disable"
+    | "enable"
+    | "sourceAdd"
+    | "sourceRefresh"
+    | "sourceRemove"
+    | "track"
+    | "switch"
+    | "sync"
+    | "bulk"
+    | "mcp";
+  subject?: "agent" | "skill" | "skillSource" | "mcp";
+  subjectName?: string;
   agentSlug?: string;
   agentName?: string;
   tool?: Tool;
   scope?: "user" | "project";
   projectPath?: string;
-  outcome: "ok" | "error";
+  outcome: "ok" | "error" | "pending";
   /** Free-form detail — error message, bulk summary ("3 agents"), etc. */
   detail?: string;
 }
@@ -47,10 +63,33 @@ interface PersistedShape {
   entries: JournalEntry[];
 }
 
+export function selectMcpAuditEntries(entries: McpAuditEntry[]): McpAuditEntry[] {
+  const selected = new Map<string, McpAuditEntry>();
+  for (const entry of entries) {
+    const current = selected.get(entry.id);
+    if (
+      !current
+      || (current.phase === "attempt" && entry.phase === "terminal")
+      || (
+        current.phase === entry.phase
+        && Date.parse(entry.timestamp) > Date.parse(current.timestamp)
+      )
+    ) {
+      selected.set(entry.id, entry);
+    }
+  }
+  return [...selected.values()].sort(
+    (left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp),
+  );
+}
+
 class ActivityStore {
   /** The journal, newest-first. */
   entries: JournalEntry[] = $state([]);
+  hasLocalEntries: boolean = $state(false);
 
+  private localEntries: JournalEntry[] = [];
+  private mcpEntries: JournalEntry[] = [];
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private hydrated = false;
 
@@ -66,15 +105,15 @@ class ActivityStore {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) {
         console.info("[activity] hydrate: no persisted entry (first launch or storage cleared)");
-        return;
+      } else {
+        const parsed = JSON.parse(raw) as PersistedShape;
+        if (!parsed || parsed.v !== 2 || !Array.isArray(parsed.entries)) {
+          console.warn("[activity] hydrate: persisted entry has unexpected shape; ignoring");
+        } else {
+          this.localEntries = parsed.entries.slice(0, MAX_ENTRIES);
+          console.info(`[activity] hydrate: restored ${parsed.entries.length} entry(ies) from localStorage`);
+        }
       }
-      const parsed = JSON.parse(raw) as PersistedShape;
-      if (!parsed || parsed.v !== 2 || !Array.isArray(parsed.entries)) {
-        console.warn("[activity] hydrate: persisted entry has unexpected shape; ignoring");
-        return;
-      }
-      this.entries = parsed.entries;
-      console.info(`[activity] hydrate: restored ${parsed.entries.length} entry(ies) from localStorage`);
     } catch (e) {
       console.warn(
         `[activity] hydrate failed (corrupt entry): ${
@@ -83,6 +122,8 @@ class ActivityStore {
       );
       try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
     }
+    this.mergeEntries();
+    void this.refreshMcpAudit();
   }
 
   /**
@@ -106,7 +147,7 @@ class ActivityStore {
   private persistNow(): void {
     if (typeof window === "undefined") return;
     try {
-      const trimmed = this.entries.slice(0, MAX_ENTRIES);
+      const trimmed = this.localEntries.slice(0, MAX_ENTRIES);
       const payload: PersistedShape = { v: 2, entries: trimmed };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch (e) {
@@ -128,15 +169,49 @@ class ActivityStore {
       id: crypto.randomUUID(),
       ts: new Date().toISOString(),
     };
-    this.entries = [full, ...this.entries].slice(0, MAX_ENTRIES);
+    this.localEntries = [full, ...this.localEntries].slice(0, MAX_ENTRIES);
+    this.mergeEntries();
     // Debounced so a bulk loop's per-item logs coalesce into one write.
     this.schedulePersist();
   }
 
-  /** Wipe the journal including the localStorage mirror. */
+  /** Wipe the local journal and its mirror; durable MCP audit entries remain. */
   clear(): void {
-    this.entries = [];
+    this.localEntries = [];
+    this.mergeEntries();
     this.persistNow();
+  }
+
+  async refreshMcpAudit(): Promise<void> {
+    try {
+      this.mcpEntries = selectMcpAuditEntries(await mcpAuditList())
+        .map((entry) => this.fromMcpAudit(entry));
+      this.mergeEntries();
+    } catch (error) {
+      console.warn(
+        `[activity] MCP audit load failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private fromMcpAudit(entry: McpAuditEntry): JournalEntry {
+    return {
+      id: `mcp:${entry.id}`,
+      ts: entry.timestamp,
+      action: "mcp",
+      subject: "mcp",
+      subjectName: entry.tool,
+      projectPath: entry.projectPath ?? undefined,
+      outcome: entry.phase === "attempt" ? "pending" : entry.success ? "ok" : "error",
+      detail: entry.action,
+    };
+  }
+
+  private mergeEntries(): void {
+    this.hasLocalEntries = this.localEntries.length > 0;
+    this.entries = [...this.localEntries, ...this.mcpEntries].sort(
+      (left, right) => Date.parse(right.ts) - Date.parse(left.ts),
+    );
   }
 }
 
