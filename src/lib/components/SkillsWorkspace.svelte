@@ -20,6 +20,8 @@
   import type { InstalledSkill, SkillDraft, SkillPackageResult, SkillSource, SkillSourceResult, SkillType } from "$lib/types";
 
   type StatusFilter = "all" | "ready" | "rejected";
+  type DetailTab = "overview" | "files" | "security";
+  type SortOrder = "name" | "type" | "source";
   type PackageView = { pkg: SkillPackageResult; source: SkillSource };
   type SkillGroupNode = { key: string; label: string; children: SkillGroupNode[]; packages: PackageView[] };
 
@@ -31,9 +33,12 @@
   let githubSubdirectory = $state("");
   let githubRegistrationRejected = $state(false);
   let query = $state("");
+  let searchInput: HTMLInputElement | undefined = $state();
   let statusFilter: StatusFilter = $state("all");
   let sourceFilter = $state("all");
-  let typeFilter: SkillType | "all" = $state("all");
+  let libraryFilter = $state("all");
+  let sortOrder: SortOrder = $state("name");
+  let detailTab: DetailTab = $state("overview");
   let selectedKey: string | null = $state(null);
   let uninstallCandidate: InstalledSkill | null = $state(null);
   let rejectDraftCandidate: SkillDraft | null = $state(null);
@@ -46,11 +51,18 @@
   );
   const filtered = $derived.by<PackageView[]>(() => {
     const q = query.trim().toLowerCase();
-    return packages.filter(({ pkg, source }) => {
+    const visible = packages.filter(({ pkg, source }) => {
       if (statusFilter === "ready" && !pkg.installable) return false;
       if (statusFilter === "rejected" && pkg.installable) return false;
       if (sourceFilter !== "all" && source.id !== sourceFilter) return false;
-      if (typeFilter !== "all" && pkg.skillType !== typeFilter) return false;
+      if (libraryFilter === "installed" && !isInstalled(pkg)) return false;
+      if (libraryFilter === "trusted" && !trustedScripts(pkg)) return false;
+      if (libraryFilter === "review" && pkg.installable && !requiresTrust(pkg)) return false;
+      if (libraryFilter.startsWith("taxonomy:")) {
+        const path = libraryFilter.slice("taxonomy:".length).split("/");
+        if (pkg.skillType !== path[0]) return false;
+        if (!path.slice(1).every((segment, index) => pkg.group[index] === segment)) return false;
+      }
       if (!q) return true;
       return [
         pkg.name ?? "",
@@ -62,10 +74,21 @@
         sourceLabel(source),
       ].some((value) => value.toLowerCase().includes(q));
     });
+    return visible.sort((left, right) => {
+      if (sortOrder === "type") {
+        const byType = typeLabel(left.pkg.skillType).localeCompare(typeLabel(right.pkg.skillType));
+        if (byType !== 0) return byType;
+      }
+      if (sortOrder === "source") {
+        const bySource = sourceLabel(left.source).localeCompare(sourceLabel(right.source));
+        if (bySource !== 0) return bySource;
+      }
+      return (left.pkg.name ?? left.pkg.relativePath).localeCompare(right.pkg.name ?? right.pkg.relativePath);
+    });
   });
   const grouped = $derived.by<SkillGroupNode[]>(() => {
     const roots = new Map<string, SkillGroupNode>();
-    for (const view of filtered) {
+    for (const view of packages) {
       let root = roots.get(view.pkg.skillType);
       if (!root) {
         root = { key: view.pkg.skillType, label: typeLabel(view.pkg.skillType), children: [], packages: [] };
@@ -120,6 +143,19 @@
     skillSources.installed.filter((record) => record.state === "sourceUnavailable"),
   );
   const pendingDrafts = $derived(skillSources.drafts.filter((draft) => draft.state === "pending"));
+  const installedCount = $derived(packages.filter(({ pkg }) => isInstalled(pkg)).length);
+  const trustedCount = $derived(packages.filter(({ pkg }) => trustedScripts(pkg)).length);
+  const reviewCount = $derived(packages.filter(({ pkg }) => !pkg.installable || requiresTrust(pkg)).length);
+  const libraryTitle = $derived.by(() => {
+    if (libraryFilter === "installed") return i18n.t("skills.installed");
+    if (libraryFilter === "trusted") return i18n.t("skills.trustedScripts");
+    if (libraryFilter === "review") return i18n.t("skills.needsReview");
+    if (libraryFilter.startsWith("taxonomy:")) {
+      const node = findGroup(grouped, libraryFilter.slice("taxonomy:".length));
+      return node?.label ?? i18n.t("skills.allSkills");
+    }
+    return i18n.t("skills.allSkills");
+  });
 
   $effect(() => {
     if (selectedKey !== null && !filtered.some(({ pkg }) => skillSources.packageKey(pkg) === selectedKey)) {
@@ -129,10 +165,18 @@
 
   onMount(() => {
     projects.hydrate();
+    const focusSearch = (event: KeyboardEvent): void => {
+      const target = event.target as HTMLElement | null;
+      if (event.key !== "/" || target?.matches("input, textarea, select, [contenteditable='true']")) return;
+      event.preventDefault();
+      searchInput?.focus();
+    };
+    document.addEventListener("keydown", focusSearch);
     void (async () => {
       await skillSources.load();
       await skillSources.reconcileInstalls(projects.list.map((project) => project.path));
     })();
+    return () => document.removeEventListener("keydown", focusSearch);
   });
 
   function sourceLabel(source: SkillSource): string {
@@ -163,6 +207,23 @@
 
   function groupCount(node: SkillGroupNode): number {
     return node.packages.length + node.children.reduce((count, child) => count + groupCount(child), 0);
+  }
+
+  function findGroup(nodes: SkillGroupNode[], key: string): SkillGroupNode | undefined {
+    for (const node of nodes) {
+      if (node.key === key) return node;
+      const child = findGroup(node.children, key);
+      if (child) return child;
+    }
+    return undefined;
+  }
+
+  function isInstalled(pkg: SkillPackageResult): boolean {
+    return skillSources.installed.some((record) =>
+      record.sourceId === pkg.sourceId
+      && record.relativePath === pkg.relativePath
+      && record.state !== "missing",
+    );
   }
 
   function formatBytes(bytes: number): string {
@@ -209,6 +270,7 @@
 
   function selectPackage(view: PackageView): void {
     selectedKey = skillSources.packageKey(view.pkg);
+    detailTab = "overview";
   }
 
   function installedAt(pkg: SkillPackageResult, runtime: string, projectPath: string | null): InstalledSkill | undefined {
@@ -359,9 +421,9 @@
   }
 </script>
 
-{#snippet packageRow(view: PackageView, depth: number)}
+{#snippet packageRow(view: PackageView)}
   {@const key = skillSources.packageKey(view.pkg)}
-  <li class="package-row" style:--tree-depth={depth}>
+  <li class="package-row">
     <button class:selected={selectedKey === key} aria-pressed={selectedKey === key} onclick={() => selectPackage(view)}>
       <span class="row-top">
         <strong>{view.pkg.name ?? view.pkg.relativePath}</strong>
@@ -370,7 +432,7 @@
         </span>
       </span>
       <span class="description">{view.pkg.description ?? i18n.t("skills.packageValidationFailed")}</span>
-      <span class="provenance">{sourceKind(view.source)} · {view.pkg.relativePath}</span>
+      <span class="provenance">{typeLabel(view.pkg.skillType)} · {sourceKind(view.source)}</span>
     </button>
   </li>
 {/snippet}
@@ -378,16 +440,18 @@
 {#snippet groupNode(node: SkillGroupNode, depth: number)}
   <li class="skill-group">
     <details open>
-      <summary style:--tree-depth={depth}>
+      <summary
+        class:active={libraryFilter === `taxonomy:${node.key}`}
+        aria-current={libraryFilter === `taxonomy:${node.key}` ? "page" : undefined}
+        style:--tree-depth={depth}
+        onclick={() => (libraryFilter = `taxonomy:${node.key}`)}
+      >
         <span>{node.label}</span>
         <span>{groupCount(node)}</span>
       </summary>
       <ul>
         {#each node.children as child (child.key)}
           {@render groupNode(child, depth + 1)}
-        {/each}
-        {#each node.packages as view (skillSources.packageKey(view.pkg))}
-          {@render packageRow(view, depth + 1)}
         {/each}
       </ul>
     </details>
@@ -400,6 +464,7 @@
       <h2>{i18n.t("skills.title")}</h2>
       <p>{i18n.t("skills.subtitle")}</p>
     </div>
+    <div class="header-actions">
     <details class="source-manager">
       <summary>{i18n.t("skills.manageSources")} <span>{skillSources.sources.length}</span></summary>
       <div class="source-popover">
@@ -504,6 +569,7 @@
         {/if}
       </div>
     </details>
+    </div>
   </header>
 
   <div class="announcement" role="status" aria-live="polite">{announcement}</div>
@@ -533,11 +599,44 @@
     </EmptyState>
   {:else}
     <div class="browser">
+      <nav class="library-pane" aria-label={i18n.t("skills.library")}>
+        <div class="pane-heading">
+          <span>{i18n.t("skills.library")}</span>
+          <span>{packages.length}</span>
+        </div>
+        <div class="quick-filters">
+          {#each [
+            ["all", i18n.t("skills.allSkills"), packages.length],
+            ["installed", i18n.t("skills.installed"), installedCount],
+            ["trusted", i18n.t("skills.trustedScripts"), trustedCount],
+            ["review", i18n.t("skills.needsReview"), reviewCount],
+          ] as item}
+            <button
+              class:active={libraryFilter === item[0]}
+              aria-pressed={libraryFilter === item[0]}
+              onclick={() => (libraryFilter = item[0] as string)}
+            >
+              <span>{item[1]}</span><span>{item[2]}</span>
+            </button>
+          {/each}
+        </div>
+        <div class="tree-heading">{i18n.t("skills.typesAndFolders")}</div>
+        <ul class="taxonomy-tree">
+          {#each grouped as node (node.key)}
+            {@render groupNode(node, 0)}
+          {/each}
+        </ul>
+      </nav>
+
       <section class="package-list" aria-label={i18n.t("skills.packagesAria")}>
+        <div class="pane-heading">
+          <span>{libraryTitle}</span>
+          <span>{filtered.length}</span>
+        </div>
         <div class="filters">
           <label class="search">
             <Search size={15} aria-hidden="true" />
-            <input bind:value={query} type="search" placeholder={i18n.t("skills.search")} aria-label={i18n.t("skills.search")} />
+            <input bind:this={searchInput} bind:value={query} type="search" placeholder={i18n.t("skills.search")} aria-label={i18n.t("skills.search")} />
           </label>
           <div class="filter-row">
             <div class="segments" aria-label={i18n.t("skills.validationStatus")}>
@@ -553,11 +652,10 @@
                 <option value={source.id}>{sourceLabel(source)}</option>
               {/each}
             </select>
-            <select bind:value={typeFilter} aria-label={i18n.t("skills.filterType")}>
-              <option value="all">{i18n.t("skills.allTypes")}</option>
-              {#each ["design", "development", "testing", "devops", "security", "data", "ai", "productivity", "other"] as type}
-                <option value={type}>{typeLabel(type as SkillType)}</option>
-              {/each}
+            <select bind:value={sortOrder} aria-label={i18n.t("skills.sortBy")}>
+              <option value="name">{i18n.t("skills.sortName")}</option>
+              <option value="type">{i18n.t("skills.sortType")}</option>
+              <option value="source">{i18n.t("skills.sortSource")}</option>
             </select>
           </div>
         </div>
@@ -567,8 +665,8 @@
           <EmptyState title={i18n.t("skills.noMatches")} body={i18n.t("skills.noMatchesBody", { query: query || statusLabel(statusFilter) })} />
         {:else}
           <ul class="results" aria-label={i18n.t("skills.resultsAria")}>
-            {#each grouped as node (node.key)}
-              {@render groupNode(node, 0)}
+            {#each filtered as view (skillSources.packageKey(view.pkg))}
+              {@render packageRow(view)}
             {/each}
           </ul>
         {/if}
@@ -588,6 +686,18 @@
               </span>
             </div>
 
+            <div class="detail-tabs" role="tablist" aria-label={i18n.t("skills.detailSections")}>
+              {#each ["overview", "files", "security"] as tab}
+                <button
+                  role="tab"
+                  aria-selected={detailTab === tab}
+                  class:active={detailTab === tab}
+                  onclick={() => (detailTab = tab as DetailTab)}
+                >{i18n.t(`skills.${tab}` as "skills.overview" | "skills.files" | "skills.security")}</button>
+              {/each}
+            </div>
+
+            {#if detailTab === "overview"}
             <section class="detail-section">
               <h4>{i18n.t("skills.provenance")}</h4>
               <dl>
@@ -603,7 +713,9 @@
                 <div><dt>{i18n.t("skills.packagePath")}</dt><dd>{selected.pkg.relativePath || "."}</dd></div>
               </dl>
             </section>
+            {/if}
 
+            {#if detailTab === "security"}
             <section class="detail-section">
               <h4>{i18n.t("skills.validation")}</h4>
               {#if selected.pkg.errors.length === 0}
@@ -632,7 +744,9 @@
                 >{i18n.t("skills.revokeTrust")}</Button>
               {/if}
             </section>
+            {/if}
 
+            {#if detailTab === "overview"}
             <section class="detail-section">
               <h4>{i18n.t("skills.destinations")}</h4>
               <p class="section-help">{i18n.t("skills.destinationsHelp")}</p>
@@ -691,7 +805,9 @@
                 {/if}
               {/if}
             </section>
+            {/if}
 
+            {#if detailTab === "files"}
             <section class="detail-section">
               <h4>{i18n.t("skills.packageFiles")} <span>{selected.pkg.files.length}</span></h4>
               {#if selected.pkg.files.length === 0}
@@ -707,6 +823,7 @@
                 </ul>
               {/if}
             </section>
+            {/if}
           </div>
         {:else}
           <EmptyState title={i18n.t("skills.select")} body={i18n.t("skills.selectBody")} />
@@ -779,7 +896,8 @@
 <style>
   .workspace { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   header { position: relative; z-index: 3; flex: none; display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-4); border-bottom: 1px solid var(--color-border); }
-  h2 { font-size: var(--text-h2); font-weight: var(--fw-semibold); color: var(--color-text-primary); }
+  .header-actions { display: flex; align-items: center; gap: var(--space-2); }
+  h2 { font-size: var(--text-h2); font-weight: var(--fw-semibold); color: var(--color-text-primary); text-wrap: balance; }
   header p, .quiet, .section-help { margin-top: var(--space-1); color: var(--color-text-muted); font-size: var(--text-body-sm); }
   .announcement { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
   .unavailable { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-warning); color: var(--color-text-secondary); font-size: var(--text-body-sm); }
@@ -808,8 +926,18 @@
   .source strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .source span { color: var(--color-text-muted); font-size: var(--text-caption); }
   .source .alert, .source .diagnostics { grid-column: 1 / -1; }
-  .browser { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(300px, 38%) minmax(0, 1fr); }
-  .package-list { min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--color-border); }
+  .browser { flex: 1; min-height: 0; display: grid; grid-template-columns: 224px minmax(320px, 380px) minmax(360px, 1fr); }
+  .library-pane, .package-list { min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--color-border); }
+  .library-pane { overflow-y: auto; background: var(--color-surface-sunken); }
+  .pane-heading { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 0 var(--space-3); border-bottom: 1px solid var(--color-border); color: var(--color-text-primary); font-size: var(--text-body-sm); font-weight: var(--fw-semibold); }
+  .pane-heading span:last-child { color: var(--color-text-muted); font-variant-numeric: tabular-nums; font-weight: var(--fw-normal); }
+  .quick-filters { display: grid; gap: 2px; padding: var(--space-2); }
+  .quick-filters button { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: var(--space-2); border-radius: var(--radius-sm); color: var(--color-text-secondary); text-align: left; font-size: var(--text-body-sm); }
+  .quick-filters button:hover { background: var(--color-surface-raised); color: var(--color-text-primary); }
+  .quick-filters button.active { background: color-mix(in srgb, var(--color-brand) 14%, transparent); color: var(--color-text-primary); }
+  .quick-filters button span:last-child { color: var(--color-text-muted); font-size: var(--text-caption); font-variant-numeric: tabular-nums; }
+  .tree-heading { padding: var(--space-3) var(--space-3) var(--space-1); color: var(--color-text-muted); font-size: var(--text-caption); font-weight: var(--fw-semibold); text-transform: uppercase; }
+  .taxonomy-tree { padding-bottom: var(--space-3); }
   .filters { display: grid; gap: var(--space-2); padding: var(--space-3); border-bottom: 1px solid var(--color-border); }
   .search { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-text-muted); background: var(--color-surface-raised); }
   .search:focus-within { border-color: var(--color-brand); }
@@ -821,13 +949,15 @@
   select { min-width: 0; max-width: 45%; padding: var(--space-1) var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-raised); color: var(--color-text-secondary); font-size: var(--text-caption); }
   .result-count { padding: var(--space-2) var(--space-3); color: var(--color-text-muted); font-size: var(--text-caption); border-bottom: 1px solid var(--color-border); }
   .results { flex: 1; min-height: 0; overflow-y: auto; }
-  .skill-group summary { display: flex; justify-content: space-between; padding: var(--space-2) var(--space-3); padding-left: calc(var(--space-3) + var(--tree-depth) * 14px); border-bottom: 1px solid var(--color-border); cursor: pointer; color: var(--color-text-secondary); background: var(--color-surface-sunken); font-size: var(--text-caption); font-weight: var(--fw-semibold); }
+  .skill-group summary { display: flex; justify-content: space-between; padding: var(--space-2) var(--space-3); padding-left: calc(var(--space-3) + var(--tree-depth) * 14px); cursor: pointer; color: var(--color-text-secondary); font-size: var(--text-body-sm); }
+  .skill-group summary:hover { background: var(--color-surface-raised); color: var(--color-text-primary); }
+  .skill-group summary.active { background: color-mix(in srgb, var(--color-brand) 14%, transparent); color: var(--color-text-primary); }
   .skill-group summary span:last-child { color: var(--color-text-muted); font-weight: var(--fw-normal); }
-  .results button { width: 100%; display: grid; gap: var(--space-1); padding: var(--space-3); padding-left: calc(var(--space-3) + var(--tree-depth) * 14px); border-bottom: 1px solid var(--color-border); color: var(--color-text-primary); text-align: left; }
+  .results button { width: 100%; display: grid; gap: var(--space-1); padding: var(--space-3); border-bottom: 1px solid var(--color-border); color: var(--color-text-primary); text-align: left; }
   .results button:hover { background: var(--color-surface-sunken); }
-  .results button.selected { background: var(--color-selection); box-shadow: inset 3px 0 var(--color-brand); }
+  .results button.selected { background: color-mix(in srgb, var(--color-brand) 14%, transparent); box-shadow: inset 3px 0 var(--color-brand); }
   .row-top { justify-content: space-between; }
-  .description { display: -webkit-box; overflow: hidden; line-clamp: 2; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--color-text-secondary); font-size: var(--text-body-sm); }
+  .description { display: -webkit-box; overflow: hidden; line-clamp: 2; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--color-text-secondary); font-size: var(--text-body-sm); text-wrap: pretty; }
   .provenance { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-text-muted); font-size: var(--text-caption); }
   .status-badge { flex: none; padding: 2px var(--space-2); border-radius: var(--radius-full); font-size: var(--text-caption); font-weight: var(--fw-semibold); }
   .status-badge.ready { color: var(--color-success); background: color-mix(in srgb, var(--color-success) 12%, transparent); }
@@ -835,9 +965,13 @@
   .detail { min-width: 0; min-height: 0; display: flex; }
   .detail-scroll { flex: 1; min-width: 0; overflow-y: auto; padding: var(--space-5); }
   .detail-title { align-items: flex-start; justify-content: space-between; padding-bottom: var(--space-4); }
-  .detail-title h3 { margin-top: var(--space-1); font-size: var(--text-h2); color: var(--color-text-primary); }
-  .detail-title p { margin-top: var(--space-2); max-width: 70ch; color: var(--color-text-secondary); }
-  .eyebrow { color: var(--color-text-muted); font-size: var(--text-caption); font-weight: var(--fw-semibold); text-transform: uppercase; letter-spacing: .05em; }
+  .detail-title h3 { margin-top: var(--space-1); font-size: var(--text-h2); color: var(--color-text-primary); text-wrap: balance; }
+  .detail-title p { margin-top: var(--space-2); max-width: 70ch; color: var(--color-text-secondary); text-wrap: pretty; }
+  .detail-tabs { position: sticky; top: 0; z-index: 1; display: flex; gap: var(--space-1); padding: var(--space-2) 0; border-bottom: 1px solid var(--color-border); background: var(--color-surface-raised); }
+  .detail-tabs button { padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); color: var(--color-text-muted); font-size: var(--text-body-sm); }
+  .detail-tabs button:hover { background: var(--color-surface-sunken); color: var(--color-text-primary); }
+  .detail-tabs button.active { background: color-mix(in srgb, var(--color-brand) 14%, transparent); color: var(--color-text-primary); }
+  .eyebrow { color: var(--color-text-muted); font-size: var(--text-caption); font-weight: var(--fw-semibold); text-transform: uppercase; }
   .detail-section { display: grid; gap: var(--space-3); padding: var(--space-4) 0; border-top: 1px solid var(--color-border); }
   .detail-section h4 { color: var(--color-text-primary); font-size: var(--text-body); font-weight: var(--fw-semibold); }
   .detail-section h4 span { color: var(--color-text-muted); font-weight: var(--fw-normal); }
@@ -864,10 +998,16 @@
   .files div code { overflow-wrap: anywhere; color: var(--color-text-primary); font-size: var(--text-body-sm); }
   .files div span, .hash { color: var(--color-text-muted); font-size: var(--text-caption); }
   .hash { display: block; margin-top: var(--space-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  @media (max-width: 1100px) {
+    .browser { grid-template-columns: 200px minmax(300px, 1fr); }
+    .detail { grid-column: 1 / -1; border-top: 1px solid var(--color-border); min-height: 45vh; }
+  }
   @media (max-width: 760px) {
-    .browser { grid-template-columns: 1fr; }
-    .package-list { border-right: 0; }
+    .browser { grid-template-columns: 1fr; overflow-y: auto; }
+    .library-pane, .package-list { border-right: 0; max-height: 45vh; }
     .detail { border-top: 1px solid var(--color-border); min-height: 50vh; }
+    header { align-items: flex-start; }
+    .header-actions { flex-wrap: wrap; justify-content: flex-end; }
     .source-popover { position: fixed; left: var(--space-4); right: var(--space-4); width: auto; }
     .draft-popover { position: fixed; left: var(--space-4); right: var(--space-4); width: auto; }
   }
