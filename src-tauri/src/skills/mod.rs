@@ -19,19 +19,21 @@ use crate::types::{
     InstalledSkill, SkillDestinationPresence, SkillFileContent, SkillInstallRecord,
     SkillInstallState, SkillPackageFile, SkillPackageResult, SkillSource, SkillSourceKind,
     SkillSourceResult, SkillTrustFingerprint, SkillTrustedExecutable, SkillType,
-    SkillValidationCode, SkillValidationError,
+    SkillValidationCode, SkillValidationError, SkillVersionSnapshot,
 };
 use crate::util::fs::atomic_write;
 
 pub mod drafts;
 mod install;
 pub mod mcp;
+pub mod organize;
 
 pub const MAX_SKILL_FILES: usize = 512;
 pub const MAX_SKILL_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_SKILL_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SKILL_GROUP_DEPTH: usize = 4;
 const MAX_SKILL_TAGS: usize = 12;
+const MAX_SKILL_DEPENDENCIES: usize = 32;
 const MAX_SKILL_TAXONOMY_SEGMENT_BYTES: usize = 32;
 const SKILL_TRUST_KEY_ACCOUNT: &str = "skill-trust-hmac-v1";
 
@@ -1391,6 +1393,11 @@ pub(crate) fn validate_package(
         skill_type: SkillType::Other,
         group: Vec::new(),
         tags: Vec::new(),
+        dependencies: Vec::new(),
+        recommended_skills: Vec::new(),
+        permissions: Vec::new(),
+        quality_score: 0,
+        quality_checks: Vec::new(),
         files: Vec::new(),
         trust_fingerprint: None,
         errors: Vec::new(),
@@ -1421,14 +1428,19 @@ pub(crate) fn validate_package(
 
     result.files = inventory_package(package_root, &mut result.errors);
 
+    let mut skill_text = None;
     match read_bounded(&package_root.join("SKILL.md"), MAX_SKILL_FILE_BYTES) {
-        Ok(bytes) => match parse_skill_metadata(&bytes) {
+        Ok(bytes) => {
+            skill_text = String::from_utf8(bytes.clone()).ok();
+            match parse_skill_metadata(&bytes) {
             Ok(metadata) => {
                 result.name = Some(metadata.name.clone());
                 result.description = Some(metadata.description);
                 result.skill_type = metadata.skill_type;
                 result.group = metadata.group;
                 result.tags = metadata.tags;
+                result.dependencies = metadata.dependencies;
+                result.recommended_skills = metadata.recommended_skills;
                 let directory_name = package_root.file_name().and_then(|name| name.to_str());
                 if directory_name != Some(metadata.name.as_str()) {
                     result.errors.push(SkillValidationError {
@@ -1447,7 +1459,8 @@ pub(crate) fn validate_package(
                 path: "SKILL.md".into(),
                 message,
             }),
-        },
+        }
+        }
         Err(error) => {
             let code = error.code();
             result.errors.push(SkillValidationError {
@@ -1476,6 +1489,7 @@ pub(crate) fn validate_package(
     }
     sort_validation_errors(&mut result.errors);
     result.installable = result.errors.is_empty();
+    analyze_package(&mut result, skill_text.as_deref().unwrap_or_default());
     result
 }
 
@@ -1488,6 +1502,11 @@ fn invalid_package_root(source_id: &str, relative_path: &str, message: &str) -> 
         skill_type: SkillType::Other,
         group: Vec::new(),
         tags: Vec::new(),
+        dependencies: Vec::new(),
+        recommended_skills: Vec::new(),
+        permissions: Vec::new(),
+        quality_score: 0,
+        quality_checks: Vec::new(),
         files: Vec::new(),
         trust_fingerprint: None,
         errors: vec![unsafe_entry_error(
@@ -1496,6 +1515,68 @@ fn invalid_package_root(source_id: &str, relative_path: &str, message: &str) -> 
         )],
         installable: false,
     }
+}
+
+fn analyze_package(result: &mut SkillPackageResult, skill_text: &str) {
+    let lower = skill_text.to_ascii_lowercase();
+    if result
+        .files
+        .iter()
+        .any(|file| file.relative_path.to_ascii_lowercase().starts_with("scripts/"))
+    {
+        result.permissions.push("execute-scripts".into());
+    }
+    if ["https://", "http://", "curl ", "wget ", "fetch("]
+        .iter()
+        .any(|token| lower.contains(token))
+    {
+        result.permissions.push("network".into());
+    }
+    if ["~/", "/users/", "filesystem", "read file", "write file"]
+        .iter()
+        .any(|token| lower.contains(token))
+    {
+        result.permissions.push("filesystem".into());
+    }
+    if ["mcp", "command line", "shell command"]
+        .iter()
+        .any(|token| lower.contains(token))
+    {
+        result.permissions.push("external-tools".into());
+    }
+
+    let mut score = 0;
+    if result.name.is_some() && result.description.is_some() {
+        score += 20;
+        result.quality_checks.push("Valid required metadata".into());
+    }
+    if result
+        .description
+        .as_ref()
+        .is_some_and(|description| description.chars().count() >= 80)
+    {
+        score += 20;
+        result.quality_checks.push("Detailed description".into());
+    }
+    if result.skill_type != SkillType::Other {
+        score += 20;
+        result.quality_checks.push("Explicit skill type".into());
+    }
+    if !result.group.is_empty() || !result.tags.is_empty() {
+        score += 20;
+        result.quality_checks.push("Discoverability metadata".into());
+    }
+    if lower.contains("```")
+        || lower.contains("example")
+        || result
+            .files
+            .iter()
+            .any(|file| file.relative_path.starts_with("references/"))
+    {
+        score += 20;
+        result.quality_checks.push("Examples or references".into());
+    }
+    result.quality_score = score;
 }
 
 fn inventory_package(
@@ -1702,6 +1783,10 @@ struct SkillMetadata {
     group: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default, rename = "recommended-skills")]
+    recommended_skills: Vec<String>,
 }
 
 fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
@@ -1735,6 +1820,13 @@ fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
             "SKILL.md tags must contain at most {MAX_SKILL_TAGS} entries."
         ));
     }
+    if metadata.dependencies.len() > MAX_SKILL_DEPENDENCIES
+        || metadata.recommended_skills.len() > MAX_SKILL_DEPENDENCIES
+    {
+        return Err(format!(
+            "SKILL.md dependencies and recommended-skills may contain at most {MAX_SKILL_DEPENDENCIES} entries each."
+        ));
+    }
     if metadata
         .group
         .iter()
@@ -1748,6 +1840,27 @@ fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
     let unique_tags = metadata.tags.iter().collect::<HashSet<_>>();
     if unique_tags.len() != metadata.tags.len() {
         return Err("SKILL.md tags must not contain duplicates.".into());
+    }
+    for dependency in metadata
+        .dependencies
+        .iter()
+        .chain(metadata.recommended_skills.iter())
+    {
+        if !valid_skill_name(dependency) {
+            return Err(
+                "SKILL.md dependencies and recommended-skills must use valid skill names.".into(),
+            );
+        }
+    }
+    if metadata.dependencies.iter().collect::<HashSet<_>>().len() != metadata.dependencies.len()
+        || metadata
+            .recommended_skills
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != metadata.recommended_skills.len()
+    {
+        return Err("SKILL.md dependency lists must not contain duplicates.".into());
     }
     Ok(metadata)
 }
@@ -2991,6 +3104,175 @@ pub async fn skill_backups_list(state: State<'_, AppState>) -> Result<Vec<String
     };
     backups.sort();
     Ok(backups)
+}
+
+pub(crate) async fn skill_version_history(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> Result<Vec<SkillVersionSnapshot>, AppError> {
+    let project = canonical_project_string(project_path)?;
+    let records = install::load_ledger(&state.app_data_dir).await?;
+    let record = &records[skill_record_index(
+        &records,
+        source_id,
+        relative_path,
+        runtime,
+        &project,
+    )?];
+    let directory = state.app_data_dir.join("skill-backups");
+    let prefix = format!("{}-", record.name);
+    let mut snapshots = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .filter_map(|entry| {
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some(SkillVersionSnapshot {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    created_at: chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("read skill backups {}: {error}", directory.display()),
+            })
+        }
+    };
+    snapshots.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(snapshots)
+}
+
+pub(crate) async fn rollback_skill_authorized(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    snapshot_path: &str,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<InstalledSkill, AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
+    let project = canonical_project_string_authorized(project_path, project_authorization)?;
+    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let index = skill_record_index(
+        &records,
+        source_id,
+        relative_path,
+        runtime,
+        &project,
+    )?;
+    let old_records = records.clone();
+    let record = records[index].clone();
+    record_destination_authorized(&record, project_authorization)?;
+
+    let backup_root = state.app_data_dir.join("skill-backups");
+    let canonical_root = std::fs::canonicalize(&backup_root).map_err(|error| AppError::Io {
+        message: format!("open skill backup root {}: {error}", backup_root.display()),
+    })?;
+    let snapshot = std::fs::canonicalize(snapshot_path).map_err(|error| AppError::Io {
+        message: format!("open skill version snapshot {snapshot_path}: {error}"),
+    })?;
+    if snapshot.parent() != Some(canonical_root.as_path())
+        || !snapshot
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&format!("{}-", record.name)))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "snapshot does not belong to this tracked skill".into(),
+        });
+    }
+    let mut errors = Vec::new();
+    let files = inventory_package(&snapshot, &mut errors);
+    if errors
+        .iter()
+        .any(|error| error.code != SkillValidationCode::TrustRequired)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "snapshot contains an unsafe or unreadable entry".into(),
+        });
+    }
+    let source_hash = install::validated_tree_hash(&snapshot, &files)?;
+    records[index].source_hash = source_hash.clone();
+    records[index].installed_hash = source_hash;
+    records[index].installed_at = chrono::Utc::now().to_rfc3339();
+    install::save_ledger(&state.app_data_dir, &records).await?;
+
+    let destination = PathBuf::from(&record.dest);
+    let install_result = match project_authorization {
+        Some(authorization) => install::install_validated_directory_in_project(
+            authorization.root(),
+            &snapshot,
+            &files,
+            &install::project_target_path(runtime, &record.name)?,
+            &backup_root,
+            true,
+        ),
+        None => install::install_validated_directory(
+            &snapshot,
+            &files,
+            &destination,
+            &backup_root,
+            true,
+        ),
+    };
+    if let Err(error) = install_result {
+        return match install::save_ledger(&state.app_data_dir, &old_records).await {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error("rollback skill", error, rollback)),
+        };
+    }
+    Ok(installed_view(&records[index], SkillInstallState::Current))
+}
+
+#[tauri::command]
+pub async fn skill_version_history_list(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+) -> Result<Vec<SkillVersionSnapshot>, AppError> {
+    skill_version_history(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_version_rollback(
+    state: State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+    snapshot_path: String,
+) -> Result<InstalledSkill, AppError> {
+    rollback_skill_authorized(
+        &state,
+        &source_id,
+        &relative_path,
+        &runtime,
+        project_path.as_deref(),
+        &snapshot_path,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn reconcile_skill_installs(

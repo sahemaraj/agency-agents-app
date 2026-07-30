@@ -22,6 +22,13 @@ import type {
   RepoStats,
   Settings,
   SkillDraft,
+  SkillFolderState,
+  SkillCollection,
+  SkillReference,
+  SkillSmartFolder,
+  SkillWorkspaceProfile,
+  SkillUpdatePolicy,
+  SkillApproval,
   SkillPackageResult,
   SkillSource,
   SkillDestinationPresence,
@@ -30,6 +37,7 @@ import type {
   McpClient,
   McpClientStatus,
   SkillSourceResult,
+  SkillVersionSnapshot,
   UpdateCheckOutcome,
 } from "./types";
 
@@ -202,6 +210,28 @@ export function skillBackupsList(): Promise<string[]> {
   return invoke<string[]>("skill_backups_list");
 }
 
+export function skillVersionHistory(installed: InstalledSkill): Promise<SkillVersionSnapshot[]> {
+  return invoke<SkillVersionSnapshot[]>("skill_version_history_list", {
+    sourceId: installed.sourceId,
+    relativePath: installed.relativePath,
+    runtime: installed.runtime,
+    projectPath: installed.projectPath,
+  });
+}
+
+export function skillVersionRollback(
+  installed: InstalledSkill,
+  snapshotPath: string,
+): Promise<InstalledSkill> {
+  return invoke<InstalledSkill>("skill_version_rollback", {
+    sourceId: installed.sourceId,
+    relativePath: installed.relativePath,
+    runtime: installed.runtime,
+    projectPath: installed.projectPath,
+    snapshotPath,
+  });
+}
+
 export function skillSourceAddLocal(root: string): Promise<SkillSource> {
   return invoke<SkillSource>("skill_source_add_local", { root });
 }
@@ -236,6 +266,120 @@ export function skillDraftPublish(id: string): Promise<SkillDraft> {
 
 export function skillDraftReject(id: string): Promise<SkillDraft> {
   return invoke<SkillDraft>("skill_draft_reject", { id });
+}
+
+export function skillDraftCreate(
+  name: string,
+  description: string,
+  skillType: import("./types").SkillType,
+  group: string[],
+  tags: string[],
+  body: string,
+): Promise<SkillDraft> {
+  return invoke<SkillDraft>("skill_draft_create", { name, description, skillType, group, tags, body });
+}
+
+export function skillDraftEdit(
+  sourceId: string,
+  relativePath: string,
+  skillMd: string,
+): Promise<SkillDraft> {
+  return invoke<SkillDraft>("skill_draft_edit", { sourceId, relativePath, skillMd });
+}
+
+export function skillTextRead(sourceId: string, relativePath: string): Promise<string> {
+  return invoke<string>("skill_text_read", { sourceId, relativePath });
+}
+
+export function skillFoldersList(): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_folders_list");
+}
+
+export function skillFolderCreate(path: string): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_folder_create", { path });
+}
+
+export function skillFolderRename(path: string, newName: string): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_folder_rename", { path, newName });
+}
+
+export function skillFolderMove(path: string, newParent: string | null): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_folder_move", { path, newParent });
+}
+
+export function skillFolderDelete(path: string, recursive: boolean): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_folder_delete", { path, recursive });
+}
+
+export function skillFolderAssign(
+  sourceId: string,
+  relativePath: string,
+  folderPath: string | null,
+): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_folder_assign", { sourceId, relativePath, folderPath });
+}
+
+export function skillFoldersImport(imported: SkillFolderState): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_folders_import", { imported });
+}
+
+export function skillFavoriteSet(skill: SkillReference, favorite: boolean): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_favorite_set", { skill, favorite });
+}
+
+export function skillRecentTouch(skill: SkillReference): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_recent_touch", { skill });
+}
+
+export function skillCollectionSave(collection: SkillCollection): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_collection_save", { collection });
+}
+
+export function skillCollectionDelete(name: string): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_collection_delete", { name });
+}
+
+export function skillSmartFolderSave(smartFolder: SkillSmartFolder): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_smart_folder_save", { smartFolder });
+}
+
+export function skillSmartFolderDelete(name: string): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_smart_folder_delete", { name });
+}
+
+export function skillProfileSave(profile: SkillWorkspaceProfile): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_profile_save", { profile });
+}
+
+export function skillProfileDelete(name: string): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_profile_delete", { name });
+}
+
+export function skillLibraryReplace(replacement: SkillFolderState): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_library_replace", { replacement });
+}
+
+export function skillLibraryExport(path: string): Promise<number> {
+  return invoke<number>("skill_library_export", { path });
+}
+
+export function skillLibraryImport(path: string): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_library_import", { path });
+}
+
+export function skillUpdatePolicySet(
+  skill: SkillReference,
+  policy: SkillUpdatePolicy,
+): Promise<SkillFolderState> {
+  return invoke<SkillFolderState>("skill_update_policy_set", { skill, policy });
+}
+
+export function skillApprovalApprove(id: string): Promise<SkillApproval> {
+  return invoke<SkillApproval>("skill_approval_approve", { id });
+}
+
+export function skillApprovalReject(id: string): Promise<SkillApproval> {
+  return invoke<SkillApproval>("skill_approval_reject", { id });
 }
 
 // ============================================================

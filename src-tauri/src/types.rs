@@ -150,6 +150,11 @@ pub struct SkillPackageResult {
     pub skill_type: SkillType,
     pub group: Vec<String>,
     pub tags: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub recommended_skills: Vec<String>,
+    pub permissions: Vec<String>,
+    pub quality_score: u8,
+    pub quality_checks: Vec<String>,
     pub files: Vec<SkillPackageFile>,
     pub trust_fingerprint: Option<SkillTrustFingerprint>,
     pub errors: Vec<SkillValidationError>,
@@ -194,12 +199,194 @@ pub struct SkillSourceResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct SkillFolderAssignment {
+    pub source_id: String,
+    pub relative_path: String,
+    pub folder_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillReference {
+    pub source_id: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRecent {
+    pub skill: SkillReference,
+    pub viewed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillCollection {
+    pub name: String,
+    #[serde(default)]
+    pub skills: Vec<SkillReference>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSmartFolderRule {
+    pub query: Option<String>,
+    pub skill_type: Option<SkillType>,
+    pub tag: Option<String>,
+    pub source_id: Option<String>,
+    pub installable: Option<bool>,
+    pub favorite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSmartFolder {
+    pub name: String,
+    pub rule: SkillSmartFolderRule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillWorkspaceProfile {
+    pub name: String,
+    #[serde(default)]
+    pub folders: Vec<String>,
+    #[serde(default)]
+    pub collections: Vec<String>,
+    pub runtime: Option<String>,
+    pub project_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillUpdatePolicy {
+    Notify,
+    AutoTrusted,
+    Pin,
+    ReviewScripts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUpdatePolicyRecord {
+    pub skill: SkillReference,
+    pub policy: SkillUpdatePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SkillApprovalAction {
+    FolderCreate {
+        path: String,
+    },
+    FolderRename {
+        path: String,
+        new_name: String,
+    },
+    FolderMove {
+        path: String,
+        new_parent: Option<String>,
+    },
+    FolderDelete {
+        path: String,
+        recursive: bool,
+    },
+    FolderAssign {
+        source_id: String,
+        relative_path: String,
+        folder_path: Option<String>,
+    },
+    Install {
+        source_id: String,
+        relative_path: String,
+        runtime: String,
+        project_path: Option<String>,
+    },
+    CollectionDelete {
+        name: String,
+    },
+    SmartFolderDelete {
+        name: String,
+    },
+    ProfileDelete {
+        name: String,
+    },
+    UpdatePolicySet {
+        source_id: String,
+        relative_path: String,
+        policy: SkillUpdatePolicy,
+    },
+    Rollback {
+        source_id: String,
+        relative_path: String,
+        runtime: String,
+        project_path: Option<String>,
+        snapshot_path: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillApprovalState {
+    Pending,
+    Running,
+    Approved,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillApproval {
+    pub id: String,
+    pub submitted_at: String,
+    pub state: SkillApprovalState,
+    pub requested_by: String,
+    pub request: SkillApprovalAction,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFolderState {
+    #[serde(default)]
+    pub folders: Vec<String>,
+    #[serde(default)]
+    pub assignments: Vec<SkillFolderAssignment>,
+    #[serde(default)]
+    pub favorites: Vec<SkillReference>,
+    #[serde(default)]
+    pub recent: Vec<SkillRecent>,
+    #[serde(default)]
+    pub collections: Vec<SkillCollection>,
+    #[serde(default)]
+    pub smart_folders: Vec<SkillSmartFolder>,
+    #[serde(default)]
+    pub profiles: Vec<SkillWorkspaceProfile>,
+    #[serde(default)]
+    pub update_policies: Vec<SkillUpdatePolicyRecord>,
+    #[serde(default)]
+    pub approvals: Vec<SkillApproval>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SkillDestinationPresence {
     pub runtime: String,
     pub scope: String,
     pub project_path: Option<String>,
     pub path: String,
     pub present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillVersionSnapshot {
+    pub path: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
+  import Settings2 from "@lucide/svelte/icons/settings-2";
+  import Star from "@lucide/svelte/icons/star";
   import Search from "@lucide/svelte/icons/search";
 
   import Button from "$lib/components/Button.svelte";
@@ -18,7 +20,7 @@
   import { projects } from "$lib/stores/projects.svelte";
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { InstalledSkill, SkillDraft, SkillPackageResult, SkillSource, SkillSourceResult, SkillType } from "$lib/types";
+  import type { InstalledSkill, SkillApprovalAction, SkillDraft, SkillPackageResult, SkillSmartFolderRule, SkillSource, SkillSourceResult, SkillType, SkillUpdatePolicy, SkillVersionSnapshot } from "$lib/types";
 
   type StatusFilter = "all" | "ready" | "rejected";
   type DetailTab = "overview" | "files" | "security";
@@ -47,18 +49,36 @@
   let uninstallCandidate: InstalledSkill | null = $state(null);
   let rejectDraftCandidate: SkillDraft | null = $state(null);
   let trustCandidate: PackageView | null = $state(null);
-  let personalFolders: string[] = $state([]);
-  let folderAssignments: Record<string, string> = $state({});
   let folderModalOpen = $state(false);
   let folderName = $state("");
   let folderParent = $state("");
   let folderError = $state("");
+  let organizeOpen = $state(false);
+  let collectionName = $state("");
+  let smartFolderName = $state("");
+  let profileName = $state("");
+  let organizeDelete: { kind: "collection" | "smart" | "profile"; name: string } | null = $state(null);
+  let versionHistory: Record<string, SkillVersionSnapshot[]> = $state({});
+  let collectionInstallOpen = $state(false);
+  let collectionRuntime: "claudeCode" | "codex" = $state("codex");
+  let collectionProject = $state("");
+  let creatorOpen = $state(false);
+  let creatorName = $state("");
+  let creatorDescription = $state("");
+  let creatorType: SkillType = $state("other");
+  let creatorGroup = $state("");
+  let creatorTags = $state("");
+  let creatorBody = $state("");
+  let editorOpen = $state(false);
+  let editorText = $state("");
+  let editorLoading = $state(false);
 
   const packages = $derived.by<PackageView[]>(() =>
     Object.values(skillSources.results).flatMap((result) =>
       result.packages.map((pkg) => ({ pkg, source: result.source })),
     ),
   );
+  const personalFolders = $derived(skillSources.folderState.folders);
   const filtered = $derived.by<PackageView[]>(() => {
     const q = query.trim().toLowerCase();
     const visible = packages.filter(({ pkg, source }) => {
@@ -68,9 +88,25 @@
       if (libraryFilter === "installed" && !isInstalled(pkg)) return false;
       if (libraryFilter === "trusted" && !trustedScripts(pkg)) return false;
       if (libraryFilter === "review" && pkg.installable && !requiresTrust(pkg)) return false;
+      if (libraryFilter === "favorites" && !skillSources.isFavorite(pkg)) return false;
+      if (libraryFilter === "recent" && !skillSources.folderState.recent.some((recent) =>
+        recent.skill.sourceId === pkg.sourceId && recent.skill.relativePath === pkg.relativePath
+      )) return false;
+      if (libraryFilter.startsWith("collection:")) {
+        const name = libraryFilter.slice("collection:".length);
+        const collection = skillSources.folderState.collections.find((item) => item.name === name);
+        if (!collection?.skills.some((skill) =>
+          skill.sourceId === pkg.sourceId && skill.relativePath === pkg.relativePath
+        )) return false;
+      }
+      if (libraryFilter.startsWith("smart:")) {
+        const name = libraryFilter.slice("smart:".length);
+        const rule = skillSources.folderState.smartFolders.find((item) => item.name === name)?.rule;
+        if (!rule || !matchesSmartFolder(pkg, rule)) return false;
+      }
       if (libraryFilter.startsWith("personal:")) {
         const folder = libraryFilter.slice("personal:".length);
-        const assigned = folderAssignments[skillSources.packageKey(pkg)];
+        const assigned = skillSources.folderFor(pkg);
         if (assigned !== folder && !assigned?.startsWith(`${folder}/`)) return false;
       }
       if (libraryFilter.startsWith("taxonomy:")) {
@@ -90,6 +126,16 @@
       ].some((value) => value.toLowerCase().includes(q));
     });
     return visible.sort((left, right) => {
+      if (libraryFilter === "recent") {
+        const recent = skillSources.folderState.recent;
+        const leftIndex = recent.findIndex((item) =>
+          item.skill.sourceId === left.pkg.sourceId && item.skill.relativePath === left.pkg.relativePath
+        );
+        const rightIndex = recent.findIndex((item) =>
+          item.skill.sourceId === right.pkg.sourceId && item.skill.relativePath === right.pkg.relativePath
+        );
+        return leftIndex - rightIndex;
+      }
       if (sortOrder === "type") {
         const byType = typeLabel(left.pkg.skillType).localeCompare(typeLabel(right.pkg.skillType));
         if (byType !== 0) return byType;
@@ -176,6 +222,7 @@
     skillSources.installed.filter((record) => record.state === "sourceUnavailable"),
   );
   const pendingDrafts = $derived(skillSources.drafts.filter((draft) => draft.state === "pending"));
+  const pendingApprovals = $derived(skillSources.folderState.approvals.filter((approval) => approval.state === "pending"));
   const installedCount = $derived(packages.filter(({ pkg }) => isInstalled(pkg)).length);
   const trustedCount = $derived(packages.filter(({ pkg }) => trustedScripts(pkg)).length);
   const reviewCount = $derived(packages.filter(({ pkg }) => !pkg.installable || requiresTrust(pkg)).length);
@@ -183,6 +230,11 @@
     if (libraryFilter === "installed") return i18n.t("skills.installed");
     if (libraryFilter === "trusted") return i18n.t("skills.trustedScripts");
     if (libraryFilter === "review") return i18n.t("skills.needsReview");
+    if (libraryFilter === "favorites") return i18n.t("skills.favorites");
+    if (libraryFilter === "recent") return i18n.t("skills.recent");
+    if (libraryFilter.startsWith("collection:") || libraryFilter.startsWith("smart:")) {
+      return libraryFilter.slice(libraryFilter.indexOf(":") + 1);
+    }
     if (libraryFilter.startsWith("personal:")) {
       return libraryFilter.slice("personal:".length).split("/").at(-1) ?? i18n.t("skills.allSkills");
     }
@@ -201,7 +253,6 @@
 
   onMount(() => {
     projects.hydrate();
-    hydratePersonalFolders();
     const focusSearch = (event: KeyboardEvent): void => {
       const target = event.target as HTMLElement | null;
       if (event.key !== "/" || target?.matches("input, textarea, select, [contenteditable='true']")) return;
@@ -211,6 +262,7 @@
     document.addEventListener("keydown", focusSearch);
     void (async () => {
       await skillSources.load();
+      await migratePersonalFolders();
       await skillSources.reconcileInstalls(projects.list.map((project) => project.path));
     })();
     return () => document.removeEventListener("keydown", focusSearch);
@@ -255,31 +307,58 @@
     return undefined;
   }
 
-  function hydratePersonalFolders(): void {
+  function matchesSmartFolder(pkg: SkillPackageResult, rule: SkillSmartFolderRule): boolean {
+    if (rule.query) {
+      const query = rule.query.toLowerCase();
+      if (![pkg.name ?? "", pkg.description ?? "", pkg.relativePath].some((value) =>
+        value.toLowerCase().includes(query)
+      )) return false;
+    }
+    if (rule.skillType && pkg.skillType !== rule.skillType) return false;
+    if (rule.tag && !pkg.tags.includes(rule.tag)) return false;
+    if (rule.sourceId && pkg.sourceId !== rule.sourceId) return false;
+    if (rule.installable !== null && pkg.installable !== rule.installable) return false;
+    if (rule.favorite !== null && skillSources.isFavorite(pkg) !== rule.favorite) return false;
+    return true;
+  }
+
+  async function migratePersonalFolders(): Promise<void> {
     try {
       const parsed = JSON.parse(localStorage.getItem(PERSONAL_FOLDERS_KEY) ?? "{}") as {
         folders?: unknown;
         assignments?: unknown;
       };
-      personalFolders = Array.isArray(parsed.folders)
+      const folders = Array.isArray(parsed.folders)
         ? parsed.folders.filter((value): value is string => typeof value === "string" && value.length > 0)
         : [];
-      folderAssignments = parsed.assignments && typeof parsed.assignments === "object"
-        ? Object.fromEntries(Object.entries(parsed.assignments).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
-        : {};
-    } catch {
-      personalFolders = [];
-      folderAssignments = {};
-    }
-  }
-
-  function persistPersonalFolders(folders: string[], assignments: Record<string, string>): boolean {
-    try {
-      localStorage.setItem(PERSONAL_FOLDERS_KEY, JSON.stringify({ folders, assignments }));
-      return true;
+      const assignments = parsed.assignments && typeof parsed.assignments === "object"
+        ? Object.entries(parsed.assignments).flatMap(([key, folderPath]) => {
+            const separator = key.indexOf("\0");
+            return separator > 0 && typeof folderPath === "string"
+              ? [{
+                  sourceId: key.slice(0, separator),
+                  relativePath: key.slice(separator + 1),
+                  folderPath,
+                }]
+              : [];
+          })
+        : [];
+      if (folders.length === 0 && assignments.length === 0) return;
+      if (await skillSources.importFolders({
+        folders,
+        assignments,
+        favorites: [],
+        recent: [],
+        collections: [],
+        smartFolders: [],
+        profiles: [],
+        updatePolicies: [],
+        approvals: [],
+      })) {
+        localStorage.removeItem(PERSONAL_FOLDERS_KEY);
+      }
     } catch {
       folderError = i18n.t("skills.folderSaveError");
-      return false;
     }
   }
 
@@ -290,38 +369,205 @@
     folderModalOpen = true;
   }
 
-  function createPersonalFolder(): void {
+  async function createPersonalFolder(): Promise<void> {
     const name = folderName.trim();
     if (!name || name.includes("/") || name.length > 64) {
       folderError = i18n.t("skills.folderNameError");
       return;
     }
     const path = folderParent ? `${folderParent}/${name}` : name;
-    if (personalFolders.some((folder) => folder.toLocaleLowerCase() === path.toLocaleLowerCase())) {
-      folderError = i18n.t("skills.folderExists");
+    if (!(await skillSources.createFolder(path))) {
+      folderError = skillSources.addError ?? i18n.t("skills.folderSaveError");
       return;
     }
-    const folders = [...personalFolders, path];
-    if (!persistPersonalFolders(folders, folderAssignments)) return;
-    personalFolders = folders;
     libraryFilter = `personal:${path}`;
     folderModalOpen = false;
   }
 
-  function assignSelectedFolder(folder: string): void {
+  async function assignSelectedFolder(folder: string): Promise<void> {
     if (!selected) return;
-    const key = skillSources.packageKey(selected.pkg);
-    const { [key]: _removed, ...remaining } = folderAssignments;
-    const assignments = folder ? { ...remaining, [key]: folder } : remaining;
-    if (!persistPersonalFolders(personalFolders, assignments)) return;
-    folderAssignments = assignments;
+    if (!(await skillSources.assignFolder(selected.pkg, folder || null))) {
+      folderError = skillSources.addError ?? i18n.t("skills.folderSaveError");
+    }
   }
 
   function personalFolderCount(path: string): number {
     return packages.filter(({ pkg }) => {
-      const assigned = folderAssignments[skillSources.packageKey(pkg)];
+      const assigned = skillSources.folderFor(pkg);
       return assigned === path || assigned?.startsWith(`${path}/`);
     }).length;
+  }
+
+  function missingDependencies(pkg: SkillPackageResult): string[] {
+    const available = new Set(packages.flatMap(({ pkg }) => pkg.name ? [pkg.name] : []));
+    return pkg.dependencies.filter((name) => !available.has(name));
+  }
+
+  function packageConflicts(pkg: SkillPackageResult): PackageView[] {
+    return packages.filter((candidate) =>
+      candidate.pkg.sourceId !== pkg.sourceId
+      && candidate.pkg.name !== null
+      && candidate.pkg.name === pkg.name
+    );
+  }
+
+  async function saveCurrentCollection(): Promise<void> {
+    const name = collectionName.trim();
+    if (!name) return;
+    const skills = filtered.map(({ pkg }) => skillSources.reference(pkg));
+    if (await skillSources.saveCollection({ name, skills })) {
+      collectionName = "";
+      libraryFilter = `collection:${name}`;
+    }
+  }
+
+  async function saveCurrentSmartFolder(): Promise<void> {
+    const name = smartFolderName.trim();
+    if (!name) return;
+    const taxonomyType = libraryFilter.startsWith("taxonomy:")
+      ? libraryFilter.slice("taxonomy:".length).split("/")[0] as SkillType
+      : null;
+    const rule: SkillSmartFolderRule = {
+      query: query.trim() || null,
+      skillType: taxonomyType,
+      tag: null,
+      sourceId: sourceFilter === "all" ? null : sourceFilter,
+      installable: statusFilter === "all" ? null : statusFilter === "ready",
+      favorite: libraryFilter === "favorites" ? true : null,
+    };
+    if (Object.values(rule).every((value) => value === null)) {
+      folderError = i18n.t("skills.smartFolderNeedsFilter");
+      return;
+    }
+    if (await skillSources.saveSmartFolder({ name, rule })) {
+      smartFolderName = "";
+      libraryFilter = `smart:${name}`;
+    }
+  }
+
+  async function saveCurrentProfile(): Promise<void> {
+    const name = profileName.trim();
+    if (!name) return;
+    if (await skillSources.saveProfile({
+      name,
+      folders: [...skillSources.folderState.folders],
+      collections: skillSources.folderState.collections.map((collection) => collection.name),
+      runtime: null,
+      projectPath: null,
+    })) profileName = "";
+  }
+
+  async function exportLibrary(): Promise<void> {
+    const path = await saveDialog({
+      title: i18n.t("skills.exportLibrary"),
+      defaultPath: "skills-library.json",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path) return;
+    const count = await skillSources.exportLibrary(path);
+    announcement = i18n.t("skills.libraryExported", { count });
+  }
+
+  async function importLibrary(): Promise<void> {
+    const path = await openDialog({
+      title: i18n.t("skills.importLibrary"),
+      multiple: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path || Array.isArray(path)) return;
+    const succeeded = await skillSources.importLibrary(path);
+    announcement = succeeded
+      ? i18n.t("skills.libraryImported")
+      : skillSources.addError ?? i18n.t("skills.folderSaveError");
+  }
+
+  async function deleteOrganizeItem(): Promise<void> {
+    if (!organizeDelete) return;
+    const { kind, name } = organizeDelete;
+    const succeeded = kind === "collection"
+      ? await skillSources.deleteCollection(name)
+      : kind === "smart"
+        ? await skillSources.deleteSmartFolder(name)
+        : await skillSources.deleteProfile(name);
+    if (succeeded) organizeDelete = null;
+  }
+
+  async function loadVersionHistory(installed: InstalledSkill): Promise<void> {
+    try {
+      versionHistory = {
+        ...versionHistory,
+        [lifecycleKey(installed)]: await skillSources.history(installed),
+      };
+    } catch {
+      announcement = skillSources.addError ?? i18n.t("skills.historyFailed");
+    }
+  }
+
+  async function rollbackVersion(installed: InstalledSkill, snapshotPath: string): Promise<void> {
+    const succeeded = await skillSources.rollback(
+      installed,
+      snapshotPath,
+      projects.list.map((project) => project.path),
+    );
+    announcement = succeeded
+      ? i18n.t("skills.rollbackSucceeded")
+      : skillSources.addError ?? i18n.t("skills.rollbackFailed");
+    if (succeeded) await loadVersionHistory(installed);
+  }
+
+  async function installCurrentCollection(): Promise<void> {
+    let installed = 0;
+    for (const { pkg } of filtered) {
+      if (await skillSources.installPackage(
+        pkg,
+        collectionRuntime,
+        collectionProject || null,
+        projects.list.map((project) => project.path),
+      )) installed += 1;
+    }
+    collectionInstallOpen = false;
+    announcement = i18n.t("skills.collectionInstalled", { installed, total: filtered.length });
+  }
+
+  async function createSkillDraft(): Promise<void> {
+    const succeeded = await skillSources.createDraft(
+      creatorName.trim(),
+      creatorDescription.trim(),
+      creatorType,
+      creatorGroup.split("/").map((value) => value.trim()).filter(Boolean),
+      creatorTags.split(",").map((value) => value.trim()).filter(Boolean),
+      creatorBody,
+    );
+    if (succeeded) {
+      creatorOpen = false;
+      announcement = i18n.t("skills.creatorSubmitted");
+    } else {
+      folderError = skillSources.addError ?? i18n.t("skills.creatorFailed");
+    }
+  }
+
+  async function openEditor(): Promise<void> {
+    if (!selected) return;
+    editorLoading = true;
+    try {
+      editorText = await skillSources.readSkillText(selected.pkg);
+      editorOpen = true;
+    } catch (error) {
+      folderError = String(error);
+    } finally {
+      editorLoading = false;
+    }
+  }
+
+  async function submitEditDraft(): Promise<void> {
+    if (!selected) return;
+    const succeeded = await skillSources.editDraft(selected.pkg, editorText);
+    if (succeeded) {
+      editorOpen = false;
+      announcement = i18n.t("skills.editorSubmitted");
+    } else {
+      folderError = skillSources.addError ?? i18n.t("skills.creatorFailed");
+    }
   }
 
   function isInstalled(pkg: SkillPackageResult): boolean {
@@ -356,6 +602,20 @@
     return pkg.installable ? i18n.t("skills.ready") : i18n.t("skills.rejected");
   }
 
+  function approvalLabel(action: SkillApprovalAction): string {
+    if (action.action === "install") return `Install ${action.relativePath} in ${action.runtime}`;
+    if (action.action === "folderCreate") return `Create folder ${action.path}`;
+    if (action.action === "folderRename") return `Rename ${action.path} to ${action.newName}`;
+    if (action.action === "folderMove") return `Move ${action.path}`;
+    if (action.action === "folderDelete") return `Delete folder ${action.path}`;
+    if (action.action === "folderAssign") return `Assign ${action.relativePath} to ${action.folderPath ?? "no folder"}`;
+    if (action.action === "collectionDelete") return `Delete collection ${action.name}`;
+    if (action.action === "smartFolderDelete") return `Delete smart folder ${action.name}`;
+    if (action.action === "profileDelete") return `Delete profile ${action.name}`;
+    if (action.action === "updatePolicySet") return `Set ${action.relativePath} policy to ${action.policy}`;
+    return `Roll back ${action.relativePath} in ${action.runtime}`;
+  }
+
   async function grantTrust(): Promise<void> {
     if (!trustCandidate) return;
     const name = trustCandidate.pkg.name ?? trustCandidate.pkg.relativePath;
@@ -377,6 +637,7 @@
   function selectPackage(view: PackageView): void {
     selectedKey = skillSources.packageKey(view.pkg);
     detailTab = "overview";
+    void skillSources.touchRecent(view.pkg);
   }
 
   function installedAt(pkg: SkillPackageResult, runtime: string, projectPath: string | null): InstalledSkill | undefined {
@@ -592,6 +853,7 @@
       <p>{i18n.t("skills.subtitle")}</p>
     </div>
     <div class="header-actions">
+    <Button size="sm" onclick={() => (creatorOpen = true)}>{i18n.t("skills.createSkill")}</Button>
     <details class="source-manager">
       <summary>{i18n.t("skills.manageSources")} <span>{skillSources.sources.length}</span></summary>
       <div class="source-popover">
@@ -658,11 +920,24 @@
       </div>
     </details>
     <details class="draft-inbox">
-      <summary>{i18n.t("skills.draftInbox")} <span>{pendingDrafts.length}</span></summary>
+      <summary>{i18n.t("skills.approvalInbox")} <span>{pendingDrafts.length + pendingApprovals.length}</span></summary>
       <div class="draft-popover" aria-label={i18n.t("skills.draftInboxAria")}>
-        {#if pendingDrafts.length === 0}
+        {#if pendingDrafts.length === 0 && pendingApprovals.length === 0}
           <p class="quiet">{i18n.t("skills.noDrafts")}</p>
         {:else}
+          {#each pendingApprovals as approval (approval.id)}
+            <article class="draft">
+              <div>
+                <strong>{approvalLabel(approval.request)}</strong>
+                <span>{approval.requestedBy} · {new Date(approval.submittedAt).toLocaleString()}</span>
+              </div>
+              <div class="draft-actions">
+                <Button size="sm" onclick={() => void skillSources.approveRequest(approval.id)}>{i18n.t("skills.approve")}</Button>
+                <Button size="sm" variant="danger" onclick={() => void skillSources.rejectRequest(approval.id)}>{i18n.t("skills.reject")}</Button>
+              </div>
+              {#if approval.result}<p class="draft-error">{approval.result}</p>{/if}
+            </article>
+          {/each}
           {#each pendingDrafts as draft (draft.id)}
             <article class="draft">
               <div>
@@ -729,7 +1004,12 @@
       <nav class="library-pane" aria-label={i18n.t("skills.library")}>
         <div class="pane-heading">
           <span>{i18n.t("skills.library")}</span>
-          <span>{packages.length}</span>
+          <span class="pane-tools">
+            <span>{packages.length}</span>
+            <button aria-label={i18n.t("skills.organize")} onclick={() => (organizeOpen = true)}>
+              <Settings2 size={15} />
+            </button>
+          </span>
         </div>
         <div class="quick-filters">
           {#each [
@@ -737,6 +1017,8 @@
             ["installed", i18n.t("skills.installed"), installedCount],
             ["trusted", i18n.t("skills.trustedScripts"), trustedCount],
             ["review", i18n.t("skills.needsReview"), reviewCount],
+            ["favorites", i18n.t("skills.favorites"), skillSources.folderState.favorites.length],
+            ["recent", i18n.t("skills.recent"), skillSources.folderState.recent.length],
           ] as item}
             <button
               class:active={libraryFilter === item[0]}
@@ -762,6 +1044,34 @@
             {/each}
           </ul>
         {/if}
+        {#if skillSources.folderState.collections.length > 0}
+          <div class="tree-heading">{i18n.t("skills.collections")}</div>
+          <ul class="named-views">
+            {#each skillSources.folderState.collections as collection (collection.name)}
+              <li>
+                <button
+                  class:active={libraryFilter === `collection:${collection.name}`}
+                  aria-pressed={libraryFilter === `collection:${collection.name}`}
+                  onclick={() => (libraryFilter = `collection:${collection.name}`)}
+                ><span>{collection.name}</span><span>{collection.skills.length}</span></button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if skillSources.folderState.smartFolders.length > 0}
+          <div class="tree-heading">{i18n.t("skills.smartFolders")}</div>
+          <ul class="named-views">
+            {#each skillSources.folderState.smartFolders as smartFolder (smartFolder.name)}
+              <li>
+                <button
+                  class:active={libraryFilter === `smart:${smartFolder.name}`}
+                  aria-pressed={libraryFilter === `smart:${smartFolder.name}`}
+                  onclick={() => (libraryFilter = `smart:${smartFolder.name}`)}
+                ><span>{smartFolder.name}</span></button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
         <div class="tree-heading">{i18n.t("skills.typesAndFolders")}</div>
         <ul class="taxonomy-tree">
           {#each grouped as node (node.key)}
@@ -773,7 +1083,12 @@
       <section class="package-list" aria-label={i18n.t("skills.packagesAria")}>
         <div class="pane-heading">
           <span>{libraryTitle}</span>
-          <span>{filtered.length}</span>
+          <span class="pane-tools">
+            <span>{filtered.length}</span>
+            {#if libraryFilter.startsWith("collection:") && filtered.length > 0}
+              <Button size="sm" onclick={() => (collectionInstallOpen = true)}>{i18n.t("skills.installCollection")}</Button>
+            {/if}
+          </span>
         </div>
         <div class="filters">
           <label class="search">
@@ -823,9 +1138,19 @@
                 <h3>{selected.pkg.name ?? selected.pkg.relativePath}</h3>
                 <p>{selected.pkg.description ?? i18n.t("skills.invalidMetadata")}</p>
               </div>
-              <span class:ready={selected.pkg.installable} class:rejected={!selected.pkg.installable} class="status-badge">
-                {selected.pkg.installable ? i18n.t("skills.validationPassed") : i18n.t("skills.validationFailed")}
-              </span>
+              <div class="detail-actions">
+                <Button size="sm" loading={editorLoading} onclick={() => void openEditor()}>{i18n.t("skills.editAsDraft")}</Button>
+                <button
+                  class="favorite-button"
+                  class:active={skillSources.isFavorite(selected.pkg)}
+                  aria-label={skillSources.isFavorite(selected.pkg) ? i18n.t("skills.removeFavorite") : i18n.t("skills.addFavorite")}
+                  aria-pressed={skillSources.isFavorite(selected.pkg)}
+                  onclick={() => void skillSources.setFavorite(selected.pkg, !skillSources.isFavorite(selected.pkg))}
+                ><Star size={17} fill={skillSources.isFavorite(selected.pkg) ? "currentColor" : "none"} /></button>
+                <span class:ready={selected.pkg.installable} class:rejected={!selected.pkg.installable} class="status-badge">
+                  {selected.pkg.installable ? i18n.t("skills.validationPassed") : i18n.t("skills.validationFailed")}
+                </span>
+              </div>
             </div>
 
             <div class="detail-tabs" role="tablist" aria-label={i18n.t("skills.detailSections")}>
@@ -843,14 +1168,14 @@
             <section class="detail-section folder-assignment">
               <div class="section-title-row">
                 <h4>{i18n.t("skills.myFolder")}</h4>
-                <Button size="sm" onclick={() => openFolderModal(folderAssignments[skillSources.packageKey(selected.pkg)] ?? "")}>
+                <Button size="sm" onclick={() => openFolderModal(skillSources.folderFor(selected.pkg) ?? "")}>
                   {i18n.t("skills.newFolder")}
                 </Button>
               </div>
               <select
                 aria-label={i18n.t("skills.assignFolder")}
-                value={folderAssignments[skillSources.packageKey(selected.pkg)] ?? ""}
-                onchange={(event) => assignSelectedFolder(event.currentTarget.value)}
+                value={skillSources.folderFor(selected.pkg) ?? ""}
+                onchange={(event) => void assignSelectedFolder(event.currentTarget.value)}
               >
                 <option value="">{i18n.t("skills.noFolder")}</option>
                 {#each personalFolders.toSorted((left, right) => left.localeCompare(right)) as folder (folder)}
@@ -859,6 +1184,32 @@
               </select>
               {#if folderError === i18n.t("skills.folderSaveError")}
                 <p class="alert" role="alert">{folderError}</p>
+              {/if}
+            </section>
+            <section class="detail-section">
+              <h4>{i18n.t("skills.lifecyclePolicy")}</h4>
+              <select
+                class="policy-select"
+                aria-label={i18n.t("skills.lifecyclePolicy")}
+                value={skillSources.updatePolicy(selected.pkg)}
+                onchange={(event) => void skillSources.setUpdatePolicy(selected.pkg, event.currentTarget.value as SkillUpdatePolicy)}
+              >
+                <option value="notify">{i18n.t("skills.policyNotify")}</option>
+                <option value="autoTrusted">{i18n.t("skills.policyAutoTrusted")}</option>
+                <option value="pin">{i18n.t("skills.policyPin")}</option>
+                <option value="reviewScripts">{i18n.t("skills.policyReviewScripts")}</option>
+              </select>
+              {#if selected.pkg.dependencies.length > 0 || selected.pkg.recommendedSkills.length > 0}
+                <dl>
+                  <div><dt>{i18n.t("skills.dependencies")}</dt><dd>{selected.pkg.dependencies.join(", ") || i18n.t("skills.none")}</dd></div>
+                  <div><dt>{i18n.t("skills.recommendedSkills")}</dt><dd>{selected.pkg.recommendedSkills.join(", ") || i18n.t("skills.none")}</dd></div>
+                </dl>
+              {/if}
+              {#if missingDependencies(selected.pkg).length > 0}
+                <p class="warning">{i18n.t("skills.missingDependencies", { names: missingDependencies(selected.pkg).join(", ") })}</p>
+              {/if}
+              {#if packageConflicts(selected.pkg).length > 0}
+                <p class="warning">{i18n.t("skills.nameConflict", { count: packageConflicts(selected.pkg).length })}</p>
               {/if}
             </section>
             <section class="detail-section">
@@ -907,6 +1258,24 @@
                 >{i18n.t("skills.revokeTrust")}</Button>
               {/if}
             </section>
+            <section class="detail-section">
+              <h4>{i18n.t("skills.permissionsManifest")}</h4>
+              {#if selected.pkg.permissions.length === 0}
+                <p class="healthy">{i18n.t("skills.noElevatedPermissions")}</p>
+              {:else}
+                <ul class="permission-list">
+                  {#each selected.pkg.permissions as permission (permission)}
+                    <li>{permission}</li>
+                  {/each}
+                </ul>
+              {/if}
+              <h4>{i18n.t("skills.qualityScore", { score: selected.pkg.qualityScore })}</h4>
+              <ul class="quality-list">
+                {#each selected.pkg.qualityChecks as check (check)}
+                  <li>{check}</li>
+                {/each}
+              </ul>
+            </section>
             {/if}
 
             {#if detailTab === "overview"}
@@ -952,6 +1321,28 @@
                         {#if skillSources.installErrors[lifecycleKey(installed)]}
                           <div class="alert" role="alert">{skillSources.installErrors[lifecycleKey(installed)]}</div>
                         {/if}
+                        <details
+                          class="version-history"
+                          ontoggle={(event) => {
+                            if (event.currentTarget.open && !versionHistory[lifecycleKey(installed)]) {
+                              void loadVersionHistory(installed);
+                            }
+                          }}
+                        >
+                          <summary>{i18n.t("skills.versionHistory")}</summary>
+                          {#if (versionHistory[lifecycleKey(installed)] ?? []).length === 0}
+                            <p class="quiet">{i18n.t("skills.noVersionHistory")}</p>
+                          {:else}
+                            <ul>
+                              {#each versionHistory[lifecycleKey(installed)] as snapshot (snapshot.path)}
+                                <li>
+                                  <span>{new Date(snapshot.createdAt).toLocaleString()}</span>
+                                  <Button size="sm" onclick={() => void rollbackVersion(installed, snapshot.path)}>{i18n.t("skills.rollback")}</Button>
+                                </li>
+                              {/each}
+                            </ul>
+                          {/if}
+                        </details>
                       </li>
                     {/each}
                   </ul>
@@ -1002,7 +1393,7 @@
       class="folder-form"
       onsubmit={(event) => {
         event.preventDefault();
-        createPersonalFolder();
+        void createPersonalFolder();
       }}
     >
       <label>
@@ -1029,10 +1420,147 @@
     </form>
     {#snippet actions()}
       <Button variant="secondary" modalAction="cancel" onclick={() => (folderModalOpen = false)}>{i18n.t("common.cancel")}</Button>
-      <Button variant="primary" modalAction="confirm" onclick={createPersonalFolder}>{i18n.t("skills.createFolder")}</Button>
+      <Button variant="primary" modalAction="confirm" onclick={() => void createPersonalFolder()}>{i18n.t("skills.createFolder")}</Button>
     {/snippet}
   </Modal>
 {/if}
+
+{#if creatorOpen}
+  <Modal open size="wide" title={i18n.t("skills.createSkill")} defaultFocus="first" onClose={() => (creatorOpen = false)}>
+    <div class="creator-form">
+      <label><span>{i18n.t("skills.skillName")}</span><Input bind:value={creatorName} placeholder="my-skill" ariaLabel={i18n.t("skills.skillName")} /></label>
+      <label><span>{i18n.t("skills.description")}</span><Input bind:value={creatorDescription} ariaLabel={i18n.t("skills.description")} /></label>
+      <div class="creator-row">
+        <label>
+          <span>{i18n.t("skills.type")}</span>
+          <select bind:value={creatorType}>
+            {#each ["design", "development", "testing", "devops", "security", "data", "ai", "productivity", "other"] as type}
+              <option value={type}>{typeLabel(type as SkillType)}</option>
+            {/each}
+          </select>
+        </label>
+        <label><span>{i18n.t("skills.group")}</span><Input bind:value={creatorGroup} placeholder="frontend/svelte" ariaLabel={i18n.t("skills.group")} /></label>
+        <label><span>{i18n.t("skills.tags")}</span><Input bind:value={creatorTags} placeholder="typescript, ui" ariaLabel={i18n.t("skills.tags")} /></label>
+      </div>
+      <label>
+        <span>{i18n.t("skills.instructions")}</span>
+        <textarea bind:value={creatorBody} rows="12" placeholder="# My skill&#10;&#10;Describe when and how to use it."></textarea>
+      </label>
+      {#if folderError}<p class="alert" role="alert">{folderError}</p>{/if}
+    </div>
+    {#snippet actions()}
+      <Button variant="secondary" modalAction="cancel" onclick={() => (creatorOpen = false)}>{i18n.t("common.cancel")}</Button>
+      <Button variant="primary" modalAction="confirm" disabled={!creatorName.trim() || !creatorDescription.trim() || !creatorBody.trim()} onclick={() => void createSkillDraft()}>{i18n.t("skills.submitForReview")}</Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+{#if editorOpen && selected}
+  <Modal open size="wide" title={i18n.t("skills.editSkill", { name: selected.pkg.name ?? selected.pkg.relativePath })} defaultFocus="first" onClose={() => (editorOpen = false)}>
+    <div class="creator-form">
+      <p>{i18n.t("skills.editorHelp")}</p>
+      <textarea bind:value={editorText} rows="20" aria-label={i18n.t("skills.skillMarkdown")}></textarea>
+      {#if folderError}<p class="alert" role="alert">{folderError}</p>{/if}
+    </div>
+    {#snippet actions()}
+      <Button variant="secondary" modalAction="cancel" onclick={() => (editorOpen = false)}>{i18n.t("common.cancel")}</Button>
+      <Button variant="primary" modalAction="confirm" disabled={!editorText.trim()} onclick={() => void submitEditDraft()}>{i18n.t("skills.submitForReview")}</Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+{#if organizeOpen}
+  <Modal open size="wide" title={i18n.t("skills.organize")} defaultFocus="first" onClose={() => (organizeOpen = false)}>
+    <div class="organize-grid">
+      <section>
+        <h4>{i18n.t("skills.collections")}</h4>
+        <p>{i18n.t("skills.collectionsHelp", { count: filtered.length })}</p>
+        <div class="organize-form">
+          <Input bind:value={collectionName} placeholder={i18n.t("skills.collectionName")} ariaLabel={i18n.t("skills.collectionName")} />
+          <Button size="sm" disabled={!collectionName.trim() || filtered.length === 0} onclick={() => void saveCurrentCollection()}>{i18n.t("skills.saveResults")}</Button>
+        </div>
+        <ul>
+          {#each skillSources.folderState.collections as collection (collection.name)}
+            <li><span>{collection.name} · {collection.skills.length}</span><Button size="sm" variant="danger" onclick={() => (organizeDelete = { kind: "collection", name: collection.name })}>{i18n.t("common.delete")}</Button></li>
+          {/each}
+        </ul>
+      </section>
+      <section>
+        <h4>{i18n.t("skills.smartFolders")}</h4>
+        <p>{i18n.t("skills.smartFoldersHelp")}</p>
+        <div class="organize-form">
+          <Input bind:value={smartFolderName} placeholder={i18n.t("skills.smartFolderName")} ariaLabel={i18n.t("skills.smartFolderName")} />
+          <Button size="sm" disabled={!smartFolderName.trim()} onclick={() => void saveCurrentSmartFolder()}>{i18n.t("skills.saveFilters")}</Button>
+        </div>
+        <ul>
+          {#each skillSources.folderState.smartFolders as smartFolder (smartFolder.name)}
+            <li><span>{smartFolder.name}</span><Button size="sm" variant="danger" onclick={() => (organizeDelete = { kind: "smart", name: smartFolder.name })}>{i18n.t("common.delete")}</Button></li>
+          {/each}
+        </ul>
+      </section>
+      <section>
+        <h4>{i18n.t("skills.workspaceProfiles")}</h4>
+        <p>{i18n.t("skills.workspaceProfilesHelp")}</p>
+        <div class="organize-form">
+          <Input bind:value={profileName} placeholder={i18n.t("skills.profileName")} ariaLabel={i18n.t("skills.profileName")} />
+          <Button size="sm" disabled={!profileName.trim()} onclick={() => void saveCurrentProfile()}>{i18n.t("skills.saveProfile")}</Button>
+        </div>
+        <ul>
+          {#each skillSources.folderState.profiles as profile (profile.name)}
+            <li><span>{profile.name}</span><Button size="sm" variant="danger" onclick={() => (organizeDelete = { kind: "profile", name: profile.name })}>{i18n.t("common.delete")}</Button></li>
+          {/each}
+        </ul>
+      </section>
+      <section>
+        <h4>{i18n.t("skills.portableLibrary")}</h4>
+        <p>{i18n.t("skills.portableLibraryHelp")}</p>
+        <div class="organize-form">
+          <Button size="sm" onclick={() => void exportLibrary()}>{i18n.t("skills.exportLibrary")}</Button>
+          <Button size="sm" onclick={() => void importLibrary()}>{i18n.t("skills.importLibrary")}</Button>
+        </div>
+      </section>
+      {#if folderError}<p class="alert" role="alert">{folderError}</p>{/if}
+    </div>
+  </Modal>
+{/if}
+
+{#if collectionInstallOpen}
+  <Modal open title={i18n.t("skills.installCollection")} onClose={() => (collectionInstallOpen = false)}>
+    <div class="folder-form">
+      <label>
+        <span>{i18n.t("skills.runtime")}</span>
+        <select bind:value={collectionRuntime}>
+          <option value="claudeCode">Claude Code</option>
+          <option value="codex">Codex</option>
+        </select>
+      </label>
+      <label>
+        <span>{i18n.t("skills.destination")}</span>
+        <select bind:value={collectionProject}>
+          <option value="">{i18n.t("skills.globalDestination")}</option>
+          {#each projects.list as project (project.path)}
+            <option value={project.path}>{project.label}</option>
+          {/each}
+        </select>
+      </label>
+      <p class="quiet">{i18n.t("skills.installCollectionHelp", { count: filtered.length })}</p>
+    </div>
+    {#snippet actions()}
+      <Button variant="secondary" modalAction="cancel" onclick={() => (collectionInstallOpen = false)}>{i18n.t("common.cancel")}</Button>
+      <Button variant="primary" modalAction="confirm" onclick={() => void installCurrentCollection()}>{i18n.t("skills.installCollection")}</Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+<DestructiveConfirm
+  open={organizeDelete !== null}
+  title={i18n.t("skills.deleteOrganizeTitle")}
+  confirmLabel={i18n.t("common.delete")}
+  onConfirm={() => void deleteOrganizeItem()}
+  onCancel={() => (organizeDelete = null)}
+>
+  <p>{i18n.t("skills.deleteOrganizeBody", { name: organizeDelete?.name ?? "" })}</p>
+</DestructiveConfirm>
 
 <DestructiveConfirm
   open={removeCandidate !== null}
@@ -1132,6 +1660,10 @@
   .library-pane { overflow-y: auto; background: var(--color-surface-sunken); }
   .pane-heading { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 0 var(--space-3); border-bottom: 1px solid var(--color-border); color: var(--color-text-primary); font-size: var(--text-body-sm); font-weight: var(--fw-semibold); }
   .pane-heading span:last-child { color: var(--color-text-muted); font-variant-numeric: tabular-nums; font-weight: var(--fw-normal); }
+  .pane-tools { display: flex; align-items: center; gap: var(--space-2); }
+  .pane-tools button, .favorite-button { display: inline-flex; padding: var(--space-1); border-radius: var(--radius-sm); color: var(--color-text-muted); }
+  .pane-tools button:hover, .favorite-button:hover { background: var(--color-surface-sunken); color: var(--color-text-primary); }
+  .favorite-button.active { color: var(--color-brand); }
   .quick-filters { display: grid; gap: 2px; padding: var(--space-2); }
   .quick-filters button { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: var(--space-2); border-radius: var(--radius-sm); color: var(--color-text-secondary); text-align: left; font-size: var(--text-body-sm); }
   .quick-filters button:hover { background: var(--color-surface-raised); color: var(--color-text-primary); }
@@ -1147,6 +1679,11 @@
   .personal-folder button:hover { background: var(--color-surface-raised); color: var(--color-text-primary); }
   .personal-folder button.active { background: color-mix(in srgb, var(--color-brand) 14%, transparent); color: var(--color-text-primary); }
   .personal-folder button span:last-child { color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
+  .named-views { padding-bottom: var(--space-2); }
+  .named-views button { display: flex; justify-content: space-between; width: 100%; padding: var(--space-2) var(--space-3); color: var(--color-text-secondary); font-size: var(--text-body-sm); text-align: left; }
+  .named-views button:hover { background: var(--color-surface-raised); color: var(--color-text-primary); }
+  .named-views button.active { background: color-mix(in srgb, var(--color-brand) 14%, transparent); color: var(--color-text-primary); }
+  .named-views button span:last-child { color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
   .taxonomy-tree { padding-bottom: var(--space-3); }
   .filters { display: grid; gap: var(--space-2); padding: var(--space-3); border-bottom: 1px solid var(--color-border); }
   .search { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-text-muted); background: var(--color-surface-raised); }
@@ -1175,6 +1712,7 @@
   .detail { min-width: 0; min-height: 0; display: flex; }
   .detail-scroll { flex: 1; min-width: 0; overflow-y: auto; padding: var(--space-5); }
   .detail-title { align-items: flex-start; justify-content: space-between; padding-bottom: var(--space-4); }
+  .detail-actions { display: flex; align-items: center; gap: var(--space-2); }
   .detail-title h3 { margin-top: var(--space-1); font-size: var(--text-h2); color: var(--color-text-primary); text-wrap: balance; }
   .detail-title p { margin-top: var(--space-2); max-width: 70ch; color: var(--color-text-secondary); text-wrap: pretty; }
   .detail-tabs { position: sticky; top: 0; z-index: 1; display: flex; gap: var(--space-1); padding: var(--space-2) 0; border-bottom: 1px solid var(--color-border); background: var(--color-surface-raised); }
@@ -1187,10 +1725,30 @@
   .detail-section h4 span { color: var(--color-text-muted); font-weight: var(--fw-normal); }
   .section-title-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
   .folder-assignment select { max-width: 100%; width: min(360px, 100%); }
+  .policy-select { max-width: 100%; width: min(360px, 100%); }
+  .warning { color: var(--color-warning); font-size: var(--text-body-sm); }
+  .permission-list, .quality-list { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+  .permission-list li, .quality-list li { padding: var(--space-1) var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-full); color: var(--color-text-secondary); font-size: var(--text-caption); }
   .folder-form { display: grid; gap: var(--space-3); }
   .folder-form label { display: grid; gap: var(--space-1); color: var(--color-text-secondary); font-size: var(--text-body-sm); }
   .folder-form select { width: 100%; max-width: none; min-height: 30px; }
   .form-submit { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
+  .organize-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+  .organize-grid section { display: grid; align-content: start; gap: var(--space-2); padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+  .organize-grid h4 { color: var(--color-text-primary); font-weight: var(--fw-semibold); text-wrap: balance; }
+  .organize-grid p { color: var(--color-text-muted); font-size: var(--text-body-sm); text-wrap: pretty; }
+  .organize-form { display: flex; align-items: center; gap: var(--space-2); }
+  .organize-form > :global(:first-child) { flex: 1; }
+  .organize-grid ul { display: grid; gap: var(--space-1); }
+  .organize-grid li { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); color: var(--color-text-secondary); font-size: var(--text-body-sm); }
+  .organize-grid > .alert { grid-column: 1 / -1; }
+  .creator-form { display: grid; gap: var(--space-3); }
+  .creator-form label { display: grid; gap: var(--space-1); color: var(--color-text-secondary); font-size: var(--text-body-sm); }
+  .creator-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2); }
+  .creator-row select { width: 100%; max-width: none; min-height: 30px; }
+  .creator-form textarea { width: 100%; resize: vertical; padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); color: var(--color-text-primary); font-family: var(--font-mono); font-size: var(--text-body-sm); }
+  .creator-form textarea:focus { border-color: var(--color-brand); box-shadow: var(--shadow-focus-ring); outline: none; }
+  .creator-form p { color: var(--color-text-muted); font-size: var(--text-body-sm); text-wrap: pretty; }
   dl { display: grid; gap: var(--space-2); }
   dl div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: var(--space-3); }
   dt { color: var(--color-text-muted); font-size: var(--text-body-sm); }
@@ -1207,6 +1765,11 @@
   .install-state { color: var(--color-text-muted); font-size: var(--text-caption); text-transform: capitalize; }
   .lifecycle-actions { display: flex; align-items: center; gap: var(--space-2); }
   .skill-installs .alert { grid-column: 1 / -1; }
+  .version-history { grid-column: 1 / -1; }
+  .version-history summary { cursor: pointer; color: var(--color-text-secondary); font-size: var(--text-body-sm); }
+  .version-history ul { display: grid; gap: var(--space-1); margin-top: var(--space-2); }
+  .version-history li { display: flex; align-items: center; justify-content: space-between; padding: var(--space-2); }
+  .version-history li span { color: var(--color-text-muted); font-size: var(--text-caption); }
   .backups summary { cursor: pointer; color: var(--color-text-secondary); font-size: var(--text-body-sm); }
   .backups ul { display: grid; gap: var(--space-1); margin-top: var(--space-2); }
   .files li { min-width: 0; padding: var(--space-3); border-radius: var(--radius-md); background: var(--color-surface-sunken); }
@@ -1226,5 +1789,7 @@
     .header-actions { flex-wrap: wrap; justify-content: flex-end; }
     .source-popover { position: fixed; left: var(--space-4); right: var(--space-4); width: auto; }
     .draft-popover { position: fixed; left: var(--space-4); right: var(--space-4); width: auto; }
+    .organize-grid { grid-template-columns: 1fr; }
+    .creator-row { grid-template-columns: 1fr; }
   }
 </style>

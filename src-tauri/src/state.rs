@@ -80,6 +80,9 @@ pub struct AppState {
     /// Serializes read-modify-write updates to `state/skill-installs.json`.
     pub skill_installs_write_lock: Arc<Mutex<()>>,
 
+    /// Serializes read-modify-write updates to `state/skill-folders.json`.
+    pub skill_folders_write_lock: Arc<Mutex<()>>,
+
     /// Persisted user settings (Phase 12d). Three-state container that
     /// distinguishes file-absent (defaults apply) from file-corrupt
     /// (fail closed — every outbound call denied until repaired).
@@ -129,6 +132,7 @@ impl AppState {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(settings_state)),
             updater_state: crate::commands::updater::empty_state(),
         })
@@ -876,6 +880,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         };
@@ -986,6 +991,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         };
@@ -1051,6 +1057,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::Loaded(initial))),
             updater_state: crate::commands::updater::empty_state(),
         };
@@ -1091,6 +1098,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         };

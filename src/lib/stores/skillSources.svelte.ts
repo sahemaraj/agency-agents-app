@@ -3,6 +3,8 @@ import {
   skillInstall,
   skillInstallsReconcile,
   skillBackupsList,
+  skillVersionHistory,
+  skillVersionRollback,
   skillDisable,
   skillEnable,
   skillUninstall,
@@ -14,7 +16,31 @@ import {
   skillSourcesInspect,
   skillDraftPublish,
   skillDraftReject,
+  skillDraftCreate,
+  skillDraftEdit,
+  skillTextRead,
   skillDraftsList,
+  skillFolderAssign,
+  skillFolderCreate,
+  skillFolderDelete,
+  skillFolderMove,
+  skillFolderRename,
+  skillFoldersImport,
+  skillFoldersList,
+  skillFavoriteSet,
+  skillRecentTouch,
+  skillCollectionSave,
+  skillCollectionDelete,
+  skillSmartFolderSave,
+  skillSmartFolderDelete,
+  skillProfileSave,
+  skillProfileDelete,
+  skillLibraryReplace,
+  skillLibraryExport,
+  skillLibraryImport,
+  skillUpdatePolicySet,
+  skillApprovalApprove,
+  skillApprovalReject,
   skillTrustGrant,
   skillTrustRevoke,
 } from "$lib/api";
@@ -23,6 +49,13 @@ import {
   isAppError,
   type InstalledSkill,
   type SkillDraft,
+  type SkillFolderState,
+  type SkillCollection,
+  type SkillReference,
+  type SkillSmartFolder,
+  type SkillWorkspaceProfile,
+  type SkillUpdatePolicy,
+  type SkillVersionSnapshot,
   type SkillDestinationPresence,
   type SkillPackageResult,
   type SkillSource,
@@ -51,6 +84,17 @@ class SkillSourcesStore {
   installed: InstalledSkill[] = $state([]);
   drafts: SkillDraft[] = $state([]);
   backups: string[] = $state([]);
+  folderState: SkillFolderState = $state({
+    folders: [],
+    assignments: [],
+    favorites: [],
+    recent: [],
+    collections: [],
+    smartFolders: [],
+    profiles: [],
+    updatePolicies: [],
+    approvals: [],
+  });
   installErrors: Record<string, string> = $state({});
   destinationErrors: Record<string, string> = $state({});
   refreshErrors: Record<string, string> = $state({});
@@ -70,6 +114,7 @@ class SkillSourcesStore {
     try {
       const results = await skillSourcesInspect();
       this.drafts = await skillDraftsList();
+      this.folderState = await skillFoldersList();
       this.sources = results.map((result) => result.source);
       this.results = Object.fromEntries(results.map((result) => [result.source.id, result]));
     } catch (error) {
@@ -131,8 +176,264 @@ class SkillSourcesStore {
     }
   }
 
+  async createDraft(
+    name: string,
+    description: string,
+    skillType: import("$lib/types").SkillType,
+    group: string[],
+    tags: string[],
+    body: string,
+  ): Promise<boolean> {
+    try {
+      const draft = await skillDraftCreate(name, description, skillType, group, tags, body);
+      this.drafts = [...this.drafts, draft];
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  readSkillText(pkg: SkillPackageResult): Promise<string> {
+    return skillTextRead(pkg.sourceId, pkg.relativePath);
+  }
+
+  async editDraft(pkg: SkillPackageResult, skillMd: string): Promise<boolean> {
+    try {
+      const draft = await skillDraftEdit(pkg.sourceId, pkg.relativePath, skillMd);
+      this.drafts = [...this.drafts, draft];
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
   packageKey(pkg: SkillPackageResult): string {
     return `${pkg.sourceId}\0${pkg.relativePath}`;
+  }
+
+  folderFor(pkg: SkillPackageResult): string | null {
+    return this.folderState.assignments.find((assignment) =>
+      assignment.sourceId === pkg.sourceId && assignment.relativePath === pkg.relativePath
+    )?.folderPath ?? null;
+  }
+
+  reference(pkg: SkillPackageResult): SkillReference {
+    return { sourceId: pkg.sourceId, relativePath: pkg.relativePath };
+  }
+
+  isFavorite(pkg: SkillPackageResult): boolean {
+    return this.folderState.favorites.some((skill) =>
+      skill.sourceId === pkg.sourceId && skill.relativePath === pkg.relativePath
+    );
+  }
+
+  updatePolicy(pkg: SkillPackageResult): SkillUpdatePolicy {
+    return this.folderState.updatePolicies.find((record) =>
+      record.skill.sourceId === pkg.sourceId && record.skill.relativePath === pkg.relativePath
+    )?.policy ?? "notify";
+  }
+
+  async setUpdatePolicy(pkg: SkillPackageResult, policy: SkillUpdatePolicy): Promise<boolean> {
+    try {
+      this.folderState = await skillUpdatePolicySet(this.reference(pkg), policy);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async setFavorite(pkg: SkillPackageResult, favorite: boolean): Promise<boolean> {
+    try {
+      this.folderState = await skillFavoriteSet(this.reference(pkg), favorite);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async touchRecent(pkg: SkillPackageResult): Promise<void> {
+    try {
+      this.folderState = await skillRecentTouch(this.reference(pkg));
+    } catch (error) {
+      this.addError = errorMessage(error);
+    }
+  }
+
+  async saveCollection(collection: SkillCollection): Promise<boolean> {
+    try {
+      this.folderState = await skillCollectionSave(collection);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async deleteCollection(name: string): Promise<boolean> {
+    try {
+      this.folderState = await skillCollectionDelete(name);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async saveSmartFolder(smartFolder: SkillSmartFolder): Promise<boolean> {
+    try {
+      this.folderState = await skillSmartFolderSave(smartFolder);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async deleteSmartFolder(name: string): Promise<boolean> {
+    try {
+      this.folderState = await skillSmartFolderDelete(name);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async saveProfile(profile: SkillWorkspaceProfile): Promise<boolean> {
+    try {
+      this.folderState = await skillProfileSave(profile);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async deleteProfile(name: string): Promise<boolean> {
+    try {
+      this.folderState = await skillProfileDelete(name);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async replaceLibrary(replacement: SkillFolderState): Promise<boolean> {
+    try {
+      this.folderState = await skillLibraryReplace(replacement);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async exportLibrary(path: string): Promise<number> {
+    return skillLibraryExport(path);
+  }
+
+  async importLibrary(path: string): Promise<boolean> {
+    try {
+      this.folderState = await skillLibraryImport(path);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async approveRequest(id: string): Promise<boolean> {
+    try {
+      await skillApprovalApprove(id);
+      this.folderState = await skillFoldersList();
+      await this.load();
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async rejectRequest(id: string): Promise<boolean> {
+    try {
+      await skillApprovalReject(id);
+      this.folderState = await skillFoldersList();
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async createFolder(path: string): Promise<boolean> {
+    try {
+      this.folderState = await skillFolderCreate(path);
+      this.addError = null;
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async renameFolder(path: string, newName: string): Promise<boolean> {
+    try {
+      this.folderState = await skillFolderRename(path, newName);
+      this.addError = null;
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async moveFolder(path: string, newParent: string | null): Promise<boolean> {
+    try {
+      this.folderState = await skillFolderMove(path, newParent);
+      this.addError = null;
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async deleteFolder(path: string, recursive: boolean): Promise<boolean> {
+    try {
+      this.folderState = await skillFolderDelete(path, recursive);
+      this.addError = null;
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async assignFolder(pkg: SkillPackageResult, folderPath: string | null): Promise<boolean> {
+    try {
+      this.folderState = await skillFolderAssign(pkg.sourceId, pkg.relativePath, folderPath);
+      this.addError = null;
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
+  }
+
+  async importFolders(imported: SkillFolderState): Promise<boolean> {
+    try {
+      this.folderState = await skillFoldersImport(imported);
+      this.addError = null;
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
+    }
   }
 
   private replacePackage(pkg: SkillPackageResult): void {
@@ -239,6 +540,21 @@ class SkillSourcesStore {
     } finally {
       const { [key]: _cleared, ...installing } = this.installing;
       this.installing = installing;
+    }
+  }
+
+  history(installed: InstalledSkill): Promise<SkillVersionSnapshot[]> {
+    return skillVersionHistory(installed);
+  }
+
+  async rollback(installed: InstalledSkill, snapshotPath: string, projectPaths: string[]): Promise<boolean> {
+    try {
+      await skillVersionRollback(installed, snapshotPath);
+      await this.reconcileInstalls(projectPaths);
+      return true;
+    } catch (error) {
+      this.addError = errorMessage(error);
+      return false;
     }
   }
 

@@ -396,10 +396,99 @@ export interface SkillPackageResult {
   skillType: SkillType;
   group: string[];
   tags: string[];
+  dependencies: string[];
+  recommendedSkills: string[];
+  permissions: string[];
+  qualityScore: number;
+  qualityChecks: string[];
   files: SkillPackageFile[];
   trustFingerprint: SkillTrustFingerprint | null;
   errors: SkillValidationError[];
   installable: boolean;
+}
+
+export interface SkillFolderAssignment {
+  sourceId: string;
+  relativePath: string;
+  folderPath: string;
+}
+
+export interface SkillReference {
+  sourceId: string;
+  relativePath: string;
+}
+
+export interface SkillRecent {
+  skill: SkillReference;
+  viewedAt: string;
+}
+
+export interface SkillCollection {
+  name: string;
+  skills: SkillReference[];
+}
+
+export interface SkillSmartFolderRule {
+  query: string | null;
+  skillType: SkillType | null;
+  tag: string | null;
+  sourceId: string | null;
+  installable: boolean | null;
+  favorite: boolean | null;
+}
+
+export interface SkillSmartFolder {
+  name: string;
+  rule: SkillSmartFolderRule;
+}
+
+export interface SkillWorkspaceProfile {
+  name: string;
+  folders: string[];
+  collections: string[];
+  runtime: string | null;
+  projectPath: string | null;
+}
+
+export type SkillUpdatePolicy = "notify" | "autoTrusted" | "pin" | "reviewScripts";
+
+export interface SkillUpdatePolicyRecord {
+  skill: SkillReference;
+  policy: SkillUpdatePolicy;
+}
+
+export type SkillApprovalAction =
+  | { action: "folderCreate"; path: string }
+  | { action: "folderRename"; path: string; newName: string }
+  | { action: "folderMove"; path: string; newParent: string | null }
+  | { action: "folderDelete"; path: string; recursive: boolean }
+  | { action: "folderAssign"; sourceId: string; relativePath: string; folderPath: string | null }
+  | { action: "install"; sourceId: string; relativePath: string; runtime: string; projectPath: string | null }
+  | { action: "collectionDelete"; name: string }
+  | { action: "smartFolderDelete"; name: string }
+  | { action: "profileDelete"; name: string }
+  | { action: "updatePolicySet"; sourceId: string; relativePath: string; policy: SkillUpdatePolicy }
+  | { action: "rollback"; sourceId: string; relativePath: string; runtime: string; projectPath: string | null; snapshotPath: string };
+
+export interface SkillApproval {
+  id: string;
+  submittedAt: string;
+  state: "pending" | "running" | "approved" | "rejected";
+  requestedBy: string;
+  request: SkillApprovalAction;
+  result: string | null;
+}
+
+export interface SkillFolderState {
+  folders: string[];
+  assignments: SkillFolderAssignment[];
+  favorites: SkillReference[];
+  recent: SkillRecent[];
+  collections: SkillCollection[];
+  smartFolders: SkillSmartFolder[];
+  profiles: SkillWorkspaceProfile[];
+  updatePolicies: SkillUpdatePolicyRecord[];
+  approvals: SkillApproval[];
 }
 
 export type SkillDraftState = "pending" | "published" | "rejected";
@@ -432,6 +521,11 @@ export interface SkillDestinationPresence {
   projectPath: string | null;
   path: string;
   present: boolean;
+}
+
+export interface SkillVersionSnapshot {
+  path: string;
+  createdAt: string;
 }
 
 export type SkillInstallState =

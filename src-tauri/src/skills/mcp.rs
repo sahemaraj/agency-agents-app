@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use crate::{
     state::{append_mcp_audit, AppState, McpAction, McpProjectAuthorization},
-    types::{McpAuditEntry, SkillPackageResult, SkillSourceResult},
+    types::{
+        McpAuditEntry, SkillApprovalAction, SkillCollection, SkillPackageResult, SkillReference,
+        SkillSmartFolder, SkillSmartFolderRule, SkillSourceResult, SkillType, SkillUpdatePolicy,
+        SkillWorkspaceProfile,
+    },
 };
 use axum::{
     extract::{Request, State},
@@ -164,6 +168,273 @@ struct DraftRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FolderPathRequest {
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RenameFolderRequest {
+    path: String,
+    new_name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MoveFolderRequest {
+    path: String,
+    new_parent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DeleteFolderRequest {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AssignFolderRequest {
+    source_id: String,
+    relative_path: String,
+    folder_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SkillReferenceRequest {
+    source_id: String,
+    relative_path: String,
+}
+
+impl From<SkillReferenceRequest> for SkillReference {
+    fn from(value: SkillReferenceRequest) -> Self {
+        Self {
+            source_id: value.source_id,
+            relative_path: value.relative_path,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FavoriteRequest {
+    source_id: String,
+    relative_path: String,
+    favorite: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CollectionRequest {
+    name: String,
+    skills: Vec<SkillReferenceRequest>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SmartFolderRequest {
+    name: String,
+    query: Option<String>,
+    skill_type: Option<String>,
+    tag: Option<String>,
+    source_id: Option<String>,
+    installable: Option<bool>,
+    favorite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProfileRequest {
+    name: String,
+    #[serde(default)]
+    folders: Vec<String>,
+    #[serde(default)]
+    collections: Vec<String>,
+    runtime: Option<String>,
+    project_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CreateDraftRequest {
+    name: String,
+    description: String,
+    skill_type: String,
+    #[serde(default)]
+    group: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EditDraftRequest {
+    source_id: String,
+    relative_path: String,
+    skill_md: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct VersionHistoryRequest {
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct NamedApprovalRequest {
+    name: String,
+    requested_by: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct UpdatePolicyApprovalRequest {
+    source_id: String,
+    relative_path: String,
+    policy: String,
+    requested_by: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RollbackApprovalRequest {
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+    snapshot_path: String,
+    requested_by: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SubmitApprovalRequest {
+    requested_by: String,
+    request: ApprovalActionRequest,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum ApprovalActionRequest {
+    FolderCreate {
+        path: String,
+    },
+    FolderRename {
+        path: String,
+        new_name: String,
+    },
+    FolderMove {
+        path: String,
+        new_parent: Option<String>,
+    },
+    FolderDelete {
+        path: String,
+        recursive: bool,
+    },
+    FolderAssign {
+        source_id: String,
+        relative_path: String,
+        folder_path: Option<String>,
+    },
+    Install {
+        source_id: String,
+        relative_path: String,
+        runtime: String,
+        project_path: Option<String>,
+    },
+    CollectionDelete {
+        name: String,
+    },
+    SmartFolderDelete {
+        name: String,
+    },
+    ProfileDelete {
+        name: String,
+    },
+    UpdatePolicySet {
+        source_id: String,
+        relative_path: String,
+        policy: String,
+    },
+    Rollback {
+        source_id: String,
+        relative_path: String,
+        runtime: String,
+        project_path: Option<String>,
+        snapshot_path: String,
+    },
+}
+
+impl TryFrom<ApprovalActionRequest> for SkillApprovalAction {
+    type Error = String;
+
+    fn try_from(value: ApprovalActionRequest) -> Result<Self, Self::Error> {
+        Ok(match value {
+            ApprovalActionRequest::FolderCreate { path } => Self::FolderCreate { path },
+            ApprovalActionRequest::FolderRename { path, new_name } => {
+                Self::FolderRename { path, new_name }
+            }
+            ApprovalActionRequest::FolderMove { path, new_parent } => {
+                Self::FolderMove { path, new_parent }
+            }
+            ApprovalActionRequest::FolderDelete { path, recursive } => {
+                Self::FolderDelete { path, recursive }
+            }
+            ApprovalActionRequest::FolderAssign {
+                source_id,
+                relative_path,
+                folder_path,
+            } => Self::FolderAssign {
+                source_id,
+                relative_path,
+                folder_path,
+            },
+            ApprovalActionRequest::Install {
+                source_id,
+                relative_path,
+                runtime,
+                project_path,
+            } => Self::Install {
+                source_id,
+                relative_path,
+                runtime,
+                project_path,
+            },
+            ApprovalActionRequest::CollectionDelete { name } => Self::CollectionDelete { name },
+            ApprovalActionRequest::SmartFolderDelete { name } => Self::SmartFolderDelete { name },
+            ApprovalActionRequest::ProfileDelete { name } => Self::ProfileDelete { name },
+            ApprovalActionRequest::UpdatePolicySet {
+                source_id,
+                relative_path,
+                policy,
+            } => Self::UpdatePolicySet {
+                source_id,
+                relative_path,
+                policy: parse_update_policy(&policy)?,
+            },
+            ApprovalActionRequest::Rollback {
+                source_id,
+                relative_path,
+                runtime,
+                project_path,
+                snapshot_path,
+            } => Self::Rollback {
+                source_id,
+                relative_path,
+                runtime,
+                project_path,
+                snapshot_path,
+            },
+        })
+    }
+}
+
+fn parse_skill_type(value: &str) -> Result<SkillType, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|_| "skill_type must be design, development, testing, devops, security, data, ai, productivity, or other".into())
+}
+
+fn parse_update_policy(value: &str) -> Result<SkillUpdatePolicy, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|_| "policy must be notify, autoTrusted, pin, or reviewScripts".into())
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SubmitDraftRequest {
     files: Vec<SubmitDraftFile>,
 }
@@ -220,6 +491,17 @@ impl SkillMcpServer {
         }
     }
 
+    async fn submit_approval_json(
+        &self,
+        requested_by: String,
+        request: SkillApprovalAction,
+    ) -> Result<String, String> {
+        let approval = super::organize::submit_approval(&self.state, requested_by, request)
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string_pretty(&approval).map_err(|error| error.to_string())
+    }
+
     async fn run_tool<T, F>(
         &self,
         _tool: &'static str,
@@ -271,17 +553,37 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "skills_list_sources"
         | "skills_list_drafts"
         | "skills_get_draft"
+        | "skills_get_library"
+        | "skills_list_folders"
+        | "skills_list_approvals"
         | "skills_source_status"
-        | "skills_recommend" => Some(McpAction::Read),
+        | "skills_recommend"
+        | "skills_version_history" => Some(McpAction::Read),
         "skills_add_local_source"
         | "skills_add_github_source"
         | "skills_refresh_source"
         | "skills_refresh_all" => Some(McpAction::Source),
-        "skills_submit_draft" => Some(McpAction::Source),
+        "skills_submit_draft"
+        | "skills_create_draft"
+        | "skills_edit_draft"
+        | "skills_create_folder"
+        | "skills_rename_folder"
+        | "skills_move_folder"
+        | "skills_assign_folder"
+        | "skills_set_favorite"
+        | "skills_save_collection"
+        | "skills_save_smart_folder"
+        | "skills_save_profile"
+        | "skills_delete_collection"
+        | "skills_delete_smart_folder"
+        | "skills_delete_profile"
+        | "skills_set_update_policy"
+        | "skills_request_rollback" => Some(McpAction::Source),
+        "skills_submit_approval" => Some(McpAction::Source),
         "skills_install" | "skills_find_and_install" | "skills_update" | "skills_enable" => {
             Some(McpAction::Install)
         }
-        "skills_disable" | "skills_uninstall" | "skills_remove_source" => {
+        "skills_disable" | "skills_uninstall" | "skills_remove_source" | "skills_delete_folder" => {
             Some(McpAction::Destructive)
         }
         _ => None,
@@ -799,6 +1101,407 @@ impl SkillMcpServer {
                 .await
                 .map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&draft).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Create a validated skill package draft for desktop review")]
+    async fn skills_create_draft(
+        &self,
+        Parameters(request): Parameters<CreateDraftRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_create_draft", McpAction::Source, None, async {
+            let draft = super::drafts::create(
+                &self.state,
+                request.name,
+                request.description,
+                parse_skill_type(&request.skill_type)?,
+                request.group,
+                request.tags,
+                request.body,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&draft).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Copy a validated skill into a draft with replacement SKILL.md content")]
+    async fn skills_edit_draft(
+        &self,
+        Parameters(request): Parameters<EditDraftRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_edit_draft", McpAction::Source, None, async {
+            let draft = super::drafts::edit(
+                &self.state,
+                request.source_id,
+                request.relative_path,
+                request.skill_md,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&draft).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Read the complete Skills library organization state")]
+    async fn skills_get_library(&self) -> Result<String, String> {
+        self.run_tool("skills_get_library", McpAction::Read, None, async {
+            let library = super::organize::list(&self.state)
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&library).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "List personal skill folders and skill assignments")]
+    async fn skills_list_folders(&self) -> Result<String, String> {
+        self.run_tool("skills_list_folders", McpAction::Read, None, async {
+            let folders = super::organize::list(&self.state)
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&folders).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Create a personal skill folder; parent folders must already exist")]
+    async fn skills_create_folder(
+        &self,
+        Parameters(FolderPathRequest { path }): Parameters<FolderPathRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_create_folder", McpAction::Source, None, async {
+            let folders = super::organize::create_folder(&self.state, path)
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&folders).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Rename a personal skill folder and update descendants and assignments")]
+    async fn skills_rename_folder(
+        &self,
+        Parameters(RenameFolderRequest { path, new_name }): Parameters<RenameFolderRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_rename_folder", McpAction::Source, None, async {
+            let folders = super::organize::rename_folder(&self.state, path, new_name)
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&folders).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Move a personal skill folder beneath another folder or to the root")]
+    async fn skills_move_folder(
+        &self,
+        Parameters(MoveFolderRequest { path, new_parent }): Parameters<MoveFolderRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_move_folder", McpAction::Source, None, async {
+            let folders = super::organize::move_folder(&self.state, path, new_parent)
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&folders).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Delete a personal skill folder; recursive=true is required when it contains descendants or assignments"
+    )]
+    async fn skills_delete_folder(
+        &self,
+        Parameters(DeleteFolderRequest { path, recursive }): Parameters<DeleteFolderRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_delete_folder",
+            McpAction::Destructive,
+            None,
+            async {
+                let folders = super::organize::delete_folder(&self.state, path, recursive)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&folders).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Assign a validated skill to a personal folder, or pass null to unassign it"
+    )]
+    async fn skills_assign_folder(
+        &self,
+        Parameters(AssignFolderRequest {
+            source_id,
+            relative_path,
+            folder_path,
+        }): Parameters<AssignFolderRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_assign_folder", McpAction::Source, None, async {
+            if folder_path.is_some() {
+                let sources = super::inspect_skill_sources(&self.state)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let exists = sources.iter().any(|source| {
+                    source.packages.iter().any(|package| {
+                        package.source_id == source_id && package.relative_path == relative_path
+                    })
+                });
+                if !exists {
+                    return Err("skill package does not exist".into());
+                }
+            }
+            let folders =
+                super::organize::assign_folder(&self.state, source_id, relative_path, folder_path)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&folders).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Add or remove a validated skill from favorites")]
+    async fn skills_set_favorite(
+        &self,
+        Parameters(request): Parameters<FavoriteRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_set_favorite", McpAction::Source, None, async {
+            let library = super::organize::set_favorite(
+                &self.state,
+                SkillReference {
+                    source_id: request.source_id,
+                    relative_path: request.relative_path,
+                },
+                request.favorite,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&library).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Create or replace a named collection of validated skills")]
+    async fn skills_save_collection(
+        &self,
+        Parameters(request): Parameters<CollectionRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_save_collection", McpAction::Source, None, async {
+            let library = super::organize::save_collection(
+                &self.state,
+                SkillCollection {
+                    name: request.name,
+                    skills: request.skills.into_iter().map(Into::into).collect(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&library).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Create or replace a named dynamic skill filter")]
+    async fn skills_save_smart_folder(
+        &self,
+        Parameters(request): Parameters<SmartFolderRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_save_smart_folder", McpAction::Source, None, async {
+            let library = super::organize::save_smart_folder(
+                &self.state,
+                SkillSmartFolder {
+                    name: request.name,
+                    rule: SkillSmartFolderRule {
+                        query: request.query,
+                        skill_type: request
+                            .skill_type
+                            .as_deref()
+                            .map(parse_skill_type)
+                            .transpose()?,
+                        tag: request.tag,
+                        source_id: request.source_id,
+                        installable: request.installable,
+                        favorite: request.favorite,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&library).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Create or replace a named Skills workspace profile")]
+    async fn skills_save_profile(
+        &self,
+        Parameters(request): Parameters<ProfileRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_save_profile", McpAction::Source, None, async {
+            let library = super::organize::save_profile(
+                &self.state,
+                SkillWorkspaceProfile {
+                    name: request.name,
+                    folders: request.folders,
+                    collections: request.collections,
+                    runtime: request.runtime,
+                    project_path: request.project_path,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&library).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "List recoverable versions for an installed skill")]
+    async fn skills_version_history(
+        &self,
+        Parameters(request): Parameters<VersionHistoryRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_version_history",
+            McpAction::Read,
+            request.project_path.clone(),
+            async {
+                let history = super::skill_version_history(
+                    &self.state,
+                    &request.source_id,
+                    &request.relative_path,
+                    &request.runtime,
+                    request.project_path.as_deref(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&history).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Request desktop approval to delete a named skill collection")]
+    async fn skills_delete_collection(
+        &self,
+        Parameters(request): Parameters<NamedApprovalRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_delete_collection", McpAction::Source, None, async {
+            self.submit_approval_json(
+                request.requested_by,
+                SkillApprovalAction::CollectionDelete { name: request.name },
+            )
+            .await
+        })
+        .await
+    }
+
+    #[tool(description = "Request desktop approval to delete a named smart folder")]
+    async fn skills_delete_smart_folder(
+        &self,
+        Parameters(request): Parameters<NamedApprovalRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_delete_smart_folder",
+            McpAction::Source,
+            None,
+            async {
+                self.submit_approval_json(
+                    request.requested_by,
+                    SkillApprovalAction::SmartFolderDelete { name: request.name },
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Request desktop approval to delete a named workspace profile")]
+    async fn skills_delete_profile(
+        &self,
+        Parameters(request): Parameters<NamedApprovalRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_delete_profile", McpAction::Source, None, async {
+            self.submit_approval_json(
+                request.requested_by,
+                SkillApprovalAction::ProfileDelete { name: request.name },
+            )
+            .await
+        })
+        .await
+    }
+
+    #[tool(description = "Request desktop approval to change a skill update policy")]
+    async fn skills_set_update_policy(
+        &self,
+        Parameters(request): Parameters<UpdatePolicyApprovalRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_set_update_policy", McpAction::Source, None, async {
+            self.submit_approval_json(
+                request.requested_by,
+                SkillApprovalAction::UpdatePolicySet {
+                    source_id: request.source_id,
+                    relative_path: request.relative_path,
+                    policy: parse_update_policy(&request.policy)?,
+                },
+            )
+            .await
+        })
+        .await
+    }
+
+    #[tool(description = "Request desktop approval to roll back an installed skill")]
+    async fn skills_request_rollback(
+        &self,
+        Parameters(request): Parameters<RollbackApprovalRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_request_rollback",
+            McpAction::Source,
+            request.project_path.clone(),
+            async {
+                self.submit_approval_json(
+                    request.requested_by,
+                    SkillApprovalAction::Rollback {
+                        source_id: request.source_id,
+                        relative_path: request.relative_path,
+                        runtime: request.runtime,
+                        project_path: request.project_path,
+                        snapshot_path: request.snapshot_path,
+                    },
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Submit a bounded skill or folder mutation for desktop approval")]
+    async fn skills_submit_approval(
+        &self,
+        Parameters(SubmitApprovalRequest {
+            requested_by,
+            request,
+        }): Parameters<SubmitApprovalRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("skills_submit_approval", McpAction::Source, None, async {
+            self.submit_approval_json(requested_by, request.try_into()?)
+                .await
+        })
+        .await
+    }
+
+    #[tool(description = "List mutation requests in the desktop approval inbox")]
+    async fn skills_list_approvals(&self) -> Result<String, String> {
+        self.run_tool("skills_list_approvals", McpAction::Read, None, async {
+            let library = super::organize::list(&self.state)
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&library.approvals).map_err(|error| error.to_string())
         })
         .await
     }
@@ -1508,9 +2211,9 @@ mod tests {
 
     use super::{
         action_for_tool, catalog_revision, package_resource_uri, parse_package_resource_uri,
-        recommend_skills, resource_list_changed, search_packages, validate_recommend_request,
-        FindAndInstallRequest, HttpAuth, RecommendRequest, SkillMcpServer, SkillRuntime,
-        SourceRequest,
+        parse_skill_type, parse_update_policy, recommend_skills, resource_list_changed,
+        search_packages, validate_recommend_request, FindAndInstallRequest, HttpAuth,
+        NamedApprovalRequest, RecommendRequest, SkillMcpServer, SkillRuntime, SourceRequest,
     };
 
     fn package(name: &str, description: &str, installable: bool) -> SkillPackageResult {
@@ -1522,6 +2225,11 @@ mod tests {
             skill_type: crate::types::SkillType::Other,
             group: Vec::new(),
             tags: Vec::new(),
+            dependencies: Vec::new(),
+            recommended_skills: Vec::new(),
+            permissions: Vec::new(),
+            quality_score: 0,
+            quality_checks: Vec::new(),
             files: Vec::new(),
             trust_fingerprint: None,
             errors: Vec::new(),
@@ -1536,6 +2244,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         })
@@ -1961,6 +2670,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2054,6 +2764,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2092,6 +2803,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2169,6 +2881,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2239,6 +2952,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2288,6 +3002,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2339,6 +3054,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2394,6 +3110,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::Loaded(
                 crate::commands::settings::Settings {
                     mcp_install_access: true,
@@ -2477,6 +3194,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         }));
@@ -2497,28 +3215,85 @@ mod tests {
             [
                 "skills_add_github_source",
                 "skills_add_local_source",
+                "skills_assign_folder",
+                "skills_create_draft",
+                "skills_create_folder",
+                "skills_delete_collection",
+                "skills_delete_folder",
+                "skills_delete_profile",
+                "skills_delete_smart_folder",
                 "skills_disable",
+                "skills_edit_draft",
                 "skills_enable",
                 "skills_find_and_install",
                 "skills_get",
                 "skills_get_draft",
                 "skills_get_file",
+                "skills_get_library",
                 "skills_install",
                 "skills_installed",
+                "skills_list_approvals",
                 "skills_list_drafts",
                 "skills_list_files",
+                "skills_list_folders",
                 "skills_list_sources",
+                "skills_move_folder",
                 "skills_recommend",
                 "skills_refresh_all",
                 "skills_refresh_source",
                 "skills_remove_source",
+                "skills_rename_folder",
+                "skills_request_rollback",
+                "skills_save_collection",
+                "skills_save_profile",
+                "skills_save_smart_folder",
                 "skills_search",
+                "skills_set_favorite",
+                "skills_set_update_policy",
                 "skills_source_status",
+                "skills_submit_approval",
                 "skills_submit_draft",
                 "skills_uninstall",
                 "skills_update",
+                "skills_version_history",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn destructive_library_tools_create_pending_approvals() {
+        let root = tempfile::tempdir().expect("app data");
+        let server = SkillMcpServer::new(Arc::new(AppState {
+            app_data_dir: root.path().to_path_buf(),
+            corpus_cache: Arc::new(Mutex::new(None)),
+            corpus_refresh_in_flight: Arc::new(Mutex::new(())),
+            skill_sources_write_lock: Arc::new(Mutex::new(())),
+            skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
+            settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
+            updater_state: crate::commands::updater::empty_state(),
+        }));
+
+        let response: serde_json::Value = serde_json::from_str(
+            &server
+                .skills_delete_collection(Parameters(NamedApprovalRequest {
+                    name: "Review set".into(),
+                    requested_by: "Codex".into(),
+                }))
+                .await
+                .expect("submit delete approval"),
+        )
+        .expect("approval JSON");
+
+        assert_eq!(response["state"], "pending");
+        assert_eq!(response["request"]["action"], "collectionDelete");
+        assert_eq!(response["request"]["name"], "Review set");
+    }
+
+    #[test]
+    fn mcp_rejects_unknown_creator_types_and_update_policies() {
+        assert!(parse_skill_type("unknown").is_err());
+        assert!(parse_update_policy("always").is_err());
     }
 
     #[tokio::test]
@@ -2543,6 +3318,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2812,6 +3588,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2910,6 +3687,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
@@ -2992,6 +3770,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });

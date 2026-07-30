@@ -22,6 +22,18 @@ pub struct DraftInputFile {
     pub base64: Option<String>,
 }
 
+#[derive(serde::Serialize)]
+struct CreatorMetadata {
+    name: String,
+    description: String,
+    #[serde(rename = "type")]
+    skill_type: crate::types::SkillType,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    group: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
+}
+
 #[cfg(test)]
 fn drafts_root(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("skills").join("drafts")
@@ -505,6 +517,66 @@ pub async fn submit(state: &AppState, files: Vec<DraftInputFile>) -> Result<Skil
     Ok(draft)
 }
 
+pub async fn create(
+    state: &AppState,
+    name: String,
+    description: String,
+    skill_type: crate::types::SkillType,
+    group: Vec<String>,
+    tags: Vec<String>,
+    body: String,
+) -> Result<SkillDraft, AppError> {
+    let metadata = serde_yaml::to_string(&CreatorMetadata {
+        name,
+        description,
+        skill_type,
+        group,
+        tags,
+    })
+    .map_err(|error| AppError::Internal {
+        message: format!("serialize skill creator metadata: {error}"),
+    })?;
+    let skill_md = format!("---\n{}---\n\n{}\n", metadata.trim_start_matches("---\n"), body.trim());
+    submit(
+        state,
+        vec![DraftInputFile {
+            relative_path: "SKILL.md".into(),
+            text: Some(skill_md),
+            base64: None,
+        }],
+    )
+    .await
+}
+
+pub async fn edit(
+    state: &AppState,
+    source_id: String,
+    relative_path: String,
+    skill_md: String,
+) -> Result<SkillDraft, AppError> {
+    let package = super::resolve_skill_package(state, &source_id, &relative_path).await?;
+    let mut files = Vec::with_capacity(package.files().len());
+    for file in package.files() {
+        let content = super::read_skill_file(
+            state,
+            &source_id,
+            &relative_path,
+            &file.relative_path,
+        )
+        .await?;
+        files.push(DraftInputFile {
+            relative_path: file.relative_path.clone(),
+            text: if file.relative_path == "SKILL.md" {
+                Some(skill_md.clone())
+            } else {
+                content.text
+            },
+            base64: content.base64,
+        });
+    }
+    submit(state, files).await
+}
+
 pub async fn list(state: &AppState) -> Result<Vec<SkillDraft>, AppError> {
     let _lock = lock_drafts(&state.app_data_dir)?;
     load_index(&state.app_data_dir).await
@@ -717,6 +789,52 @@ pub async fn skill_draft_reject(
     reject(&state, &id).await
 }
 
+#[tauri::command]
+pub async fn skill_draft_create(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    description: String,
+    skill_type: crate::types::SkillType,
+    group: Vec<String>,
+    tags: Vec<String>,
+    body: String,
+) -> Result<SkillDraft, AppError> {
+    create(
+        &state,
+        name,
+        description,
+        skill_type,
+        group,
+        tags,
+        body,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_draft_edit(
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+    skill_md: String,
+) -> Result<SkillDraft, AppError> {
+    edit(&state, source_id, relative_path, skill_md).await
+}
+
+#[tauri::command]
+pub async fn skill_text_read(
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+    relative_path: String,
+) -> Result<String, AppError> {
+    super::read_skill_file(&state, &source_id, &relative_path, "SKILL.md")
+        .await?
+        .text
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "SKILL.md must be UTF-8".into(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,6 +849,7 @@ mod tests {
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
             skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: Arc::new(RwLock::new(Default::default())),
         }
