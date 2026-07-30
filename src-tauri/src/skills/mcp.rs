@@ -1109,7 +1109,11 @@ fn search_packages(results: &[SkillSourceResult], query: &str) -> Vec<SkillPacka
                 && package
                     .name
                     .iter()
-                    .chain(package.description.iter())
+                    .map(String::as_str)
+                    .chain(package.description.iter().map(String::as_str))
+                    .chain(std::iter::once(package.skill_type.as_str()))
+                    .chain(package.group.iter().map(String::as_str))
+                    .chain(package.tags.iter().map(String::as_str))
                     .any(|value| value.to_lowercase().contains(&query))
         })
         .cloned()
@@ -1165,6 +1169,11 @@ fn recommend_skills(
             let name_tokens = metadata_tokens(package.name.as_deref().unwrap_or_default());
             let description_tokens =
                 metadata_tokens(package.description.as_deref().unwrap_or_default());
+            let taxonomy_tokens = std::iter::once(package.skill_type.as_str())
+                .chain(package.group.iter().map(String::as_str))
+                .chain(package.tags.iter().map(String::as_str))
+                .flat_map(metadata_tokens)
+                .collect::<std::collections::BTreeSet<_>>();
             let mut score = 0;
             let mut reasons = Vec::new();
             for token in &task_tokens {
@@ -1174,10 +1183,16 @@ fn recommend_skills(
                 } else if description_tokens.contains(token) {
                     score += 2;
                     reasons.push(format!("task:description:{token}"));
+                } else if taxonomy_tokens.contains(token) {
+                    score += 2;
+                    reasons.push(format!("task:taxonomy:{token}"));
                 }
             }
             for token in &language_tokens {
-                if name_tokens.contains(token) || description_tokens.contains(token) {
+                if name_tokens.contains(token)
+                    || description_tokens.contains(token)
+                    || taxonomy_tokens.contains(token)
+                {
                     score += 3;
                     reasons.push(format!("language:{token}"));
                 }
@@ -1504,6 +1519,9 @@ mod tests {
             relative_path: name.to_lowercase().replace(' ', "-"),
             name: Some(name.into()),
             description: Some(description.into()),
+            skill_type: crate::types::SkillType::Other,
+            group: Vec::new(),
+            tags: Vec::new(),
             files: Vec::new(),
             trust_fingerprint: None,
             errors: Vec::new(),
@@ -1751,6 +1769,10 @@ mod tests {
 
     #[test]
     fn search_is_case_insensitive_and_excludes_invalid_packages() {
+        let mut taxonomy_match = package("Interface Builder", "Builds interfaces", true);
+        taxonomy_match.skill_type = crate::types::SkillType::Design;
+        taxonomy_match.group = vec!["frontend".into()];
+        taxonomy_match.tags = vec!["svelte".into()];
         let results = vec![SkillSourceResult {
             source: SkillSource {
                 id: "source-1".into(),
@@ -1761,7 +1783,7 @@ mod tests {
             packages: vec![
                 package("Rust Reviewer", "Reviews unsafe Rust", true),
                 package("Broken Rust Skill", "Invalid metadata", false),
-                package("Svelte Builder", "Builds interfaces", true),
+                taxonomy_match,
             ],
             errors: Vec::new(),
         }];
@@ -1770,6 +1792,9 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name.as_deref(), Some("Rust Reviewer"));
+        assert_eq!(search_packages(&results, "frontend").len(), 1);
+        assert_eq!(search_packages(&results, "svelte").len(), 1);
+        assert_eq!(search_packages(&results, "design").len(), 1);
     }
 
     #[test]

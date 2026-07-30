@@ -17,10 +17,11 @@
   import { projects } from "$lib/stores/projects.svelte";
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { InstalledSkill, SkillDraft, SkillPackageResult, SkillSource, SkillSourceResult } from "$lib/types";
+  import type { InstalledSkill, SkillDraft, SkillPackageResult, SkillSource, SkillSourceResult, SkillType } from "$lib/types";
 
   type StatusFilter = "all" | "ready" | "rejected";
   type PackageView = { pkg: SkillPackageResult; source: SkillSource };
+  type SkillGroupNode = { key: string; label: string; children: SkillGroupNode[]; packages: PackageView[] };
 
   let localPath = $state("");
   let announcement = $state("");
@@ -32,6 +33,7 @@
   let query = $state("");
   let statusFilter: StatusFilter = $state("all");
   let sourceFilter = $state("all");
+  let typeFilter: SkillType | "all" = $state("all");
   let selectedKey: string | null = $state(null);
   let uninstallCandidate: InstalledSkill | null = $state(null);
   let rejectDraftCandidate: SkillDraft | null = $state(null);
@@ -48,14 +50,50 @@
       if (statusFilter === "ready" && !pkg.installable) return false;
       if (statusFilter === "rejected" && pkg.installable) return false;
       if (sourceFilter !== "all" && source.id !== sourceFilter) return false;
+      if (typeFilter !== "all" && pkg.skillType !== typeFilter) return false;
       if (!q) return true;
       return [
         pkg.name ?? "",
         pkg.description ?? "",
         pkg.relativePath,
+        pkg.skillType,
+        ...pkg.group,
+        ...pkg.tags,
         sourceLabel(source),
       ].some((value) => value.toLowerCase().includes(q));
     });
+  });
+  const grouped = $derived.by<SkillGroupNode[]>(() => {
+    const roots = new Map<string, SkillGroupNode>();
+    for (const view of filtered) {
+      let root = roots.get(view.pkg.skillType);
+      if (!root) {
+        root = { key: view.pkg.skillType, label: typeLabel(view.pkg.skillType), children: [], packages: [] };
+        roots.set(view.pkg.skillType, root);
+      }
+      let node: SkillGroupNode = root;
+      for (const segment of view.pkg.group) {
+        let child: SkillGroupNode | undefined = node.children.find((candidate) => candidate.key === `${node.key}/${segment}`);
+        if (!child) {
+          child = { key: `${node.key}/${segment}`, label: taxonomyLabel(segment), children: [], packages: [] };
+          node.children.push(child);
+        }
+        node = child;
+      }
+      node.packages.push(view);
+    }
+    const sort = (nodes: SkillGroupNode[]): void => {
+      nodes.sort((left, right) => left.label.localeCompare(right.label));
+      for (const node of nodes) {
+        node.packages.sort((left, right) =>
+          (left.pkg.name ?? left.pkg.relativePath).localeCompare(right.pkg.name ?? right.pkg.relativePath),
+        );
+        sort(node.children);
+      }
+    };
+    const result = [...roots.values()];
+    sort(result);
+    return result;
   });
   const selected = $derived(
     selectedKey === null
@@ -113,6 +151,18 @@
     if (status === "ready") return i18n.t("skills.ready");
     if (status === "rejected") return i18n.t("skills.rejected");
     return i18n.t("skills.all");
+  }
+
+  function taxonomyLabel(value: string): string {
+    return value.split("-").map((part) => part ? `${part[0].toUpperCase()}${part.slice(1)}` : part).join(" ");
+  }
+
+  function typeLabel(value: SkillType): string {
+    return value === "ai" ? "AI" : value === "devops" ? "DevOps" : taxonomyLabel(value);
+  }
+
+  function groupCount(node: SkillGroupNode): number {
+    return node.packages.length + node.children.reduce((count, child) => count + groupCount(child), 0);
   }
 
   function formatBytes(bytes: number): string {
@@ -309,6 +359,41 @@
   }
 </script>
 
+{#snippet packageRow(view: PackageView, depth: number)}
+  {@const key = skillSources.packageKey(view.pkg)}
+  <li class="package-row" style:--tree-depth={depth}>
+    <button class:selected={selectedKey === key} aria-pressed={selectedKey === key} onclick={() => selectPackage(view)}>
+      <span class="row-top">
+        <strong>{view.pkg.name ?? view.pkg.relativePath}</strong>
+        <span class:ready={view.pkg.installable} class:rejected={!view.pkg.installable} class="status-badge">
+          {packageStatus(view.pkg)}
+        </span>
+      </span>
+      <span class="description">{view.pkg.description ?? i18n.t("skills.packageValidationFailed")}</span>
+      <span class="provenance">{sourceKind(view.source)} · {view.pkg.relativePath}</span>
+    </button>
+  </li>
+{/snippet}
+
+{#snippet groupNode(node: SkillGroupNode, depth: number)}
+  <li class="skill-group">
+    <details open>
+      <summary style:--tree-depth={depth}>
+        <span>{node.label}</span>
+        <span>{groupCount(node)}</span>
+      </summary>
+      <ul>
+        {#each node.children as child (child.key)}
+          {@render groupNode(child, depth + 1)}
+        {/each}
+        {#each node.packages as view (skillSources.packageKey(view.pkg))}
+          {@render packageRow(view, depth + 1)}
+        {/each}
+      </ul>
+    </details>
+  </li>
+{/snippet}
+
 <div class="workspace">
   <header>
     <div>
@@ -468,6 +553,12 @@
                 <option value={source.id}>{sourceLabel(source)}</option>
               {/each}
             </select>
+            <select bind:value={typeFilter} aria-label={i18n.t("skills.filterType")}>
+              <option value="all">{i18n.t("skills.allTypes")}</option>
+              {#each ["design", "development", "testing", "devops", "security", "data", "ai", "productivity", "other"] as type}
+                <option value={type}>{typeLabel(type as SkillType)}</option>
+              {/each}
+            </select>
           </div>
         </div>
 
@@ -476,20 +567,8 @@
           <EmptyState title={i18n.t("skills.noMatches")} body={i18n.t("skills.noMatchesBody", { query: query || statusLabel(statusFilter) })} />
         {:else}
           <ul class="results" aria-label={i18n.t("skills.resultsAria")}>
-            {#each filtered as view (skillSources.packageKey(view.pkg))}
-              {@const key = skillSources.packageKey(view.pkg)}
-              <li>
-                <button class:selected={selectedKey === key} aria-pressed={selectedKey === key} onclick={() => selectPackage(view)}>
-                  <span class="row-top">
-                    <strong>{view.pkg.name ?? view.pkg.relativePath}</strong>
-                    <span class:ready={view.pkg.installable} class:rejected={!view.pkg.installable} class="status-badge">
-                      {packageStatus(view.pkg)}
-                    </span>
-                  </span>
-                  <span class="description">{view.pkg.description ?? i18n.t("skills.packageValidationFailed")}</span>
-                  <span class="provenance">{sourceKind(view.source)} · {view.pkg.relativePath}</span>
-                </button>
-              </li>
+            {#each grouped as node (node.key)}
+              {@render groupNode(node, 0)}
             {/each}
           </ul>
         {/if}
@@ -512,6 +591,9 @@
             <section class="detail-section">
               <h4>{i18n.t("skills.provenance")}</h4>
               <dl>
+                <div><dt>{i18n.t("skills.type")}</dt><dd>{typeLabel(selected.pkg.skillType)}</dd></div>
+                <div><dt>{i18n.t("skills.group")}</dt><dd>{selected.pkg.group.length ? selected.pkg.group.map(taxonomyLabel).join(" / ") : i18n.t("skills.none")}</dd></div>
+                <div><dt>{i18n.t("skills.tags")}</dt><dd>{selected.pkg.tags.length ? selected.pkg.tags.join(", ") : i18n.t("skills.none")}</dd></div>
                 <div><dt>{i18n.t("skills.source")}</dt><dd>{sourceKind(selected.source)}</dd></div>
                 <div><dt>{i18n.t("skills.identity")}</dt><dd title={sourceLabel(selected.source)}>{sourceLabel(selected.source)}</dd></div>
                 {#if selected.source.kind.kind === "github"}
@@ -732,14 +814,16 @@
   .search { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-text-muted); background: var(--color-surface-raised); }
   .search:focus-within { border-color: var(--color-brand); }
   .search input { flex: 1; min-width: 0; background: transparent; color: var(--color-text-primary); }
-  .filter-row { justify-content: space-between; }
+  .filter-row { flex-wrap: wrap; justify-content: space-between; gap: var(--space-2); }
   .segments { display: flex; padding: 2px; border-radius: var(--radius-md); background: var(--color-surface-sunken); }
   .segments button { padding: var(--space-1) var(--space-2); border-radius: var(--radius-sm); color: var(--color-text-muted); font-size: var(--text-caption); }
   .segments button.active { background: var(--color-surface-raised); color: var(--color-text-primary); box-shadow: var(--shadow-sm); }
   select { min-width: 0; max-width: 45%; padding: var(--space-1) var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-raised); color: var(--color-text-secondary); font-size: var(--text-caption); }
   .result-count { padding: var(--space-2) var(--space-3); color: var(--color-text-muted); font-size: var(--text-caption); border-bottom: 1px solid var(--color-border); }
   .results { flex: 1; min-height: 0; overflow-y: auto; }
-  .results button { width: 100%; display: grid; gap: var(--space-1); padding: var(--space-3); border-bottom: 1px solid var(--color-border); color: var(--color-text-primary); text-align: left; }
+  .skill-group summary { display: flex; justify-content: space-between; padding: var(--space-2) var(--space-3); padding-left: calc(var(--space-3) + var(--tree-depth) * 14px); border-bottom: 1px solid var(--color-border); cursor: pointer; color: var(--color-text-secondary); background: var(--color-surface-sunken); font-size: var(--text-caption); font-weight: var(--fw-semibold); }
+  .skill-group summary span:last-child { color: var(--color-text-muted); font-weight: var(--fw-normal); }
+  .results button { width: 100%; display: grid; gap: var(--space-1); padding: var(--space-3); padding-left: calc(var(--space-3) + var(--tree-depth) * 14px); border-bottom: 1px solid var(--color-border); color: var(--color-text-primary); text-align: left; }
   .results button:hover { background: var(--color-surface-sunken); }
   .results button.selected { background: var(--color-selection); box-shadow: inset 3px 0 var(--color-brand); }
   .row-top { justify-content: space-between; }

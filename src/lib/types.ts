@@ -369,6 +369,17 @@ export interface SkillTrustFingerprint {
   executables: SkillTrustedExecutable[];
 }
 
+export type SkillType =
+  | "design"
+  | "development"
+  | "testing"
+  | "devops"
+  | "security"
+  | "data"
+  | "ai"
+  | "productivity"
+  | "other";
+
 export type SkillValidationCode = "invalidMetadata" | "trustRequired" | "unsafeEntry" | "io";
 
 export interface SkillValidationError {
@@ -382,6 +393,9 @@ export interface SkillPackageResult {
   relativePath: string;
   name: string | null;
   description: string | null;
+  skillType: SkillType;
+  group: string[];
+  tags: string[];
   files: SkillPackageFile[];
   trustFingerprint: SkillTrustFingerprint | null;
   errors: SkillValidationError[];

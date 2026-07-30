@@ -18,8 +18,8 @@ use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
     InstalledSkill, SkillDestinationPresence, SkillFileContent, SkillInstallRecord,
     SkillInstallState, SkillPackageFile, SkillPackageResult, SkillSource, SkillSourceKind,
-    SkillSourceResult, SkillTrustFingerprint, SkillTrustedExecutable, SkillValidationCode,
-    SkillValidationError,
+    SkillSourceResult, SkillTrustFingerprint, SkillTrustedExecutable, SkillType,
+    SkillValidationCode, SkillValidationError,
 };
 use crate::util::fs::atomic_write;
 
@@ -30,6 +30,9 @@ pub mod mcp;
 pub const MAX_SKILL_FILES: usize = 512;
 pub const MAX_SKILL_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_SKILL_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SKILL_GROUP_DEPTH: usize = 4;
+const MAX_SKILL_TAGS: usize = 12;
+const MAX_SKILL_TAXONOMY_SEGMENT_BYTES: usize = 32;
 const SKILL_TRUST_KEY_ACCOUNT: &str = "skill-trust-hmac-v1";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -1385,6 +1388,9 @@ pub(crate) fn validate_package(
         relative_path: relative,
         name: None,
         description: None,
+        skill_type: SkillType::Other,
+        group: Vec::new(),
+        tags: Vec::new(),
         files: Vec::new(),
         trust_fingerprint: None,
         errors: Vec::new(),
@@ -1420,6 +1426,9 @@ pub(crate) fn validate_package(
             Ok(metadata) => {
                 result.name = Some(metadata.name.clone());
                 result.description = Some(metadata.description);
+                result.skill_type = metadata.skill_type;
+                result.group = metadata.group;
+                result.tags = metadata.tags;
                 let directory_name = package_root.file_name().and_then(|name| name.to_str());
                 if directory_name != Some(metadata.name.as_str()) {
                     result.errors.push(SkillValidationError {
@@ -1476,6 +1485,9 @@ fn invalid_package_root(source_id: &str, relative_path: &str, message: &str) -> 
         relative_path: relative_path.into(),
         name: None,
         description: None,
+        skill_type: SkillType::Other,
+        group: Vec::new(),
+        tags: Vec::new(),
         files: Vec::new(),
         trust_fingerprint: None,
         errors: vec![unsafe_entry_error(
@@ -1684,6 +1696,12 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
 struct SkillMetadata {
     name: String,
     description: String,
+    #[serde(default, rename = "type")]
+    skill_type: SkillType,
+    #[serde(default)]
+    group: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
@@ -1707,7 +1725,42 @@ fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
     if !(1..=1024).contains(&description_length) {
         return Err("SKILL.md description must contain 1-1024 trimmed characters.".into());
     }
+    if metadata.group.len() > MAX_SKILL_GROUP_DEPTH {
+        return Err(format!(
+            "SKILL.md group must contain at most {MAX_SKILL_GROUP_DEPTH} nested segments."
+        ));
+    }
+    if metadata.tags.len() > MAX_SKILL_TAGS {
+        return Err(format!(
+            "SKILL.md tags must contain at most {MAX_SKILL_TAGS} entries."
+        ));
+    }
+    if metadata
+        .group
+        .iter()
+        .chain(metadata.tags.iter())
+        .any(|value| !valid_taxonomy_segment(value))
+    {
+        return Err(format!(
+            "SKILL.md group and tags must use 1-{MAX_SKILL_TAXONOMY_SEGMENT_BYTES} lowercase letters, digits, or single hyphens."
+        ));
+    }
+    let unique_tags = metadata.tags.iter().collect::<HashSet<_>>();
+    if unique_tags.len() != metadata.tags.len() {
+        return Err("SKILL.md tags must not contain duplicates.".into());
+    }
     Ok(metadata)
+}
+
+fn valid_taxonomy_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SKILL_TAXONOMY_SEGMENT_BYTES
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn valid_skill_name(name: &str) -> bool {
@@ -3201,6 +3254,8 @@ mod tests {
     use sha2::Digest;
     use tempfile::tempdir;
 
+    use crate::types::SkillType;
+
     use super::{
         add_github_source, add_local_source, apply_skill_trust, discover_source,
         discover_source_blocking, ensure_local_source, inspect_skill_sources,
@@ -4153,6 +4208,34 @@ mod tests {
             !validate_fixture(source.path(), "malformed").installable,
             "malformed frontmatter was accepted"
         );
+
+        let taxonomy = source.path().join("taxonomy");
+        write_skill_md(
+            &taxonomy,
+            "name: taxonomy\ndescription: Typed skill\ntype: development\ngroup:\n  - frontend\n  - react\ntags:\n  - typescript\n  - ui\n",
+        );
+        let taxonomy = validate_fixture(source.path(), "taxonomy");
+        assert!(taxonomy.installable, "{:?}", taxonomy.errors);
+        assert_eq!(taxonomy.skill_type, SkillType::Development);
+        assert_eq!(taxonomy.group, ["frontend", "react"]);
+        assert_eq!(taxonomy.tags, ["typescript", "ui"]);
+
+        for (directory, extra) in [
+            ("bad-type", "type: unknown\n"),
+            ("bad-group", "group: [one, two, three, four, five]\n"),
+            ("bad-tag", "tags: [UPPERCASE]\n"),
+            ("duplicate-tags", "tags: [ui, ui]\n"),
+        ] {
+            let package = source.path().join(directory);
+            write_skill_md(
+                &package,
+                &format!("name: {directory}\ndescription: Invalid taxonomy\n{extra}"),
+            );
+            assert!(
+                !validate_fixture(source.path(), directory).installable,
+                "invalid taxonomy for {directory} was accepted"
+            );
+        }
 
         let inert = source.path().join("inert-files");
         write_skill(&inert, "", "inert-files", "Inert content");

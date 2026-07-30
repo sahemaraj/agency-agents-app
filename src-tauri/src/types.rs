@@ -83,6 +83,37 @@ pub struct SkillTrustFingerprint {
     pub executables: Vec<SkillTrustedExecutable>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillType {
+    Design,
+    Development,
+    Testing,
+    Devops,
+    Security,
+    Data,
+    Ai,
+    Productivity,
+    #[default]
+    Other,
+}
+
+impl SkillType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Design => "design",
+            Self::Development => "development",
+            Self::Testing => "testing",
+            Self::Devops => "devops",
+            Self::Security => "security",
+            Self::Data => "data",
+            Self::Ai => "ai",
+            Self::Productivity => "productivity",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillFileContent {
@@ -116,6 +147,9 @@ pub struct SkillPackageResult {
     pub relative_path: String,
     pub name: Option<String>,
     pub description: Option<String>,
+    pub skill_type: SkillType,
+    pub group: Vec<String>,
+    pub tags: Vec<String>,
     pub files: Vec<SkillPackageFile>,
     pub trust_fingerprint: Option<SkillTrustFingerprint>,
     pub errors: Vec<SkillValidationError>,
