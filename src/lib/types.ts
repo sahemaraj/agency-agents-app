@@ -10,26 +10,18 @@
 // =========================================================
 
 /**
- * Legacy icon-fetching mode inherited from the source app. Kept in the
- * settings schema for compatibility until the settings model is pruned.
- */
-export type CaskIconMode = "off" | "installed-only" | "all";
-
-/**
  * Persisted user settings (Phase 12d). Lives at
  * `~/Library/Application Support/com.zerologic.agency-agents-app/settings.json` and is
  * round-tripped via `settingsGet` / `settingsSet`.
  *
  * Bounds (enforced server-side, also re-checked client-side for snappier
- * UX): `catalogStaleBannerDays` ∈ [1, 365]; `trendingTtlMinutes` ∈ [5, 1440].
+ * UX): `catalogStaleBannerDays` ∈ [1, 365].
  */
 export interface Settings {
   /** Master switch — when true, every outbound command fails with
       `paranoid_mode_blocked`. */
   paranoidMode: boolean;
   catalogStaleBannerDays: number;
-  caskIconMode: CaskIconMode;
-  trendingTtlMinutes: number;
   /** Phase 12c — when true, PackageDetail probes `api.github.com` for
       repo stats whenever the package's homepage is a GitHub URL. Off
       by default; the user opts in via Settings → GitHub. Independent
@@ -45,15 +37,6 @@ export interface Settings {
       opts in via Settings → Network → Updates. Suppressed (no fetch)
       while Offline Mode is on, regardless of this flag. */
   updateAutoCheck: boolean;
-  /** Legacy enhanced-trending toggle inherited from the source app.
-      Retained for settings-file compatibility. */
-  enhancedTrendingEnabled: boolean;
-  /** Legacy vulnerability-scanning toggle inherited from the source app.
-      Agency Agents does not currently run a vulnerability scanner. */
-  vulnerabilityScanningEnabled: boolean;
-  /** Legacy live-enrichment toggle inherited from the source app. Agency
-      Agents currently reads metadata from the active AA catalog. */
-  liveEnrichmentEnabled: boolean;
   /** Per-tool custom install base path (tool id → absolute base dir). When set,
       user-scope installs + detection resolve against it instead of the OS home
       (e.g. pointing Claude Code at a WSL home). Absent/empty = OS home. */
@@ -78,14 +61,9 @@ export type GeneralSettingsPatch = Partial<
     Settings,
     | "paranoidMode"
     | "catalogStaleBannerDays"
-    | "caskIconMode"
-    | "trendingTtlMinutes"
     | "githubEnabled"
     | "aiFeaturesEnabled"
     | "updateAutoCheck"
-    | "enhancedTrendingEnabled"
-    | "vulnerabilityScanningEnabled"
-    | "liveEnrichmentEnabled"
     | "toolPaths"
   >
 >;
@@ -96,8 +74,6 @@ export type GeneralSettingsPatch = Partial<
 export const SETTINGS_DEFAULTS: Settings = {
   paranoidMode: false,
   catalogStaleBannerDays: 14,
-  caskIconMode: "all",
-  trendingTtlMinutes: 60,
   // Phase 12c — anonymous GitHub stats opt-in. Off by default per the
   // "zero outbound unless user consented" posture.
   githubEnabled: false,
@@ -107,13 +83,6 @@ export const SETTINGS_DEFAULTS: Settings = {
   // Auto-check for new Agency Agents releases. Off by
   // default per the "zero outbound unless user consented" posture.
   updateAutoCheck: false,
-  // Legacy retained field. Off by default.
-  enhancedTrendingEnabled: false,
-  // Legacy retained field. Off by default.
-  vulnerabilityScanningEnabled: false,
-  // Opt-in live refresh of categories + descriptions. Off by default; same
-  // legacy live enrichment path.
-  liveEnrichmentEnabled: false,
   // Per-tool custom install base paths. Empty by default (all tools use ~).
   toolPaths: {},
   mcpSourceAccess: false,
