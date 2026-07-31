@@ -22,13 +22,26 @@
   import { i18n } from "$lib/stores/i18n.svelte";
   import { skillCollectionBatch, skillInstallPlan } from "$lib/api";
   import type { InstalledSkill, SkillApprovalAction, SkillDraft, SkillMutationPlan, SkillPackageResult, SkillSmartFolderRule, SkillSource, SkillSourceResult, SkillType, SkillUpdatePolicy, SkillVersionSnapshot } from "$lib/types";
+  import {
+    buildPersonalFolderTree,
+    filterPackages,
+    groupPackages,
+    isInstalled as packageIsInstalled,
+    libraryMetrics,
+    packageConflicts as findPackageConflicts,
+    requiresTrust,
+    sourceLabel,
+    taxonomyLabel,
+    trustedScripts,
+    typeLabel,
+    type PackageView,
+    type PersonalFolderNode,
+    type SkillGroupNode,
+    type SortOrder,
+    type StatusFilter,
+  } from "$lib/skills/libraryModel";
 
-  type StatusFilter = "all" | "ready" | "rejected";
   type DetailTab = "overview" | "files" | "security";
-  type SortOrder = "name" | "type" | "source";
-  type PackageView = { pkg: SkillPackageResult; source: SkillSource };
-  type SkillGroupNode = { key: string; label: string; children: SkillGroupNode[]; packages: PackageView[] };
-  type PersonalFolderNode = { path: string; label: string; children: PersonalFolderNode[] };
 
   const PERSONAL_FOLDERS_KEY = "agency-agents:skill-folders:v1";
 
@@ -83,136 +96,23 @@
     ),
   );
   const personalFolders = $derived(skillSources.folderState.folders);
-  const filtered = $derived.by<PackageView[]>(() => {
-    const q = query.trim().toLowerCase();
-    const visible = packages.filter(({ pkg, source }) => {
-      if (statusFilter === "ready" && !pkg.installable) return false;
-      if (statusFilter === "rejected" && pkg.installable) return false;
-      if (sourceFilter !== "all" && source.id !== sourceFilter) return false;
-      if (libraryFilter === "installed" && !isInstalled(pkg)) return false;
-      if (libraryFilter === "trusted" && !trustedScripts(pkg)) return false;
-      if (libraryFilter === "review" && pkg.installable && !requiresTrust(pkg)) return false;
-      if (libraryFilter === "favorites" && !skillSources.isFavorite(pkg)) return false;
-      if (libraryFilter === "recommendations" && (isInstalled(pkg) || pkg.qualityScore < 60)) return false;
-      if (libraryFilter === "duplicates" && packageConflicts(pkg).length === 0) return false;
-      if (libraryFilter === "cleanup" && (!isInstalled(pkg) || skillSources.folderState.usage.some((usage) =>
-        usage.skill.sourceId === pkg.sourceId
-        && usage.skill.relativePath === pkg.relativePath
-        && (usage.fetches > 0 || usage.installs > 0)
-      ))) return false;
-      if (libraryFilter === "recent" && !skillSources.folderState.recent.some((recent) =>
-        recent.skill.sourceId === pkg.sourceId && recent.skill.relativePath === pkg.relativePath
-      )) return false;
-      if (libraryFilter.startsWith("collection:")) {
-        const name = libraryFilter.slice("collection:".length);
-        const collection = skillSources.folderState.collections.find((item) => item.name === name);
-        if (!collection?.skills.some((skill) =>
-          skill.sourceId === pkg.sourceId && skill.relativePath === pkg.relativePath
-        )) return false;
-      }
-      if (libraryFilter.startsWith("smart:")) {
-        const name = libraryFilter.slice("smart:".length);
-        const rule = skillSources.folderState.smartFolders.find((item) => item.name === name)?.rule;
-        if (!rule || !matchesSmartFolder(pkg, rule)) return false;
-      }
-      if (libraryFilter.startsWith("personal:")) {
-        const folder = libraryFilter.slice("personal:".length);
-        const assigned = skillSources.folderFor(pkg);
-        if (assigned !== folder && !assigned?.startsWith(`${folder}/`)) return false;
-      }
-      if (libraryFilter.startsWith("taxonomy:")) {
-        const path = libraryFilter.slice("taxonomy:".length).split("/");
-        if (pkg.skillType !== path[0]) return false;
-        if (!path.slice(1).every((segment, index) => pkg.group[index] === segment)) return false;
-      }
-      if (!q) return true;
-      return [
-        pkg.name ?? "",
-        pkg.description ?? "",
-        pkg.relativePath,
-        pkg.skillType,
-        ...pkg.group,
-        ...pkg.tags,
-        sourceLabel(source),
-      ].some((value) => value.toLowerCase().includes(q));
-    });
-    return visible.sort((left, right) => {
-      if (libraryFilter === "recent") {
-        const recent = skillSources.folderState.recent;
-        const leftIndex = recent.findIndex((item) =>
-          item.skill.sourceId === left.pkg.sourceId && item.skill.relativePath === left.pkg.relativePath
-        );
-        const rightIndex = recent.findIndex((item) =>
-          item.skill.sourceId === right.pkg.sourceId && item.skill.relativePath === right.pkg.relativePath
-        );
-        return leftIndex - rightIndex;
-      }
-      if (sortOrder === "type") {
-        const byType = typeLabel(left.pkg.skillType).localeCompare(typeLabel(right.pkg.skillType));
-        if (byType !== 0) return byType;
-      }
-      if (sortOrder === "source") {
-        const bySource = sourceLabel(left.source).localeCompare(sourceLabel(right.source));
-        if (bySource !== 0) return bySource;
-      }
-      return (left.pkg.name ?? left.pkg.relativePath).localeCompare(right.pkg.name ?? right.pkg.relativePath);
-    });
-  });
-  const grouped = $derived.by<SkillGroupNode[]>(() => {
-    const roots = new Map<string, SkillGroupNode>();
-    for (const view of packages) {
-      let root = roots.get(view.pkg.skillType);
-      if (!root) {
-        root = { key: view.pkg.skillType, label: typeLabel(view.pkg.skillType), children: [], packages: [] };
-        roots.set(view.pkg.skillType, root);
-      }
-      let node: SkillGroupNode = root;
-      for (const segment of view.pkg.group) {
-        let child: SkillGroupNode | undefined = node.children.find((candidate) => candidate.key === `${node.key}/${segment}`);
-        if (!child) {
-          child = { key: `${node.key}/${segment}`, label: taxonomyLabel(segment), children: [], packages: [] };
-          node.children.push(child);
-        }
-        node = child;
-      }
-      node.packages.push(view);
-    }
-    const sort = (nodes: SkillGroupNode[]): void => {
-      nodes.sort((left, right) => left.label.localeCompare(right.label));
-      for (const node of nodes) {
-        node.packages.sort((left, right) =>
-          (left.pkg.name ?? left.pkg.relativePath).localeCompare(right.pkg.name ?? right.pkg.relativePath),
-        );
-        sort(node.children);
-      }
-    };
-    const result = [...roots.values()];
-    sort(result);
-    return result;
-  });
+  const filtered = $derived(filterPackages({
+    packages,
+    installed: skillSources.installed,
+    folderState: skillSources.folderState,
+    query,
+    statusFilter,
+    sourceFilter,
+    libraryFilter,
+    sortOrder,
+  }));
+  const grouped = $derived(groupPackages(packages));
   const selected = $derived(
     selectedKey === null
       ? null
       : packages.find(({ pkg }) => skillSources.packageKey(pkg) === selectedKey) ?? null,
   );
-  const personalFolderTree = $derived.by<PersonalFolderNode[]>(() => {
-    const roots: PersonalFolderNode[] = [];
-    for (const path of personalFolders) {
-      let nodes = roots;
-      let current = "";
-      for (const label of path.split("/")) {
-        current = current ? `${current}/${label}` : label;
-        let node = nodes.find((candidate) => candidate.path === current);
-        if (!node) {
-          node = { path: current, label, children: [] };
-          nodes.push(node);
-          nodes.sort((left, right) => left.label.localeCompare(right.label));
-        }
-        nodes = node.children;
-      }
-    }
-    return roots;
-  });
+  const personalFolderTree = $derived(buildPersonalFolderTree(personalFolders));
   const deploymentColumns: DeploymentColumn[] = [
     { id: "claudeCode", label: "Claude Code", supportsUser: true, supportsProject: true },
     { id: "codex", label: "Codex", supportsUser: true, supportsProject: true },
@@ -234,18 +134,13 @@
   );
   const pendingDrafts = $derived(skillSources.drafts.filter((draft) => draft.state === "pending"));
   const pendingApprovals = $derived(skillSources.folderState.approvals.filter((approval) => approval.state === "pending"));
-  const installedCount = $derived(packages.filter(({ pkg }) => isInstalled(pkg)).length);
-  const trustedCount = $derived(packages.filter(({ pkg }) => trustedScripts(pkg)).length);
-  const reviewCount = $derived(packages.filter(({ pkg }) => !pkg.installable || requiresTrust(pkg)).length);
-  const recommendationCount = $derived(packages.filter(({ pkg }) => !isInstalled(pkg) && pkg.qualityScore >= 60).length);
-  const duplicateCount = $derived(packages.filter(({ pkg }) => packageConflicts(pkg).length > 0).length);
-  const cleanupCount = $derived(packages.filter(({ pkg }) =>
-    isInstalled(pkg) && !skillSources.folderState.usage.some((usage) =>
-      usage.skill.sourceId === pkg.sourceId
-      && usage.skill.relativePath === pkg.relativePath
-      && (usage.fetches > 0 || usage.installs > 0)
-    )
-  ).length);
+  const metrics = $derived(libraryMetrics(packages, skillSources.installed, skillSources.folderState));
+  const installedCount = $derived(metrics.installed);
+  const trustedCount = $derived(metrics.trusted);
+  const reviewCount = $derived(metrics.review);
+  const recommendationCount = $derived(metrics.recommendations);
+  const duplicateCount = $derived(metrics.duplicates);
+  const cleanupCount = $derived(metrics.cleanup);
   const libraryTitle = $derived.by(() => {
     if (libraryFilter === "installed") return i18n.t("skills.installed");
     if (libraryFilter === "trusted") return i18n.t("skills.trustedScripts");
@@ -291,10 +186,6 @@
     return () => document.removeEventListener("keydown", focusSearch);
   });
 
-  function sourceLabel(source: SkillSource): string {
-    return source.kind.kind === "local" ? source.kind.root : source.kind.repository;
-  }
-
   function sourceKind(source: SkillSource): string {
     return source.kind.kind === "local" ? i18n.t("skills.localFolder") : i18n.t("skills.github");
   }
@@ -309,14 +200,6 @@
     return i18n.t("skills.all");
   }
 
-  function taxonomyLabel(value: string): string {
-    return value.split("-").map((part) => part ? `${part[0].toUpperCase()}${part.slice(1)}` : part).join(" ");
-  }
-
-  function typeLabel(value: SkillType): string {
-    return value === "ai" ? "AI" : value === "devops" ? "DevOps" : taxonomyLabel(value);
-  }
-
   function groupCount(node: SkillGroupNode): number {
     return node.packages.length + node.children.reduce((count, child) => count + groupCount(child), 0);
   }
@@ -328,21 +211,6 @@
       if (child) return child;
     }
     return undefined;
-  }
-
-  function matchesSmartFolder(pkg: SkillPackageResult, rule: SkillSmartFolderRule): boolean {
-    if (rule.query) {
-      const query = rule.query.toLowerCase();
-      if (![pkg.name ?? "", pkg.description ?? "", pkg.relativePath].some((value) =>
-        value.toLowerCase().includes(query)
-      )) return false;
-    }
-    if (rule.skillType && pkg.skillType !== rule.skillType) return false;
-    if (rule.tag && !pkg.tags.includes(rule.tag)) return false;
-    if (rule.sourceId && pkg.sourceId !== rule.sourceId) return false;
-    if (rule.installable !== null && pkg.installable !== rule.installable) return false;
-    if (rule.favorite !== null && skillSources.isFavorite(pkg) !== rule.favorite) return false;
-    return true;
   }
 
   async function migratePersonalFolders(): Promise<void> {
@@ -430,11 +298,7 @@
   }
 
   function packageConflicts(pkg: SkillPackageResult): PackageView[] {
-    return packages.filter((candidate) =>
-      candidate.pkg.sourceId !== pkg.sourceId
-      && candidate.pkg.name !== null
-      && candidate.pkg.name === pkg.name
-    );
+    return findPackageConflicts(pkg, packages);
   }
 
   async function saveCurrentCollection(): Promise<void> {
@@ -602,29 +466,13 @@
   }
 
   function isInstalled(pkg: SkillPackageResult): boolean {
-    return skillSources.installed.some((record) =>
-      record.sourceId === pkg.sourceId
-      && record.relativePath === pkg.relativePath
-      && record.state !== "missing",
-    );
+    return packageIsInstalled(pkg, skillSources.installed);
   }
 
   function formatBytes(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-  }
-
-  function scriptFiles(pkg: SkillPackageResult) {
-    return pkg.files.filter((file) => file.relativePath.toLowerCase().startsWith("scripts/"));
-  }
-
-  function requiresTrust(pkg: SkillPackageResult): boolean {
-    return pkg.errors.some((error) => error.code === "trustRequired");
-  }
-
-  function trustedScripts(pkg: SkillPackageResult): boolean {
-    return pkg.installable && scriptFiles(pkg).length > 0;
   }
 
   function packageStatus(pkg: SkillPackageResult): string {
