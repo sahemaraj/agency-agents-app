@@ -66,6 +66,7 @@ pub struct AppState {
     /// Phase 1 (corpus) — memoized in-memory corpus (parsed agents +
     /// index). Built lazily on the first `corpus_*` command (seed + parse
     /// + persist index), then served from this cache. `corpus_refresh`
+    ///
     /// swaps the inner Arc after re-indexing the freshly-fetched tree.
     /// Mirrors the `categories_cache` lazy-`Option<Arc<_>>` pattern.
     pub corpus_cache: Arc<Mutex<Option<Arc<crate::corpus::Corpus>>>>,
@@ -402,6 +403,7 @@ fn lock_mcp_audit(app_data_dir: &Path) -> Result<McpAuditLock, AppError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|error| AppError::Io {
             message: format!("open MCP audit lock {}: {error}", lock_path.display()),
@@ -1224,6 +1226,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)
             .expect("open audit lock");
         lock.lock().expect("hold audit lock");

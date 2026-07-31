@@ -85,6 +85,7 @@ fn lock_drafts(app_data_dir: &Path) -> Result<File, AppError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(directory.join("skill-drafts.lock"))
         .map_err(io("open draft lock"))?;
     file.lock().map_err(io("lock draft state"))?;
@@ -536,7 +537,11 @@ pub async fn create(
     .map_err(|error| AppError::Internal {
         message: format!("serialize skill creator metadata: {error}"),
     })?;
-    let skill_md = format!("---\n{}---\n\n{}\n", metadata.trim_start_matches("---\n"), body.trim());
+    let skill_md = format!(
+        "---\n{}---\n\n{}\n",
+        metadata.trim_start_matches("---\n"),
+        body.trim()
+    );
     submit(
         state,
         vec![DraftInputFile {
@@ -557,13 +562,8 @@ pub async fn edit(
     let package = super::resolve_skill_package(state, &source_id, &relative_path).await?;
     let mut files = Vec::with_capacity(package.files().len());
     for file in package.files() {
-        let content = super::read_skill_file(
-            state,
-            &source_id,
-            &relative_path,
-            &file.relative_path,
-        )
-        .await?;
+        let content =
+            super::read_skill_file(state, &source_id, &relative_path, &file.relative_path).await?;
         files.push(DraftInputFile {
             relative_path: file.relative_path.clone(),
             text: if file.relative_path == "SKILL.md" {
@@ -799,16 +799,7 @@ pub async fn skill_draft_create(
     tags: Vec<String>,
     body: String,
 ) -> Result<SkillDraft, AppError> {
-    create(
-        &state,
-        name,
-        description,
-        skill_type,
-        group,
-        tags,
-        body,
-    )
-    .await
+    create(&state, name, description, skill_type, group, tags, body).await
 }
 
 #[tauri::command]

@@ -568,9 +568,11 @@ pub enum Scope {
 /// discriminated union.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[derive(Default)]
 pub enum CatalogSource {
     /// App-managed copy seeded from the bundled baseline (`<app_data>/corpus`).
     /// The always-works default; never touches anything outside app data.
+    #[default]
     Bundled,
     /// A clone the app provisioned and owns (default `~/.agency-agents`). The
     /// app may pull/refresh it; it's shared with the CLI.
@@ -579,12 +581,6 @@ pub enum CatalogSource {
     /// granted permission to pull it (manage-with-permission); when false we
     /// only ever read from it.
     UserClone { path: String, manage: bool },
-}
-
-impl Default for CatalogSource {
-    fn default() -> Self {
-        CatalogSource::Bundled
-    }
 }
 
 /// A catalog directory discovered on disk (for the first-run / Settings picker).

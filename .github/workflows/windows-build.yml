@@ -51,6 +51,9 @@ jobs:
       - name: Check frontend
         run: npm run check
 
+      - name: Test frontend
+        run: npm run test:frontend
+
       - name: Build frontend
         run: npm run build
 

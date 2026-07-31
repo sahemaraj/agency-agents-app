@@ -52,7 +52,7 @@ struct HttpAuth([u8; 32]);
 
 impl HttpAuth {
     fn new(token: &str) -> Result<Self, String> {
-        if token.as_bytes().len() < MIN_HTTP_TOKEN_BYTES {
+        if token.len() < MIN_HTTP_TOKEN_BYTES {
             return Err(format!(
                 "AGENCY_AGENTS_MCP_TOKEN must be at least {MIN_HTTP_TOKEN_BYTES} bytes"
             ));
@@ -3332,6 +3332,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)
             .expect("open audit lock");
         lock.lock().expect("hold audit lock");

@@ -292,6 +292,7 @@ fn lock_skill_sources(app_data_dir: &Path) -> Result<File, AppError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|error| AppError::Io {
             message: format!("open skill source lock {}: {error}", path.display()),
@@ -312,6 +313,7 @@ fn lock_skill_installs(app_data_dir: &Path) -> Result<File, AppError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|error| AppError::Io {
             message: format!("open skill install lock {}: {error}", path.display()),
@@ -1875,7 +1877,7 @@ fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
         .find("\n---")
         .ok_or_else(|| "SKILL.md frontmatter must end with '---'.".to_string())?;
     let yaml = &rest[..end];
-    let metadata: SkillMetadata = serde_yaml::from_str(&yaml)
+    let metadata: SkillMetadata = serde_yaml::from_str(yaml)
         .map_err(|error| format!("SKILL.md frontmatter is invalid: {error}"))?;
     if !valid_skill_name(&metadata.name) {
         return Err(
@@ -2770,7 +2772,7 @@ pub(crate) async fn install_skill_authorized(
         Some(project) => project.to_path_buf(),
         None => canonical_target_base(&home)?,
     };
-    let destination = install::target_path(&base, project.as_deref(), &runtime, &name)?;
+    let destination = install::target_path(&base, project.as_deref(), runtime, &name)?;
     if project_authorization.is_none() {
         reject_linked_destination_ancestors(&base, &destination)?;
         if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
@@ -4480,8 +4482,10 @@ mod tests {
             .is_ok());
         }
 
-        let mut paranoid = Settings::default();
-        paranoid.paranoid_mode = true;
+        let paranoid = Settings {
+            paranoid_mode: true,
+            ..Settings::default()
+        };
         for settings in [
             SettingsLoadState::Loaded(paranoid),
             SettingsLoadState::Corrupt {
@@ -5591,9 +5595,10 @@ mod tests {
             Path::new(&canonical_project).join(".agents/skills/reviewer")
         );
 
-        let reconciled = super::reconcile_skill_installs(&state, &[project_path.clone()])
-            .await
-            .expect("reconcile current skill");
+        let reconciled =
+            super::reconcile_skill_installs(&state, std::slice::from_ref(&project_path))
+                .await
+                .expect("reconcile current skill");
         assert!(reconciled.iter().any(|skill| {
             skill.path == installed.path && skill.state == SkillInstallState::Current
         }));
