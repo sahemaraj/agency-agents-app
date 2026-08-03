@@ -7,6 +7,7 @@
 mod commands;
 mod corpus;
 mod error;
+mod expert_runs;
 mod experts;
 mod github;
 mod install;
@@ -201,6 +202,9 @@ pub fn run() {
             experts::expert_creation_request_get,
             experts::expert_creation_request_approve,
             experts::expert_creation_request_reject,
+            expert_runs::expert_runs_list,
+            expert_runs::expert_run_get,
+            expert_runs::expert_run_review,
             skills::skill_sources_list,
             skills::skill_sources_inspect,
             skills::skill_trust_grant,

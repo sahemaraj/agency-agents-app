@@ -38,6 +38,8 @@ pub struct ExpertDefinition {
     pub runbook: Option<String>,
     pub preferred_client: Option<String>,
     pub starter_prompt: String,
+    #[serde(default)]
+    pub quality_contract: crate::expert_runs::QualityContract,
     pub source: String,
 }
 
@@ -59,6 +61,8 @@ pub struct ExpertProposalInput {
     pub runbook: Option<String>,
     pub preferred_client: Option<String>,
     pub starter_prompt: String,
+    #[serde(default)]
+    pub quality_contract: crate::expert_runs::QualityContract,
 }
 
 impl ExpertProposalInput {
@@ -77,6 +81,7 @@ impl ExpertProposalInput {
             runbook: self.runbook,
             preferred_client: self.preferred_client,
             starter_prompt: self.starter_prompt,
+            quality_contract: self.quality_contract,
             source: "custom".into(),
         }
     }
@@ -103,6 +108,18 @@ pub enum ExpertCreationState {
     Pending,
     Approved,
     Rejected,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExpertChangeKind {
+    #[default]
+    Create,
+    Update,
+    Clone,
+    Archive,
+    Delete,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,6 +255,7 @@ fn validate_proposal_references(
         runbook: definition.runbook,
         preferred_client: definition.preferred_client,
         starter_prompt: definition.starter_prompt,
+        quality_contract: definition.quality_contract,
     };
     Ok(())
 }
@@ -359,6 +377,8 @@ struct ExpertFile {
     experts: Vec<ExpertDefinition>,
     #[serde(default)]
     creation_requests: Vec<ExpertCreationRequest>,
+    #[serde(default)]
+    archived_experts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -405,6 +425,8 @@ pub struct ExpertActivationRecord {
     pub activated_at: String,
     pub installed_agents: Vec<String>,
     pub installed_skills: Vec<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +457,12 @@ pub struct ExpertCreationRequest {
     pub agent_substitutions: Vec<AgentSubstitution>,
     pub state: ExpertCreationState,
     pub saved_expert_id: Option<String>,
+    #[serde(default)]
+    pub kind: ExpertChangeKind,
+    #[serde(default)]
+    pub target_expert_id: Option<String>,
+    #[serde(default)]
+    pub base_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -530,6 +558,7 @@ fn lock_expert_state(state: &AppState) -> Result<std::fs::File, AppError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(directory.join("experts.lock"))
         .map_err(|error| AppError::Io {
             message: format!("open Expert state lock: {error}"),
@@ -563,6 +592,49 @@ fn insert_creation_request(
     Ok(request)
 }
 
+fn revise_pending_change_request(
+    request: &mut ExpertCreationRequest,
+    requested_by: &str,
+    proposal: ExpertProposalInput,
+    base_version: Option<u32>,
+) -> Result<(), AppError> {
+    if request.requested_by != requested_by || request.state != ExpertCreationState::Pending {
+        return Err(invalid(
+            "caller does not own a pending Expert change request",
+        ));
+    }
+    validate_portable_proposal(&proposal, Path::new(&request.project_path))?;
+    request.proposal = proposal;
+    request.base_version = base_version;
+    Ok(())
+}
+
+fn cancel_pending_change_request(
+    request: &mut ExpertCreationRequest,
+    requested_by: &str,
+) -> Result<(), AppError> {
+    if request.requested_by != requested_by || request.state != ExpertCreationState::Pending {
+        return Err(invalid(
+            "caller does not own a pending Expert change request",
+        ));
+    }
+    request.state = ExpertCreationState::Cancelled;
+    Ok(())
+}
+
+fn cancel_pending_activation_request(
+    request: &mut ExpertActivationRequest,
+    requested_by: &str,
+) -> Result<(), AppError> {
+    if request.requested_by != requested_by || request.state != "pending" {
+        return Err(invalid(
+            "caller does not own a pending Expert activation request",
+        ));
+    }
+    request.state = "cancelled".into();
+    Ok(())
+}
+
 fn validate(definition: &mut ExpertDefinition, custom: bool) -> Result<(), AppError> {
     let bounded = [
         ("id", &definition.id),
@@ -580,6 +652,7 @@ fn validate(definition: &mut ExpertDefinition, custom: bool) -> Result<(), AppEr
     if definition.version == 0 {
         return Err(invalid("expert version must be positive"));
     }
+    crate::expert_runs::validate_contract(&definition.quality_contract)?;
     if !definition
         .id
         .chars()
@@ -645,6 +718,7 @@ async fn custom_state(state: &AppState) -> Result<ExpertFile, AppError> {
             schema_version: SCHEMA_VERSION,
             experts: Vec::new(),
             creation_requests: Vec::new(),
+            archived_experts: Vec::new(),
         });
     }
     let raw = read_capped(&path, MAX_EXPERT_STATE_BYTES).await?;
@@ -683,6 +757,66 @@ async fn save_expert_state(state: &AppState, file: &ExpertFile) -> Result<(), Ap
     atomic_write(&state_path(state, "experts.json"), &bytes).await
 }
 
+fn apply_change_request(
+    file: &mut ExpertFile,
+    request: &mut ExpertCreationRequest,
+    proposal: ExpertProposalInput,
+) -> Result<Option<String>, AppError> {
+    let target = request.target_expert_id.clone();
+    let saved = match request.kind {
+        ExpertChangeKind::Create | ExpertChangeKind::Clone => {
+            let used = file
+                .experts
+                .iter()
+                .map(|expert| expert.id.clone())
+                .collect::<HashSet<_>>();
+            let id = collision_safe_custom_id(&proposal.name, &used);
+            let mut definition = proposal.clone().into_definition(id.clone());
+            validate(&mut definition, true)?;
+            file.experts.push(definition);
+            Some(id)
+        }
+        ExpertChangeKind::Update => {
+            let target = target.ok_or_else(|| invalid("update requires targetExpertId"))?;
+            let expert = file
+                .experts
+                .iter_mut()
+                .find(|expert| expert.id == target)
+                .ok_or_else(|| invalid("Expert update target does not exist"))?;
+            if request.base_version != Some(expert.version) {
+                return Err(invalid("stale Expert version"));
+            }
+            let mut replacement = proposal.clone().into_definition(target.clone());
+            replacement.version = expert.version + 1;
+            validate(&mut replacement, true)?;
+            *expert = replacement;
+            file.archived_experts.retain(|id| id != &target);
+            Some(target)
+        }
+        ExpertChangeKind::Archive => {
+            let target = target.ok_or_else(|| invalid("archive requires targetExpertId"))?;
+            if !file.archived_experts.contains(&target) {
+                file.archived_experts.push(target.clone());
+                file.archived_experts.sort();
+            }
+            Some(target)
+        }
+        ExpertChangeKind::Delete => {
+            let target = target.ok_or_else(|| invalid("delete requires targetExpertId"))?;
+            file.experts.retain(|expert| expert.id != target);
+            if !file.archived_experts.contains(&target) {
+                file.archived_experts.push(target.clone());
+                file.archived_experts.sort();
+            }
+            Some(target)
+        }
+    };
+    request.proposal = proposal;
+    request.state = ExpertCreationState::Approved;
+    request.saved_expert_id = saved.clone();
+    Ok(saved)
+}
+
 async fn definitions(app: &AppHandle, state: &AppState) -> Result<Vec<ExpertDefinition>, AppError> {
     let root = crate::corpus::active_catalog_root(app).await?;
     let manifest = root.join("strategy").join("experts.json");
@@ -701,6 +835,8 @@ async fn definitions(app: &AppHandle, state: &AppState) -> Result<Vec<ExpertDefi
             merged.push(custom);
         }
     }
+    let archived = custom_state(state).await?.archived_experts;
+    merged.retain(|expert| !archived.contains(&expert.id));
     Ok(merged)
 }
 
@@ -721,6 +857,8 @@ pub(crate) async fn mcp_definitions(state: &AppState) -> Result<Vec<ExpertDefini
             merged.push(custom);
         }
     }
+    let archived = custom_state(state).await?.archived_experts;
+    merged.retain(|expert| !archived.contains(&expert.id));
     Ok(merged)
 }
 
@@ -880,6 +1018,28 @@ fn validate_request_metadata(
     Ok(())
 }
 
+fn validate_portable_proposal(
+    proposal: &ExpertProposalInput,
+    project_path: &Path,
+) -> Result<(), AppError> {
+    let serialized = serde_json::to_string(proposal)
+        .map_err(|error| invalid(format!("serialize Expert proposal: {error}")))?;
+    let normalized = serialized.to_ascii_lowercase();
+    let project = project_path.to_string_lossy().to_ascii_lowercase();
+    if (!project.is_empty() && normalized.contains(&project))
+        || normalized.contains("/users/")
+        || normalized.contains("c:\\\\users\\\\")
+        || ["password=", "token=", "secret=", "api_key", "apikey"]
+            .iter()
+            .any(|marker| normalized.contains(marker))
+    {
+        return Err(invalid(
+            "portable Expert proposals must not contain project paths or credentials",
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_live_proposal(
     state: &AppState,
     proposal: &mut ExpertProposalInput,
@@ -905,6 +1065,39 @@ async fn validate_live_proposal(
     )
 }
 
+pub(crate) async fn mcp_validate_proposal(
+    state: &AppState,
+    project_path: &str,
+    mut proposal: ExpertProposalInput,
+    links: Vec<LinkedSkillDraft>,
+    substitutions: Vec<AgentSubstitution>,
+) -> Result<serde_json::Value, AppError> {
+    let project = std::fs::canonicalize(project_path)
+        .map_err(|error| invalid(format!("invalid project: {error}")))?;
+    if Path::new(project_path) != project
+        || !crate::install::project_is_registered(&state.app_data_dir, &project).await?
+    {
+        return Err(invalid(
+            "project must be exactly canonical and registered in the desktop app",
+        ));
+    }
+    validate_portable_proposal(&proposal, &project)?;
+    validate_live_proposal(state, &mut proposal, &links, &substitutions).await?;
+    let evaluation = derive_readiness(
+        &proposal,
+        &links,
+        &catalog_skills(state).await?,
+        &draft_availability(state).await?,
+    );
+    Ok(serde_json::json!({
+        "valid": evaluation.readiness != ExpertReadiness::Blocked,
+        "readiness": evaluation.readiness,
+        "blockers": evaluation.blockers,
+        "warnings": evaluation.warnings,
+        "proposal": proposal,
+    }))
+}
+
 pub(crate) async fn mcp_creation_context(
     state: &AppState,
     outcome: &str,
@@ -915,7 +1108,7 @@ pub(crate) async fn mcp_creation_context(
     }
     let project = std::fs::canonicalize(project_path)
         .map_err(|error| invalid(format!("invalid project: {error}")))?;
-    if PathBuf::from(project_path) != project
+    if Path::new(project_path) != project
         || !crate::install::project_is_registered(&state.app_data_dir, &project).await?
     {
         return Err(invalid(
@@ -1127,7 +1320,7 @@ pub(crate) async fn mcp_request_creation(
     validate_request_metadata(&client_request_id, &outcome, &requested_by)?;
     let project = std::fs::canonicalize(&project_path)
         .map_err(|error| invalid(format!("invalid project: {error}")))?;
-    if PathBuf::from(&project_path) != project
+    if Path::new(&project_path) != project
         || !crate::install::project_is_registered(&state.app_data_dir, &project).await?
     {
         return Err(invalid(
@@ -1141,6 +1334,7 @@ pub(crate) async fn mcp_request_creation(
     }) {
         return creation_view(state, existing.clone()).await;
     }
+    validate_portable_proposal(&proposal, &project)?;
     validate_live_proposal(
         state,
         &mut proposal,
@@ -1160,10 +1354,151 @@ pub(crate) async fn mcp_request_creation(
         agent_substitutions,
         state: ExpertCreationState::Pending,
         saved_expert_id: None,
+        kind: ExpertChangeKind::Create,
+        target_expert_id: None,
+        base_version: None,
     };
     let request = insert_creation_request(&mut file.creation_requests, request)?;
     save_expert_state(state, &file).await?;
     creation_view(state, request).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn mcp_request_change(
+    state: &AppState,
+    client_request_id: String,
+    outcome: String,
+    project_path: String,
+    proposal: ExpertProposalInput,
+    linked_skill_drafts: Vec<LinkedSkillDraft>,
+    agent_substitutions: Vec<AgentSubstitution>,
+    requested_by: String,
+    kind: ExpertChangeKind,
+    target_expert_id: Option<String>,
+    base_version: Option<u32>,
+) -> Result<ExpertCreationRequestView, AppError> {
+    if kind != ExpertChangeKind::Create {
+        let target = target_expert_id
+            .as_deref()
+            .ok_or_else(|| invalid("Expert change requires targetExpertId"))?;
+        let current = mcp_definitions(state)
+            .await?
+            .into_iter()
+            .find(|expert| expert.id == target)
+            .ok_or_else(|| invalid("Expert change target does not exist"))?;
+        if matches!(kind, ExpertChangeKind::Update) && base_version != Some(current.version) {
+            return Err(invalid("stale Expert version"));
+        }
+    }
+    let view = mcp_request_creation(
+        state,
+        client_request_id,
+        outcome,
+        project_path,
+        proposal,
+        linked_skill_drafts,
+        agent_substitutions,
+        requested_by.clone(),
+    )
+    .await?;
+    let _lock = lock_expert_state(state)?;
+    let mut file = custom_state(state).await?;
+    let request = file
+        .creation_requests
+        .iter_mut()
+        .find(|request| request.id == view.request.id && request.requested_by == requested_by)
+        .ok_or_else(|| invalid("Expert change request does not exist"))?;
+    request.kind = kind;
+    request.target_expert_id = target_expert_id;
+    request.base_version = base_version;
+    let request = request.clone();
+    save_expert_state(state, &file).await?;
+    creation_view(state, request).await
+}
+
+pub(crate) async fn mcp_revise_change_request(
+    state: &AppState,
+    id: &str,
+    requested_by: &str,
+    mut proposal: ExpertProposalInput,
+    base_version: Option<u32>,
+) -> Result<ExpertCreationRequestView, AppError> {
+    let _lock = lock_expert_state(state)?;
+    validate_live_proposal(state, &mut proposal, &[], &[]).await?;
+    let mut file = custom_state(state).await?;
+    let request = file
+        .creation_requests
+        .iter_mut()
+        .find(|request| request.id == id)
+        .ok_or_else(|| invalid("Expert change request does not exist"))?;
+    revise_pending_change_request(request, requested_by, proposal, base_version)?;
+    let request = request.clone();
+    save_expert_state(state, &file).await?;
+    creation_view(state, request).await
+}
+
+pub(crate) async fn mcp_cancel_change_request(
+    state: &AppState,
+    id: &str,
+    requested_by: &str,
+) -> Result<ExpertCreationRequestView, AppError> {
+    let _lock = lock_expert_state(state)?;
+    let mut file = custom_state(state).await?;
+    let request = file
+        .creation_requests
+        .iter_mut()
+        .find(|request| request.id == id)
+        .ok_or_else(|| invalid("Expert change request does not exist"))?;
+    cancel_pending_change_request(request, requested_by)?;
+    let request = request.clone();
+    save_expert_state(state, &file).await?;
+    creation_view(state, request).await
+}
+
+pub(crate) async fn mcp_list_activation_requests(
+    state: &AppState,
+    requested_by: &str,
+) -> Result<Vec<ExpertActivationRequest>, AppError> {
+    Ok(requests(state)
+        .await?
+        .into_iter()
+        .filter(|request| request.requested_by == requested_by)
+        .collect())
+}
+
+pub(crate) async fn mcp_get_activation_request(
+    state: &AppState,
+    id: &str,
+    requested_by: &str,
+) -> Result<ExpertActivationRequest, AppError> {
+    requests(state)
+        .await?
+        .into_iter()
+        .find(|request| request.id == id && request.requested_by == requested_by)
+        .ok_or_else(|| invalid("Expert activation request does not exist"))
+}
+
+pub(crate) async fn mcp_cancel_activation_request(
+    state: &AppState,
+    id: &str,
+    requested_by: &str,
+) -> Result<ExpertActivationRequest, AppError> {
+    let _lock = lock_expert_state(state)?;
+    let mut items = requests(state).await?;
+    let request = items
+        .iter_mut()
+        .find(|request| request.id == id)
+        .ok_or_else(|| invalid("Expert activation request does not exist"))?;
+    cancel_pending_activation_request(request, requested_by)?;
+    let request = request.clone();
+    let bytes = serde_json::to_vec_pretty(&items)
+        .map_err(|error| invalid(format!("serialize activation requests: {error}")))?;
+    atomic_write(
+        &state_path(state, "expert-activation-requests.json"),
+        &bytes,
+    )
+    .await?;
+    Ok(request)
 }
 
 pub(crate) async fn mcp_list_creation_requests(
@@ -1254,19 +1589,28 @@ async fn approve_creation_request(
             evaluation.blockers.join("; ")
         }));
     }
-    let mut used = mcp_definitions(state)
-        .await?
-        .into_iter()
-        .map(|expert| expert.id)
-        .collect::<HashSet<_>>();
-    used.extend(file.experts.iter().map(|expert| expert.id.clone()));
-    let id = collision_safe_custom_id(&proposal.name, &used);
-    let mut definition = proposal.clone().into_definition(id.clone());
-    validate(&mut definition, true)?;
-    file.experts.push(definition);
-    file.creation_requests[index].proposal = proposal;
-    file.creation_requests[index].state = ExpertCreationState::Approved;
-    file.creation_requests[index].saved_expert_id = Some(id);
+    if matches!(
+        file.creation_requests[index].kind,
+        ExpertChangeKind::Create | ExpertChangeKind::Clone
+    ) {
+        let mut used = mcp_definitions(state)
+            .await?
+            .into_iter()
+            .map(|expert| expert.id)
+            .collect::<HashSet<_>>();
+        used.extend(file.experts.iter().map(|expert| expert.id.clone()));
+        let id = collision_safe_custom_id(&proposal.name, &used);
+        let mut definition = proposal.clone().into_definition(id.clone());
+        validate(&mut definition, true)?;
+        file.experts.push(definition);
+        file.creation_requests[index].proposal = proposal;
+        file.creation_requests[index].state = ExpertCreationState::Approved;
+        file.creation_requests[index].saved_expert_id = Some(id);
+    } else {
+        let mut request = file.creation_requests[index].clone();
+        apply_change_request(&mut file, &mut request, proposal)?;
+        file.creation_requests[index] = request;
+    }
     let request = file.creation_requests[index].clone();
     save_expert_state(state, &file).await?;
     creation_view(state, request).await
@@ -1405,6 +1749,7 @@ pub async fn expert_export(state: State<'_, AppState>, path: String) -> Result<u
         schema_version: SCHEMA_VERSION,
         experts,
         creation_requests: Vec::new(),
+        archived_experts: Vec::new(),
     })
     .map_err(|e| invalid(format!("serialize experts: {e}")))?;
     atomic_write(Path::new(&path), &bytes).await?;
@@ -1695,6 +2040,48 @@ pub async fn expert_activate(
             }
         }
     }
+    let run = match crate::expert_runs::create_run(
+        &state,
+        crate::expert_runs::ExpertRunCreate {
+            expert_id: plan.expert.definition.id.clone(),
+            expert_version: plan.expert.definition.version,
+            project_path: plan.project_path.clone(),
+            client: plan.client.clone(),
+            lead_agent: plan.expert.definition.lead_agent.clone(),
+            supporting_agents: plan.expert.definition.supporting_agents.clone(),
+            required_skills: plan.expert.definition.required_skills.clone(),
+            optional_skills: plan.expert.definition.optional_skills.clone(),
+            runbook: plan.expert.definition.runbook.clone(),
+            contract: plan.expert.definition.quality_contract.clone(),
+        },
+    )
+    .await
+    {
+        Ok(run) => run,
+        Err(error) => {
+            for (source_id, relative_path) in installed_skill_refs.iter().rev() {
+                let _ = crate::skills::uninstall_skill(
+                    state.inner(),
+                    source_id,
+                    relative_path,
+                    &plan.client,
+                    Some(&plan.project_path),
+                )
+                .await;
+            }
+            for slug in installed_agents.iter().rev() {
+                let _ = crate::install::do_uninstall(
+                    &app,
+                    &state,
+                    slug.clone(),
+                    plan.client.clone(),
+                    Some(plan.project_path.clone()),
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
     let record = ExpertActivationRecord {
         id: uuid::Uuid::new_v4().to_string(),
         expert_id: plan.expert.definition.id,
@@ -1704,6 +2091,7 @@ pub async fn expert_activate(
         activated_at: chrono::Utc::now().to_rfc3339(),
         installed_agents,
         installed_skills,
+        run_id: Some(run.id),
     };
     let mut history = activation_history(&state).await?;
     history.push(record.clone());
@@ -1824,6 +2212,15 @@ mod tests {
             runbook: Some("review-runbook".into()),
             preferred_client: Some("codex".into()),
             starter_prompt: "Review {{project}} with {{leadAgent}}.".into(),
+            quality_contract: crate::expert_runs::QualityContract {
+                version: 1,
+                checks: vec![crate::expert_runs::ExpertCheck {
+                    name: "tests".into(),
+                    kind: "tests".into(),
+                    required: true,
+                    evidence_mode: "clientReported".into(),
+                }],
+            },
         }
     }
 
@@ -1860,6 +2257,13 @@ mod tests {
     fn malformed_templates_and_duplicate_ids_are_rejected() {
         let mut expert = parse_file(BUNDLED, false).unwrap().remove(0);
         expert.starter_prompt = "{{project}".into();
+        assert!(validate(&mut expert, true).is_err());
+
+        let mut expert = proposal().into_definition("quality-contract".into());
+        expert
+            .quality_contract
+            .checks
+            .push(expert.quality_contract.checks[0].clone());
         assert!(validate(&mut expert, true).is_err());
         let raw = format!(
             r#"{{"schemaVersion":1,"experts":[{},{}]}}"#,
@@ -1984,6 +2388,9 @@ mod tests {
             agent_substitutions: Vec::new(),
             state,
             saved_expert_id: None,
+            kind: ExpertChangeKind::Create,
+            target_expert_id: None,
+            base_version: None,
         }
     }
 
@@ -2159,5 +2566,290 @@ mod tests {
         assert!(json.contains("root-only"));
         assert!(!json.contains("nested-secret"));
         assert!(json.contains("Skipped oversized or unreadable AGENTS.md"));
+    }
+
+    #[test]
+    fn portable_proposals_reject_project_paths_and_credentials() {
+        let project = Path::new("/Users/client/secret-project");
+        let mut input = proposal();
+        assert!(validate_portable_proposal(&input, project).is_ok());
+
+        input.summary = format!("Use files from {}", project.display());
+        assert!(validate_portable_proposal(&input, project).is_err());
+
+        input.summary = "Review safely".into();
+        input.starter_prompt = "token=super-secret".into();
+        assert!(validate_portable_proposal(&input, project).is_err());
+    }
+
+    #[test]
+    fn change_requests_apply_versioned_updates_and_reversible_archive() {
+        let mut existing = proposal().into_definition("custom-rust-review".into());
+        existing.version = 2;
+        let mut file = ExpertFile {
+            schema_version: SCHEMA_VERSION,
+            experts: vec![existing],
+            creation_requests: Vec::new(),
+            archived_experts: Vec::new(),
+        };
+        let mut request = creation_request("update", ExpertCreationState::Pending);
+        request.kind = ExpertChangeKind::Update;
+        request.target_expert_id = Some("custom-rust-review".into());
+        request.base_version = Some(1);
+        assert!(apply_change_request(&mut file, &mut request, proposal()).is_err());
+
+        request.base_version = Some(2);
+        let saved = apply_change_request(&mut file, &mut request, proposal()).unwrap();
+        assert_eq!(saved.as_deref(), Some("custom-rust-review"));
+        assert_eq!(file.experts[0].version, 3);
+
+        request.kind = ExpertChangeKind::Archive;
+        request.state = ExpertCreationState::Pending;
+        assert!(apply_change_request(&mut file, &mut request, proposal()).is_ok());
+        assert_eq!(file.archived_experts, vec!["custom-rust-review"]);
+
+        request.kind = ExpertChangeKind::Update;
+        request.state = ExpertCreationState::Pending;
+        request.base_version = Some(3);
+        assert!(apply_change_request(&mut file, &mut request, proposal()).is_ok());
+        assert!(file.archived_experts.is_empty());
+    }
+
+    #[test]
+    fn pending_requests_are_owned_revisable_and_cancellable() {
+        let mut change = creation_request("change", ExpertCreationState::Pending);
+        let mut leaked = proposal();
+        leaked.summary = format!("Read {}", change.project_path);
+        assert!(revise_pending_change_request(&mut change, "codex", leaked, Some(1)).is_err());
+        let mut revised = proposal();
+        revised.summary = "Revised outcome".into();
+        revise_pending_change_request(&mut change, "codex", revised.clone(), Some(1)).unwrap();
+        assert_eq!(change.proposal.summary, revised.summary);
+        assert!(revise_pending_change_request(&mut change, "claude", revised, Some(1)).is_err());
+        cancel_pending_change_request(&mut change, "codex").unwrap();
+        assert_eq!(change.state, ExpertCreationState::Cancelled);
+
+        let mut activation = ExpertActivationRequest {
+            id: "activation-1".into(),
+            expert_id: "expert-1".into(),
+            project_path: "/project".into(),
+            client: Some("codex".into()),
+            requested_by: "codex".into(),
+            requested_at: "2026-08-03T00:00:00Z".into(),
+            state: "pending".into(),
+        };
+        cancel_pending_activation_request(&mut activation, "codex").unwrap();
+        assert_eq!(activation.state, "cancelled");
+        assert!(cancel_pending_activation_request(&mut activation, "claude").is_err());
+    }
+
+    #[tokio::test]
+    async fn runs_scope_idempotent_evidence_and_freeze_after_review() {
+        use crate::expert_runs::{
+            EvidenceResult, EvidenceSubmission, ExpertCheck, ExpertRunCreate, ExpertRunState,
+            QualityContract,
+        };
+
+        let app = tempfile::tempdir().unwrap();
+        let state = test_state(app.path());
+        let run = crate::expert_runs::create_run(
+            &state,
+            ExpertRunCreate {
+                expert_id: "expert-1".into(),
+                expert_version: 1,
+                project_path: "/project".into(),
+                client: "codex".into(),
+                lead_agent: "lead".into(),
+                supporting_agents: Vec::new(),
+                required_skills: Vec::new(),
+                optional_skills: Vec::new(),
+                runbook: None,
+                contract: QualityContract {
+                    version: 1,
+                    checks: vec![ExpertCheck {
+                        name: "tests".into(),
+                        kind: "tests".into(),
+                        required: true,
+                        evidence_mode: "clientReported".into(),
+                    }],
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let evidence = EvidenceSubmission {
+            idempotency_key: "evidence-1".into(),
+            check_name: "tests".into(),
+            result: EvidenceResult::Pass,
+            command_label: Some("cargo test".into()),
+            summary: "All tests passed".into(),
+        };
+        let first = crate::expert_runs::submit_evidence(
+            &state,
+            &run.id,
+            "codex",
+            "/project",
+            evidence.clone(),
+        )
+        .await
+        .unwrap();
+        let retry = crate::expert_runs::submit_evidence(
+            &state,
+            &run.id,
+            "codex",
+            "/project",
+            evidence.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, retry.id);
+        assert!(crate::expert_runs::submit_evidence(
+            &state,
+            &run.id,
+            "claudeCode",
+            "/project",
+            evidence.clone(),
+        )
+        .await
+        .is_err());
+        let mut changed = evidence;
+        changed.summary = "Changed replay".into();
+        assert!(
+            crate::expert_runs::submit_evidence(&state, &run.id, "codex", "/project", changed,)
+                .await
+                .is_err()
+        );
+        crate::expert_runs::submit_evidence(
+            &state,
+            &run.id,
+            "codex",
+            "/project",
+            EvidenceSubmission {
+                idempotency_key: "evidence-fail".into(),
+                check_name: "tests".into(),
+                result: EvidenceResult::Fail,
+                command_label: None,
+                summary: "Latest run failed".into(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::expert_runs::report_blocker(
+            &state,
+            &run.id,
+            "codex",
+            "/project",
+            "dependency",
+            "Waiting for access",
+        )
+        .await
+        .unwrap();
+        crate::expert_runs::request_review(&state, &run.id, "codex", "/project")
+            .await
+            .unwrap();
+        assert!(crate::expert_runs::review_run_with_waivers(
+            &state,
+            &run.id,
+            ExpertRunState::Accepted,
+            Vec::new(),
+        )
+        .await
+        .is_err());
+        crate::expert_runs::review_run_with_waivers(
+            &state,
+            &run.id,
+            ExpertRunState::Accepted,
+            vec![crate::expert_runs::ExpertWaiverInput {
+                check_name: "tests".into(),
+                reason: "Approved exception".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(crate::expert_runs::submit_evidence(
+            &state,
+            &run.id,
+            "codex",
+            "/project",
+            EvidenceSubmission {
+                idempotency_key: "late".into(),
+                check_name: "tests".into(),
+                result: EvidenceResult::Pass,
+                command_label: None,
+                summary: "late".into(),
+            },
+        )
+        .await
+        .is_err());
+
+        let waiver_run = crate::expert_runs::create_run(
+            &state,
+            ExpertRunCreate {
+                expert_id: "expert-2".into(),
+                expert_version: 1,
+                project_path: "/project".into(),
+                client: "codex".into(),
+                lead_agent: "lead".into(),
+                supporting_agents: Vec::new(),
+                required_skills: Vec::new(),
+                optional_skills: Vec::new(),
+                runbook: None,
+                contract: QualityContract {
+                    version: 1,
+                    checks: vec![ExpertCheck {
+                        name: "security".into(),
+                        kind: "security".into(),
+                        required: true,
+                        evidence_mode: "userConfirmed".into(),
+                    }],
+                },
+            },
+        )
+        .await
+        .unwrap();
+        crate::expert_runs::request_review(&state, &waiver_run.id, "codex", "/project")
+            .await
+            .unwrap();
+        assert!(crate::expert_runs::review_run_with_waivers(
+            &state,
+            &waiver_run.id,
+            ExpertRunState::Accepted,
+            Vec::new(),
+        )
+        .await
+        .is_err());
+        assert!(crate::expert_runs::review_run_with_waivers(
+            &state,
+            &waiver_run.id,
+            ExpertRunState::Accepted,
+            vec![
+                crate::expert_runs::ExpertWaiverInput {
+                    check_name: "security".into(),
+                    reason: "Approved emergency exception".into(),
+                },
+                crate::expert_runs::ExpertWaiverInput {
+                    check_name: "not-required".into(),
+                    reason: "Irrelevant".into(),
+                },
+            ],
+        )
+        .await
+        .is_err());
+        let accepted = crate::expert_runs::review_run_with_waivers(
+            &state,
+            &waiver_run.id,
+            ExpertRunState::Accepted,
+            vec![crate::expert_runs::ExpertWaiverInput {
+                check_name: "security".into(),
+                reason: "Approved emergency exception".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.state, ExpertRunState::Accepted);
+        assert_eq!(accepted.waivers.len(), 1);
+        let mcp_json = crate::expert_runs::mcp_view(&accepted).to_string();
+        assert!(!mcp_json.contains("Approved emergency exception"));
+        assert!(mcp_json.contains("security"));
     }
 }

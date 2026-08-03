@@ -1,5 +1,23 @@
 # Decisions (ADRs) — Agency Agents
 
+### 2026-08-03: Expert MCP automation proposes; desktop humans approve and review
+**Status**: Approved. **Context**: Claude Code and Codex need a complete Expert lifecycle without
+being granted silent authority to mutate reusable Expert definitions, install project components,
+or certify outcomes. Expert definitions must remain reusable and portable, while execution records
+contain project-scoped operational evidence with different privacy and retention needs. **Decision**:
+all MCP create/update/clone/archive/delete and activation actions enter existing desktop approval
+flows; terminal run verdicts are desktop-only. Definitions carry versioned quality contracts but no
+project paths or credentials. Activation snapshots the selected Expert into a separately persisted,
+client/project-scoped run; evidence and blockers are append-only until terminal review, acceptance
+uses the latest evidence for each required check, and missing/failed checks require explicit human
+waivers whose reasons are redacted from MCP views. **Alternatives**: direct MCP mutation or automatic
+acceptance (rejected—removes human authority); storing runs inside Expert definitions (rejected—mixes
+portable configuration with sensitive, high-churn execution history); separate request queues per
+change kind (rejected—duplicates ownership, idempotency, and approval logic). **Consequences**: one
+auditable lifecycle supports both clients and later trusted-automation policy without weakening the
+Release 1 approval boundary. Run retention is capped independently at 500 records / 4 MiB.
+**References**: `tasks/2026-08/260803_expert-mcp-release1.md`.
+
 ### 2026-06-05: Fork brew-browser structurally
 **Status**: Approved. **Context**: brew-browser is a proven, signed, shipping Tauri 2 +
 Svelte 5 native macOS app that is "a thin respectful frontend over a CLI." Agency Agents

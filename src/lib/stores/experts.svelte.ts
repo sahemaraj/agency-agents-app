@@ -8,6 +8,7 @@ import type {
   ExpertDefinition,
   ExpertProposalInput,
   ExpertResolved,
+  ExpertRun,
 } from "$lib/types";
 
 class ExpertsStore {
@@ -18,6 +19,7 @@ class ExpertsStore {
   requests: ExpertActivationRequest[] = $state([]);
   creationRequests: ExpertCreationRequest[] = $state([]);
   history: ExpertActivationRecord[] = $state([]);
+  runs: ExpertRun[] = $state([]);
 
   selected = $derived(this.list.find((expert) => expert.id === this.selectedId) ?? this.list[0] ?? null);
 
@@ -26,11 +28,12 @@ class ExpertsStore {
     this.loading = true;
     this.error = null;
     try {
-      [this.list, this.requests, this.creationRequests, this.history] = await Promise.all([
+      [this.list, this.requests, this.creationRequests, this.history, this.runs] = await Promise.all([
         invoke<ExpertResolved[]>("experts_list"),
         invoke<ExpertActivationRequest[]>("expert_activation_requests"),
         invoke<ExpertCreationRequest[]>("expert_creation_requests"),
         invoke<ExpertActivationRecord[]>("expert_activation_history", { projectPath: null }),
+        invoke<ExpertRun[]>("expert_runs_list", { projectPath: null }),
       ]);
       if (!this.selectedId || !this.list.some((expert) => expert.id === this.selectedId)) {
         this.selectedId = this.list[0]?.id ?? null;
@@ -86,6 +89,11 @@ class ExpertsStore {
   async rejectCreation(requestId: string): Promise<void> {
     await invoke("expert_creation_request_reject", { requestId });
     this.creationRequests = await invoke<ExpertCreationRequest[]>("expert_creation_requests");
+  }
+
+  async reviewRun(id: string, verdict: "accepted" | "rework" | "rejected" | "cancelled", waivers: Array<{ checkName: string; reason: string }> = []): Promise<void> {
+    await invoke("expert_run_review", { id, verdict, waivers });
+    this.runs = await invoke<ExpertRun[]>("expert_runs_list", { projectPath: null });
   }
 }
 

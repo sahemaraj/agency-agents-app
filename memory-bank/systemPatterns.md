@@ -120,3 +120,17 @@ Activity drawer (live install/convert stdout). Cmd+K palette, Cmd+0…6 nav inhe
 
 Long ops stream stdout/stderr via `Channel<Event>` with a global write-lock, exactly
 like brew-browser's `run_brew_streaming`. Install/convert/refresh are the streaming ops.
+
+## 9. Expert definition and execution lifecycle
+
+Portable Expert definitions live in `state/experts.json`; they contain roster, skill/runbook
+references, starter prompt, version, and quality contract, but never project paths or credentials.
+MCP lifecycle changes reuse one owned, idempotent desktop approval inbox for create, update, clone,
+archive, and delete. Updates use optimistic `baseVersion` checks; archive is reversible.
+
+Activation resolves and installs through the existing agent/skill transaction paths, then snapshots
+the definition into `state/expert-runs.json`. Runs are separately lock-serialized, atomically written,
+capped at 500 records / 4 MiB, and scoped to the originating MCP client plus canonical project.
+Evidence and blockers append while active; terminal desktop review freezes the run. Acceptance uses
+the latest evidence for every required contract check or an explicit human waiver. MCP views expose
+that a check was waived but redact the human waiver reason.
