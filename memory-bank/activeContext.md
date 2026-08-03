@@ -1,5 +1,16 @@
 # Active Context — Agency Agents
 
+## ✅ Expert MCP Lifecycle — Release 1 (2026-08-03)
+
+The `feat/experts-hub` branch now provides the human-approved Expert lifecycle for Claude Code and
+Codex: discovery, portable create/update/clone/archive/delete proposals, activation requests,
+quality-contract runs, idempotent evidence, blockers, waivers, and desktop review. MCP mutations
+reuse the existing default-denied policy/audit boundary; callers are scoped by client and canonical
+registered project, while terminal verdicts remain desktop-only. Verified: Rust 411 passed / 1
+environment-gated parity test ignored, Svelte check 0 errors and 0 warnings, production frontend
+build green, native macOS Tauri debug build green, and diff/format checks clean. User approved the
+implementation. Task: `tasks/2026-08/260803_expert-mcp-release1.md`.
+
 ## ✅ MCP Skills Platform (2026-07-30)
 
 The `feat/skills-library` branch now exposes the validated Skills library to Claude Code and Codex

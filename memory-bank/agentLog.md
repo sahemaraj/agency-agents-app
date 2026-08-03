@@ -709,3 +709,14 @@ never separate releases; they ship here. Then took it further: **turned auto-upd
   the matching filtered view; an active lens shows a **flat all-divisions list** (`showDivisions` gates on
   `lens === "all"`). New "Needs attention" bucket = Outdated ∪ Modified ∪ Missing. Dropped the lens's cross-launch
   localStorage persistence (a sticky filter would hijack the landing). svelte-check 0, build clean.
+
+## 2026-08-03 — Expert MCP Lifecycle Release 1
+
+- Completed PLAN → BUILD → DIFF → QA → APPROVAL → APPLY → DOCS on `feat/experts-hub`.
+- Added the 27-tool canonical Expert MCP lifecycle plus 2 compatibility aliases, shared change
+  requests, activation requests, quality-contract runs, evidence, blockers, waivers, and desktop
+  review.
+- User approved after 411 Rust tests passed, Svelte check reported 0 errors/0 warnings, and both the
+  production frontend and native macOS Tauri debug builds succeeded.
+- User selected a local merge into `origin/main`; the Release 1 commit excludes the pre-existing
+  `Cargo.toml` edit and untracked `node_modules`.

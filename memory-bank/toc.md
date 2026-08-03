@@ -1,8 +1,8 @@
 # Memory Bank — Table of Contents
 
 - `projectbrief.md` — vision, thesis, what it is/isn't.
-- `systemPatterns.md` — corpus-copy model, 2 indexes, deterministic renderer, 5-state
-  reconciliation, both scopes, domain module map, frontend sections.
+- `systemPatterns.md` — corpus-copy model, indexes, deterministic renderer, reconciliation,
+  both scopes, domain module map, frontend sections, and Expert definition/run lifecycle.
 - `contracts.md` — **the build spec**: core types, install-target matrix, command surface,
   frontend stores, determinism rules. Build against this.
 - `decisions.md` — ADRs (fork, Plan B, corpus-copy, state tracking, hash-match provenance,
@@ -15,3 +15,4 @@
 - `tasks/2026-06/` — monthly README + per-task docs (Phase 0 fork, Phase 1 corpus+discover, etc.).
 - `tasks/2026-07/` — Skills library inspection, transactional installation, managed lifecycle,
   project/application integration, and the MCP Skills Platform.
+- `tasks/2026-08/` — Expert MCP lifecycle Release 1.

@@ -730,6 +730,15 @@ export interface Runbook {
 
 export type ExpertClient = "claudeCode" | "codex";
 
+export interface ExpertCheck {
+  name: string;
+  kind: string;
+  required: boolean;
+  evidenceMode: "clientReported" | "userConfirmed";
+}
+
+export interface ExpertQualityContract { version: number; checks: ExpertCheck[]; }
+
 export interface ExpertDefinition {
   id: string;
   name: string;
@@ -744,6 +753,7 @@ export interface ExpertDefinition {
   runbook: string | null;
   preferredClient: ExpertClient | null;
   starterPrompt: string;
+  qualityContract: ExpertQualityContract;
   source: "curated" | "custom";
 }
 
@@ -759,6 +769,7 @@ export interface ExpertProposalInput {
   runbook: string | null;
   preferredClient: ExpertClient | null;
   starterPrompt: string;
+  qualityContract: ExpertQualityContract;
 }
 
 export interface ExpertLinkedSkillDraft {
@@ -793,8 +804,11 @@ interface ExpertProposalRequestFields {
   proposal: ExpertProposalInput;
   linkedSkillDrafts: ExpertLinkedSkillDraft[];
   agentSubstitutions: ExpertAgentSubstitution[];
-  state: "pending" | "approved" | "rejected";
+  state: "pending" | "approved" | "rejected" | "cancelled";
   savedExpertId: string | null;
+  kind: "create" | "update" | "clone" | "archive" | "delete";
+  targetExpertId: string | null;
+  baseVersion: number | null;
 }
 
 export interface ExpertResolved extends ExpertDefinition {
@@ -831,6 +845,7 @@ export interface ExpertActivationRecord {
   activatedAt: string;
   installedAgents: string[];
   installedSkills: string[];
+  runId: string | null;
 }
 
 export interface ExpertActivationRequest {
@@ -840,7 +855,38 @@ export interface ExpertActivationRequest {
   client: ExpertClient | null;
   requestedBy: string;
   requestedAt: string;
-  state: "pending" | "approved" | "rejected";
+  state: "pending" | "approved" | "rejected" | "cancelled";
+}
+
+export interface ExpertEvidence {
+  id: string;
+  idempotencyKey: string;
+  checkName: string;
+  result: "pass" | "fail" | "skipped";
+  commandLabel: string | null;
+  summary: string;
+  submittedAt: string;
+}
+
+export interface ExpertWaiver { checkName: string; reason: string; createdAt: string; }
+export interface ExpertRun {
+  id: string;
+  expertId: string;
+  expertVersion: number;
+  projectPath: string;
+  client: ExpertClient;
+  leadAgent: string;
+  supportingAgents: string[];
+  requiredSkills: string[];
+  optionalSkills: string[];
+  runbook: string | null;
+  contract: ExpertQualityContract;
+  state: "inProgress" | "awaitingReview" | "accepted" | "rework" | "rejected" | "cancelled";
+  startedAt: string;
+  endedAt: string | null;
+  evidence: ExpertEvidence[];
+  blockers: Array<{ kind: string; summary: string; reportedAt: string }>;
+  waivers: ExpertWaiver[];
 }
 
 export interface CatalogUpdateCheck {

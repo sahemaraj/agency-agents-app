@@ -557,6 +557,63 @@ struct ExpertCreationGetRequest {
     id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertSearchRequest {
+    query: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertChangeSubmitRequest {
+    client_request_id: String,
+    outcome: String,
+    project_path: String,
+    proposal: serde_json::Value,
+    target_expert_id: Option<String>,
+    base_version: Option<u32>,
+    #[serde(default)]
+    linked_skill_drafts: Vec<serde_json::Value>,
+    #[serde(default)]
+    agent_substitutions: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertChangeReviseRequest {
+    id: String,
+    proposal: serde_json::Value,
+    base_version: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertRunListRequest {
+    project_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertRunGetRequest {
+    id: String,
+    project_path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertEvidenceRequest {
+    id: String,
+    project_path: String,
+    idempotency_key: String,
+    check_name: String,
+    result: String,
+    command_label: Option<String>,
+    summary: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExpertBlockerRequest {
+    id: String,
+    project_path: String,
+    kind: String,
+    summary: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SkillRecommendation {
@@ -610,6 +667,43 @@ impl SkillMcpServer {
             .await
             .map_err(|error| error.to_string())?;
         serde_json::to_string_pretty(&approval).map_err(|error| error.to_string())
+    }
+
+    async fn submit_expert_change(
+        &self,
+        request: ExpertChangeSubmitRequest,
+        kind: crate::experts::ExpertChangeKind,
+    ) -> Result<String, String> {
+        let proposal = serde_json::from_value(request.proposal)
+            .map_err(|error| format!("invalid Expert proposal: {error}"))?;
+        let links = request
+            .linked_skill_drafts
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("invalid linked skill draft: {error}"))?;
+        let substitutions = request
+            .agent_substitutions
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("invalid agent substitution: {error}"))?;
+        let value = crate::experts::mcp_request_change(
+            &self.state,
+            request.client_request_id,
+            request.outcome,
+            request.project_path,
+            proposal,
+            links,
+            substitutions,
+            self.client_identity.clone(),
+            kind,
+            request.target_expert_id,
+            request.base_version,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
     }
 
     async fn run_tool<T, F>(
@@ -673,11 +767,22 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "skills_plan_install"
         | "skills_version_history" => Some(McpAction::Read),
         "experts_list"
+        | "expert_runs_list"
+        | "expert_runs_get"
+        | "expert_runs_get_contract"
+        | "expert_runs_get_review"
         | "experts_get"
+        | "experts_capabilities"
+        | "experts_search"
+        | "experts_validate_proposal"
         | "experts_plan_activation"
         | "experts_creation_context"
         | "experts_list_creation_requests"
-        | "experts_get_creation_request" => Some(McpAction::Read),
+        | "experts_get_creation_request"
+        | "experts_list_change_requests"
+        | "experts_get_change_request"
+        | "experts_list_activation_requests"
+        | "experts_get_activation_request" => Some(McpAction::Read),
         "skills_add_local_source"
         | "skills_add_github_source"
         | "skills_refresh_source"
@@ -701,8 +806,19 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         "skills_set_preferred_source"
         | "skills_request_publisher_trust"
         | "skills_request_batch_collection" => Some(McpAction::Source),
-        "experts_request_creation" => Some(McpAction::Source),
-        "experts_request_activation" => Some(McpAction::Install),
+        "experts_request_creation"
+        | "expert_runs_submit_evidence"
+        | "expert_runs_report_blocker"
+        | "expert_runs_request_review"
+        | "experts_request_update"
+        | "experts_request_clone"
+        | "experts_request_archive"
+        | "experts_revise_change_request"
+        | "experts_cancel_change_request" => Some(McpAction::Source),
+        "experts_request_activation" | "experts_cancel_activation_request" => {
+            Some(McpAction::Install)
+        }
+        "experts_request_delete" => Some(McpAction::Destructive),
         "skills_submit_approval" => Some(McpAction::Source),
         "skills_install" | "skills_find_and_install" | "skills_update" | "skills_enable" => {
             Some(McpAction::Install)
@@ -1839,6 +1955,97 @@ impl SkillMcpServer {
         .await
     }
 
+    #[tool(description = "Describe the supported Expert MCP lifecycle, clients, and limits")]
+    async fn experts_capabilities(&self) -> Result<String, String> {
+        self.run_tool("experts_capabilities", McpAction::Read, None, async {
+            Ok(serde_json::json!({
+                "schemaVersion": 1,
+                "clients": ["claudeCode", "codex"],
+                "changeKinds": ["create", "update", "clone", "archive", "delete"],
+                "runStates": ["inProgress", "awaitingReview", "accepted", "rework", "rejected", "cancelled"],
+                "humanApprovalRequired": true,
+                "maxExperts": 200,
+                "maxRequests": 200
+            }).to_string())
+        }).await
+    }
+
+    #[tool(
+        description = "Search reusable Expert definitions by outcome, category, tags, agents, or skills"
+    )]
+    async fn experts_search(
+        &self,
+        Parameters(ExpertSearchRequest { query, limit }): Parameters<ExpertSearchRequest>,
+    ) -> Result<String, String> {
+        self.run_tool("experts_search", McpAction::Read, None, async {
+            let query = query.trim().to_ascii_lowercase();
+            if query.is_empty() || query.len() > 512 {
+                return Err("query is empty or oversized".into());
+            }
+            let limit = limit.unwrap_or(20).clamp(1, 100);
+            let experts = crate::experts::mcp_definitions(&self.state)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|expert| {
+                    format!(
+                        "{} {} {} {} {} {}",
+                        expert.name,
+                        expert.summary,
+                        expert.category,
+                        expert.tags.join(" "),
+                        expert.lead_agent,
+                        expert.required_skills.join(" ")
+                    )
+                    .to_ascii_lowercase()
+                    .contains(&query)
+                })
+                .take(limit)
+                .collect::<Vec<_>>();
+            serde_json::to_string_pretty(&experts).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "Validate a portable Expert proposal without saving or activating it")]
+    async fn experts_validate_proposal(
+        &self,
+        Parameters(request): Parameters<ExpertChangeSubmitRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_validate_proposal",
+            McpAction::Read,
+            Some(request.project_path.clone()),
+            async {
+                let proposal = serde_json::from_value(request.proposal)
+                    .map_err(|error| format!("invalid Expert proposal: {error}"))?;
+                let links = request
+                    .linked_skill_drafts
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                let substitutions = request
+                    .agent_substitutions
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                let result = crate::experts::mcp_validate_proposal(
+                    &self.state,
+                    &request.project_path,
+                    proposal,
+                    links,
+                    substitutions,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
     #[tool(description = "List reusable Expert workspace definitions")]
     async fn experts_list(&self) -> Result<String, String> {
         self.run_tool("experts_list", McpAction::Read, None, async {
@@ -1992,6 +2199,141 @@ impl SkillMcpServer {
         .await
     }
 
+    #[tool(description = "List this MCP client's Expert change requests")]
+    async fn experts_list_change_requests(&self) -> Result<String, String> {
+        self.experts_list_creation_requests().await
+    }
+
+    #[tool(description = "Read one of this MCP client's Expert change requests")]
+    async fn experts_get_change_request(
+        &self,
+        Parameters(request): Parameters<ExpertCreationGetRequest>,
+    ) -> Result<String, String> {
+        self.experts_get_creation_request(Parameters(request)).await
+    }
+
+    #[tool(description = "Propose an update to an exact Expert version for desktop approval")]
+    async fn experts_request_update(
+        &self,
+        Parameters(request): Parameters<ExpertChangeSubmitRequest>,
+    ) -> Result<String, String> {
+        let project = request.project_path.clone();
+        self.run_tool(
+            "experts_request_update",
+            McpAction::Source,
+            Some(project),
+            async {
+                self.submit_expert_change(request, crate::experts::ExpertChangeKind::Update)
+                    .await
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Propose a new Expert cloned from an existing Expert")]
+    async fn experts_request_clone(
+        &self,
+        Parameters(request): Parameters<ExpertChangeSubmitRequest>,
+    ) -> Result<String, String> {
+        let project = request.project_path.clone();
+        self.run_tool(
+            "experts_request_clone",
+            McpAction::Source,
+            Some(project),
+            async {
+                self.submit_expert_change(request, crate::experts::ExpertChangeKind::Clone)
+                    .await
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Request reversible archival of an Expert")]
+    async fn experts_request_archive(
+        &self,
+        Parameters(request): Parameters<ExpertChangeSubmitRequest>,
+    ) -> Result<String, String> {
+        let project = request.project_path.clone();
+        self.run_tool(
+            "experts_request_archive",
+            McpAction::Source,
+            Some(project),
+            async {
+                self.submit_expert_change(request, crate::experts::ExpertChangeKind::Archive)
+                    .await
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Request destructive deletion of an Expert through desktop approval")]
+    async fn experts_request_delete(
+        &self,
+        Parameters(request): Parameters<ExpertChangeSubmitRequest>,
+    ) -> Result<String, String> {
+        let project = request.project_path.clone();
+        self.run_tool(
+            "experts_request_delete",
+            McpAction::Destructive,
+            Some(project),
+            async {
+                self.submit_expert_change(request, crate::experts::ExpertChangeKind::Delete)
+                    .await
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Revise this MCP client's pending Expert change request")]
+    async fn experts_revise_change_request(
+        &self,
+        Parameters(request): Parameters<ExpertChangeReviseRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_revise_change_request",
+            McpAction::Source,
+            None,
+            async {
+                let proposal = serde_json::from_value(request.proposal)
+                    .map_err(|error| format!("invalid Expert proposal: {error}"))?;
+                let result = crate::experts::mcp_revise_change_request(
+                    &self.state,
+                    &request.id,
+                    &self.client_identity,
+                    proposal,
+                    request.base_version,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Cancel this MCP client's pending Expert change request")]
+    async fn experts_cancel_change_request(
+        &self,
+        Parameters(ExpertCreationGetRequest { id }): Parameters<ExpertCreationGetRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_cancel_change_request",
+            McpAction::Source,
+            None,
+            async {
+                let result = crate::experts::mcp_cancel_change_request(
+                    &self.state,
+                    &id,
+                    &self.client_identity,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
     #[tool(description = "Prepare an Expert activation request for a canonical local project")]
     async fn experts_plan_activation(
         &self,
@@ -2045,6 +2387,244 @@ impl SkillMcpServer {
             },
         )
         .await
+    }
+
+    #[tool(description = "List this MCP client's Expert activation requests")]
+    async fn experts_list_activation_requests(&self) -> Result<String, String> {
+        self.run_tool(
+            "experts_list_activation_requests",
+            McpAction::Read,
+            None,
+            async {
+                let result = crate::experts::mcp_list_activation_requests(
+                    &self.state,
+                    &self.client_identity,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Read this MCP client's Expert activation request")]
+    async fn experts_get_activation_request(
+        &self,
+        Parameters(ExpertCreationGetRequest { id }): Parameters<ExpertCreationGetRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_get_activation_request",
+            McpAction::Read,
+            None,
+            async {
+                let result = crate::experts::mcp_get_activation_request(
+                    &self.state,
+                    &id,
+                    &self.client_identity,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Cancel this MCP client's pending Expert activation request")]
+    async fn experts_cancel_activation_request(
+        &self,
+        Parameters(ExpertCreationGetRequest { id }): Parameters<ExpertCreationGetRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "experts_cancel_activation_request",
+            McpAction::Install,
+            None,
+            async {
+                let result = crate::experts::mcp_cancel_activation_request(
+                    &self.state,
+                    &id,
+                    &self.client_identity,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "List this MCP client's Expert runs")]
+    async fn expert_runs_list(
+        &self,
+        Parameters(request): Parameters<ExpertRunListRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "expert_runs_list",
+            McpAction::Read,
+            request.project_path.clone(),
+            async {
+                let runs = crate::expert_runs::list_runs(
+                    &self.state,
+                    &self.client_identity,
+                    request.project_path.as_deref(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                let runs = runs
+                    .iter()
+                    .map(crate::expert_runs::mcp_view)
+                    .collect::<Vec<_>>();
+                serde_json::to_string_pretty(&runs).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Read a client- and project-scoped Expert run")]
+    async fn expert_runs_get(
+        &self,
+        Parameters(request): Parameters<ExpertRunGetRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "expert_runs_get",
+            McpAction::Read,
+            Some(request.project_path.clone()),
+            async {
+                let run = crate::expert_runs::get_run(
+                    &self.state,
+                    &request.id,
+                    &self.client_identity,
+                    &request.project_path,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&crate::expert_runs::mcp_view(&run))
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Read the immutable quality contract for an Expert run")]
+    async fn expert_runs_get_contract(
+        &self,
+        Parameters(request): Parameters<ExpertRunGetRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "expert_runs_get_contract",
+            McpAction::Read,
+            Some(request.project_path.clone()),
+            async {
+                let run = crate::expert_runs::get_run(
+                    &self.state,
+                    &request.id,
+                    &self.client_identity,
+                    &request.project_path,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&run.snapshot.contract)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Submit bounded idempotent evidence for an Expert run contract check")]
+    async fn expert_runs_submit_evidence(
+        &self,
+        Parameters(request): Parameters<ExpertEvidenceRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "expert_runs_submit_evidence",
+            McpAction::Source,
+            Some(request.project_path.clone()),
+            async {
+                let result = match request.result.as_str() {
+                    "pass" => crate::expert_runs::EvidenceResult::Pass,
+                    "fail" => crate::expert_runs::EvidenceResult::Fail,
+                    "skipped" => crate::expert_runs::EvidenceResult::Skipped,
+                    _ => return Err("result must be pass, fail, or skipped".into()),
+                };
+                let evidence = crate::expert_runs::submit_evidence(
+                    &self.state,
+                    &request.id,
+                    &self.client_identity,
+                    &request.project_path,
+                    crate::expert_runs::EvidenceSubmission {
+                        idempotency_key: request.idempotency_key,
+                        check_name: request.check_name,
+                        result,
+                        command_label: request.command_label,
+                        summary: request.summary,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&evidence).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Report a bounded structured blocker for an Expert run")]
+    async fn expert_runs_report_blocker(
+        &self,
+        Parameters(request): Parameters<ExpertBlockerRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "expert_runs_report_blocker",
+            McpAction::Source,
+            Some(request.project_path.clone()),
+            async {
+                let blocker = crate::expert_runs::report_blocker(
+                    &self.state,
+                    &request.id,
+                    &self.client_identity,
+                    &request.project_path,
+                    &request.kind,
+                    &request.summary,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&blocker).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Move an in-progress Expert run to desktop review")]
+    async fn expert_runs_request_review(
+        &self,
+        Parameters(request): Parameters<ExpertRunGetRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "expert_runs_request_review",
+            McpAction::Source,
+            Some(request.project_path.clone()),
+            async {
+                let run = crate::expert_runs::request_review(
+                    &self.state,
+                    &request.id,
+                    &self.client_identity,
+                    &request.project_path,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&crate::expert_runs::mcp_view(&run))
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Read the current desktop review result for an Expert run")]
+    async fn expert_runs_get_review(
+        &self,
+        Parameters(request): Parameters<ExpertRunGetRequest>,
+    ) -> Result<String, String> {
+        self.expert_runs_get(Parameters(request)).await
     }
 }
 
@@ -3804,14 +4384,35 @@ mod tests {
         assert_eq!(
             names,
             [
+                "expert_runs_get",
+                "expert_runs_get_contract",
+                "expert_runs_get_review",
+                "expert_runs_list",
+                "expert_runs_report_blocker",
+                "expert_runs_request_review",
+                "expert_runs_submit_evidence",
+                "experts_cancel_activation_request",
+                "experts_cancel_change_request",
+                "experts_capabilities",
                 "experts_creation_context",
                 "experts_get",
+                "experts_get_activation_request",
+                "experts_get_change_request",
                 "experts_get_creation_request",
                 "experts_list",
+                "experts_list_activation_requests",
+                "experts_list_change_requests",
                 "experts_list_creation_requests",
                 "experts_plan_activation",
                 "experts_request_activation",
+                "experts_request_archive",
+                "experts_request_clone",
                 "experts_request_creation",
+                "experts_request_delete",
+                "experts_request_update",
+                "experts_revise_change_request",
+                "experts_search",
+                "experts_validate_proposal",
                 "skills_add_github_source",
                 "skills_add_local_source",
                 "skills_assign_folder",

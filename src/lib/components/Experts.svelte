@@ -21,13 +21,14 @@
     ExpertDefinition,
     ExpertProposalInput,
     ExpertResolved,
+    ExpertRun,
   } from "$lib/types";
 
   onMount(() => {
     void Promise.all([experts.load(), projects.refresh(), corpus.ensureLoaded()]);
   });
 
-  let tab = $state<"experts" | "drafts" | "runbooks">("experts");
+  let tab = $state<"experts" | "drafts" | "runs" | "runbooks">("experts");
   let query = $state("");
   let filter = $state<"all" | "ready" | "setup" | "custom" | "recent">("all");
   let projectPath = $state("");
@@ -37,6 +38,8 @@
   let activating = $state(false);
   let builder = $state<ExpertDefinition | null>(null);
   let creationReview = $state<ExpertCreationRequest | null>(null);
+  let runReview = $state<ExpertRun | null>(null);
+  let waiverReason = $state("");
   const pendingRequests = $derived(experts.requests.filter((request) => request.state === "pending"));
 
   const knownAgents = $derived(new Map(corpus.agents.map((agent) => [agent.slug, agent])));
@@ -68,6 +71,7 @@
       runbook: null,
       preferredClient: null,
       starterPrompt: "Use {{expert}} for {{project}}. Lead with {{leadAgent}} and verify the outcome before completion.",
+      qualityContract: { version: 1, checks: [] },
       source: "custom",
     };
   }
@@ -99,7 +103,7 @@
     activating = true;
     try {
       const pending = pendingRequests.find((item) => item.expertId === plan?.expert.id && item.projectPath === plan?.projectPath);
-      await experts.activate(plan.expert.id, plan.projectPath, plan.client);
+      const activation = await experts.activate(plan.expert.id, plan.projectPath, plan.client);
       if (pending) await experts.resolveRequest(pending.id, true);
       await experts.load();
       activity.log({
@@ -110,7 +114,10 @@
         outcome: "ok",
         detail: `Activated Expert with ${plan.rollbackScope.length} new component(s)`,
       });
-      await navigator.clipboard.writeText(plan.promptPreview);
+      const prompt = activation.runId
+        ? `${plan.promptPreview}\n\nRun ID: ${activation.runId}. Read the quality contract with expert_runs_get_contract, then submit evidence for each check before requesting review.`
+        : plan.promptPreview;
+      await navigator.clipboard.writeText(prompt);
       toast.success(`${plan.expert.name} activated; starter prompt copied`);
       plan = null;
     } catch (error) {
@@ -192,6 +199,28 @@
     }
   }
 
+  function missingRequired(run: ExpertRun | null): string[] {
+    if (!run) return [];
+    return run.contract.checks.filter((check) => check.required && !run.evidence.some((evidence) => evidence.checkName === check.name && evidence.result === "pass")).map((check) => check.name);
+  }
+
+  function reportedChecks(run: ExpertRun): number {
+    return new Set(run.evidence.map((item) => item.checkName)).size;
+  }
+
+  async function finishRun(verdict: "accepted" | "rework" | "rejected" | "cancelled", waive = false) {
+    if (!runReview) return;
+    const waivers = waive ? missingRequired(runReview).map((checkName) => ({ checkName, reason: waiverReason.trim() })) : [];
+    try {
+      await experts.reviewRun(runReview.id, verdict, waivers);
+      runReview = null;
+      waiverReason = "";
+      toast.success(`Run marked ${verdict}`);
+    } catch (error) {
+      toast.error("Could not review run", String(error));
+    }
+  }
+
   function normalizedSkill(value: string): string {
     return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   }
@@ -235,28 +264,40 @@
   <header class="head">
     <div><h1>Experts</h1><p>Project-ready specialist workspaces.</p></div>
     <div class="tabs" role="tablist">
-      <button class:active={tab === "experts"} onclick={() => (tab = "experts")}>Experts</button>
-      <button class:active={tab === "drafts"} onclick={() => { tab = "drafts"; void experts.load(); }}>Drafts ({experts.creationRequests.filter((request) => request.state === "pending").length})</button>
-      <button class:active={tab === "runbooks"} onclick={() => (tab = "runbooks")}>Runbooks</button>
+      <button role="tab" aria-selected={tab === "experts"} class:active={tab === "experts"} onclick={() => (tab = "experts")}>Experts</button>
+      <button role="tab" aria-selected={tab === "drafts"} class:active={tab === "drafts"} onclick={() => { tab = "drafts"; void experts.load(); }}>Changes ({experts.creationRequests.filter((request) => request.state === "pending").length})</button>
+      <button role="tab" aria-selected={tab === "runs"} class:active={tab === "runs"} onclick={() => { tab = "runs"; void experts.load(); }}>Runs ({experts.runs.filter((run) => run.state === "awaitingReview").length})</button>
+      <button role="tab" aria-selected={tab === "runbooks"} class:active={tab === "runbooks"} onclick={() => (tab = "runbooks")}>Runbooks</button>
     </div>
   </header>
 
   {#if tab === "runbooks"}
     <div class="runbooks"><Runbooks /></div>
+  {:else if tab === "runs"}
+    <div class="drafts" aria-label="Expert runs">
+      {#if experts.runs.length === 0}<p class="empty">No Expert runs.</p>
+      {:else}{#each experts.runs as run (run.id)}
+        <article class="draft-card">
+          <div class="title"><div><h2>{experts.list.find((expert) => expert.id === run.expertId)?.name ?? run.expertId}</h2><p>{run.projectPath} · {run.client} · {new Date(run.startedAt).toLocaleString()}</p></div><span class:ready={run.state === "accepted"} class="status">{run.state}</span></div>
+          <p>{reportedChecks(run)}/{run.contract.checks.length} checks reported · {run.blockers.length} blockers</p>
+          {#if run.state === "awaitingReview"}<footer><button onclick={() => { runReview = run; waiverReason = ""; }}>Review run</button></footer>{/if}
+        </article>
+      {/each}{/if}
+    </div>
   {:else if tab === "drafts"}
-    <div class="drafts" aria-label="Expert creation drafts">
+    <div class="drafts" aria-label="Expert change requests">
       {#if experts.loading}
-        <p class="empty">Loading Expert drafts…</p>
+        <p class="empty">Loading Expert changes…</p>
       {:else if experts.error}
         <p class="empty">{experts.error}</p>
       {:else if experts.creationRequests.length === 0}
-        <p class="empty">No Expert creation drafts.</p>
+        <p class="empty">No Expert change requests.</p>
       {:else}
         {#each experts.creationRequests as request (request.id)}
           <article class="draft-card">
             <div class="title">
               <div>
-                <h2>{request.proposal.name}</h2>
+                <h2>{request.kind}: {request.proposal.name}</h2>
                 <p>{request.requestedBy} · {request.projectPath} · {new Date(request.requestedAt).toLocaleString()}</p>
               </div>
               <span class:ready={request.readiness === "ready"} class="status">{request.readiness}</span>
@@ -342,6 +383,7 @@
           {@const expert = experts.selected}
           <div class="title"><div><h2>{expert.name}</h2><p>{expert.summary}</p></div><span class="source">{expert.source}</span></div>
           <section><h3>Expected outcome</h3><p>{expert.summary}</p></section>
+          <section><h3>Quality contract</h3><p>{expert.qualityContract.checks.length ? expert.qualityContract.checks.map((check) => `${check.name} · ${check.required ? "required" : "optional"}`).join(" · ") : "No checks configured"}</p></section>
           <section>
             <h3>Roster</h3>
             <button class="link" onclick={() => ui.openAgents(null)}>{knownAgents.get(expert.leadAgent)?.name ?? expert.leadAgent} · lead</button>
@@ -385,6 +427,7 @@
       {#each plan.skills as skill}{#each skill.packages as pkg}<p>{pkg.dependency ? "Dependency" : "Skill"}: {pkg.name} → {pkg.destination}</p>{/each}{/each}
       {#if plan.blockers.length}<div class="warning"><strong>Blocked</strong>{#each plan.blockers as blocker}<p>{blocker}</p>{/each}</div>{/if}
       <h3>Rollback scope</h3><p>{plan.rollbackScope.join(", ") || "No new components"}</p>
+      <h3>Quality contract</h3><p>{plan.expert.qualityContract.checks.length ? plan.expert.qualityContract.checks.map((check) => check.name).join(", ") : "No checks configured"}</p>
       <h3>Generated starter prompt</h3><pre>{plan.promptPreview}</pre>
     </div>
     {#snippet actions()}
@@ -394,8 +437,32 @@
   </Modal>
 {/if}
 
+{#if runReview}
+  <Modal open title={`Review run ${runReview.id.slice(0, 8)}`} size="wide" onClose={() => (runReview = null)}>
+    <div class="review">
+      <p><strong>Expert:</strong> {runReview.expertId} v{runReview.expertVersion}</p>
+      <p><strong>Project:</strong> {runReview.projectPath}</p>
+      <h3>Checks</h3>
+      {#each runReview.contract.checks as check}
+        {@const evidence = runReview.evidence.filter((item) => item.checkName === check.name).at(-1)}
+        <p>{check.name} · {check.required ? "required" : "optional"} — {evidence?.result ?? "missing"}{evidence?.summary ? `: ${evidence.summary}` : ""}</p>
+      {/each}
+      {#if runReview.blockers.length}<h3>Blockers</h3>{#each runReview.blockers as blocker}<p>{blocker.kind}: {blocker.summary}</p>{/each}{/if}
+      {#if missingRequired(runReview).length}<label>Waiver reason<textarea maxlength="4096" bind:value={waiverReason}></textarea></label>{/if}
+    </div>
+    {#snippet actions()}
+      <button onclick={() => finishRun("cancelled")}>Cancel run</button>
+      <button onclick={() => finishRun("rejected")}>Reject</button>
+      <button onclick={() => finishRun("rework")}>Request rework</button>
+      {#if missingRequired(runReview).length}
+        <button class="primary" disabled={!waiverReason.trim()} onclick={() => finishRun("accepted", true)}>Accept with waiver</button>
+      {:else}<button class="primary" onclick={() => finishRun("accepted")}>Accept</button>{/if}
+    {/snippet}
+  </Modal>
+{/if}
+
 {#if builder}
-  <Modal open title={creationReview ? `Review ${creationReview.proposal.name}` : builder.source === "custom" ? "Edit Expert" : "Clone Expert"} size="wide" onClose={() => { builder = null; creationReview = null; }}>
+  <Modal open title={creationReview ? `Review ${creationReview.kind} request` : builder.source === "custom" ? "Edit Expert" : "Clone Expert"} size="wide" onClose={() => { builder = null; creationReview = null; }}>
     <form class="builder" onsubmit={(event) => { event.preventDefault(); void saveBuilder(); }}>
       <label>Name<input required maxlength="120" bind:value={builder.name} /></label>
       <label>Summary<textarea required maxlength="1000" bind:value={builder.summary}></textarea></label>
@@ -408,6 +475,8 @@
       <label>Runbook slug<input maxlength="160" value={builder.runbook ?? ""} oninput={(event) => (builder!.runbook = event.currentTarget.value.trim() || null)} /></label>
       <label>Preferred client<select bind:value={builder.preferredClient}><option value={null}>Ask during activation</option><option value="claudeCode">Claude Code</option><option value="codex">Codex</option></select></label>
       <label>Starter prompt<textarea required maxlength="4096" rows="6" bind:value={builder.starterPrompt}></textarea></label>
+      <label>Required quality checks<input maxlength="500" value={builder.qualityContract.checks.filter((check) => check.required).map((check) => check.name).join(", ")} oninput={(event) => { const optional = builder!.qualityContract.checks.filter((check) => !check.required); builder!.qualityContract = { version: 1, checks: [...event.currentTarget.value.split(",").map((name) => name.trim()).filter(Boolean).map((name) => ({ name, kind: name, required: true, evidenceMode: "clientReported" as const })), ...optional] }; }} /></label>
+      <label>Optional quality checks<input maxlength="500" value={builder.qualityContract.checks.filter((check) => !check.required).map((check) => check.name).join(", ")} oninput={(event) => { const required = builder!.qualityContract.checks.filter((check) => check.required); builder!.qualityContract = { version: 1, checks: [...required, ...event.currentTarget.value.split(",").map((name) => name.trim()).filter(Boolean).map((name) => ({ name, kind: name, required: false, evidenceMode: "clientReported" as const }))] }; }} /></label>
     </form>
     {#snippet actions()}<button onclick={() => { builder = null; creationReview = null; }}>Cancel</button><button class="primary" disabled={pendingRequiredSkill} onclick={saveBuilder}>Save</button>{/snippet}
   </Modal>
