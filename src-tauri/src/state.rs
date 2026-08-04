@@ -181,7 +181,7 @@ impl AppState {
         action: McpAction,
         project_path: Option<&str>,
     ) -> Result<Option<AuthorizedMcpProject>, AppError> {
-        if action == McpAction::Read {
+        if action == McpAction::Read && project_path.is_none() {
             return Ok(None);
         }
         let loaded = settings::load_async(&self.app_data_dir).await;
@@ -252,6 +252,9 @@ pub enum McpAction {
     Source,
     Install,
     Destructive,
+    AgentSource,
+    AgentInstall,
+    AgentDestructive,
 }
 
 impl McpAction {
@@ -261,6 +264,9 @@ impl McpAction {
             Self::Source => "source",
             Self::Install => "install",
             Self::Destructive => "destructive",
+            Self::AgentSource => "agent_source",
+            Self::AgentInstall => "agent_install",
+            Self::AgentDestructive => "agent_destructive",
         }
     }
 }
@@ -297,6 +303,15 @@ pub fn authorize_mcp_for_client(
         McpAction::Destructive => client_policy
             .map(|value| value.destructive_access)
             .unwrap_or(policy.mcp_destructive_access),
+        McpAction::AgentSource => client_policy
+            .map(|value| value.agent_source_access)
+            .unwrap_or(policy.mcp_agent_source_access),
+        McpAction::AgentInstall => client_policy
+            .map(|value| value.agent_install_access)
+            .unwrap_or(policy.mcp_agent_install_access),
+        McpAction::AgentDestructive => client_policy
+            .map(|value| value.agent_destructive_access)
+            .unwrap_or(policy.mcp_agent_destructive_access),
     };
     if !enabled {
         return Err(mcp_denied(action));
@@ -866,11 +881,32 @@ mod tests {
             McpAction::Source,
             McpAction::Install,
             McpAction::Destructive,
+            McpAction::AgentSource,
+            McpAction::AgentInstall,
+            McpAction::AgentDestructive,
         ] {
             assert!(
                 authorize_mcp(&policy, action, None).is_err(),
                 "{action:?} unexpectedly allowed"
             );
+        }
+    }
+
+    #[test]
+    fn skill_mcp_grants_never_imply_agent_mcp_grants() {
+        let policy = Settings {
+            mcp_source_access: true,
+            mcp_install_access: true,
+            mcp_destructive_access: true,
+            ..Settings::default()
+        };
+
+        for action in [
+            McpAction::AgentSource,
+            McpAction::AgentInstall,
+            McpAction::AgentDestructive,
+        ] {
+            assert!(authorize_mcp(&policy, action, None).is_err());
         }
     }
 
@@ -886,12 +922,22 @@ mod tests {
                 source_access: false,
                 install_access: true,
                 destructive_access: false,
+                ..Default::default()
             },
         );
 
         assert!(authorize_mcp_for_client(&policy, "claude", McpAction::Source, None).is_err());
         assert!(authorize_mcp_for_client(&policy, "claude", McpAction::Install, None).is_ok());
         assert!(authorize_mcp_for_client(&policy, "codex", McpAction::Source, None).is_ok());
+
+        policy
+            .mcp_client_policies
+            .get_mut("claude")
+            .expect("claude policy")
+            .agent_source_access = true;
+        assert!(authorize_mcp_for_client(&policy, "claude", McpAction::AgentSource, None).is_ok());
+        assert!(authorize_mcp_for_client(&policy, "codex", McpAction::AgentSource, None).is_err());
+        assert!(authorize_mcp_for_client(&policy, "claude", McpAction::Source, None).is_err());
     }
 
     #[test]
@@ -908,6 +954,7 @@ mod tests {
             .into_owned();
         let policy = Settings {
             mcp_install_access: true,
+            mcp_agent_install_access: true,
             mcp_project_allowlist: vec![allowed.clone()],
             ..Settings::default()
         };
@@ -918,6 +965,12 @@ mod tests {
             Some(allowed.clone())
         );
         assert!(authorize_mcp(&policy, McpAction::Install, Some(&denied)).is_err());
+        assert_eq!(
+            authorize_mcp(&policy, McpAction::AgentInstall, Some(&allowed))
+                .expect("Agent mutation uses the shared exact allowlist"),
+            Some(allowed.clone())
+        );
+        assert!(authorize_mcp(&policy, McpAction::AgentInstall, Some(&denied)).is_err());
         assert!(authorize_mcp(
             &policy,
             McpAction::Install,
@@ -943,32 +996,50 @@ mod tests {
             app.path(),
             Settings {
                 mcp_source_access: true,
+                mcp_agent_source_access: true,
                 ..Settings::default()
             },
         )
         .await
         .expect("persist enabled policy");
         assert!(state.authorize_mcp(McpAction::Source, None).await.is_ok());
+        assert!(state
+            .authorize_mcp(McpAction::AgentSource, None)
+            .await
+            .is_ok());
 
         settings::persist(app.path(), Settings::default())
             .await
             .expect("persist revoked policy");
         assert!(state.authorize_mcp(McpAction::Source, None).await.is_err());
+        assert!(state
+            .authorize_mcp(McpAction::AgentSource, None)
+            .await
+            .is_err());
 
         settings::persist(
             app.path(),
             Settings {
                 paranoid_mode: true,
                 mcp_source_access: true,
+                mcp_agent_source_access: true,
                 ..Settings::default()
             },
         )
         .await
         .expect("persist paranoid policy");
         assert!(state.authorize_mcp(McpAction::Source, None).await.is_err());
+        assert!(state
+            .authorize_mcp(McpAction::AgentSource, None)
+            .await
+            .is_err());
 
         std::fs::write(settings::settings_path(app.path()), b"{invalid").expect("corrupt settings");
         assert!(state.authorize_mcp(McpAction::Source, None).await.is_err());
+        assert!(state
+            .authorize_mcp(McpAction::AgentSource, None)
+            .await
+            .is_err());
         assert!(matches!(
             &*state.settings.read().await,
             SettingsLoadState::Corrupt { .. }

@@ -709,3 +709,33 @@ never separate releases; they ship here. Then took it further: **turned auto-upd
   the matching filtered view; an active lens shows a **flat all-divisions list** (`showDivisions` gates on
   `lens === "all"`). New "Needs attention" bucket = Outdated ∪ Modified ∪ Missing. Dropped the lens's cross-launch
   localStorage persistence (a sticky filter would hijack the landing). svelte-check 0, build clean.
+
+{"timestamp":"2026-08-03T18:49:54Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","mode":"standard","mb_version":"2026-07"}
+{"timestamp":"2026-08-04T06:06:44Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"PLAN","to":"BUILD","task":"agents-skills-feature-parity-stage-1"}
+{"timestamp":"2026-08-04T08:12:09Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"BUILD","to":"DIFF","task":"agents-skills-feature-parity-stage-1"}
+{"timestamp":"2026-08-04T08:12:10Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"DIFF","to":"QA","task":"agents-skills-feature-parity-stage-1"}
+{"timestamp":"2026-08-04T08:12:11Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"QA","to":"APPROVAL","task":"agents-skills-feature-parity-stage-1"}
+{"timestamp":"2026-08-04T08:17:58Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"APPROVAL","to":"APPLY","task":"agents-skills-feature-parity-stage-1"}
+{"timestamp":"2026-08-04T08:18:00Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"APPLY","to":"DOCS","task":"agents-skills-feature-parity-stage-1"}
+{"timestamp":"2026-08-04T08:18:05Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"DOCS","to":"PLAN","task":"agents-skills-feature-parity-stage-2"}
+{"timestamp":"2026-08-04T08:18:07Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"PLAN","to":"BUILD","task":"agents-skills-feature-parity-stage-2"}
+{"timestamp":"2026-08-04T10:29:53Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"BUILD","to":"DIFF","task":"agents-skills-feature-parity-stage-2"}
+{"timestamp":"2026-08-04T10:29:54Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"DIFF","to":"QA","task":"agents-skills-feature-parity-stage-2"}
+{"timestamp":"2026-08-04T10:29:55Z","session_id":"f7359500-3763-4e8a-9c44-94bd36499d73","event":"state_transition","from":"QA","to":"APPROVAL","task":"agents-skills-feature-parity-stage-2"}
+{"timestamp":"2026-08-04T11:28:12Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"APPROVAL","to":"APPLY","task":"agent-lifecycle-parity","approval":"user-approved"}
+{"timestamp":"2026-08-04T11:28:12Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"APPLY","to":"DOCS","task":"agent-lifecycle-parity"}
+{"timestamp":"2026-08-04T11:28:12Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"DOCS","to":"PLAN","task":"agents-mcp"}
+{"timestamp":"2026-08-04T11:28:12Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"PLAN","to":"BUILD","task":"agents-mcp","substate":"CODING"}
+{"timestamp":"2026-08-04T12:46:20Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"BUILD","to":"DIFF","task":"agents-mcp"}
+{"timestamp":"2026-08-04T12:46:20Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"DIFF","to":"QA","task":"agents-mcp","tests":"445 library + 2 CLI + 13 frontend","result":"pass"}
+{"timestamp":"2026-08-04T12:46:20Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"QA","to":"APPROVAL","task":"agents-mcp","substate":"IDLE"}
+{"timestamp":"2026-08-04T12:46:20Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"APPROVAL","to":"APPLY","task":"agents-mcp","approval":"user-approved"}
+{"timestamp":"2026-08-04T12:46:20Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"APPLY","to":"DOCS","task":"agents-mcp"}
+{"timestamp":"2026-08-04T12:46:20Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"DOCS","to":"PLAN","task":"agent-parity-integration","substate":"IDLE"}
+{"timestamp":"2026-08-04T13:00:00Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"PLAN","to":"BUILD","task":"agent-parity-integration","substate":"CODING","approval":"user-approved"}
+{"timestamp":"2026-08-04T14:37:09Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"BUILD","to":"DIFF","task":"agent-parity-integration"}
+{"timestamp":"2026-08-04T14:37:10Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"DIFF","to":"QA","task":"agent-parity-integration","tests":"453 library + 2 CLI + 19 frontend","result":"pass","cross_platform":"macOS pass; optional Ubuntu absent; Windows runner unprepared"}
+{"timestamp":"2026-08-04T14:37:11Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"QA","to":"APPROVAL","task":"agent-parity-integration","substate":"IDLE"}
+{"timestamp":"2026-08-04T15:23:14Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"APPROVAL","to":"APPLY","task":"agent-parity-integration","approval":"user-approved"}
+{"timestamp":"2026-08-04T15:23:14Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"APPLY","to":"DOCS","task":"agent-parity-integration","verification":"453 library + 2 CLI + 19 frontend; live MCP 49 Skills + 49 Agents"}
+{"timestamp":"2026-08-04T15:23:14Z","session_id":"agents-skills-parity-20260804","event":"state_transition","from":"DOCS","to":"END","task":"agents-skills-feature-parity","result":"complete","commit":"not-created"}

@@ -14,24 +14,26 @@
   import { install } from "$lib/stores/install.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { diffLines, diffStat, type DiffRow } from "$lib/util/diff";
-  import type { AgentDiff, Tool } from "$lib/types";
+  import type { AgentDiff, AgentReference, Tool } from "$lib/types";
 
   interface Props {
     slug: string;
     tool: Tool;
     projectPath: string | null;
     name: string;
+    reference?: AgentReference;
     onClose: () => void;
   }
-  let { slug, tool, projectPath, name, onClose }: Props = $props();
+  let { slug, tool, projectPath, name, reference, onClose }: Props = $props();
 
   let data = $state<AgentDiff | null>(null);
   let error = $state<string | null>(null);
   let loading = $state(true);
 
   onMount(() => {
-    void install
-      .diff(slug, tool, projectPath)
+    void (reference
+      ? install.diffReference(reference, tool, projectPath)
+      : install.diff(slug, tool, projectPath))
       .then((d) => (data = d))
       .catch((e) => (error = String(e)))
       .finally(() => (loading = false));

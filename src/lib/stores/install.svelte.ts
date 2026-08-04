@@ -3,7 +3,7 @@
  * (install_agent / uninstall_agent / installs_reconcile / tools_list).
  *
  * Singleton: import `install` everywhere. `reconcile()` refreshes the
- * cross-tool installed view (the 5-state Library model); `install()` /
+ * cross-tool installed view (the seven-state Library model); `install()` /
  * `uninstall()` mutate then re-reconcile so the UI reflects truth.
  *
  * Backend-not-ready posture (matches corpus store): every invoke is wrapped
@@ -11,11 +11,39 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 
-import { activity } from "$lib/stores/activity.svelte";
+import { activity, safeActivityDetail } from "$lib/stores/activity.svelte";
 import { i18n } from "$lib/stores/i18n.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
 import { wiredTools } from "$lib/data/toolRegistry";
-import type { AgentDiff, InstalledAgent, InstallRecord, InstallState, Tool, ToolInfo, ToolVersion } from "$lib/types";
+import {
+  agentDisable,
+  agentCollectionApply,
+  agentCollectionPlan,
+  agentDiffExact,
+  agentEnable,
+  agentInstallPlan,
+  agentInstallWithDependencies,
+  agentTrackExact,
+  agentUninstallExact,
+  agentUninstallPlan,
+  agentUpdateExact,
+  agentUpdatePlan,
+  agentVersionHistory,
+  agentVersionRollback,
+} from "$lib/api";
+import { agentInstallKey } from "$lib/agents/libraryModel";
+import type {
+  AgentDiff,
+  AgentMutationPlan,
+  AgentReference,
+  AgentVersionSnapshot,
+  InstalledAgent,
+  InstallRecord,
+  InstallState,
+  Tool,
+  ToolInfo,
+  ToolVersion,
+} from "$lib/types";
 
 /** The tools Phase 2 can install to. Mirrors the Rust `SUPPORTED` set and the
     `supports_user()`/`supports_project()` capabilities in `render/mod.rs`.
@@ -110,7 +138,7 @@ class InstallStore {
       tool,
       scope: this.scopeOf(null),
       outcome: "ok",
-      detail: nowSelected ? "added as default target" : "removed as default target",
+      detail: i18n.t(nowSelected ? "common.defaultTargetAdded" : "common.defaultTargetRemoved"),
     });
   }
 
@@ -204,7 +232,7 @@ class InstallStore {
   }
 
   /** The reconciled state for `slug` in `tool` (current/outdated/modified/
-      removed/foreign), or null if there's no install on disk. Lets the UI show
+      missing/foreign/disabled/source-unavailable), or null if there's no install on disk. Lets the UI show
       the SAME truth everywhere instead of a flat "installed". */
   stateFor(slug: string, tool: Tool, projectPath: string | null = null): InstallState | null {
     const row = this.installed.find(
@@ -214,6 +242,183 @@ class InstallStore {
         (i.projectPath ?? null) === (projectPath ?? null),
     );
     return row?.state ?? null;
+  }
+
+  forReference(reference: AgentReference): InstalledAgent[] {
+    return this.installed.filter(
+      (row) => row.sourceId === reference.sourceId && row.relativePath === reference.relativePath,
+    );
+  }
+
+  stateForReference(
+    reference: AgentReference,
+    tool: Tool,
+    projectPath: string | null = null,
+  ): InstallState | null {
+    return this.installed.find(
+      (row) =>
+        row.sourceId === reference.sourceId &&
+        row.relativePath === reference.relativePath &&
+        row.tool === tool &&
+        (row.projectPath ?? null) === projectPath,
+    )?.state ?? null;
+  }
+
+  private async exactMutation<T>(
+    action: "install" | "update" | "track" | "uninstall" | "disable" | "enable" | "rollback",
+    reference: AgentReference,
+    tool: Tool,
+    projectPath: string | null,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    this.busy = agentInstallKey(reference, tool, projectPath);
+    try {
+      const result = await run();
+      await this.reconcile();
+      void this.loadTools();
+      activity.log({
+        action,
+        subject: "agent",
+        subjectName: `${reference.relativePath} · ${reference.sourceId}`,
+        agentSlug: reference.relativePath.replace(/\.md$/, "").split("/").pop(),
+        tool,
+        scope: this.scopeOf(projectPath),
+        projectPath: projectPath ?? undefined,
+        outcome: "ok",
+      });
+      return result;
+    } catch (error) {
+      activity.log({
+        action,
+        subject: "agent",
+        subjectName: `${reference.relativePath} · ${reference.sourceId}`,
+        tool,
+        scope: this.scopeOf(projectPath),
+        projectPath: projectPath ?? undefined,
+        outcome: "error",
+        detail: safeActivityDetail(error instanceof Error ? error.message : error),
+      });
+      throw error;
+    } finally {
+      this.busy = null;
+    }
+  }
+
+  plan(
+    operation: "install" | "update" | "uninstall",
+    reference: AgentReference,
+    tool: Tool,
+    projectPath: string | null,
+  ): Promise<AgentMutationPlan> {
+    if (operation === "install") return agentInstallPlan(reference, tool, projectPath);
+    if (operation === "update") return agentUpdatePlan(reference, tool, projectPath);
+    return agentUninstallPlan(reference, tool, projectPath);
+  }
+
+  installReference(
+    reference: AgentReference,
+    tool: Tool,
+    projectPath: string | null,
+    confirmed: boolean,
+  ): Promise<InstallRecord[]> {
+    return this.exactMutation("install", reference, tool, projectPath, () =>
+      agentInstallWithDependencies(reference, tool, projectPath, confirmed));
+  }
+
+  updateReference(
+    reference: AgentReference,
+    tool: Tool,
+    projectPath: string | null,
+    confirmed: boolean,
+  ): Promise<InstallRecord> {
+    return this.exactMutation("update", reference, tool, projectPath, () =>
+      agentUpdateExact(reference, tool, projectPath, confirmed));
+  }
+
+  trackReference(reference: AgentReference, tool: Tool, projectPath: string | null): Promise<InstallRecord> {
+    return this.exactMutation("track", reference, tool, projectPath, () =>
+      agentTrackExact(reference, tool, projectPath));
+  }
+
+  uninstallReference(reference: AgentReference, tool: Tool, projectPath: string | null): Promise<void> {
+    return this.exactMutation("uninstall", reference, tool, projectPath, () =>
+      agentUninstallExact(reference, tool, projectPath));
+  }
+
+  disableReference(reference: AgentReference, tool: Tool, projectPath: string | null): Promise<InstallRecord> {
+    return this.exactMutation("disable", reference, tool, projectPath, () =>
+      agentDisable(reference, tool, projectPath));
+  }
+
+  enableReference(reference: AgentReference, tool: Tool, projectPath: string | null): Promise<InstallRecord> {
+    return this.exactMutation("enable", reference, tool, projectPath, () =>
+      agentEnable(reference, tool, projectPath));
+  }
+
+  history(reference: AgentReference, tool: Tool, projectPath: string | null): Promise<AgentVersionSnapshot[]> {
+    return agentVersionHistory(reference, tool, projectPath);
+  }
+
+  diffReference(reference: AgentReference, tool: Tool, projectPath: string | null): Promise<AgentDiff> {
+    return agentDiffExact(reference, tool, projectPath);
+  }
+
+  rollbackReference(
+    reference: AgentReference,
+    tool: Tool,
+    projectPath: string | null,
+    snapshotId: string,
+  ): Promise<InstallRecord> {
+    return this.exactMutation("rollback", reference, tool, projectPath, () =>
+      agentVersionRollback(reference, tool, projectPath, snapshotId));
+  }
+
+  planCollection(
+    name: string,
+    operation: "install" | "update" | "uninstall",
+    tool: Tool,
+    projectPath: string | null,
+  ): Promise<AgentMutationPlan> {
+    return agentCollectionPlan(name, operation, tool, projectPath);
+  }
+
+  async applyCollection(
+    name: string,
+    operation: "install" | "update" | "uninstall",
+    tool: Tool,
+    projectPath: string | null,
+  ): Promise<InstallRecord[]> {
+    this.busy = JSON.stringify(["collection", name, operation, tool, projectPath]);
+    try {
+      const records = await agentCollectionApply(name, operation, tool, projectPath, true);
+      await this.reconcile();
+      void this.loadTools();
+      activity.log({
+        action: "bulk",
+        subject: "agentLibrary",
+        subjectName: name,
+        tool,
+        scope: this.scopeOf(projectPath),
+        projectPath: projectPath ?? undefined,
+        outcome: "ok",
+        detail: `${i18n.t(`common.${operation}`)} · ${records.length}`,
+      });
+      return records;
+    } catch (error) {
+      activity.log({
+        action: "bulk",
+        subject: "agentLibrary",
+        subjectName: name,
+        tool,
+        scope: this.scopeOf(projectPath),
+        projectPath: projectPath ?? undefined,
+        outcome: "error",
+        detail: safeActivityDetail(error instanceof Error ? error.message : error),
+      });
+      throw error;
+    } finally {
+      this.busy = null;
+    }
   }
 
   /** Resolve an agent's friendly name from the loaded corpus, if available.
@@ -254,7 +459,7 @@ class InstallStore {
         scope: this.scopeOf(projectPath),
         projectPath: projectPath ?? undefined,
         outcome: "error",
-        detail: e instanceof Error ? e.message : String(e),
+        detail: safeActivityDetail(e instanceof Error ? e.message : e),
       });
       throw e;
     } finally {
@@ -286,7 +491,7 @@ class InstallStore {
         scope: this.scopeOf(projectPath),
         projectPath: projectPath ?? undefined,
         outcome: "error",
-        detail: e instanceof Error ? e.message : String(e),
+        detail: safeActivityDetail(e instanceof Error ? e.message : e),
       });
       throw e;
     } finally {
@@ -318,7 +523,7 @@ class InstallStore {
         scope: this.scopeOf(projectPath),
         projectPath: projectPath ?? undefined,
         outcome: "error",
-        detail: e instanceof Error ? e.message : String(e),
+        detail: safeActivityDetail(e instanceof Error ? e.message : e),
       });
       throw e;
     } finally {
@@ -355,7 +560,7 @@ class InstallStore {
         scope: this.scopeOf(projectPath),
         projectPath: projectPath ?? undefined,
         outcome: "error",
-        detail: e instanceof Error ? e.message : String(e),
+        detail: safeActivityDetail(e instanceof Error ? e.message : e),
       });
       throw e;
     } finally {
@@ -394,12 +599,14 @@ class InstallStore {
             : "update_agent";
     let ok = 0;
     let fail = 0;
+    const failures: { target: (typeof targets)[number]; error: unknown }[] = [];
     for (const t of targets) {
       try {
         await invoke(cmd, { slug: t.slug, tool: t.tool, projectPath: t.projectPath });
         ok++;
-      } catch {
+      } catch (error) {
         fail++;
+        failures.push({ target: t, error });
       }
     }
     await this.reconcile();
@@ -421,6 +628,18 @@ class InstallStore {
       outcome: fail > 0 ? "error" : "ok",
       detail: fail > 0 ? i18n.t("activity.bulkFailed", { summary, fail }) : summary,
     });
+    for (const { target, error } of failures) {
+      activity.log({
+        action: action === "update" ? "sync" : "bulk",
+        subject: "agent",
+        subjectName: target.slug,
+        tool: target.tool,
+        scope: this.scopeOf(target.projectPath),
+        projectPath: target.projectPath ?? undefined,
+        outcome: "error",
+        detail: safeActivityDetail(error instanceof Error ? error.message : error),
+      });
+    }
     return { ok, fail };
   }
 

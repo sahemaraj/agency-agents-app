@@ -119,7 +119,7 @@ class UiStore {
       can restore it. */
   agentsCategory: string | null = $state(null);
   /** Install-state lens for the Agents workspace ("all" | "attention" | "current"
-      | "outdated" | "foreign" | "removed" | "none"). In ui so the Dashboard can
+      | "outdated" | "modified" | "foreign" | "missing" | "disabled" | "sourceUnavailable" | "none"). In ui so the Dashboard can
       deep-link a filter and back/forward can restore it. */
   agentsLens: string = $state("all");
   /** Slug of the agent open in the workspace detail pane; null = none. In ui so

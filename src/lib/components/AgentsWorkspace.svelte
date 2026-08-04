@@ -25,12 +25,17 @@
   import EmptyState from "./EmptyState.svelte";
   import LoadingState from "./LoadingState.svelte";
   import ResizeHandle from "./ResizeHandle.svelte";
-  import PersonaBody from "./PersonaBody.svelte";
-  import DeploymentMatrix from "./DeploymentMatrix.svelte";
   import DiffModal from "./DiffModal.svelte";
   import DivisionsLanding from "./DivisionsLanding.svelte";
   import InstallModal from "./InstallModal.svelte";
   import StarterPrompt from "./StarterPrompt.svelte";
+  import AgentLibrarySidebar from "./AgentLibrarySidebar.svelte";
+  import AgentSourceManager from "./AgentSourceManager.svelte";
+  import AgentCreatorModal from "./AgentCreatorModal.svelte";
+  import AgentApprovalInbox from "./AgentApprovalInbox.svelte";
+  import AgentDetailTabs from "./AgentDetailTabs.svelte";
+  import AgentOrganizerModal from "./AgentOrganizerModal.svelte";
+  import { findAgentPackage } from "$lib/agents/libraryModel";
   import { divisionPrompt } from "$lib/data/playbook";
   import DownloadIcon from "@lucide/svelte/icons/download";
 
@@ -45,10 +50,16 @@
   } from "$lib/stores/ui.svelte";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
+  import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
+  import { agentTextRead } from "$lib/api";
+  import { installStateMessageKey } from "$lib/agents/libraryModel";
   import type { MessageKey } from "$lib/i18n/messages";
-  import type { Agent, InstalledAgent, InstallState, Tool } from "$lib/types";
+  import type { Agent, AgentPackageResult, InstalledAgent, InstallState, Tool } from "$lib/types";
 
-  onMount(() => corpus.ensureLoaded());
+  onMount(() => {
+    void corpus.ensureLoaded();
+    void agentLibrary.load();
+  });
 
   // ── OS-style dropdown dismissal: click anywhere outside (or Escape) closes the
   //    open menu. Each trigger button is excluded so clicking it just toggles. ──
@@ -98,7 +109,7 @@
   // same dot tones shown per row). Local + localStorage like the Tools lens —
   // not nav state. An agent matches a bucket if ANY of its install rows is in
   // it; "none" = no install rows anywhere.
-  type Lens = "all" | "attention" | "current" | "outdated" | "foreign" | "removed" | "none";
+  type Lens = "all" | "attention" | InstallState | "none";
   // The lens lives in nav (ui.agentsLens) — the single source of truth — so the
   // Dashboard can deep-link a filter ("5 need attention" → the flat attention list)
   // and back/forward restores it. It no longer persists across launches: a sticky
@@ -114,9 +125,10 @@
     if (rows.length === 0) { s.add("none"); return s; }
     for (const r of rows) {
       if (r.state === "current") s.add("current");
-      else if (r.state === "outdated" || r.state === "modified") { s.add("outdated"); s.add("attention"); }
+      else if (r.state === "outdated" || r.state === "modified") { s.add(r.state); s.add("attention"); }
       else if (r.state === "foreign") s.add("foreign");
-      else if (r.state === "removed") { s.add("removed"); s.add("attention"); }
+      else if (r.state === "missing" || r.state === "sourceUnavailable") { s.add(r.state); s.add("attention"); }
+      else if (r.state === "disabled") s.add("disabled");
     }
     return s;
   }
@@ -127,7 +139,10 @@
   const visible = $derived(lens === "all" ? base : base.filter((a) => buckets(a.slug).has(lens)));
 
   const lensCounts = $derived.by<Record<Lens, number>>(() => {
-    const c: Record<Lens, number> = { all: base.length, attention: 0, current: 0, outdated: 0, foreign: 0, removed: 0, none: 0 };
+    const c: Record<Lens, number> = {
+      all: base.length, attention: 0, current: 0, outdated: 0, modified: 0,
+      missing: 0, foreign: 0, disabled: 0, sourceUnavailable: 0, none: 0,
+    };
     for (const a of base) for (const b of buckets(a.slug)) c[b]++;
     return c;
   });
@@ -138,8 +153,11 @@
     { id: "attention", key: "state.attention", tone: "warn" },
     { id: "current", key: "state.current", tone: "ok" },
     { id: "outdated", key: "state.outdated", tone: "warn" },
+    { id: "modified", key: "state.modified", tone: "warn" },
     { id: "foreign", key: "state.foreign", tone: "info" },
-    { id: "removed", key: "state.removed", tone: "danger" },
+    { id: "missing", key: "state.missing", tone: "danger" },
+    { id: "disabled", key: "state.disabled", tone: "none" },
+    { id: "sourceUnavailable", key: "state.sourceUnavailable", tone: "danger" },
     { id: "none", key: "state.none", tone: "none" },
   ];
   // Show "All" plus any bucket present in the current view (zero-count lenses hide).
@@ -197,7 +215,8 @@
     if (s === "current") return "ok";
     if (s === "outdated" || s === "modified") return "warn";
     if (s === "foreign") return "info";
-    return "danger"; // removed
+    if (s === "disabled") return "none";
+    return "danger";
   }
 
   // ── Detail selection (persistent pane) ──
@@ -205,8 +224,23 @@
   // agent. The effect shows the list-view stub instantly, then loads the body.
   let detailStub = $state<Agent | null>(null);
   let detail = $state<Agent | null>(null);
+  let libraryDetail = $state<Agent | null>(null);
+  let libraryPackage = $state<AgentPackageResult | null>(null);
   let detailLoading = $state(false);
-  const panelAgent = $derived(detail ?? detailStub);
+  const selectedLibraryPackage = $derived(findAgentPackage(
+    agentLibrary.packages,
+    agentLibrary.selectedReference,
+  ));
+  const panelAgent = $derived(selectedLibraryPackage?.agent ?? libraryDetail ?? detail ?? detailStub);
+  const panelPackage = $derived(selectedLibraryPackage ?? libraryPackage ?? (panelAgent
+    ? agentLibrary.packages.find((pkg) =>
+        pkg.agent?.slug === panelAgent.slug
+        && agentLibrary.sources.find((source) => source.id === pkg.reference.sourceId)?.kind.kind === "builtIn"
+      ) ?? null
+    : null));
+  const panelSource = $derived(panelPackage
+    ? agentLibrary.sources.find((source) => source.id === panelPackage.reference.sourceId) ?? null
+    : null);
 
   $effect(() => {
     const slug = ui.agentsSelected;
@@ -234,11 +268,61 @@
   });
 
   function openAgent(a: Agent) {
+    libraryDetail = null;
+    libraryPackage = null;
+    agentLibrary.selectedReference = null;
     ui.selectAgent(a.slug);
   }
+  function openLibraryAgent(pkg: AgentPackageResult) {
+    if (!pkg.agent) return;
+    ui.selectAgent(null);
+    libraryPackage = pkg;
+    libraryDetail = pkg.agent;
+    agentLibrary.selectedReference = pkg.reference;
+    void agentLibrary.touchRecent(pkg.reference);
+  }
   function closeDetail() {
+    libraryDetail = null;
+    libraryPackage = null;
+    agentLibrary.selectedReference = null;
     ui.selectAgent(null);
   }
+
+  let sourceManagerOpen = $state(false);
+  let creatorOpen = $state(false);
+  let organizerOpen = $state(false);
+  let approvalsOpen = $state(false);
+  let collectionInstall = $state<string | null>(null);
+  let creatorInitial = $state<{ relativePath: string; text: string } | null>(null);
+  let sourceButton: HTMLButtonElement | undefined = $state();
+  let creatorButton: HTMLButtonElement | undefined = $state();
+  let organizerButton: HTMLButtonElement | undefined = $state();
+  let approvalsButton: HTMLButtonElement | undefined = $state();
+  async function editLibraryAgent() {
+    if (!panelPackage) return;
+    const text = await agentTextRead(panelPackage.reference);
+    creatorInitial = { relativePath: panelPackage.reference.relativePath, text };
+    creatorOpen = true;
+  }
+  function closeSourceManager() {
+    sourceManagerOpen = false;
+    setTimeout(() => sourceButton?.focus());
+  }
+  function closeCreator() {
+    creatorOpen = false;
+    creatorInitial = null;
+    setTimeout(() => creatorButton?.focus());
+  }
+  function closeOrganizer() {
+    organizerOpen = false;
+    setTimeout(() => organizerButton?.focus());
+  }
+  function closeApprovals() {
+    approvalsOpen = false;
+    setTimeout(() => approvalsButton?.focus());
+  }
+
+  const pendingApprovals = $derived(agentLibrary.library.approvals.filter((approval) => approval.state === "pending").length);
 
   // ── Diff modal (opened from the deployment pills) ──
   let diffTarget = $state<{ slug: string; tool: Tool; projectPath: string | null; name: string } | null>(null);
@@ -307,10 +391,17 @@
 </script>
 
 <section class="ws" class:sel={!!panelAgent}>
+  <AgentLibrarySidebar onSelectAgent={openLibraryAgent} onSelectCollection={(name) => (collectionInstall = name)} />
   <!-- ── List pane ── -->
   <div class="list-pane">
     <div class="lp-head">
       <div class="lp-search-row">
+        <button class="ghost" bind:this={sourceButton} onclick={() => (sourceManagerOpen = true)}>{i18n.t("agents.sources")}</button>
+        <button class="ghost" bind:this={creatorButton} onclick={() => { creatorInitial = null; creatorOpen = true; }}><PlusIcon size={14} /> {i18n.t("agents.create")}</button>
+        <button class="ghost" bind:this={organizerButton} onclick={() => (organizerOpen = true)}>{i18n.t("agents.organize")}</button>
+        <button class="ghost" bind:this={approvalsButton} onclick={() => (approvalsOpen = true)}>
+          {i18n.t("agents.approvals")}{#if pendingApprovals > 0}<span class="badge" aria-label={i18n.t("agents.pendingApprovals", { count: pendingApprovals })}>{pendingApprovals}</span>{/if}
+        </button>
         <div class="cat-wrap">
           <button class="ghost cat-btn" bind:this={catBtn} onclick={() => (catMenuOpen = !catMenuOpen)}>
             <span class="truncate">{categoryLabel}</span><ChevronDown size={13} />
@@ -449,9 +540,12 @@
                   {#if a.vibe}<span class="row-vibe truncate">{a.vibe}</span>{/if}
                 </span>
                 {#if rows.length > 0}
-                  <span class="row-dots" aria-hidden="true">
+                  <span class="row-dots">
                     {#each rows as r (r.dest)}
-                      <span class="dot" data-tone={dotTone(r.state)} title={`${install.toolLabel(r.tool)} · ${r.state}`}></span>
+                      <span class="state-chip" title={`${install.toolLabel(r.tool)} · ${i18n.t(installStateMessageKey(r.state))}`}>
+                        <span class="dot" data-tone={dotTone(r.state)} aria-hidden="true"></span>
+                        <span>{i18n.t(installStateMessageKey(r.state))}</span>
+                      </span>
                     {/each}
                   </span>
                 {/if}
@@ -484,20 +578,18 @@
         <button class="dp-close" onclick={closeDetail} aria-label={i18n.t("agents.closeDetail")} title={i18n.t("agents.closeDetail")}><XIcon size={16} /></button>
       </div>
       <div class="dp-scroll">
-        <PersonaBody agent={panelAgent} loading={detailLoading} onCategory={(slug) => ui.openDivision(slug)}>
-          {#snippet headerAction()}
-            {#if panelAgent}
-              <button class="dp-install" onclick={() => (installOpen = true)}>
-                <DownloadIcon size={14} /> {i18n.t("agents.installAgent")}
-              </button>
-            {/if}
-          {/snippet}
-          {#snippet deploy()}
-            {#if panelAgent}
-              <DeploymentMatrix agent={panelAgent} onDiff={(t) => (diffTarget = t)} />
-            {/if}
-          {/snippet}
-        </PersonaBody>
+        <AgentDetailTabs
+          agent={panelAgent}
+          pkg={panelPackage}
+          source={panelSource}
+          loading={detailLoading}
+          catalogDeployment={!libraryPackage}
+          onCategory={(slug) => ui.openDivision(slug)}
+          onInstall={() => (installOpen = true)}
+          onEdit={panelPackage ? editLibraryAgent : undefined}
+          onDuplicate={panelPackage ? () => agentLibrary.duplicateDraft(panelPackage!.reference) : undefined}
+          onDiff={(target) => (diffTarget = target)}
+        />
       </div>
     </aside>
 
@@ -516,8 +608,18 @@
   />
 {/if}
 
+<AgentSourceManager open={sourceManagerOpen} onClose={closeSourceManager} />
+<AgentCreatorModal open={creatorOpen} initial={creatorInitial} onClose={closeCreator} />
+<AgentOrganizerModal open={organizerOpen} pkg={panelPackage} onClose={closeOrganizer} />
+<AgentApprovalInbox open={approvalsOpen} onClose={closeApprovals} />
+
 {#if installOpen && panelAgent}
-  <InstallModal title={i18n.t("agents.installAgentTitle", { name: panelAgent.name })} agentSlugs={[panelAgent.slug]} onClose={() => (installOpen = false)} />
+  <InstallModal
+    title={i18n.t("agents.installAgentTitle", { name: panelAgent.name })}
+    agentSlugs={panelPackage ? [] : [panelAgent.slug]}
+    agentPackage={panelPackage ?? undefined}
+    onClose={() => (installOpen = false)}
+  />
 {/if}
 
 {#if bulkInstallOpen && selected.size > 0}
@@ -533,6 +635,14 @@
     title={i18n.t("agents.installDivisionTitle", { division: divisionMeta.label })}
     agentSlugs={divisionMeta.slugs}
     onClose={() => (divisionInstallOpen = false)}
+  />
+{/if}
+
+{#if collectionInstall}
+  <InstallModal
+    title={i18n.t("agents.collectionInstallTitle", { name: collectionInstall })}
+    collectionName={collectionInstall}
+    onClose={() => (collectionInstall = null)}
   />
 {/if}
 
@@ -577,6 +687,7 @@
     background: transparent; color: var(--color-text-secondary);
     font-size: var(--text-body-sm); cursor: pointer;
   }
+  .badge { min-width: 18px; padding: 1px 5px; border-radius: var(--radius-full); background: var(--color-danger); color: white; font-size: var(--text-caption); text-align: center; }
   .ghost:hover:not(:disabled) { color: var(--color-text-primary); background: var(--color-surface-sunken); }
   .ghost:disabled { opacity: 0.6; cursor: default; }
   .ghost.icon { padding: 0; width: 32px; justify-content: center; }
@@ -688,7 +799,8 @@
   .row-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
   .row-name { font-size: var(--text-body-sm); font-weight: var(--fw-medium); color: var(--color-text-primary); }
   .row-vibe { font-size: var(--text-caption); color: var(--color-text-muted); }
-  .row-dots { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+  .row-dots { display: inline-flex; align-items: center; gap: 4px; flex: none; flex-wrap: wrap; justify-content: flex-end; }
+  .state-chip { display: inline-flex; align-items: center; gap: 4px; font-size: var(--text-caption); color: var(--color-text-muted); }
   .row-dots .dot { width: 7px; height: 7px; border-radius: 999px; background: var(--color-text-muted); }
   .dot[data-tone="ok"]     { background: var(--color-success); }
   .dot[data-tone="warn"]   { background: var(--color-warning); }
@@ -712,13 +824,6 @@
     color: var(--color-text-muted); background: transparent; cursor: pointer;
   }
   .dp-close:hover { background: var(--color-surface-sunken); color: var(--color-text-primary); }
-  .dp-install {
-    display: inline-flex; align-items: center; gap: 6px;
-    height: 30px; padding: 0 12px; border-radius: var(--radius-md);
-    background: var(--color-brand); color: var(--color-text-inverse);
-    font-size: var(--text-body-sm); font-weight: var(--fw-medium); cursor: pointer;
-  }
-  .dp-install:hover { filter: brightness(1.08); }
   .dp-scroll { flex: 1; overflow-y: auto; min-height: 0; }
 
   /* Narrow-window overlay scrim — hidden by default, shown only under the

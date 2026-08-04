@@ -4,6 +4,7 @@ use tauri::State;
 
 use crate::corpus::state_dir;
 use crate::error::AppError;
+use crate::library;
 use crate::state::AppState;
 use crate::types::{
     SkillApproval, SkillApprovalAction, SkillApprovalState, SkillCollection, SkillFolderAssignment,
@@ -13,9 +14,11 @@ use crate::types::{
 };
 use crate::util::fs::atomic_write;
 
-const MAX_FOLDERS: usize = 256;
-const MAX_FOLDER_DEPTH: usize = 8;
-const MAX_FOLDER_SEGMENT_CHARS: usize = 64;
+const MAX_FOLDERS: usize = library::MAX_LIBRARY_FOLDERS;
+#[cfg(test)]
+const MAX_FOLDER_DEPTH: usize = library::MAX_LIBRARY_FOLDER_DEPTH;
+#[cfg(test)]
+const MAX_FOLDER_SEGMENT_CHARS: usize = library::MAX_LIBRARY_FOLDER_SEGMENT_CHARS;
 const MAX_NAMED_ITEMS: usize = 128;
 const MAX_RECENT: usize = 50;
 
@@ -30,31 +33,11 @@ fn invalid(message: impl Into<String>) -> AppError {
 }
 
 fn validate_segment(value: &str) -> Result<(), AppError> {
-    let chars = value.chars().count();
-    if value.trim() != value
-        || chars == 0
-        || chars > MAX_FOLDER_SEGMENT_CHARS
-        || value.contains('/')
-        || value.chars().any(char::is_control)
-    {
-        return Err(invalid(
-            "folder segments must contain 1-64 non-control characters without '/' or surrounding whitespace",
-        ));
-    }
-    Ok(())
+    library::validate_folder_segment(value)
 }
 
 fn validate_path(value: &str) -> Result<(), AppError> {
-    let segments = value.split('/').collect::<Vec<_>>();
-    if segments.is_empty() || segments.len() > MAX_FOLDER_DEPTH {
-        return Err(invalid(format!(
-            "folder paths must contain 1-{MAX_FOLDER_DEPTH} segments"
-        )));
-    }
-    for segment in segments {
-        validate_segment(segment)?;
-    }
-    Ok(())
+    library::validate_folder_path(value)
 }
 
 fn validate_state(value: &SkillFolderState) -> Result<(), AppError> {
@@ -299,12 +282,7 @@ fn validate_approval_action(action: &SkillApprovalAction) -> Result<(), AppError
 }
 
 fn validate_reference(value: &SkillReference) -> Result<(), AppError> {
-    if value.source_id.trim().is_empty() || value.relative_path.trim().is_empty() {
-        return Err(invalid(
-            "skill references require source_id and relative_path",
-        ));
-    }
-    Ok(())
+    library::validate_reference(&value.source_id, &value.relative_path)
 }
 
 fn validate_name(value: &str) -> Result<(), AppError> {
@@ -362,70 +340,29 @@ async fn save(app_data_dir: &Path, state: &SkillFolderState) -> Result<(), AppEr
     atomic_write(&folders_path(app_data_dir), &bytes).await
 }
 
-fn replace_prefix(value: &str, from: &str, to: &str) -> Option<String> {
-    if value == from {
-        Some(to.to_owned())
-    } else {
-        value
-            .strip_prefix(&format!("{from}/"))
-            .map(|suffix| format!("{to}/{suffix}"))
-    }
-}
-
 fn create(state: &mut SkillFolderState, path: String) -> Result<(), AppError> {
-    validate_path(&path)?;
-    if state
-        .folders
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case(&path))
-    {
-        return Err(invalid(format!("folder already exists: {path}")));
-    }
-    if let Some((parent, _)) = path.rsplit_once('/') {
-        if !state.folders.iter().any(|folder| folder == parent) {
-            return Err(invalid(format!("parent folder does not exist: {parent}")));
-        }
-    }
-    if state.folders.len() == MAX_FOLDERS {
-        return Err(invalid(format!(
-            "at most {MAX_FOLDERS} folders are allowed"
-        )));
-    }
-    state.folders.push(path);
-    state.folders.sort();
-    Ok(())
+    library::create_folder(&mut state.folders, path)
 }
 
 fn relocate(state: &mut SkillFolderState, path: &str, destination: String) -> Result<(), AppError> {
-    validate_path(path)?;
-    validate_path(&destination)?;
-    if !state.folders.iter().any(|folder| folder == path) {
-        return Err(invalid(format!("folder does not exist: {path}")));
-    }
-    if destination == path || destination.starts_with(&format!("{path}/")) {
-        return Err(invalid("a folder cannot be moved into itself"));
-    }
-    if state
-        .folders
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case(&destination))
-    {
-        return Err(invalid(format!("folder already exists: {destination}")));
-    }
+    let rewrites = library::rewrite_folder_paths(&state.folders, path, destination)?;
     for folder in &mut state.folders {
-        if let Some(updated) = replace_prefix(folder, path, &destination) {
-            *folder = updated;
+        if let Some((_, updated)) = rewrites.iter().find(|(current, _)| current == folder) {
+            *folder = updated.clone();
         }
     }
     for assignment in &mut state.assignments {
-        if let Some(updated) = replace_prefix(&assignment.folder_path, path, &destination) {
-            assignment.folder_path = updated;
+        if let Some((_, updated)) = rewrites
+            .iter()
+            .find(|(current, _)| current == &assignment.folder_path)
+        {
+            assignment.folder_path = updated.clone();
         }
     }
     for profile in &mut state.profiles {
         for folder in &mut profile.folders {
-            if let Some(updated) = replace_prefix(folder, path, &destination) {
-                *folder = updated;
+            if let Some((_, updated)) = rewrites.iter().find(|(current, _)| current == folder) {
+                *folder = updated.clone();
             }
         }
     }
@@ -498,25 +435,17 @@ pub async fn delete_folder(
     validate_path(&path)?;
     let _guard = state.skill_folders_write_lock.lock().await;
     let mut folders = load(&state.app_data_dir).await?;
-    if !folders.folders.contains(&path) {
-        return Err(invalid(format!("folder does not exist: {path}")));
-    }
     let prefix = format!("{path}/");
-    let non_empty = folders
-        .folders
-        .iter()
-        .any(|folder| folder.starts_with(&prefix))
-        || folders.assignments.iter().any(|assignment| {
-            assignment.folder_path == path || assignment.folder_path.starts_with(&prefix)
-        });
-    if non_empty && !recursive {
+    let assigned = folders.assignments.iter().any(|assignment| {
+        assignment.folder_path == path || assignment.folder_path.starts_with(&prefix)
+    });
+    if assigned && !recursive {
         return Err(invalid(
             "folder is not empty; set recursive=true to remove descendants and assignments",
         ));
     }
-    folders
-        .folders
-        .retain(|folder| folder != &path && !folder.starts_with(&prefix));
+    let removed = library::deleted_folder_paths(&folders.folders, &path, recursive)?;
+    folders.folders.retain(|folder| !removed.contains(folder));
     folders.assignments.retain(|assignment| {
         assignment.folder_path != path && !assignment.folder_path.starts_with(&prefix)
     });
@@ -1328,6 +1257,29 @@ mod tests {
     fn persisted_state_rejects_orphan_assignments() {
         let mut folders = state();
         folders.assignments[0].folder_path = "Missing".into();
+        assert!(validate_state(&folders).is_err());
+    }
+
+    #[test]
+    fn folder_boundaries_and_case_collisions_are_enforced() {
+        let deepest = (0..MAX_FOLDER_DEPTH)
+            .map(|index| format!("f{index}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(validate_path(&deepest).is_ok());
+        assert!(validate_path(&format!("{deepest}/too-deep")).is_err());
+        assert!(validate_segment(&"x".repeat(MAX_FOLDER_SEGMENT_CHARS)).is_ok());
+        assert!(validate_segment(&"x".repeat(MAX_FOLDER_SEGMENT_CHARS + 1)).is_err());
+
+        let mut folders = SkillFolderState {
+            folders: vec!["Engineering".into(), "engineering".into()],
+            ..Default::default()
+        };
+        assert!(validate_state(&folders).is_err());
+
+        folders.folders = (0..MAX_FOLDERS).map(|index| format!("f{index}")).collect();
+        assert!(validate_state(&folders).is_ok());
+        folders.folders.push("one-too-many".into());
         assert!(validate_state(&folders).is_err());
     }
 

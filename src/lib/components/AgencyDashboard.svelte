@@ -52,29 +52,31 @@
   }
 
   const available = $derived(corpus.agents.length);
-  const managed = $derived(install.installed.filter((i) => i.state !== "foreign").length);
+  const managed = $derived(install.installed.filter((i) => i.state !== "foreign" && i.state !== "missing").length);
   // Of that present-on-disk total, how many THIS app installed (ledger-tracked)
   // vs. picked up from elsewhere (a prior CLI `install.sh` run, byte-matched).
-  const trackedByApp = $derived(install.installed.filter((i) => i.tracked && i.state !== "foreign").length);
+  const trackedByApp = $derived(install.installed.filter((i) => i.tracked && i.state !== "foreign" && i.state !== "missing").length);
   const fromOtherTools = $derived(managed - trackedByApp);
   const attention = $derived(
-    install.installed.filter((i) => ["outdated", "modified", "removed"].includes(i.state)).length,
+    install.installed.filter((i) => ["outdated", "modified", "missing", "sourceUnavailable"].includes(i.state)).length,
   );
   const foreign = $derived(install.installed.filter((i) => i.state === "foreign").length);
   const totalInstalls = $derived(install.installed.length);
 
   // ── Install-health donut (every install row, split by reconciled state) ──
   const byState = $derived.by(() => {
-    const c = { current: 0, outdated: 0, modified: 0, foreign: 0, removed: 0 };
+    const c = { current: 0, outdated: 0, modified: 0, missing: 0, foreign: 0, disabled: 0, sourceUnavailable: 0 };
     for (const i of install.installed) c[i.state]++;
     return c;
   });
   const healthSegments = $derived([
     { label: i18n.t("state.current"),   value: byState.current,  color: "var(--color-success)", onClick: () => ui.openAgents(null, "current") },
     { label: i18n.t("state.outdated"),  value: byState.outdated,  color: "var(--color-warning)", onClick: () => ui.openAgents(null, "outdated") },
-    { label: i18n.t("state.modified"),  value: byState.modified,  color: "color-mix(in srgb, var(--color-warning) 55%, var(--color-danger))", onClick: () => ui.openAgents(null, "outdated") },
+    { label: i18n.t("state.modified"),  value: byState.modified,  color: "color-mix(in srgb, var(--color-warning) 55%, var(--color-danger))", onClick: () => ui.openAgents(null, "modified") },
+    { label: i18n.t("state.disabled"), value: byState.disabled, color: "var(--color-text-muted)", onClick: () => ui.openAgents(null, "disabled") },
     { label: i18n.t("state.foreign"), value: byState.foreign,   color: "var(--color-brand)",   onClick: () => ui.openAgents(null, "foreign") },
-    { label: i18n.t("state.removed"),   value: byState.removed,   color: "var(--color-danger)",  onClick: () => ui.openAgents(null, "removed") },
+    { label: i18n.t("state.missing"), value: byState.missing, color: "var(--color-danger)", onClick: () => ui.openAgents(null, "missing") },
+    { label: i18n.t("state.sourceUnavailable"), value: byState.sourceUnavailable, color: "color-mix(in srgb, var(--color-danger) 65%, var(--color-text-muted))", onClick: () => ui.openAgents(null, "sourceUnavailable") },
   ]);
 
   // ── Coverage by tool — only tools that actually hold agents (less noise) ──

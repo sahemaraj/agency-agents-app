@@ -19,6 +19,7 @@
   import Modal from "./Modal.svelte";
   import Button from "./Button.svelte";
   import DestructiveConfirm from "./DestructiveConfirm.svelte";
+  import DiffModal from "./DiffModal.svelte";
   import DeploymentTargetGrid, {
     type DeploymentCell,
     type DeploymentColumn,
@@ -29,14 +30,29 @@
   import { projects } from "$lib/stores/projects.svelte";
   import { toast } from "$lib/stores/toast.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { Tool, Agent, InstalledAgent } from "$lib/types";
+  import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
+  import { canApplyAgentPlan, installStateMessageKey, sameAgent } from "$lib/agents/libraryModel";
+  import type {
+    Tool,
+    Agent,
+    AgentMutationPlan,
+    AgentPackageResult,
+    AgentReference,
+    AgentUpdatePolicy,
+    AgentVersionSnapshot,
+    InstalledAgent,
+    InstallState,
+  } from "$lib/types";
 
   interface Props {
     title: string;
-    agentSlugs: string[];
+    agentSlugs?: string[];
+    /** Exact source-aware single-Agent mode. Collections use `collectionName`. */
+    agentPackage?: AgentPackageResult;
+    collectionName?: string;
     onClose: () => void;
   }
-  let { title, agentSlugs, onClose }: Props = $props();
+  let { title, agentSlugs = [], agentPackage, collectionName, onClose }: Props = $props();
 
   onMount(() => {
     projects.refresh();
@@ -45,9 +61,46 @@
   });
 
   // The agents in this set that exist in the corpus (stale slugs skipped).
-  const slugSet = $derived(new Set(agentSlugs));
-  const agents = $derived<Agent[]>(corpus.agents.filter((a) => slugSet.has(a.slug)));
+  const collection = $derived(
+    collectionName
+      ? agentLibrary.library.collections.find((item) => item.name === collectionName) ?? null
+      : null,
+  );
+  const exactReferences = $derived(
+    agentPackage ? [agentPackage.reference] : collection?.agents ?? [],
+  );
+  const collectionPackages = $derived(
+    collection
+      ? collection.agents.flatMap((reference) => {
+          const pkg = agentLibrary.packages.find((item) => sameAgent(item.reference, reference));
+          return pkg ? [pkg] : [];
+        })
+      : [],
+  );
+  const slugSet = $derived(new Set(
+    agentPackage?.agent
+      ? [agentPackage.agent.slug]
+      : collectionPackages.length
+        ? collectionPackages.flatMap((pkg) => pkg.agent ? [pkg.agent.slug] : [])
+        : agentSlugs,
+  ));
+  const agents = $derived<Agent[]>(
+    agentPackage?.agent
+      ? [agentPackage.agent]
+      : collectionPackages.length
+        ? collectionPackages.flatMap((pkg) => pkg.agent ? [pkg.agent] : [])
+        : corpus.agents.filter((a) => slugSet.has(a.slug)),
+  );
   const total = $derived(agents.length);
+  const exactReference = $derived(agentPackage?.reference ?? null);
+  function matchesExact(row: InstalledAgent): boolean {
+    return exactReferences.some(
+      (reference) => row.sourceId === reference.sourceId && row.relativePath === reference.relativePath,
+    ) || !!(
+      agentPackage?.agent && row.state === "foreign" && !row.sourceId &&
+      row.slug === agentPackage.agent.slug
+    );
+  }
 
   // Columns = tools present on this device (detected, or already holding an
   // install of this set), that can take an agent in SOME scope.
@@ -55,7 +108,11 @@
     return (
       install.tools.length === 0 ||
       install.tools.some((ti) => ti.tool === t.id && ti.detected) ||
-      install.installed.some((r) => r.tool === t.id && r.state !== "removed" && slugSet.has(r.slug))
+      install.installed.some((r) => r.tool === t.id && r.state !== "missing" && (
+        exactReferences.length
+          ? matchesExact(r)
+          : slugSet.has(r.slug)
+      ))
     );
   }
   const cols = $derived(SUPPORTED_TOOLS.filter((t) => (t.supportsUser || t.supportsProject) && detected(t)));
@@ -104,9 +161,13 @@
   // Coverage of the set in one (tool, target) cell.
   function cover(tool: Tool, target: string | null) {
     const rs = install.installed.filter(
-      (r) => r.state !== "removed" && slugSet.has(r.slug) && r.tool === tool && (r.projectPath ?? null) === target,
+      (r) => r.state !== "missing" &&
+        (exactReferences.length
+          ? matchesExact(r)
+          : slugSet.has(r.slug)) &&
+        r.tool === tool && (r.projectPath ?? null) === target,
     );
-    const present = new Set(rs.map((r) => r.slug));
+    const present = new Set(rs.map((r) => exactReferences.length ? `${r.sourceId}:${r.relativePath}` : r.slug));
     return {
       rows: rs,
       count: present.size,
@@ -119,16 +180,198 @@
   let busy = $state<string | null>(null);
   const cellKey = (tool: Tool, target: string | null) => `${tool}:${target ?? ""}`;
   let confirm = $state<{ tool: Tool; target: string | null; rows: InstalledAgent[] } | null>(null);
+  let pending = $state<{
+    plan: AgentMutationPlan;
+    operation: "install" | "update" | "uninstall";
+    reference: AgentReference | null;
+    collectionName: string | null;
+  } | null>(null);
+  let planLoading = $state(false);
+  let actionError = $state<string | null>(null);
+  let historyRow = $state<InstalledAgent | null>(null);
+  let snapshots = $state<AgentVersionSnapshot[]>([]);
+  let rollbackConfirm = $state<string | null>(null);
+  let diffRow = $state<InstalledAgent | null>(null);
+
+  const exactRows = $derived(
+    exactReference
+      ? install.installed.filter(matchesExact).slice().sort((a, b) => a.dest.localeCompare(b.dest))
+      : [],
+  );
+  const collectionTargets = $derived.by(() => {
+    if (!collectionName) return [];
+    const targets = new Map<string, { tool: Tool; projectPath: string | null; states: Set<InstallState> }>();
+    for (const row of install.installed.filter(matchesExact)) {
+      const key = cellKey(row.tool, row.projectPath);
+      const target = targets.get(key) ?? { tool: row.tool, projectPath: row.projectPath, states: new Set<InstallState>() };
+      target.states.add(row.state);
+      targets.set(key, target);
+    }
+    return [...targets.values()];
+  });
+  const updatePolicy = $derived.by<AgentUpdatePolicy>(() => {
+    if (!exactReference) return "notify";
+    return agentLibrary.library.updatePolicies.find((entry) => sameAgent(entry.agent, exactReference))?.policy ?? "notify";
+  });
+
+  async function reviewPlan(
+    operation: "install" | "update" | "uninstall",
+    reference: AgentReference,
+    tool: Tool,
+    target: string | null,
+  ) {
+    planLoading = true;
+    actionError = null;
+    try {
+      pending = {
+        plan: await install.plan(operation, reference, tool, target),
+        operation,
+        reference,
+        collectionName: null,
+      };
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      planLoading = false;
+    }
+  }
+
+  async function reviewCollection(
+    operation: "install" | "update" | "uninstall",
+    tool: Tool,
+    target: string | null,
+  ) {
+    if (!collectionName) return;
+    planLoading = true;
+    actionError = null;
+    try {
+      pending = {
+        plan: await install.planCollection(collectionName, operation, tool, target),
+        operation,
+        reference: null,
+        collectionName,
+      };
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      planLoading = false;
+    }
+  }
+
+  async function applyPlan() {
+    if (!pending || !canApplyAgentPlan(pending.plan)) return;
+    const { operation, reference, collectionName: pendingCollection, plan } = pending;
+    busy = cellKey(plan.tool, plan.projectPath);
+    actionError = null;
+    try {
+      if (pendingCollection) {
+        await install.applyCollection(
+          pendingCollection, operation, plan.tool, plan.projectPath,
+        );
+      } else if (operation === "install" && reference) {
+        await install.installReference(reference, plan.tool, plan.projectPath, true);
+      } else if (operation === "update" && reference) {
+        await install.updateReference(reference, plan.tool, plan.projectPath, true);
+      } else if (reference) {
+        await install.uninstallReference(reference, plan.tool, plan.projectPath);
+      } else {
+        throw new Error("Agent mutation plan has no exact target");
+      }
+      toast.success(i18n.t("agents.lifecycleApplied", { operation }));
+      pending = null;
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function runLifecycle(
+    action: "track" | "disable" | "enable",
+    row: InstalledAgent,
+  ) {
+    if (!exactReference) return;
+    busy = cellKey(row.tool, row.projectPath);
+    actionError = null;
+    try {
+      if (action === "track") await install.trackReference(exactReference, row.tool, row.projectPath);
+      else if (action === "disable") await install.disableReference(exactReference, row.tool, row.projectPath);
+      else await install.enableReference(exactReference, row.tool, row.projectPath);
+      toast.success(i18n.t("agents.lifecycleApplied", { operation: action }));
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function showHistory(row: InstalledAgent) {
+    if (!exactReference) return;
+    historyRow = row;
+    snapshots = [];
+    rollbackConfirm = null;
+    actionError = null;
+    try {
+      snapshots = await install.history(exactReference, row.tool, row.projectPath);
+    } catch (error) {
+      actionError = String(error);
+    }
+  }
+
+  async function rollback(snapshotId: string) {
+    if (!exactReference || !historyRow) return;
+    if (rollbackConfirm !== snapshotId) {
+      rollbackConfirm = snapshotId;
+      return;
+    }
+    busy = cellKey(historyRow.tool, historyRow.projectPath);
+    try {
+      await install.rollbackReference(
+        exactReference, historyRow.tool, historyRow.projectPath, snapshotId,
+      );
+      toast.success(i18n.t("agents.rollbackSucceeded"));
+      historyRow = null;
+      rollbackConfirm = null;
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function setPolicy(event: Event) {
+    if (!exactReference) return;
+    await agentLibrary.setUpdatePolicy(
+      exactReference,
+      (event.currentTarget as HTMLSelectElement).value as AgentUpdatePolicy,
+    );
+  }
 
   async function toggle(tool: Tool, target: string | null) {
     if (busy) return;
     const cov = cover(tool, target);
     if (cov.all) {
+      if (collectionName) {
+        await reviewCollection("uninstall", tool, target);
+        return;
+      }
+      if (exactReference) {
+        await reviewPlan("uninstall", exactReference, tool, target);
+        return;
+      }
       if (cov.hasForeign) {
         confirm = { tool, target, rows: cov.rows };
         return;
       }
       await remove(tool, target, cov.rows);
+      return;
+    }
+    if (collectionName) {
+      await reviewCollection("install", tool, target);
+      return;
+    }
+    if (exactReference) {
+      await reviewPlan("install", exactReference, tool, target);
       return;
     }
     const present = new Set(cov.rows.map((r) => r.slug));
@@ -211,9 +454,137 @@
 <Modal open {title} size="wide" onClose={onClose}>
   <p class="sub">{i18n.t("install.sub", { count: total })}</p>
 
-  {#if cols.length === 0}
+  {#if exactReference}
+    <section class="provenance" aria-label={i18n.t("agents.sourceProvenance")}>
+      <strong>{i18n.t("agents.sourceProvenance")}</strong>
+      <code>{exactReference.sourceId}:{exactReference.relativePath}</code>
+      <label>
+        <span>{i18n.t("agents.updatePolicy")}</span>
+        <select value={updatePolicy} onchange={setPolicy}>
+          <option value="notify">{i18n.t("agents.policyNotify")}</option>
+          <option value="autoTrusted">{i18n.t("agents.policyAutoTrusted")}</option>
+          <option value="pin">{i18n.t("agents.policyPin")}</option>
+          <option value="reviewScripts">{i18n.t("agents.policyReviewScripts")}</option>
+        </select>
+      </label>
+      <p>{i18n.t(`agents.policyHelp.${updatePolicy}`)}</p>
+    </section>
+  {:else if collectionName}
+    <section class="provenance" aria-label={i18n.t("agents.collectionMembers")}>
+      <strong>{i18n.t("agents.collectionMembers")}: {collectionName}</strong>
+      {#each exactReferences as reference (`${reference.sourceId}:${reference.relativePath}`)}
+        <code>{reference.sourceId}:{reference.relativePath}</code>
+      {/each}
+    </section>
+  {/if}
+
+  {#if actionError}<p class="plan-error" role="alert">{actionError}</p>{/if}
+  {#if planLoading}<p class="sub">{i18n.t("agents.loadingPlan")}</p>{/if}
+
+  {#if pending}
+    <section class="plan" aria-label={i18n.t("agents.mutationPlan")}>
+      <h3>{i18n.t("agents.mutationPlan")}: {pending.operation}</h3>
+      {#if pending.plan.blockers.length > 0}
+        <div class="plan-blockers" role="alert">
+          <strong>{i18n.t("agents.planBlocked")}</strong>
+          <ul>{#each pending.plan.blockers as blocker}<li>{blocker}</li>{/each}</ul>
+        </div>
+      {/if}
+      {#if pending.plan.warnings.length > 0}
+        <div class="plan-warnings">
+          <strong>{i18n.t("agents.planWarnings")}</strong>
+          <ul>{#each pending.plan.warnings as warning}<li>{warning}</li>{/each}</ul>
+        </div>
+      {/if}
+      <ul class="plan-agents">
+        {#each pending.plan.agents as item (`${item.reference.sourceId}:${item.reference.relativePath}`)}
+          <li>
+            <strong>{item.name}</strong>{#if item.dependency} · {i18n.t("agents.requiredDependency")}{/if}
+            <code>{item.reference.sourceId}:{item.reference.relativePath}</code>
+            <span>{item.destination} · {i18n.t("agents.fileCount", { count: item.renderedFileCount })}</span>
+            <span>{i18n.t("agents.capabilities")}: {item.capabilities.length ? item.capabilities.join(", ") : i18n.t("common.none")}</span>
+          </li>
+        {/each}
+      </ul>
+      <p class="rollback-note">{pending.plan.rollbackAvailable ? i18n.t("agents.rollbackAvailable") : i18n.t("agents.rollbackUnavailable")}</p>
+    </section>
+  {/if}
+
+  {#if exactReference && exactRows.length > 0 && !pending}
+    <section class="lifecycle" aria-label={i18n.t("agents.lifecycleInstalls")}>
+      <h3>{i18n.t("agents.lifecycleInstalls")}</h3>
+      {#each exactRows as row (row.dest)}
+        <article class="install-row">
+          <div class="install-facts">
+            <strong>{install.toolLabel(row.tool)}{#if row.projectPath} · {labelOf(row.projectPath)}{/if}</strong>
+            <span class="state-text" data-state={row.state}>{i18n.t(installStateMessageKey(row.state))}</span>
+            <code title={row.dest}>{row.dest}</code>
+            <small>{row.sourceId || exactReference.sourceId}:{row.relativePath || exactReference.relativePath}</small>
+          </div>
+          <div class="row-actions">
+            {#if ["foreign", "modified", "outdated"].includes(row.state)}
+              <button onclick={() => (diffRow = row)}>{i18n.t("agents.reviewDiff")}</button>
+            {/if}
+            {#if ["outdated", "modified", "missing"].includes(row.state)}
+              <button onclick={() => reviewPlan("update", exactReference, row.tool, row.projectPath)}>{i18n.t("common.update")}</button>
+            {/if}
+            {#if row.state === "foreign"}
+              <button onclick={() => runLifecycle("track", row)}>{i18n.t("agents.track")}</button>
+            {:else}
+              {#if row.state === "disabled"}
+                <button onclick={() => runLifecycle("enable", row)}>{i18n.t("agents.enable")}</button>
+              {:else if row.state === "current" || row.state === "outdated"}
+                <button onclick={() => runLifecycle("disable", row)}>{i18n.t("agents.disable")}</button>
+              {/if}
+              <button onclick={() => showHistory(row)}>{i18n.t("agents.versionHistory")}</button>
+              <button class="danger" onclick={() => reviewPlan("uninstall", exactReference, row.tool, row.projectPath)}>{i18n.t("common.uninstall")}</button>
+            {/if}
+          </div>
+        </article>
+      {/each}
+    </section>
+  {/if}
+
+  {#if collectionName && collectionTargets.length > 0 && !pending}
+    <section class="lifecycle" aria-label={i18n.t("agents.collectionLifecycle")}>
+      <h3>{i18n.t("agents.collectionLifecycle")}</h3>
+      {#each collectionTargets as target (`${target.tool}:${target.projectPath ?? ""}`)}
+        <article class="install-row">
+          <div class="install-facts">
+            <strong>{install.toolLabel(target.tool)}{#if target.projectPath} · {labelOf(target.projectPath)}{/if}</strong>
+            <span>{[...target.states].map((state) => i18n.t(installStateMessageKey(state))).join(", ")}</span>
+          </div>
+          <div class="row-actions">
+            <button onclick={() => reviewCollection("update", target.tool, target.projectPath)}>{i18n.t("common.update")}</button>
+            <button class="danger" onclick={() => reviewCollection("uninstall", target.tool, target.projectPath)}>{i18n.t("common.uninstall")}</button>
+          </div>
+        </article>
+      {/each}
+    </section>
+  {/if}
+
+  {#if historyRow && !pending}
+    <section class="history" aria-label={i18n.t("agents.versionHistory")}>
+      <div class="history-head"><h3>{i18n.t("agents.versionHistory")}</h3><button onclick={() => (historyRow = null)}>{i18n.t("common.close")}</button></div>
+      {#if snapshots.length === 0}
+        <p class="sub">{i18n.t("agents.noVersionHistory")}</p>
+      {:else}
+        {#each snapshots as snapshot (snapshot.id)}
+          <div class="snapshot">
+            <span>{new Date(snapshot.createdAt).toLocaleString()}</span>
+            <code>{snapshot.sourceHash.slice(0, 12)}</code>
+            <button onclick={() => rollback(snapshot.id)}>
+              {rollbackConfirm === snapshot.id ? i18n.t("agents.confirmRollback") : i18n.t("agents.rollback")}
+            </button>
+          </div>
+        {/each}
+      {/if}
+    </section>
+  {/if}
+
+  {#if !pending && cols.length === 0}
     <p class="no-tools">{i18n.t("install.noTools")}</p>
-  {:else}
+  {:else if !pending}
     <DeploymentTargetGrid
       columns={cols}
       {rows}
@@ -260,10 +631,26 @@
   </div>
 
   {#snippet actions()}
-    <span class="legend"><span class="dot full"></span> {i18n.t("common.installed")} <span class="dot half"></span> {i18n.t("common.some")} <span class="dot"></span> {i18n.t("common.none")}</span>
-    <Button variant="primary" onclick={onClose}>{i18n.t("common.done")}</Button>
+    {#if pending}
+      <Button onclick={() => (pending = null)}>{i18n.t("common.cancel")}</Button>
+      <Button variant="primary" disabled={!canApplyAgentPlan(pending.plan) || !!busy} onclick={applyPlan}>{i18n.t("agents.applyPlan")}</Button>
+    {:else}
+      <span class="legend"><span class="dot full"></span> {i18n.t("common.installed")} <span class="dot half"></span> {i18n.t("common.some")} <span class="dot"></span> {i18n.t("common.none")}</span>
+      <Button variant="primary" onclick={onClose}>{i18n.t("common.done")}</Button>
+    {/if}
   {/snippet}
 </Modal>
+
+{#if diffRow && agentPackage?.agent}
+  <DiffModal
+    slug={agentPackage.agent.slug}
+    reference={agentPackage.reference}
+    tool={diffRow.tool}
+    projectPath={diffRow.projectPath}
+    name={agentPackage.agent.name}
+    onClose={() => (diffRow = null)}
+  />
+{/if}
 
 {#if confirm}
   {@const n = confirm.rows.length}
@@ -285,6 +672,43 @@
 <style>
   .sub { font-size: var(--text-body-sm); color: var(--color-text-muted); margin-bottom: var(--space-3); }
   .no-tools { font-size: var(--text-body-sm); color: var(--color-text-muted); }
+
+  .provenance, .plan, .lifecycle, .history {
+    display: flex; flex-direction: column; gap: var(--space-2);
+    padding: var(--space-3); border: 1px solid var(--color-border);
+    border-radius: var(--radius-md); background: var(--color-surface-sunken);
+  }
+  .provenance code, .install-facts code, .install-facts small, .plan-agents code {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--font-mono); font-size: var(--text-caption); color: var(--color-text-muted);
+  }
+  .provenance label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); }
+  .provenance select { padding: 5px 8px; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-primary); }
+  .provenance p, .rollback-note { margin: 0; font-size: var(--text-caption); color: var(--color-text-muted); }
+  .plan h3, .lifecycle h3, .history h3 { margin: 0; font-size: var(--text-body); }
+  .plan ul { margin: var(--space-1) 0 0; padding-left: var(--space-5); }
+  .plan-blockers { color: var(--color-danger); }
+  .plan-warnings { color: var(--color-warning); }
+  .plan-agents { display: flex; flex-direction: column; gap: var(--space-2); }
+  .plan-agents li { display: flex; flex-direction: column; gap: 2px; color: var(--color-text-secondary); }
+  .plan-error { padding: var(--space-2); color: var(--color-danger); background: color-mix(in srgb, var(--color-danger) 10%, transparent); border-radius: var(--radius-sm); font-size: var(--text-body-sm); }
+  .install-row { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) 0; border-top: 1px solid var(--color-border); }
+  .install-facts { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: var(--text-body-sm); }
+  .state-text { font-size: var(--text-caption); font-weight: var(--fw-semibold); }
+  .state-text[data-state="current"] { color: var(--color-success); }
+  .state-text[data-state="outdated"], .state-text[data-state="modified"] { color: var(--color-warning); }
+  .state-text[data-state="foreign"] { color: var(--color-brand); }
+  .state-text[data-state="missing"], .state-text[data-state="sourceUnavailable"] { color: var(--color-danger); }
+  .state-text[data-state="disabled"] { color: var(--color-text-muted); }
+  .row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+  .row-actions button, .history button, .snapshot button {
+    padding: 5px 8px; border: 1px solid var(--color-border); border-radius: var(--radius-sm);
+    background: var(--color-surface-raised); color: var(--color-text-secondary); font-size: var(--text-caption); cursor: pointer;
+  }
+  .row-actions button:hover, .history button:hover, .snapshot button:hover { color: var(--color-text-primary); border-color: var(--color-brand); }
+  .row-actions button.danger { color: var(--color-danger); }
+  .history-head, .snapshot { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+  .snapshot code { font-family: var(--font-mono); font-size: var(--text-caption); color: var(--color-text-muted); }
 
 
   .scope-hint {

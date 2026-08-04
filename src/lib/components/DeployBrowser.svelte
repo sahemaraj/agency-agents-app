@@ -72,7 +72,7 @@
   const rosterSlugs = $derived([
     ...new Set(
       install.installed
-        .filter((r) => r.state !== "removed" && (r.projectPath ?? null) === projectPath)
+        .filter((r) => r.state !== "missing" && (r.projectPath ?? null) === projectPath)
         .map((r) => r.slug),
     ),
   ]);
@@ -184,7 +184,7 @@
         (install.tools.length === 0 ||
           install.tools.some((ti) => ti.tool === t.id && ti.detected) ||
           install.installed.some(
-            (r) => r.tool === t.id && r.state !== "removed" && (r.projectPath ?? null) === projectPath,
+            (r) => r.tool === t.id && r.state !== "missing" && (r.projectPath ?? null) === projectPath,
           )),
     ),
   );
@@ -192,7 +192,7 @@
   function cover(tool: Tool) {
     const rows = install.installed.filter(
       (r) =>
-        r.state !== "removed" &&
+        r.state !== "missing" &&
         r.tool === tool &&
         (r.projectPath ?? null) === projectPath &&
         selected?.slugs.includes(r.slug),

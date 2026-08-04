@@ -10,6 +10,8 @@
     mcpClientConnect,
     mcpClientDisconnect,
     mcpClientRepair,
+    mcpAgentClientPolicySet,
+    mcpAgentPolicySet,
     mcpClientPolicySet,
     mcpClientsStatus,
     mcpPolicySet,
@@ -125,6 +127,56 @@
     }
   }
 
+  async function saveAgentPolicy(next: {
+    source?: boolean;
+    install?: boolean;
+    destructive?: boolean;
+  }) {
+    const current = settings.effective;
+    policySaving = true;
+    error = "";
+    try {
+      settings.data = await mcpAgentPolicySet(
+        next.source ?? current.mcpAgentSourceAccess,
+        next.install ?? current.mcpAgentInstallAccess,
+        next.destructive ?? current.mcpAgentDestructiveAccess,
+      );
+    } catch (cause) {
+      error = isAppError(cause) ? appErrorMessage(cause) : i18n.t("settings.mcp.policyFailed");
+    } finally {
+      policySaving = false;
+    }
+  }
+
+  async function saveAgentClientPolicy(
+    client: McpClient,
+    next: Partial<{ sourceAccess: boolean; installAccess: boolean; destructiveAccess: boolean }>,
+  ) {
+    const global = settings.effective;
+    const current = global.mcpClientPolicies[client] ?? {
+      sourceAccess: global.mcpSourceAccess,
+      installAccess: global.mcpInstallAccess,
+      destructiveAccess: global.mcpDestructiveAccess,
+      agentSourceAccess: global.mcpAgentSourceAccess,
+      agentInstallAccess: global.mcpAgentInstallAccess,
+      agentDestructiveAccess: global.mcpAgentDestructiveAccess,
+    };
+    policySaving = true;
+    error = "";
+    try {
+      settings.data = await mcpAgentClientPolicySet(
+        client,
+        next.sourceAccess ?? current.agentSourceAccess,
+        next.installAccess ?? current.agentInstallAccess,
+        next.destructiveAccess ?? current.agentDestructiveAccess,
+      );
+    } catch (cause) {
+      error = isAppError(cause) ? appErrorMessage(cause) : i18n.t("settings.mcp.policyFailed");
+    } finally {
+      policySaving = false;
+    }
+  }
+
   async function addProject() {
     const selected = await openDialog({ directory: true, multiple: false });
     if (typeof selected !== "string") return;
@@ -157,6 +209,9 @@
         sourceAccess: settings.effective.mcpSourceAccess,
         installAccess: settings.effective.mcpInstallAccess,
         destructiveAccess: settings.effective.mcpDestructiveAccess,
+        agentSourceAccess: settings.effective.mcpAgentSourceAccess,
+        agentInstallAccess: settings.effective.mcpAgentInstallAccess,
+        agentDestructiveAccess: settings.effective.mcpAgentDestructiveAccess,
       }}
       <article class="card">
         <div class="card-head">
@@ -176,10 +231,16 @@
           {/if}
         </div>
         <fieldset class="client-policy" disabled={policySaving || settings.loading}>
-          <legend>Client permissions</legend>
-          <label><input type="checkbox" checked={clientPolicy.sourceAccess} onchange={(event) => saveClientPolicy(status.client, { sourceAccess: event.currentTarget.checked })} /> Sources and organization</label>
-          <label><input type="checkbox" checked={clientPolicy.installAccess} onchange={(event) => saveClientPolicy(status.client, { installAccess: event.currentTarget.checked })} /> Install and update</label>
-          <label><input type="checkbox" checked={clientPolicy.destructiveAccess} onchange={(event) => saveClientPolicy(status.client, { destructiveAccess: event.currentTarget.checked })} /> Destructive actions</label>
+          <legend>{i18n.t("settings.mcp.policy.skills")}</legend>
+          <label><input type="checkbox" checked={clientPolicy.sourceAccess} onchange={(event) => saveClientPolicy(status.client, { sourceAccess: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.sources")}</label>
+          <label><input type="checkbox" checked={clientPolicy.installAccess} onchange={(event) => saveClientPolicy(status.client, { installAccess: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.installs")}</label>
+          <label><input type="checkbox" checked={clientPolicy.destructiveAccess} onchange={(event) => saveClientPolicy(status.client, { destructiveAccess: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.destructive")}</label>
+        </fieldset>
+        <fieldset class="client-policy" disabled={policySaving || settings.loading}>
+          <legend>{i18n.t("settings.mcp.policy.agents")}</legend>
+          <label><input type="checkbox" checked={clientPolicy.agentSourceAccess} onchange={(event) => saveAgentClientPolicy(status.client, { sourceAccess: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.agentSources")}</label>
+          <label><input type="checkbox" checked={clientPolicy.agentInstallAccess} onchange={(event) => saveAgentClientPolicy(status.client, { installAccess: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.agentInstalls")}</label>
+          <label><input type="checkbox" checked={clientPolicy.agentDestructiveAccess} onchange={(event) => saveAgentClientPolicy(status.client, { destructiveAccess: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.agentDestructive")}</label>
         </fieldset>
         {#if status.command}
           <details>
@@ -201,18 +262,18 @@
       <h3>{i18n.t("settings.mcp.policy.title")}</h3>
       <p>{i18n.t("settings.mcp.policy.help")}</p>
     </div>
-    <label>
-      <input type="checkbox" checked={settings.effective.mcpSourceAccess} disabled={policySaving || settings.loading} onchange={(event) => savePolicy({ source: event.currentTarget.checked })} />
-      <span>{i18n.t("settings.mcp.policy.sources")}</span>
-    </label>
-    <label>
-      <input type="checkbox" checked={settings.effective.mcpInstallAccess} disabled={policySaving || settings.loading} onchange={(event) => savePolicy({ install: event.currentTarget.checked })} />
-      <span>{i18n.t("settings.mcp.policy.installs")}</span>
-    </label>
-    <label>
-      <input type="checkbox" checked={settings.effective.mcpDestructiveAccess} disabled={policySaving || settings.loading} onchange={(event) => savePolicy({ destructive: event.currentTarget.checked })} />
-      <span>{i18n.t("settings.mcp.policy.destructive")}</span>
-    </label>
+    <fieldset class="client-policy" disabled={policySaving || settings.loading}>
+      <legend>{i18n.t("settings.mcp.policy.skills")}</legend>
+      <label><input type="checkbox" checked={settings.effective.mcpSourceAccess} onchange={(event) => savePolicy({ source: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.sources")}</label>
+      <label><input type="checkbox" checked={settings.effective.mcpInstallAccess} onchange={(event) => savePolicy({ install: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.installs")}</label>
+      <label><input type="checkbox" checked={settings.effective.mcpDestructiveAccess} onchange={(event) => savePolicy({ destructive: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.destructive")}</label>
+    </fieldset>
+    <fieldset class="client-policy" disabled={policySaving || settings.loading}>
+      <legend>{i18n.t("settings.mcp.policy.agents")}</legend>
+      <label><input type="checkbox" checked={settings.effective.mcpAgentSourceAccess} onchange={(event) => saveAgentPolicy({ source: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.agentSources")}</label>
+      <label><input type="checkbox" checked={settings.effective.mcpAgentInstallAccess} onchange={(event) => saveAgentPolicy({ install: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.agentInstalls")}</label>
+      <label><input type="checkbox" checked={settings.effective.mcpAgentDestructiveAccess} onchange={(event) => saveAgentPolicy({ destructive: event.currentTarget.checked })} /> {i18n.t("settings.mcp.policy.agentDestructive")}</label>
+    </fieldset>
     <div class="allowlist">
       <div class="allowlist-head">
         <strong>{i18n.t("settings.mcp.policy.projects")}</strong>
@@ -254,7 +315,6 @@
   .card { padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); display: grid; gap: var(--space-3); }
   .policy { padding-top: var(--space-4); border-top: 1px solid var(--color-border); display: grid; gap: var(--space-3); }
   .policy h3 { margin: 0 0 var(--space-1); font-size: var(--text-body); }
-  .policy > label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); }
   .allowlist { display: grid; gap: var(--space-2); }
   .allowlist-head { justify-content: space-between; gap: var(--space-3); }
   .allowlist ul { list-style: none; display: grid; gap: var(--space-2); margin: 0; padding: 0; }

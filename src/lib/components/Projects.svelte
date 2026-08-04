@@ -52,7 +52,7 @@
   const rowsByProject = $derived.by(() => {
     const m = new Map<string, InstalledAgent[]>();
     for (const r of install.installed) {
-      if (r.state === "removed") continue; // ledger says installed but file gone
+      if (r.state === "missing") continue; // ledger says installed but file gone
       const p = r.projectPath;
       if (p == null) continue; // global scope lives in Teams/Tools, not here
       const arr = m.get(p);

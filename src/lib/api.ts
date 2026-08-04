@@ -43,7 +43,240 @@ import type {
   SkillPreferredSource,
   SkillBatchResult,
   UpdateCheckOutcome,
+  AgentCollection,
+  AgentApproval,
+  AgentDraft,
+  AgentDraftInput,
+  AgentLibraryState,
+  AgentPackageResult,
+  AgentPreferredSource,
+  AgentPublisherTrust,
+  AgentReference,
+  AgentSmartFolder,
+  AgentSource,
+  AgentSourceResult,
+  AgentUpdatePolicy,
+  AgentMutationPlan,
+  AgentVersionSnapshot,
+  AgentWorkspaceProfile,
+  AgentDiff,
+  InstallRecord,
+  Tool,
 } from "./types";
+
+// ============================================================
+// Agent sources, drafts, and personal library
+// ============================================================
+
+export const agentSourcesList = () => invoke<AgentSource[]>("agent_sources_list");
+export const agentSourcesInspect = () => invoke<AgentSourceResult[]>("agent_sources_inspect");
+export const agentSourceAddLocal = (root: string) =>
+  invoke<AgentSource>("agent_source_add_local", { root });
+export const agentSourceAddGithub = (
+  repository: string,
+  gitRef: string | null = null,
+  subdirectory: string | null = null,
+) => invoke<AgentSource>("agent_source_add_github", { repository, gitRef, subdirectory });
+export const agentSourceRefresh = (sourceId: string) =>
+  invoke<AgentSourceResult>("agent_source_refresh", { sourceId });
+export const agentSourceRemove = (sourceId: string) =>
+  invoke<boolean>("agent_source_remove", { sourceId });
+export const agentGet = (reference: AgentReference) =>
+  invoke<AgentPackageResult>("agent_get", {
+    sourceId: reference.sourceId,
+    relativePath: reference.relativePath,
+  });
+export const agentTextRead = (reference: AgentReference) =>
+  invoke<string>("agent_text_read", {
+    sourceId: reference.sourceId,
+    relativePath: reference.relativePath,
+  });
+export const agentRenderPreview = (reference: AgentReference, tool: Tool) =>
+  invoke<string>("agent_render_preview", {
+    sourceId: reference.sourceId,
+    relativePath: reference.relativePath,
+    tool,
+  });
+
+export const agentDraftsList = () => invoke<AgentDraft[]>("agent_drafts_list");
+export const agentDraftGet = (id: string) => invoke<AgentDraft>("agent_draft_get", { id });
+export const agentDraftCreate = (input: AgentDraftInput) =>
+  invoke<AgentDraft>("agent_draft_create", { input });
+export const agentDraftEdit = (id: string, input: AgentDraftInput) =>
+  invoke<AgentDraft>("agent_draft_edit", { id, input });
+export const agentDraftPublish = (id: string) =>
+  invoke<AgentDraft>("agent_draft_publish", { id });
+export const agentDraftReject = (id: string) =>
+  invoke<AgentDraft>("agent_draft_reject", { id });
+export const agentDraftDuplicate = (reference: AgentReference) =>
+  invoke<AgentDraft>("agent_draft_duplicate", { reference });
+
+export const agentLibraryList = () => invoke<AgentLibraryState>("agent_library_list");
+export const agentFolderCreate = (path: string) =>
+  invoke<AgentLibraryState>("agent_folder_create", { path });
+export const agentFolderRename = (path: string, newName: string) =>
+  invoke<AgentLibraryState>("agent_folder_rename", { path, newName });
+export const agentFolderMove = (path: string, newParent: string | null) =>
+  invoke<AgentLibraryState>("agent_folder_move", { path, newParent });
+export const agentFolderDelete = (path: string, recursive: boolean) =>
+  invoke<AgentLibraryState>("agent_folder_delete", { path, recursive });
+export const agentFolderAssign = (reference: AgentReference, folderPath: string | null) =>
+  invoke<AgentLibraryState>("agent_folder_assign", { reference, folderPath });
+export const agentFavoriteSet = (reference: AgentReference, favorite: boolean) =>
+  invoke<AgentLibraryState>("agent_favorite_set", { reference, favorite });
+export const agentRecentTouch = (reference: AgentReference) =>
+  invoke<AgentLibraryState>("agent_recent_touch", { reference });
+export const agentCollectionSave = (collection: AgentCollection) =>
+  invoke<AgentLibraryState>("agent_collection_save", { collection });
+export const agentCollectionDelete = (name: string) =>
+  invoke<AgentLibraryState>("agent_collection_delete", { name });
+export const agentSmartFolderSave = (smartFolder: AgentSmartFolder) =>
+  invoke<AgentLibraryState>("agent_smart_folder_save", { smartFolder });
+export const agentSmartFolderDelete = (name: string) =>
+  invoke<AgentLibraryState>("agent_smart_folder_delete", { name });
+export const agentProfileSave = (profile: AgentWorkspaceProfile) =>
+  invoke<AgentLibraryState>("agent_profile_save", { profile });
+export const agentProfileDelete = (name: string) =>
+  invoke<AgentLibraryState>("agent_profile_delete", { name });
+export const agentLibraryReplace = (value: AgentLibraryState) =>
+  invoke<AgentLibraryState>("agent_library_replace", { value });
+export const agentLibraryExport = (path: string) =>
+  invoke<number>("agent_library_export", { path });
+export const agentLibraryImport = (path: string) =>
+  invoke<AgentLibraryState>("agent_library_import", { path });
+export const agentUpdatePolicySet = (reference: AgentReference, policy: AgentUpdatePolicy) =>
+  invoke<AgentLibraryState>("agent_update_policy_set", { reference, policy });
+export const agentPublisherTrustSet = (trust: AgentPublisherTrust) =>
+  invoke<AgentLibraryState>("agent_publisher_trust_set", { trust });
+export const agentPreferredSourceSet = (preferred: AgentPreferredSource) =>
+  invoke<AgentLibraryState>("agent_preferred_source_set", { preferred });
+export const agentUsageRecord = (reference: AgentReference, event: "fetch" | "publish" | "reject") =>
+  invoke<AgentLibraryState>("agent_usage_record", { reference, event });
+export const agentApprovalApprove = (id: string) =>
+  invoke<AgentApproval>("agent_approval_approve", { id });
+export const agentApprovalReject = (id: string) =>
+  invoke<AgentApproval>("agent_approval_reject", { id });
+
+const exactAgentArgs = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => ({
+  sourceId: reference.sourceId,
+  relativePath: reference.relativePath,
+  slug: null,
+  tool,
+  projectPath,
+});
+
+export const agentInstallPlan = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentMutationPlan>("agent_install_plan", {
+  ...exactAgentArgs(reference, tool, projectPath),
+  includeDependencies: true,
+});
+
+export const agentUpdatePlan = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentMutationPlan>(
+  "agent_update_plan", exactAgentArgs(reference, tool, projectPath),
+);
+
+export const agentUninstallPlan = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentMutationPlan>(
+  "agent_uninstall_plan", exactAgentArgs(reference, tool, projectPath),
+);
+
+export const agentInstallWithDependencies = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+  confirmed: boolean,
+) => invoke<InstallRecord[]>("agent_install_with_dependencies", {
+  ...exactAgentArgs(reference, tool, projectPath), confirmed,
+});
+
+export const agentUpdateExact = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+  confirmed: boolean,
+) => invoke<InstallRecord>("update_agent", {
+  ...exactAgentArgs(reference, tool, projectPath), confirmed,
+});
+
+export const agentTrackExact = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<InstallRecord>("track_agent", exactAgentArgs(reference, tool, projectPath));
+
+export const agentDiffExact = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentDiff>("agent_diff", exactAgentArgs(reference, tool, projectPath));
+
+export const agentUninstallExact = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<void>("uninstall_agent", exactAgentArgs(reference, tool, projectPath));
+
+export const agentDisable = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<InstallRecord>("disable_agent", exactAgentArgs(reference, tool, projectPath));
+
+export const agentEnable = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<InstallRecord>("enable_agent", exactAgentArgs(reference, tool, projectPath));
+
+export const agentVersionHistory = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentVersionSnapshot[]>(
+  "agent_version_history", exactAgentArgs(reference, tool, projectPath),
+);
+
+export const agentVersionRollback = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+  snapshotId: string,
+) => invoke<InstallRecord>("agent_version_rollback", {
+  ...exactAgentArgs(reference, tool, projectPath), snapshotId,
+});
+
+export const agentCollectionPlan = (
+  name: string,
+  operation: "install" | "update" | "uninstall",
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentMutationPlan>(`agent_collection_${operation}_plan`, {
+  name, tool, projectPath,
+});
+
+export const agentCollectionApply = (
+  name: string,
+  operation: "install" | "update" | "uninstall",
+  tool: Tool,
+  projectPath: string | null,
+  confirmed: boolean,
+) => invoke<InstallRecord[]>("agent_collection_apply", {
+  name, operation, tool, projectPath, confirmed,
+});
 
 export function skillInstallPlan(
   sourceId: string,
@@ -141,6 +374,32 @@ export function mcpClientPolicySet(
   destructiveAccess: boolean,
 ): Promise<Settings> {
   return invoke<Settings>("mcp_client_policy_set", {
+    client,
+    sourceAccess,
+    installAccess,
+    destructiveAccess,
+  });
+}
+
+export function mcpAgentPolicySet(
+  sourceAccess: boolean,
+  installAccess: boolean,
+  destructiveAccess: boolean,
+): Promise<Settings> {
+  return invoke<Settings>("mcp_agent_policy_set", {
+    sourceAccess,
+    installAccess,
+    destructiveAccess,
+  });
+}
+
+export function mcpAgentClientPolicySet(
+  client: McpClient,
+  sourceAccess: boolean,
+  installAccess: boolean,
+  destructiveAccess: boolean,
+): Promise<Settings> {
+  return invoke<Settings>("mcp_agent_client_policy_set", {
     client,
     sourceAccess,
     installAccess,

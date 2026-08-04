@@ -43,6 +43,48 @@ struct Frontmatter {
     emoji: Option<String>,
     color: Option<String>,
     vibe: Option<String>,
+    version: Option<String>,
+    channel: Option<String>,
+    changelog: Option<String>,
+    publisher: Option<String>,
+    #[serde(rename = "publisher-key")]
+    publisher_key: Option<String>,
+    #[serde(rename = "publisher-signature")]
+    publisher_signature: Option<String>,
+    #[serde(default, rename = "required-agents")]
+    required_agents: Vec<String>,
+    #[serde(default, rename = "recommended-agents")]
+    recommended_agents: Vec<String>,
+    #[serde(default, alias = "group")]
+    groups: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgentMetadata {
+    pub version: Option<String>,
+    pub channel: Option<String>,
+    pub changelog: Option<String>,
+    pub publisher: Option<String>,
+    pub publisher_key: Option<String>,
+    pub publisher_signature: Option<String>,
+    pub required_agents: Vec<String>,
+    pub recommended_agents: Vec<String>,
+    pub groups: Vec<String>,
+    pub tags: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub permissions: Vec<String>,
+}
+
+pub(crate) struct ParsedAgent {
+    pub agent: Agent,
+    pub entry: CorpusEntry,
+    pub metadata: AgentMetadata,
 }
 
 /// Result of splitting a raw `.md` into its three canonical regions.
@@ -128,6 +170,14 @@ pub fn parse_agent(
     category: &str,
     source: &str,
 ) -> Result<Option<(Agent, CorpusEntry)>, String> {
+    Ok(parse_agent_package(slug, category, source)?.map(|parsed| (parsed.agent, parsed.entry)))
+}
+
+pub(crate) fn parse_agent_package(
+    slug: &str,
+    category: &str,
+    source: &str,
+) -> Result<Option<ParsedAgent>, String> {
     let Some(split) = split_frontmatter(source) else {
         return Ok(None);
     };
@@ -173,7 +223,26 @@ pub fn parse_agent(
         body_hash,
     };
 
-    Ok(Some((agent, entry)))
+    let metadata = AgentMetadata {
+        version: fm.version,
+        channel: fm.channel,
+        changelog: fm.changelog,
+        publisher: fm.publisher,
+        publisher_key: fm.publisher_key,
+        publisher_signature: fm.publisher_signature,
+        required_agents: fm.required_agents,
+        recommended_agents: fm.recommended_agents,
+        groups: fm.groups,
+        tags: fm.tags,
+        capabilities: fm.capabilities,
+        permissions: fm.permissions,
+    };
+
+    Ok(Some(ParsedAgent {
+        agent,
+        entry,
+        metadata,
+    }))
 }
 
 #[cfg(test)]
@@ -273,5 +342,43 @@ mod tests {
         assert!(agent.color.is_none());
         assert!(agent.vibe.is_none());
         assert_eq!(entry.description, "");
+    }
+
+    #[test]
+    fn unknown_frontmatter_fields_do_not_change_supported_metadata_or_hashes() {
+        let extended = SAMPLE.replace("vibe:", "future-field: ignored\nvibe:");
+        let (agent, entry) = parse_agent("frontend-developer", "engineering", &extended)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(agent.name, "Frontend Developer");
+        assert_eq!(
+            agent.vibe.as_deref(),
+            Some("Ships pixel-perfect interfaces.")
+        );
+        assert_eq!(entry.source_hash, sha256_hex(extended.as_bytes()));
+    }
+
+    #[test]
+    fn package_parse_exposes_optional_agent_metadata() {
+        let source = "---\nname: Reviewer\ndescription: Reviews code\nversion: 1.2.0\nchannel: stable\npublisher: Example\npublisher-key: key-1\npublisher-signature: signature-1\nrequired-agents: [engineering/base.md]\nrecommended-agents: [security/reviewer.md]\ngroups: [Engineering, Review]\ntags: [code]\ncapabilities: [reads-code]\npermissions: [filesystem-read]\n---\nReview carefully.\n";
+        let parsed = parse_agent_package("reviewer", "engineering", source)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(parsed.metadata.version.as_deref(), Some("1.2.0"));
+        assert_eq!(parsed.metadata.channel.as_deref(), Some("stable"));
+        assert_eq!(parsed.metadata.publisher.as_deref(), Some("Example"));
+        assert_eq!(parsed.metadata.publisher_key.as_deref(), Some("key-1"));
+        assert_eq!(
+            parsed.metadata.publisher_signature.as_deref(),
+            Some("signature-1")
+        );
+        assert_eq!(parsed.metadata.required_agents, ["engineering/base.md"]);
+        assert_eq!(parsed.metadata.recommended_agents, ["security/reviewer.md"]);
+        assert_eq!(parsed.metadata.groups, ["Engineering", "Review"]);
+        assert_eq!(parsed.metadata.tags, ["code"]);
+        assert_eq!(parsed.metadata.capabilities, ["reads-code"]);
+        assert_eq!(parsed.metadata.permissions, ["filesystem-read"]);
     }
 }

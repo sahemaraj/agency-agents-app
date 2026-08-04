@@ -156,6 +156,115 @@ fn open_project_parent(
     Ok((open_project_dir(root, parent, create)?, name))
 }
 
+pub(crate) fn create_project_file(
+    root: &fs::File,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    let (parent, name) = open_project_parent(root, relative, true)?;
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+    let mut file = cap_primitives::fs::open(&parent, Path::new(&name), &options)
+        .map_err(|error| cap_io("create project file", relative, error))?;
+    let result = file
+        .write_all(bytes)
+        .map_err(|error| cap_io("write project file", relative, error))
+        .and_then(|_| {
+            file.sync_all()
+                .map_err(|error| cap_io("sync project file", relative, error))
+        });
+    if result.is_err() {
+        let _ = cap_primitives::fs::remove_file(&parent, Path::new(&name));
+    }
+    result
+}
+
+pub(crate) fn remove_project_file(
+    root: &fs::File,
+    relative: &Path,
+    expected_hash: &str,
+) -> Result<(), AppError> {
+    let (parent, name) = open_project_parent(root, relative, false)?;
+    let bytes = read_project_file(root, relative, 4 * 1024 * 1024)?;
+    if crate::render::sha256_hex(&bytes) != expected_hash {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "project file changed before removal: {}",
+                relative.display()
+            ),
+        });
+    }
+    cap_primitives::fs::remove_file(&parent, Path::new(&name))
+        .map_err(|error| cap_io("remove project file", relative, error))
+}
+
+pub(crate) fn read_project_file(
+    root: &fs::File,
+    relative: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    let (parent, name) = open_project_parent(root, relative, false)?;
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options
+        .read(true)
+        ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+    let file = cap_primitives::fs::open(&parent, Path::new(&name), &options)
+        .map_err(|error| cap_io("open project file", relative, error))?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| cap_io("read project file", relative, error))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(AppError::InvalidArgument {
+            message: format!("project file exceeds the {max_bytes}-byte limit"),
+        });
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn rename_project_file(
+    root: &fs::File,
+    source: &Path,
+    destination: &Path,
+    expected_hash: &str,
+) -> Result<(), AppError> {
+    if crate::render::sha256_hex(&read_project_file(root, source, 4 * 1024 * 1024)?)
+        != expected_hash
+    {
+        return Err(AppError::InvalidArgument {
+            message: format!("managed Agent file was modified: {}", source.display()),
+        });
+    }
+    let (source_parent, source_name) = open_project_parent(root, source, false)?;
+    let (destination_parent, destination_name) = open_project_parent(root, destination, true)?;
+    match cap_primitives::fs::stat(
+        &destination_parent,
+        Path::new(&destination_name),
+        cap_primitives::fs::FollowSymlinks::No,
+    ) {
+        Ok(_) => {
+            return Err(AppError::InvalidArgument {
+                message: format!(
+                    "project file destination is occupied: {}",
+                    destination.display()
+                ),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(cap_io("inspect project file", destination, error)),
+    }
+    cap_primitives::fs::rename(
+        &source_parent,
+        Path::new(&source_name),
+        &destination_parent,
+        Path::new(&destination_name),
+    )
+    .map_err(|error| cap_io("rename project file", source, error))
+}
+
 pub struct ProjectDirectoryCapability {
     parent: fs::File,
     name: OsString,

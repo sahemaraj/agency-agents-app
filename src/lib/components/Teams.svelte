@@ -201,7 +201,7 @@
 
   // How many of a team's agents exist in the corpus / are currently installed.
   const corpusSlugs = $derived(new Set(corpus.agents.map((a) => a.slug)));
-  const installedSlugs = $derived(new Set(install.installed.filter((i) => i.state !== "removed").map((i) => i.slug)));
+  const installedSlugs = $derived(new Set(install.installed.filter((i) => i.state !== "missing").map((i) => i.slug)));
   function teamStats(agents: string[]) {
     const present = agents.filter((s) => corpusSlugs.has(s));
     const deployed = present.filter((s) => installedSlugs.has(s)).length;

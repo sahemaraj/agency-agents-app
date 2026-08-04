@@ -124,33 +124,39 @@
     outdated: "var(--color-warning)",
     modified: "color-mix(in srgb, var(--color-warning) 55%, var(--color-danger))",
     foreign: "var(--color-brand)",
-    removed: "var(--color-danger)",
+    missing: "var(--color-danger)",
+    disabled: "var(--color-text-muted)",
+    sourceUnavailable: "var(--color-danger)",
   };
   const STATE_LABEL: Record<InstallState, MessageKey> = {
     current: "state.current",
     outdated: "state.outdated",
     modified: "state.modified",
     foreign: "state.foreign",
-    removed: "state.removed",
+    missing: "state.missing",
+    disabled: "state.disabled",
+    sourceUnavailable: "state.sourceUnavailable",
   };
   const DIFFABLE: InstallState[] = ["foreign", "modified", "outdated"];
-  const ORDER: InstallState[] = ["current", "outdated", "modified", "foreign", "removed"];
+  const ORDER: InstallState[] = ["current", "outdated", "modified", "disabled", "foreign", "missing", "sourceUnavailable"];
 
   function rowsFor(toolId: Tool): InstalledAgent[] {
     return install.installed.filter((i) => i.tool === toolId);
   }
   function health(toolId: Tool) {
-    const c = { current: 0, outdated: 0, modified: 0, foreign: 0, removed: 0 };
+    const c: Record<InstallState, number> = {
+      current: 0, outdated: 0, modified: 0, missing: 0, foreign: 0, disabled: 0, sourceUnavailable: 0,
+    };
     for (const r of rowsFor(toolId)) c[r.state]++;
-    const total = c.current + c.outdated + c.modified + c.foreign + c.removed;
+    const total = Object.values(c).reduce((sum, count) => sum + count, 0);
     return { ...c, total };
   }
   // Catalog coverage: how many distinct catalog agents are deployed (present on
-  // disk, i.e. not "removed") in a tool, vs the whole catalog. Drives the bar.
+  // disk, i.e. not "missing") in a tool, vs the whole catalog. Drives the bar.
   const catalogTotal = $derived(Math.max(corpus.agents.length, 1));
   function installedCount(toolId: Tool): number {
     const s = new Set<string>();
-    for (const r of rowsFor(toolId)) if (r.state !== "removed") s.add(r.slug);
+    for (const r of rowsFor(toolId)) if (r.state !== "missing") s.add(r.slug);
     return s.size;
   }
 

@@ -61,7 +61,7 @@ class ProjectsStore {
     const ensure = (p: string) => slugs.get(p) ?? (slugs.set(p, new Set()), slugs.get(p)!);
     for (const p of this.registered) ensure(p);
     for (const r of install.installed) {
-      if (r.state === "removed") continue;
+      if (r.state === "missing") continue;
       const p = r.projectPath;
       if (p == null) continue; // global lives in Teams/Tools, not here
       ensure(p).add(r.slug);

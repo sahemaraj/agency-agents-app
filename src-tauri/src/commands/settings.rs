@@ -128,6 +128,21 @@ pub struct Settings {
     #[serde(default)]
     pub mcp_destructive_access: bool,
 
+    /// Allow MCP clients to add, refresh, draft, or organize Agents.
+    /// Separate from Skills and off by default.
+    #[serde(default)]
+    pub mcp_agent_source_access: bool,
+
+    /// Allow MCP clients to install, update, or enable managed Agents.
+    /// Separate from Skills and off by default.
+    #[serde(default)]
+    pub mcp_agent_install_access: bool,
+
+    /// Allow MCP clients to request destructive Agent lifecycle changes.
+    /// Separate from Skills and off by default.
+    #[serde(default)]
+    pub mcp_agent_destructive_access: bool,
+
     /// Exact canonical project roots MCP mutations may target. User-scope
     /// mutations do not consult this list.
     #[serde(default)]
@@ -140,11 +155,14 @@ pub struct Settings {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct McpClientPolicy {
     pub source_access: bool,
     pub install_access: bool,
     pub destructive_access: bool,
+    pub agent_source_access: bool,
+    pub agent_install_access: bool,
+    pub agent_destructive_access: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,6 +227,9 @@ impl Default for Settings {
             mcp_source_access: false,
             mcp_install_access: false,
             mcp_destructive_access: false,
+            mcp_agent_source_access: false,
+            mcp_agent_install_access: false,
+            mcp_agent_destructive_access: false,
             mcp_project_allowlist: Vec::new(),
             mcp_client_policies: HashMap::new(),
         }
@@ -601,6 +622,30 @@ pub(crate) async fn mcp_policy_set_inner(
     Ok(clamped)
 }
 
+pub(crate) async fn mcp_agent_policy_set_inner(
+    state: &AppState,
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+) -> Result<Settings, AppError> {
+    let mut cache = state.settings.write().await;
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            })
+        }
+    };
+    latest.mcp_agent_source_access = source_access;
+    latest.mcp_agent_install_access = install_access;
+    latest.mcp_agent_destructive_access = destructive_access;
+    let saved = persist(&state.app_data_dir, latest).await?;
+    *cache = SettingsLoadState::Loaded(saved.clone());
+    Ok(saved)
+}
+
 /// Read the current settings.
 ///
 /// Always returns the *currently-loaded* state — does not re-read from
@@ -652,6 +697,16 @@ pub async fn mcp_policy_set(
 }
 
 #[tauri::command]
+pub async fn mcp_agent_policy_set(
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+    state: State<'_, AppState>,
+) -> Result<Settings, AppError> {
+    mcp_agent_policy_set_inner(&state, source_access, install_access, destructive_access).await
+}
+
+#[tauri::command]
 pub async fn mcp_client_policy_set(
     client: String,
     source_access: bool,
@@ -674,14 +729,42 @@ pub async fn mcp_client_policy_set(
             })
         }
     };
-    latest.mcp_client_policies.insert(
-        client,
-        McpClientPolicy {
-            source_access,
-            install_access,
-            destructive_access,
-        },
-    );
+    let policy = latest.mcp_client_policies.entry(client).or_default();
+    policy.source_access = source_access;
+    policy.install_access = install_access;
+    policy.destructive_access = destructive_access;
+    let saved = persist(&state.app_data_dir, latest).await?;
+    *cache = SettingsLoadState::Loaded(saved.clone());
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn mcp_agent_client_policy_set(
+    client: String,
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+    state: State<'_, AppState>,
+) -> Result<Settings, AppError> {
+    if !matches!(client.as_str(), "claude" | "codex") {
+        return Err(AppError::InvalidArgument {
+            message: "MCP client must be claude or codex".into(),
+        });
+    }
+    let mut cache = state.settings.write().await;
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            })
+        }
+    };
+    let policy = latest.mcp_client_policies.entry(client).or_default();
+    policy.agent_source_access = source_access;
+    policy.agent_install_access = install_access;
+    policy.agent_destructive_access = destructive_access;
     let saved = persist(&state.app_data_dir, latest).await?;
     *cache = SettingsLoadState::Loaded(saved.clone());
     Ok(saved)
@@ -780,6 +863,9 @@ mod tests {
             mcp_source_access: true,
             mcp_install_access: true,
             mcp_destructive_access: true,
+            mcp_agent_source_access: true,
+            mcp_agent_install_access: true,
+            mcp_agent_destructive_access: true,
             mcp_project_allowlist: vec!["/projects/allowed".into()],
             mcp_client_policies: HashMap::new(),
         };
@@ -841,6 +927,9 @@ mod tests {
             mcp_source_access: false,
             mcp_install_access: false,
             mcp_destructive_access: false,
+            mcp_agent_source_access: false,
+            mcp_agent_install_access: false,
+            mcp_agent_destructive_access: false,
             mcp_project_allowlist: Vec::new(),
             mcp_client_policies: HashMap::new(),
         };
@@ -961,6 +1050,9 @@ mod tests {
         assert!(!settings.mcp_source_access);
         assert!(!settings.mcp_install_access);
         assert!(!settings.mcp_destructive_access);
+        assert!(!settings.mcp_agent_source_access);
+        assert!(!settings.mcp_agent_install_access);
+        assert!(!settings.mcp_agent_destructive_access);
         assert!(settings.mcp_project_allowlist.is_empty());
 
         let project = tempfile::tempdir().expect("project");
@@ -984,6 +1076,31 @@ mod tests {
             settings.mcp_project_allowlist[63],
             format!("{canonical}/project-63")
         );
+    }
+
+    #[test]
+    fn old_skill_mcp_policy_does_not_enable_agent_mutations() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "mcpSourceAccess": true,
+            "mcpInstallAccess": true,
+            "mcpDestructiveAccess": true,
+            "mcpClientPolicies": {
+                "claude": {
+                    "sourceAccess": true,
+                    "installAccess": true,
+                    "destructiveAccess": true
+                }
+            }
+        }))
+        .expect("old settings remain readable");
+
+        assert!(!settings.mcp_agent_source_access);
+        assert!(!settings.mcp_agent_install_access);
+        assert!(!settings.mcp_agent_destructive_access);
+        let claude = settings.mcp_client_policies.get("claude").expect("policy");
+        assert!(!claude.agent_source_access);
+        assert!(!claude.agent_install_access);
+        assert!(!claude.agent_destructive_access);
     }
 
     // ---------- Phase 15 — skip-list cap + helpers ----------

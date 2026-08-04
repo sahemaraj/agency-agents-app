@@ -211,3 +211,29 @@ on exposed three latent traps that the manual-DMG (`SKIP_UPDATER`) path had alwa
    the Keychain copy must match it byte-for-byte. `release.sh` is fully Keychain-based — no `signing.env`.
 **Consequences**: `release.sh` now signs updater artifacts cleanly with no manual `signer sign -f` step; the next
 release "just works." **References**: `tasks/2026-06/260623_v0.2.0-ship.md`, `~/Downloads/fix-updater-keychain.sh`.
+
+### 2026-08-04: Agent identity is source ID plus portable relative path
+
+**Status**: Approved. **Context**: nested Agents and external sources can legitimately contain the
+same slug, so the existing slug-only catalog key cannot safely identify reads, drafts, organization,
+or lifecycle mutations. **Decision**: canonical Agent identity is `(sourceId, relativePath)`; legacy
+slug entry points remain adapters only when the built-in match is unique. Source files stay owned by
+their registered source, while personal-library folders remain logical organization. **Alternatives**:
+flatten nested paths or silently pick a source (rejected because both lose identity and can mutate the
+wrong Agent). **Consequences**: every new mutation resolves an exact reference, local source removal is
+non-destructive, and same-name Agents remain independent. **Reference**:
+`tasks/2026-08/260804_agent-foundation.md`.
+
+### 2026-08-04: Agent lifecycle extends the existing ledger transaction model
+
+**Status**: Approved. **Context**: source-aware Agents need migration, reconciliation, history, and
+safe mutations, but a parallel state database would allow the desktop, MCP, and destination bytes
+to disagree. **Decision**: extend the existing Agent install ledger and transactional lifecycle with
+exact `(sourceId, relativePath, tool, scope, project, destination)` identity. Legacy rows migrate
+only when a unique validated built-in Agent matches; migration never rewrites installed content.
+Update and rollback are backup-first, disable/enable are reversible moves, uninstall preserves
+modified content, and source removal leaves installs visible as SourceUnavailable. **Alternatives**:
+a new lifecycle database or slug-only migration (rejected because both split ownership or permit
+identity collisions). **Consequences**: desktop and future MCP operations share one recoverable
+source of truth and same-name Agents remain independent. **Reference**:
+`tasks/2026-08/260804_agent-lifecycle-parity.md`.

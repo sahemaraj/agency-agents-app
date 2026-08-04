@@ -26,6 +26,17 @@ const MAX_ENTRIES = 500;
 /** How long to wait after a change before writing to localStorage. */
 const PERSIST_DEBOUNCE_MS = 400;
 
+export function safeActivityDetail(value: unknown): string {
+  return String(value)
+    .replace(/-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/gi, "[redacted]")
+    .replace(/:\/\/[^/\s:@]+:[^@\s/]+@/g, "://[redacted]@")
+    .replace(/authorization:\s*bearer\s+\S+/gi, "Authorization: [redacted]")
+    .replace(/\b(token|api[_-]?key|secret|password)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .replace(/\b(?:gh[pousr]_|sk-)[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
+    .replace(/private\s+key(?:\s+\S+)*/gi, "[redacted]")
+    .slice(0, 512);
+}
+
 /** A discrete, already-resolved agent action recorded in the journal. */
 export interface JournalEntry {
   /** Stable id (crypto.randomUUID). */
@@ -41,12 +52,20 @@ export interface JournalEntry {
     | "sourceAdd"
     | "sourceRefresh"
     | "sourceRemove"
+    | "draftCreate"
+    | "draftEdit"
+    | "draftPublish"
+    | "draftReject"
+    | "organize"
+    | "rollback"
+    | "approvalApprove"
+    | "approvalReject"
     | "track"
     | "switch"
     | "sync"
     | "bulk"
     | "mcp";
-  subject?: "agent" | "skill" | "skillSource" | "mcp";
+  subject?: "agent" | "agentSource" | "agentDraft" | "agentLibrary" | "agentApproval" | "skill" | "skillSource" | "mcp";
   subjectName?: string;
   agentSlug?: string;
   agentName?: string;
@@ -56,6 +75,15 @@ export interface JournalEntry {
   outcome: "ok" | "error" | "pending";
   /** Free-form detail — error message, bulk summary ("3 agents"), etc. */
   detail?: string;
+}
+
+export function mergeActivityEntries(
+  localEntries: JournalEntry[],
+  mcpEntries: JournalEntry[],
+): JournalEntry[] {
+  return [...localEntries, ...mcpEntries].sort(
+    (left, right) => Date.parse(right.ts) - Date.parse(left.ts),
+  );
 }
 
 interface PersistedShape {
@@ -209,9 +237,7 @@ class ActivityStore {
 
   private mergeEntries(): void {
     this.hasLocalEntries = this.localEntries.length > 0;
-    this.entries = [...this.localEntries, ...this.mcpEntries].sort(
-      (left, right) => Date.parse(right.ts) - Date.parse(left.ts),
-    );
+    this.entries = mergeActivityEntries(this.localEntries, this.mcpEntries);
   }
 }
 
