@@ -5,26 +5,51 @@
   import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
   import { toast } from "$lib/stores/toast.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
+  import { agentFromSkillPreview } from "$lib/api";
+  import { appErrorMessage, isAppError, type SkillReference } from "$lib/types";
 
   interface Props {
     open: boolean;
     initial?: { relativePath: string; text: string } | null;
+    fromSkill?: SkillReference | null;
     onClose: () => void;
   }
-  let { open, initial = null, onClose }: Props = $props();
+  let { open, initial = null, fromSkill = null, onClose }: Props = $props();
   const DEFAULT_PATH = "custom-agent.md";
   const DEFAULT_TEXT = "---\nname: Custom Agent\ndescription: Describe what this Agent does.\n---\n\nAdd instructions here.\n";
   let relativePath = $state(DEFAULT_PATH);
   let text = $state(DEFAULT_TEXT);
   let status = $state("");
+  let previewLoading = $state(false);
+  let previewError = $state("");
+  let previewVersion = 0;
 
   $effect(() => {
     if (open) {
       relativePath = initial?.relativePath ?? DEFAULT_PATH;
       text = initial?.text ?? DEFAULT_TEXT;
       status = "";
+      previewError = "";
+      if (fromSkill) void loadSkillPreview(fromSkill, ++previewVersion);
     }
   });
+
+  async function loadSkillPreview(reference: SkillReference, version: number) {
+    previewLoading = true;
+    try {
+      const preview = await agentFromSkillPreview(reference);
+      if (open && version === previewVersion) {
+        relativePath = preview.relativePath;
+        text = preview.text;
+      }
+    } catch (error) {
+      if (version === previewVersion) {
+        previewError = isAppError(error) ? appErrorMessage(error) : String(error);
+      }
+    } finally {
+      if (version === previewVersion) previewLoading = false;
+    }
+  }
 
   async function create() {
     if (await agentLibrary.createDraft({ relativePath, text })) {
@@ -51,6 +76,7 @@
     <Input bind:value={relativePath} ariaLabel={i18n.t("agents.relativePath")} placeholder={i18n.t("agents.relativePath")} />
     <label>{i18n.t("agents.importMarkdown")}<input type="file" accept=".md,text/markdown" onchange={importFile} /></label>
     <textarea bind:value={text} aria-label={i18n.t("agents.agentMarkdown")} rows="14"></textarea>
+    {#if previewError}<p class="error" role="alert">{previewError}</p>{/if}
     {#if agentLibrary.error}<p class="error" role="alert">{agentLibrary.error}</p>{/if}
     <p class="status" aria-live="polite">{status}</p>
     {#each agentLibrary.drafts.filter((draft) => draft.state === "pending") as draft (draft.id)}
@@ -63,7 +89,7 @@
   </div>
   {#snippet actions()}
     <Button modalAction="cancel" onclick={onClose}>{i18n.t("common.cancel")}</Button>
-    <Button variant="primary" modalAction="confirm" loading={agentLibrary.busy} onclick={create}>{i18n.t("agents.saveDraft")}</Button>
+    <Button variant="primary" modalAction="confirm" loading={agentLibrary.busy || previewLoading} disabled={previewLoading || !!previewError} onclick={create}>{i18n.t("agents.saveDraft")}</Button>
   {/snippet}
 </Modal>
 

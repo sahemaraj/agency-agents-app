@@ -102,6 +102,8 @@ export const agentDraftsList = () => invoke<AgentDraft[]>("agent_drafts_list");
 export const agentDraftGet = (id: string) => invoke<AgentDraft>("agent_draft_get", { id });
 export const agentDraftCreate = (input: AgentDraftInput) =>
   invoke<AgentDraft>("agent_draft_create", { input });
+export const agentFromSkillPreview = (reference: SkillReference) =>
+  invoke<AgentDraftInput>("agent_from_skill_preview", { reference });
 export const agentDraftEdit = (id: string, input: AgentDraftInput) =>
   invoke<AgentDraft>("agent_draft_edit", { id, input });
 export const agentDraftPublish = (id: string) =>

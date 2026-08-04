@@ -18,6 +18,7 @@
     profileDelete: "agents.approvalAction.profileDelete",
     updatePolicySet: "agents.approvalAction.updatePolicySet",
     publisherTrustSet: "agents.approvalAction.publisherTrustSet",
+    draftPublish: "agents.approvalAction.draftPublish",
     install: "agents.approvalAction.install",
     update: "agents.approvalAction.update",
     uninstall: "agents.approvalAction.uninstall",

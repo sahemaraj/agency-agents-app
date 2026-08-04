@@ -10,7 +10,7 @@ use crate::library;
 use crate::state::AppState;
 use crate::types::{
     AgentDraft, AgentDraftInput, AgentDraftState, AgentPackageResult, AgentReference, AgentSource,
-    AgentSourceKind, AgentValidationCode, AgentValidationError,
+    AgentSourceKind, AgentValidationCode, AgentValidationError, SkillPackageResult, SkillReference,
 };
 
 const MAX_AGENT_DRAFTS: usize = 256;
@@ -151,6 +151,7 @@ fn empty_validation(id: &str, input: &AgentDraftInput) -> AgentPackageResult {
         publisher_key: None,
         publisher_verified: false,
         required_agents: Vec::new(),
+        required_skills: Vec::new(),
         recommended_agents: Vec::new(),
         groups: Vec::new(),
         tags: Vec::new(),
@@ -237,6 +238,108 @@ pub async fn create(state: &AppState, input: AgentDraftInput) -> Result<AgentDra
         return Err(error);
     }
     Ok(draft)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct AgentFromSkillMetadata<'a> {
+    name: &'a str,
+    description: &'a str,
+    version: Option<&'a str>,
+    channel: &'a str,
+    required_skills: [&'a str; 1],
+    groups: &'a [String],
+    tags: &'a [String],
+    permissions: &'a [String],
+}
+
+fn skill_agent_name(skill_text: &str, fallback: &str) -> String {
+    let body = skill_text
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---").map(|end| &rest[end + 4..]))
+        .unwrap_or(skill_text);
+    body.lines()
+        .find_map(|line| {
+            line.strip_prefix("# ")
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+        })
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+async fn exact_skill(
+    state: &AppState,
+    reference: &SkillReference,
+) -> Result<SkillPackageResult, AppError> {
+    crate::skills::inspect_skill_sources(state)
+        .await?
+        .into_iter()
+        .flat_map(|result| result.packages)
+        .find(|package| {
+            package.source_id == reference.source_id
+                && package.relative_path == reference.relative_path
+        })
+        .filter(|package| package.installable)
+        .ok_or_else(|| invalid("selected Skill is missing or not installable"))
+}
+
+pub(crate) async fn input_from_skill(
+    state: &AppState,
+    reference: &SkillReference,
+) -> Result<AgentDraftInput, AppError> {
+    let package = exact_skill(state, reference).await?;
+    let skill_name = package
+        .name
+        .as_deref()
+        .ok_or_else(|| invalid("selected Skill has no valid name"))?;
+    let description = package
+        .description
+        .as_deref()
+        .ok_or_else(|| invalid("selected Skill has no valid description"))?;
+    let skill_text = crate::skills::read_skill_file(
+        state,
+        &reference.source_id,
+        &reference.relative_path,
+        "SKILL.md",
+    )
+    .await?
+    .text
+    .ok_or_else(|| invalid("selected Skill metadata must be UTF-8"))?;
+    let name = skill_agent_name(&skill_text, skill_name);
+    let metadata = serde_yaml::to_string(&AgentFromSkillMetadata {
+        name: &name,
+        description,
+        version: package.version.as_deref(),
+        channel: &package.channel,
+        required_skills: [skill_name],
+        groups: &package.group,
+        tags: &package.tags,
+        permissions: &package.permissions,
+    })
+    .map_err(|error| AppError::Internal {
+        message: format!("serialize Agent-from-Skill metadata: {error}"),
+    })?;
+    let category = package
+        .group
+        .first()
+        .map(String::as_str)
+        .unwrap_or("custom");
+    let relative_path = format!("{category}/{skill_name}-agent.md");
+    let body = format!(
+        "# {name} Agent\n\nYou are a specialized agent for: {description}\n\n## Required Skill\n\nUse the `{skill_name}` skill for every task. If it is unavailable, state that limitation before giving consequential guidance.\n\n## Operating Contract\n\n1. Load and follow the required skill before acting.\n2. Preserve its evidence, validation, and safety requirements.\n3. Separate verified guidance from assumptions or supplemental knowledge.\n"
+    );
+    Ok(AgentDraftInput {
+        relative_path,
+        text: format!("---\n{}---\n\n{body}", metadata.trim_start_matches("---\n")),
+    })
+}
+
+pub(crate) async fn create_from_skill(
+    state: &AppState,
+    reference: SkillReference,
+) -> Result<AgentDraft, AppError> {
+    create(state, input_from_skill(state, &reference).await?).await
 }
 
 pub async fn list(state: &AppState) -> Result<Vec<AgentDraft>, AppError> {
@@ -418,6 +521,24 @@ pub async fn publish(state: &AppState, id: &str) -> Result<AgentDraft, AppError>
                 return Err(error);
             }
         };
+    match super::inspect_file(PUBLISHED_AGENT_SOURCE_ID, &published_root, &destination) {
+        Ok(Some(validation))
+            if validation.installable && validation.source_hash == current.source_hash => {}
+        Ok(_) => {
+            if source_created {
+                remove_published_source(&state.app_data_dir).await;
+            }
+            let _ = std::fs::remove_file(&destination);
+            return Err(invalid("published Agent failed source validation"));
+        }
+        Err(error) => {
+            if source_created {
+                remove_published_source(&state.app_data_dir).await;
+            }
+            let _ = std::fs::remove_file(&destination);
+            return Err(error);
+        }
+    }
     drafts[index].state = AgentDraftState::Published;
     drafts[index].published_source_id = Some(published_source.id);
     let result = drafts[index].clone();
@@ -498,6 +619,14 @@ pub async fn agent_draft_create(
 }
 
 #[tauri::command]
+pub async fn agent_from_skill_preview(
+    state: State<'_, AppState>,
+    reference: SkillReference,
+) -> Result<AgentDraftInput, AppError> {
+    input_from_skill(&state, &reference).await
+}
+
+#[tauri::command]
 pub async fn agent_draft_edit(
     state: State<'_, AppState>,
     id: String,
@@ -553,6 +682,80 @@ mod tests {
             text: "---\nname: Reviewer\ndescription: Reviews code.\n---\nReview carefully.\n"
                 .into(),
         }
+    }
+
+    #[tokio::test]
+    async fn create_from_skill_builds_valid_draft_with_structured_dependency() {
+        let root = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let package = skill_source
+            .path()
+            .join("project-controls/primavera-p6-eppm");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: primavera-p6-eppm\ndescription: Evidence-backed Primavera P6 guidance.\ntype: other\ngroup: [project-controls, primavera]\ntags: [primavera-p6, scheduling]\nversion: 1.0.0\nchannel: stable\n---\n# Primavera P6 EPPM v25\n\nUse Oracle documentation.\n",
+        )
+        .unwrap();
+        let app = state(root.path());
+        let source = crate::skills::add_local_source(&app, skill_source.path())
+            .await
+            .unwrap();
+
+        let draft = create_from_skill(
+            &app,
+            crate::types::SkillReference {
+                source_id: source.id,
+                relative_path: "project-controls/primavera-p6-eppm".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            draft.relative_path,
+            "project-controls/primavera-p6-eppm-agent.md"
+        );
+        assert!(draft.validation.installable);
+        assert_eq!(draft.validation.required_skills, ["primavera-p6-eppm"]);
+        assert_eq!(draft.validation.groups, ["project-controls", "primavera"]);
+        assert_eq!(draft.validation.tags, ["primavera-p6", "scheduling"]);
+        assert_eq!(
+            draft.validation.agent.as_ref().unwrap().name,
+            "Primavera P6 EPPM v25"
+        );
+
+        let published = publish(&app, &draft.id).await.unwrap();
+        let package = super::super::resolve_agent_package(
+            root.path(),
+            &AgentReference {
+                source_id: published.published_source_id.unwrap(),
+                relative_path: published.relative_path,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(package.required_skills, ["primavera-p6-eppm"]);
+    }
+
+    #[tokio::test]
+    async fn create_from_skill_rejects_a_nonexistent_exact_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let app = state(root.path());
+
+        let error = create_from_skill(
+            &app,
+            SkillReference {
+                source_id: "missing:skill-source".into(),
+                relative_path: "project-controls/primavera-p6-eppm".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("selected Skill is missing or not installable"));
     }
 
     #[tokio::test]

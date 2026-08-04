@@ -869,7 +869,9 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "agents_refresh_all"
         | "agents_submit_draft"
         | "agents_create_draft"
+        | "agents_create_from_skill"
         | "agents_edit_draft"
+        | "agents_request_publish_draft"
         | "agents_create_folder"
         | "agents_rename_folder"
         | "agents_move_folder"
@@ -4678,7 +4680,7 @@ mod tests {
             "every routed tool must have an explicit audit/policy class"
         );
 
-        assert_eq!(names.len(), 127);
+        assert_eq!(names.len(), 129);
         assert_eq!(
             names
                 .iter()
@@ -4691,7 +4693,7 @@ mod tests {
                 .iter()
                 .filter(|name| name.starts_with("agents_"))
                 .count(),
-            49
+            51
         );
         assert_eq!(
             names
@@ -4716,7 +4718,7 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(skill_names.len(), 78);
-        assert_eq!(agent_names.len(), 49);
+        assert_eq!(agent_names.len(), 51);
         assert!(skill_names.is_disjoint(&agent_names));
     }
 
@@ -4808,6 +4810,71 @@ mod tests {
             .expect("Agent library");
         assert!(library.folders.contains(&"teams/review".into()));
         assert_eq!(library.approvals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_from_skill_stdio_flow_creates_a_draft_and_requests_desktop_publication() {
+        let root = tempfile::tempdir().expect("app data");
+        let skill_source = tempfile::tempdir().expect("Skill source");
+        let package = skill_source
+            .path()
+            .join("project-controls/primavera-p6-eppm");
+        std::fs::create_dir_all(&package).expect("Skill package");
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: primavera-p6-eppm\ndescription: Evidence-backed Primavera P6 guidance.\ntype: other\ngroup: [project-controls]\n---\n# Primavera P6 EPPM v25\n",
+        )
+        .expect("Skill metadata");
+        let state = test_state(root.path());
+        let source = crate::skills::add_local_source(&state, skill_source.path())
+            .await
+            .expect("register Skill source");
+        crate::commands::settings::mcp_agent_policy_set_inner(&state, true, false, true)
+            .await
+            .expect("enable Agent source mutations");
+
+        let created = call_tools_over_stdio(
+            Arc::clone(&state),
+            vec![serde_json::json!({
+                "name": "agents_create_from_skill",
+                "arguments": {
+                    "source_id": source.id,
+                    "relative_path": "project-controls/primavera-p6-eppm",
+                },
+            })],
+        )
+        .await;
+        assert_ne!(created[0]["result"]["isError"], true, "{created:#?}");
+        let draft: serde_json::Value = serde_json::from_str(
+            created[0]["result"]["content"][0]["text"]
+                .as_str()
+                .expect("draft text"),
+        )
+        .expect("draft JSON");
+        assert_eq!(
+            draft["validation"]["requiredSkills"][0],
+            "primavera-p6-eppm"
+        );
+
+        let requested = call_tools_over_stdio(
+            Arc::clone(&state),
+            vec![serde_json::json!({
+                "name": "agents_request_publish_draft",
+                "arguments": {"id": draft["id"]},
+            })],
+        )
+        .await;
+        assert_ne!(requested[0]["result"]["isError"], true, "{requested:#?}");
+        let approval: serde_json::Value = serde_json::from_str(
+            requested[0]["result"]["content"][0]["text"]
+                .as_str()
+                .expect("approval text"),
+        )
+        .expect("approval JSON");
+        assert_eq!(approval["state"], "pending");
+        assert_eq!(approval["requestedBy"], "test");
+        assert_eq!(approval["request"]["action"], "draftPublish");
+        assert!(!root.path().join("agents/published").exists());
     }
 
     #[tokio::test]

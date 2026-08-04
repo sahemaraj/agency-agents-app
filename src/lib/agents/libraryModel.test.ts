@@ -23,7 +23,7 @@ const packageView = (sourceId: string, relativePath: string, name: string) => ({
     agent: { slug: "reviewer", name, description: "Reviews code", category: "engineering", emoji: null, color: null, vibe: null, body: "" },
     sourceHash: "hash", frontmatterHash: "front", bodyHash: "body", version: null, channel: null,
     changelog: null, publisher: null, publisherKey: null, publisherVerified: false,
-    requiredAgents: [], recommendedAgents: [], groups: [], tags: [], capabilities: ["review"], permissions: [],
+    requiredAgents: [], requiredSkills: [], recommendedAgents: [], groups: [], tags: [], capabilities: ["review"], permissions: [],
     qualityScore: 75, qualityChecks: [], diagnostics: [], installable: true,
   },
 });
@@ -97,6 +97,8 @@ describe("Agent library model", () => {
     });
     expect(agentApprovalFacts({ action: "sourceRemove", sourceId: "source:one" }))
       .toEqual({ kind: "sourceRemove", subject: "source:one", planRevision: null });
+    expect(agentApprovalFacts({ action: "draftPublish", id: "draft-1", planRevision: "rev-1" }))
+      .toEqual({ kind: "draftPublish", subject: "draft-1", planRevision: "rev-1" });
   });
 
   it("matches Agent-specific smart-folder fields", () => {

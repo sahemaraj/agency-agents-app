@@ -178,6 +178,8 @@
         <p>{pkg.permissions.length ? pkg.permissions.join(", ") : i18n.t("agents.noElevatedPermissions")}</p>
         <h3>{i18n.t("agents.dependencies")}</h3>
         <p>{pkg.requiredAgents.length ? pkg.requiredAgents.join(", ") : i18n.t("common.none")}</p>
+        <h3>{i18n.t("agents.requiredSkills")}</h3>
+        <p>{pkg.requiredSkills.length ? pkg.requiredSkills.join(", ") : i18n.t("common.none")}</p>
         <h3>{i18n.t("agents.recommendations")}</h3>
         <p>{pkg.recommendedAgents.length ? pkg.recommendedAgents.join(", ") : i18n.t("common.none")}</p>
         {#if pkg.publisher}

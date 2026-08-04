@@ -110,6 +110,13 @@ struct DraftRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct CreateFromSkillRequest {
+    source_id: String,
+    relative_path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RecommendRequest {
     task: String,
     limit: Option<usize>,
@@ -1006,6 +1013,18 @@ async fn validate_approval_target(
                 .ok_or_else(|| format!("Agent collection not found: {collection_name}"))
         }
         AgentApprovalAction::PublisherTrustSet { .. } => Ok(()),
+        AgentApprovalAction::DraftPublish { id, plan_revision } => {
+            let draft = super::drafts::get(state, id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if draft.state != crate::types::AgentDraftState::Pending
+                || !draft.validation.installable
+                || draft.source_hash != *plan_revision
+            {
+                return Err("Agent draft is not a current valid pending draft".into());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1422,6 +1441,57 @@ impl SkillMcpServer {
             .map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&draft).map_err(|error| error.to_string())
         })
+        .await
+    }
+
+    #[tool(description = "Create a validated Agent draft from one exact Skill for desktop review")]
+    async fn agents_create_from_skill(
+        &self,
+        Parameters(CreateFromSkillRequest {
+            source_id,
+            relative_path,
+        }): Parameters<CreateFromSkillRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "agents_create_from_skill",
+            McpAction::AgentSource,
+            None,
+            async {
+                let draft = super::drafts::create_from_skill(
+                    self.state(),
+                    crate::types::SkillReference {
+                        source_id,
+                        relative_path,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&draft).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Request desktop approval to publish one current valid Agent draft")]
+    async fn agents_request_publish_draft(
+        &self,
+        Parameters(DraftRequest { id }): Parameters<DraftRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "agents_request_publish_draft",
+            McpAction::AgentSource,
+            None,
+            async {
+                let draft = super::drafts::get(self.state(), &id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.submit_agent_approval_json(AgentApprovalAction::DraftPublish {
+                    id,
+                    plan_revision: draft.source_hash,
+                })
+                .await
+            },
+        )
         .await
     }
 
@@ -2471,6 +2541,7 @@ mod tests {
                 "agents_assign_folder",
                 "agents_create_draft",
                 "agents_create_folder",
+                "agents_create_from_skill",
                 "agents_delete_collection",
                 "agents_delete_folder",
                 "agents_delete_profile",
@@ -2500,6 +2571,7 @@ mod tests {
                 "agents_remove_source",
                 "agents_rename_folder",
                 "agents_request_batch_collection",
+                "agents_request_publish_draft",
                 "agents_request_publisher_trust",
                 "agents_request_rollback",
                 "agents_save_collection",

@@ -7,6 +7,7 @@
   import Search from "@lucide/svelte/icons/search";
 
   import Button from "$lib/components/Button.svelte";
+  import AgentCreatorModal from "$lib/components/AgentCreatorModal.svelte";
   import DestructiveConfirm from "$lib/components/DestructiveConfirm.svelte";
   import DeploymentTargetGrid, {
     type DeploymentCell,
@@ -21,7 +22,7 @@
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { skillCollectionBatch, skillInstallPlan } from "$lib/api";
-  import type { InstalledSkill, SkillApprovalAction, SkillDraft, SkillMutationPlan, SkillPackageResult, SkillSmartFolderRule, SkillSource, SkillSourceResult, SkillType, SkillUpdatePolicy, SkillVersionSnapshot } from "$lib/types";
+  import type { InstalledSkill, SkillApprovalAction, SkillDraft, SkillMutationPlan, SkillPackageResult, SkillReference, SkillSmartFolderRule, SkillSource, SkillSourceResult, SkillType, SkillUpdatePolicy, SkillVersionSnapshot } from "$lib/types";
   import {
     buildPersonalFolderTree,
     filterPackages,
@@ -78,6 +79,7 @@
   let collectionProject = $state("");
   let collectionOperation: "install" | "update" | "uninstall" = $state("install");
   let creatorOpen = $state(false);
+  let agentCreatorSkill: SkillReference | null = $state(null);
   let creatorName = $state("");
   let creatorDescription = $state("");
   let creatorType: SkillType = $state("other");
@@ -1038,6 +1040,7 @@
                 <p>{selected.pkg.description ?? i18n.t("skills.invalidMetadata")}</p>
               </div>
               <div class="detail-actions">
+                <Button size="sm" disabled={!selected.pkg.installable} onclick={() => (agentCreatorSkill = { sourceId: selected.pkg.sourceId, relativePath: selected.pkg.relativePath })}>{i18n.t("skills.createAgent")}</Button>
                 <Button size="sm" loading={editorLoading} onclick={() => void openEditor()}>{i18n.t("skills.editAsDraft")}</Button>
                 <button
                   class="favorite-button"
@@ -1376,6 +1379,12 @@
     {/snippet}
   </Modal>
 {/if}
+
+<AgentCreatorModal
+  open={agentCreatorSkill !== null}
+  fromSkill={agentCreatorSkill}
+  onClose={() => (agentCreatorSkill = null)}
+/>
 
 {#if editorOpen && selected}
   <Modal open size="wide" title={i18n.t("skills.editSkill", { name: selected.pkg.name ?? selected.pkg.relativePath })} defaultFocus="first" onClose={() => (editorOpen = false)}>

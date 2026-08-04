@@ -462,6 +462,7 @@ fn inspect_file(
             publisher_key: None,
             publisher_verified: false,
             required_agents: Vec::new(),
+            required_skills: Vec::new(),
             recommended_agents: Vec::new(),
             groups: Vec::new(),
             tags: Vec::new(),
@@ -496,6 +497,7 @@ fn inspect_file(
                 publisher_key: None,
                 publisher_verified: false,
                 required_agents: Vec::new(),
+                required_skills: Vec::new(),
                 recommended_agents: Vec::new(),
                 groups: Vec::new(),
                 tags: Vec::new(),
@@ -539,6 +541,7 @@ fn inspect_file(
                 publisher_key: None,
                 publisher_verified: false,
                 required_agents: Vec::new(),
+                required_skills: Vec::new(),
                 recommended_agents: Vec::new(),
                 groups: Vec::new(),
                 tags: Vec::new(),
@@ -601,6 +604,7 @@ fn inspect_file(
         publisher_key: parsed.metadata.publisher_key,
         publisher_verified,
         required_agents: parsed.metadata.required_agents,
+        required_skills: parsed.metadata.required_skills,
         recommended_agents: parsed.metadata.recommended_agents,
         groups: parsed.metadata.groups,
         tags: parsed.metadata.tags,
@@ -1439,6 +1443,34 @@ mod tests {
         .unwrap();
         assert_eq!(result.agents.len(), 1);
         assert_eq!(result.agents[0].reference.relative_path, "agent.md");
+    }
+
+    #[test]
+    fn source_discovery_exposes_required_skills() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("primavera-agent.md"),
+            "---\nname: Primavera Agent\ndescription: Advises on P6.\nrequired-skills: [primavera-p6-eppm]\n---\nUse the required skill.\n",
+        )
+        .unwrap();
+        let result = discover_source_blocking(
+            root.path(),
+            AgentSource {
+                id: "local:test".into(),
+                label: "Test".into(),
+                enabled: true,
+                kind: AgentSourceKind::Local {
+                    root: root.path().to_string_lossy().into_owned(),
+                },
+            },
+        )
+        .unwrap();
+
+        let package = serde_json::to_value(&result.agents[0]).unwrap();
+        assert_eq!(
+            package["requiredSkills"],
+            serde_json::json!(["primavera-p6-eppm"])
+        );
     }
 
     fn dependency_source(

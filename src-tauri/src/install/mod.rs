@@ -3902,6 +3902,7 @@ mod tests {
                     publisher_key: None,
                     publisher_verified: false,
                     required_agents: Vec::new(),
+                    required_skills: Vec::new(),
                     recommended_agents: Vec::new(),
                     groups: Vec::new(),
                     tags: Vec::new(),

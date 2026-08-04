@@ -753,6 +753,8 @@ pub struct AgentPackageResult {
     pub publisher_key: Option<String>,
     pub publisher_verified: bool,
     pub required_agents: Vec<String>,
+    #[serde(default)]
+    pub required_skills: Vec<String>,
     pub recommended_agents: Vec<String>,
     pub groups: Vec<String>,
     pub tags: Vec<String>,
@@ -926,6 +928,10 @@ pub enum AgentApprovalAction {
         public_key: String,
         trusted: bool,
         revoked: bool,
+    },
+    DraftPublish {
+        id: String,
+        plan_revision: String,
     },
     Install {
         reference: AgentReference,

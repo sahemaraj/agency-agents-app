@@ -31,3 +31,9 @@ audit through the existing Skills MCP server. See [260804_agents-mcp.md](./26080
 Completed the desktop workflow, Activity coverage, localization/accessibility, recovery and
 security rehearsals, and the evidence-backed Skills-to-Agents parity audit. See
 [260804_agents-skills-feature-parity.md](./260804_agents-skills-feature-parity.md).
+
+### 2026-08-05: Create Agent from Skill
+
+Added deterministic editable Skill-to-Agent drafts in the desktop app and MCP, structured
+`required-skills` metadata, and hash-bound desktop approval for MCP publication requests. See
+[260805_create-agent-from-skill.md](./260805_create-agent-from-skill.md).

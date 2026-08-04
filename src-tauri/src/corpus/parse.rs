@@ -53,6 +53,8 @@ struct Frontmatter {
     publisher_signature: Option<String>,
     #[serde(default, rename = "required-agents")]
     required_agents: Vec<String>,
+    #[serde(default, rename = "required-skills")]
+    required_skills: Vec<String>,
     #[serde(default, rename = "recommended-agents")]
     recommended_agents: Vec<String>,
     #[serde(default, alias = "group")]
@@ -74,6 +76,7 @@ pub(crate) struct AgentMetadata {
     pub publisher_key: Option<String>,
     pub publisher_signature: Option<String>,
     pub required_agents: Vec<String>,
+    pub required_skills: Vec<String>,
     pub recommended_agents: Vec<String>,
     pub groups: Vec<String>,
     pub tags: Vec<String>,
@@ -231,6 +234,7 @@ pub(crate) fn parse_agent_package(
         publisher_key: fm.publisher_key,
         publisher_signature: fm.publisher_signature,
         required_agents: fm.required_agents,
+        required_skills: fm.required_skills,
         recommended_agents: fm.recommended_agents,
         groups: fm.groups,
         tags: fm.tags,

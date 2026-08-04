@@ -228,6 +228,7 @@ pub fn run() {
             agents::drafts::agent_drafts_list,
             agents::drafts::agent_draft_get,
             agents::drafts::agent_draft_create,
+            agents::drafts::agent_from_skill_preview,
             agents::drafts::agent_draft_edit,
             agents::drafts::agent_draft_publish,
             agents::drafts::agent_draft_reject,

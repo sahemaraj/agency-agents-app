@@ -1,5 +1,18 @@
 # Active Context — Agency Agents
 
+## ✅ Create Agent from Skill [COMPLETE] (2026-08-05)
+
+The local `feat/create-agent-from-skill` branch now creates a deterministic editable Agent draft
+from an exact validated Skill in both the desktop app and MCP. Generated Agents declare structured
+`required-skills` metadata and delegate to the Skill instead of copying it. MCP publication stays
+desktop-only through a typed, source-hash-bound approval that rejects stale drafts; successful
+publication is re-read through the canonical Agent validator. Verification: 474 Rust library tests
+passed with 2 intentional ignores, 2 CLI tests passed, strict Clippy/format/diff checks passed,
+frontend check reported 0 errors and warnings, 20 frontend tests and the production build passed,
+and live stdio exposed 129 tools: 49 Skills + 51 Agents + 29 Experts. The latest development app
+was rebuilt and launched. User approved the final diff; no remote change was authorized. Record:
+`tasks/2026-08/260805_create-agent-from-skill.md`.
+
 ## ✅ Agents–Skills Feature Parity [COMPLETE] (2026-08-04)
 
 **State**: COMPLETE on local `main`, integrating feature commit `e655d28`.

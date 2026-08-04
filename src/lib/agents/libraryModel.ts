@@ -160,6 +160,7 @@ export function agentApprovalFacts(action: AgentApprovalAction): {
     : "path" in action ? action.path
     : "name" in action ? action.name
     : "collectionName" in action ? action.collectionName
+    : "id" in action ? action.id
     : "";
   return {
     kind: action.action,

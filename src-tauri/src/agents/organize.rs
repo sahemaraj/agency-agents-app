@@ -129,6 +129,10 @@ fn validate_approval_action(action: &AgentApprovalAction) -> Result<(), AppError
             }
             Ok(())
         }
+        AgentApprovalAction::DraftPublish { id, plan_revision } => {
+            Uuid::parse_str(id).map_err(|_| invalid("Agent draft id is invalid"))?;
+            validate_plan(plan_revision)
+        }
         AgentApprovalAction::Install {
             reference,
             tool,
@@ -201,6 +205,9 @@ fn approval_audit(action: &AgentApprovalAction) -> (&'static str, &'static str, 
         }
         AgentApprovalAction::PublisherTrustSet { .. } => {
             ("agents_request_publisher_trust", "agent_destructive", None)
+        }
+        AgentApprovalAction::DraftPublish { .. } => {
+            ("agents_request_publish_draft", "agent_source", None)
         }
         AgentApprovalAction::Install { project_path, .. } => {
             ("agents_install", "agent_install", project_path.as_deref())
@@ -932,6 +939,15 @@ async fn execute_organization_approval(
             )
             .await?,
         ),
+        AgentApprovalAction::DraftPublish { id, plan_revision } => {
+            let draft = super::drafts::get(state, id).await?;
+            if draft.source_hash != *plan_revision {
+                return Err(invalid(
+                    "Agent draft changed after publication was requested",
+                ));
+            }
+            serde_json::to_value(super::drafts::publish(state, id).await?)
+        }
         _ => {
             return Err(invalid(
                 "Agent approval action is not an organization mutation",
@@ -975,7 +991,8 @@ async fn approve_with_execution(
         | AgentApprovalAction::SmartFolderDelete { .. }
         | AgentApprovalAction::ProfileDelete { .. }
         | AgentApprovalAction::UpdatePolicySet { .. }
-        | AgentApprovalAction::PublisherTrustSet { .. } => {
+        | AgentApprovalAction::PublisherTrustSet { .. }
+        | AgentApprovalAction::DraftPublish { .. } => {
             execute_organization_approval(state, &action).await
         }
         _ => crate::install::execute_agent_lifecycle_approval(app, state, &action).await,
@@ -1299,6 +1316,84 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn draft_publish_approval_rejects_a_stale_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let app = state(root.path());
+        let draft = super::super::drafts::create(
+            &app,
+            crate::types::AgentDraftInput {
+                relative_path: "reviewer.md".into(),
+                text: "---\nname: Reviewer\ndescription: Reviews code.\n---\nReview carefully.\n"
+                    .into(),
+            },
+        )
+        .await
+        .unwrap();
+        let action = AgentApprovalAction::DraftPublish {
+            id: draft.id.clone(),
+            plan_revision: draft.source_hash,
+        };
+        submit_approval(&app, "codex".into(), action.clone())
+            .await
+            .unwrap();
+        super::super::drafts::edit(
+            &app,
+            &draft.id,
+            crate::types::AgentDraftInput {
+                relative_path: "reviewer.md".into(),
+                text:
+                    "---\nname: Reviewer\ndescription: Reviews code.\n---\nReview changed code.\n"
+                        .into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(execute_organization_approval(&app, &action).await.is_err());
+        assert_eq!(
+            super::super::drafts::get(&app, &draft.id)
+                .await
+                .unwrap()
+                .state,
+            crate::types::AgentDraftState::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_publish_approval_executes_the_current_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let app = state(root.path());
+        let draft = super::super::drafts::create(
+            &app,
+            crate::types::AgentDraftInput {
+                relative_path: "reviewer.md".into(),
+                text: "---\nname: Reviewer\ndescription: Reviews code.\n---\nReview carefully.\n"
+                    .into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        execute_organization_approval(
+            &app,
+            &AgentApprovalAction::DraftPublish {
+                id: draft.id.clone(),
+                plan_revision: draft.source_hash,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            super::super::drafts::get(&app, &draft.id)
+                .await
+                .unwrap()
+                .state,
+            crate::types::AgentDraftState::Published
+        );
     }
 
     #[tokio::test]

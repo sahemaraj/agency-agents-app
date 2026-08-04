@@ -687,6 +687,7 @@ export interface AgentPackageResult {
   publisherKey: string | null;
   publisherVerified: boolean;
   requiredAgents: string[];
+  requiredSkills: string[];
   recommendedAgents: string[];
   groups: string[];
   tags: string[];
@@ -801,6 +802,7 @@ export type AgentApprovalAction =
   | { action: "profileDelete"; name: string }
   | { action: "updatePolicySet"; reference: AgentReference; policy: AgentUpdatePolicy }
   | { action: "publisherTrustSet"; name: string; publicKey: string; trusted: boolean; revoked: boolean }
+  | { action: "draftPublish"; id: string; planRevision: string }
   | { action: "install"; reference: AgentReference; tool: Tool; projectPath: string | null; includeDependencies: boolean; planRevision: string }
   | { action: "update" | "uninstall"; reference: AgentReference; tool: Tool; projectPath: string | null; planRevision: string }
   | { action: "rollback"; reference: AgentReference; tool: Tool; projectPath: string | null; snapshotId: string; planRevision: string }
