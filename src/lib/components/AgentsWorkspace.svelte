@@ -35,7 +35,7 @@
   import AgentApprovalInbox from "./AgentApprovalInbox.svelte";
   import AgentDetailTabs from "./AgentDetailTabs.svelte";
   import AgentOrganizerModal from "./AgentOrganizerModal.svelte";
-  import { findAgentPackage } from "$lib/agents/libraryModel";
+  import { buildAgentBrowseViews, findAgentPackage, sameAgent } from "$lib/agents/libraryModel";
   import { divisionPrompt } from "$lib/data/playbook";
   import DownloadIcon from "@lucide/svelte/icons/download";
 
@@ -135,15 +135,18 @@
 
   // Division + search filtered (pre-lens) — lens counts are computed over THIS
   // so they reflect the current division/search, not the selected lens.
-  const base = $derived(corpus.filtered(ui.agentsCategory, query));
-  const visible = $derived(lens === "all" ? base : base.filter((a) => buckets(a.slug).has(lens)));
+  const sourcePackages = $derived.by(() => agentLibrary.results.flatMap((result) =>
+    result.agents.map((pkg) => ({ pkg, source: result.source }))
+  ));
+  const base = $derived(buildAgentBrowseViews(corpus.agents, sourcePackages, ui.agentsCategory, query));
+  const visible = $derived(lens === "all" ? base : base.filter(({ agent }) => buckets(agent.slug).has(lens)));
 
   const lensCounts = $derived.by<Record<Lens, number>>(() => {
     const c: Record<Lens, number> = {
       all: base.length, attention: 0, current: 0, outdated: 0, modified: 0,
       missing: 0, foreign: 0, disabled: 0, sourceUnavailable: 0, none: 0,
     };
-    for (const a of base) for (const b of buckets(a.slug)) c[b]++;
+    for (const { agent } of base) for (const b of buckets(agent.slug)) c[b]++;
     return c;
   });
 
@@ -176,7 +179,7 @@
     const slug = ui.agentsSelected;
     if (!slug) return;
     const inCorpus = corpus.agents.some((a) => a.slug === slug);
-    if (inCorpus && !base.some((a) => a.slug === slug)) ui.selectAgent(null);
+    if (inCorpus && !base.some(({ agent }) => agent.slug === slug)) ui.selectAgent(null);
   });
 
   // The Agents tab LANDS on the division list (not a flat agent list): only when
@@ -346,15 +349,20 @@
     else next.add(slug);
     selected = next;
   }
-  const allVisibleSelected = $derived(visible.length > 0 && visible.every((a) => selected.has(a.slug)));
+  const allVisibleSelected = $derived(visible.length > 0 && visible.every(({ agent }) => selected.has(agent.slug)));
   const someSelected = $derived(selected.size > 0 && !allVisibleSelected);
   function toggleAll() {
     if (allVisibleSelected) selected = new Set();
-    else selected = new Set(visible.map((a) => a.slug));
+    else selected = new Set(visible.map(({ agent }) => agent.slug));
   }
   // Prune selection to agents that still exist after a reconcile/reload.
   $effect(() => {
-    const live = new Set(corpus.agents.map((a) => a.slug));
+    const live = new Set([
+      ...corpus.agents.map((agent) => agent.slug),
+      ...sourcePackages.flatMap(({ pkg, source }) =>
+        source.kind.kind !== "builtIn" && pkg.agent ? [pkg.agent.slug] : []
+      ),
+    ]);
     if ([...selected].some((s) => !live.has(s))) {
       selected = new Set([...selected].filter((s) => live.has(s)));
     }
@@ -409,7 +417,7 @@
           {#if catMenuOpen}
             <div class="cat-menu" role="menu" bind:this={catMenu}>
               <button class="cat-opt" role="menuitem" class:on={!ui.agentsCategory} onclick={() => pickCategory(null)}>
-                <LayersIcon size={14} /><span class="truncate">{i18n.t("agents.allDivisions")}</span><span class="cat-c">{corpus.agents.length}</span>
+                <LayersIcon size={14} /><span class="truncate">{i18n.t("agents.allDivisions")}</span><span class="cat-c">{corpus.agents.length + sourcePackages.filter(({ pkg, source }) => source.kind.kind !== "builtIn" && pkg.agent).length}</span>
               </button>
               {#each corpus.tiles as c (c.slug)}
                 {@const Icon = resolveCategoryIcon(c.icon)}
@@ -526,14 +534,17 @@
         </EmptyState>
       {:else}
         <ul class="rows">
-          {#each visible as a (a.slug)}
+          {#each visible as view (view.key)}
+            {@const a = view.agent}
             {@const rows = installsBySlug.get(a.slug) ?? []}
-            {@const isSel = panelAgent?.slug === a.slug}
+            {@const isSel = view.pkg
+              ? !!selectedLibraryPackage && sameAgent(selectedLibraryPackage.reference, view.pkg.reference)
+              : ui.agentsSelected === a.slug}
             <li class="row" class:active={isSel} class:picked={selectMode && selected.has(a.slug)}>
               {#if selectMode}
                 <input type="checkbox" class="check" checked={selected.has(a.slug)} onchange={() => toggleRow(a.slug)} aria-label={`${i18n.t("common.select")} ${a.name}`} />
               {/if}
-              <button class="row-main" onclick={() => openAgent(a)} aria-current={isSel ? "true" : undefined}>
+              <button class="row-main" onclick={() => view.pkg ? openLibraryAgent(view.pkg) : openAgent(a)} aria-current={isSel ? "true" : undefined}>
                 <span class="row-emoji" aria-hidden="true">{a.emoji ?? "🧩"}</span>
                 <span class="row-text">
                   <span class="row-name truncate">{a.name}</span>

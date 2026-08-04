@@ -1,4 +1,5 @@
 import type {
+  Agent,
   AgentApprovalAction,
   AgentPackageResult,
   AgentReference,
@@ -13,6 +14,7 @@ export type AgentDetailTab = "overview" | "source" | "security";
 const AGENT_DETAIL_TABS: AgentDetailTab[] = ["overview", "source", "security"];
 
 export type AgentPackageView = { pkg: AgentPackageResult; source: AgentSource };
+export type AgentBrowseView = { key: string; agent: Agent; pkg: AgentPackageResult | null };
 export type AgentFolderNode = {
   path: string;
   label: string;
@@ -21,6 +23,31 @@ export type AgentFolderNode = {
 
 export function sameAgent(left: AgentReference, right: AgentReference): boolean {
   return left.sourceId === right.sourceId && left.relativePath === right.relativePath;
+}
+
+export function buildAgentBrowseViews(
+  corpusAgents: Agent[],
+  packages: AgentPackageView[],
+  category: string | null,
+  query: string,
+): AgentBrowseView[] {
+  const needle = query.trim().toLowerCase();
+  const matches = (agent: Agent) =>
+    (!category || agent.category === category)
+    && (!needle || [agent.name, agent.description, agent.vibe ?? ""]
+      .some((value) => value.toLowerCase().includes(needle)));
+  return [
+    ...corpusAgents.filter(matches).map((agent) => ({
+      key: `corpus:${agent.slug}`,
+      agent,
+      pkg: null,
+    })),
+    ...packages.flatMap(({ pkg, source }) =>
+      source.kind.kind !== "builtIn" && pkg.agent && matches(pkg.agent)
+        ? [{ key: `${pkg.reference.sourceId}:${pkg.reference.relativePath}`, agent: pkg.agent, pkg }]
+        : []
+    ),
+  ].sort((left, right) => left.agent.name.localeCompare(right.agent.name) || left.key.localeCompare(right.key));
 }
 
 export function findAgentPackage(

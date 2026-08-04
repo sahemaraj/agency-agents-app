@@ -8,6 +8,7 @@ import {
   agentInstallKey,
   agentStateBuckets,
   agentUpdateDecision,
+  buildAgentBrowseViews,
   buildAgentFolderTree,
   canApplyAgentPlan,
   installStateMessageKey,
@@ -43,6 +44,25 @@ describe("Agent library model", () => {
     const second = packageView("two", "b/reviewer.md", "Reviewer");
     expect(agentConflicts(first.pkg, [first, second])).toEqual([second]);
     expect(agentPackageLabel(first, [first, second])).toBe("Reviewer · one");
+  });
+
+  it("includes validated published Agents in desktop search", () => {
+    const published = {
+      ...packageView("published:agents", "project-controls/primavera.md", "Primavera P6 EPPM v25 Advisor"),
+      source: {
+        id: "published:agents",
+        label: "Published Agents",
+        enabled: true,
+        kind: { kind: "published" as const, root: "/published" },
+      },
+    };
+    expect(buildAgentBrowseViews([], [published], null, "primavera")).toEqual([
+      {
+        key: "published:agents:project-controls/primavera.md",
+        agent: published.pkg.agent,
+        pkg: published.pkg,
+      },
+    ]);
   });
 
   it("restores an exact selection from refreshed package objects", () => {
