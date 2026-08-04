@@ -510,6 +510,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_prompt_content_is_rendered_as_data_without_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("must-not-exist");
+        let source = format!(
+            "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\n$(touch {})\n",
+            marker.display()
+        );
+        let rendered = render(&agent(), &source, "claudeCode").unwrap();
+        assert!(rendered.contains(&marker.to_string_lossy().to_string()));
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn source_helpers_match_shell_semantics() {
         let source = "---\nname: \"Quoted Name\"\ndescription: has: colon\ntools: Read, Write\n---\nBody\n---\nTail\n\n";
         assert_eq!(source_field(source, "name"), "\"Quoted Name\"");

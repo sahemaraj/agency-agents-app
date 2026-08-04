@@ -1,5 +1,43 @@
 # Active Context — Agency Agents
 
+## ✅ Agents–Skills Feature Parity [COMPLETE] (2026-08-04)
+
+**State**: COMPLETE on local `main`, integrating feature commit `e655d28`.
+Stage 1 was approved, applied to the sandbox, and documented in
+`tasks/2026-08/260804_agent-foundation.md`. Stage 2 was approved, applied to the sandbox, and
+documented in `tasks/2026-08/260804_agent-lifecycle-parity.md`; no commit was created. Its evidence:
+434 Rust library tests passed + 2 ignored, 2 CLI tests passed, a copied real pre-feature ledger
+migrated without changing either installed destination hash, strict Clippy/format passed, and
+frontend check/13 tests/build passed. Stage 3 follows
+`docs/superpowers/plans/2026-08-04-agents-mcp.md`: compose Agent tools/resources into the existing MCP
+server, add separate default-denied Agent mutation policy, desktop approvals, and durable redacted
+audit.
+
+Stage 3 is approved and documented in `tasks/2026-08/260804_agents-mcp.md`. The existing MCP server now
+composes the exact 49 Skills and 49 Agent tools, exposes Agent catalog/source/render resources and
+subscriptions on stdio and authenticated loopback HTTP, keeps Agent permissions separately
+default-denied, and routes overwrite/destructive Agent actions through typed desktop approvals with
+plan-revision checks and durable redacted audit rows. Verification: strict format and Clippy passed;
+445/445 Rust library tests passed (2 ignored) plus 2/2 CLI tests; frontend check had 0 errors and 0
+warnings, 13/13 tests passed, and production build passed; `git diff --check` passed. Live stdio and
+HTTP smoke tests each reported 49 Skills + 49 Agents tools, readable Agent resources, successful
+Agent reads, default-denied Agent mutation, and HTTP 401 without bearer auth. Stage 4 follows
+`docs/superpowers/plans/2026-08-04-agent-parity-integration.md`. Stage 4 now completes the desktop library,
+source/draft/organizer/approval flows, Activity coverage, localization/accessibility contracts, recovery and
+security rehearsals, and exact parity audit. Final verification: 453/453 Rust library tests passed with 2
+intentional external-fixture ignores, 2/2 CLI tests passed, strict Rust format/Clippy passed, frontend check
+reported 0 errors and 0 warnings, 19/19 tests passed, production build passed, and `git diff --check` passed.
+Live stdio initialization exposed exactly 49 Skills + 49 Agent tools with no duplicates. Host Phase C passed
+6/6 including the macOS release build. The optional renderer clone and Ubuntu VM were absent; the online
+Windows 11 VM was not a configured runner because it had no shared repo, Node, Rust, or Build Tools, so no
+Windows pass is claimed. User approved the final diff; APPLY and DOCS are complete. The integrated
+record is `tasks/2026-08/260804_agents-skills-feature-parity.md`. Post-approval verification repeated
+the full Rust and frontend suites successfully, and live stdio exposed 98 unique tools: exactly 49
+Skills + 49 Agents. Local integration with Expert Release 1 passed 468 Rust library tests with 2
+intentional ignores, 2 CLI tests, 19 frontend tests, production build, strict Clippy/format/diff,
+and a live inventory of 127 unique tools: 49 Skills + 49 Agents + 29 Experts. No remote change was
+authorized.
+
 ## ✅ Expert MCP Lifecycle — Release 1 (2026-08-03)
 
 The `feat/experts-hub` branch now provides the human-approved Expert lifecycle for Claude Code and

@@ -67,17 +67,6 @@ pub struct Settings {
     /// Clamped to `[1, 365]` on every load and save.
     pub catalog_stale_banner_days: u32,
 
-    /// Legacy icon-fetching mode inherited from the source app. Retained in
-    /// the settings schema for compatibility until the network settings model
-    /// is pruned.
-    pub cask_icon_mode: CaskIconMode,
-
-    /// Trending cache TTL in minutes. Default 60 (matches the existing
-    /// `TRENDING_TTL` in `trending/cache.rs`). Clamped to `[5, 1440]`
-    /// on every load and save — five minutes minimum to be a polite
-    /// client, 24 hours maximum because anything older would be stale.
-    pub trending_ttl_minutes: u32,
-
     /// Phase 12c — when true, PackageDetail probes `api.github.com` for
     /// repo stats whenever the package's homepage is a GitHub URL.
     /// Default **false** (off) so the v0.1.x posture of "no GitHub
@@ -115,24 +104,6 @@ pub struct Settings {
     #[serde(default)]
     pub skipped_update_versions: Vec<String>,
 
-    /// Legacy enhanced-trending toggle inherited from the source app.
-    /// Retained for settings-file compatibility; Agency Agents should not
-    /// wire a runtime feature to this without a fresh endpoint audit.
-    #[serde(default)]
-    pub enhanced_trending_enabled: bool,
-
-    /// Legacy vulnerability-scanning toggle inherited from the source app.
-    /// Retained for settings-file compatibility; Agency Agents does not shell
-    /// out to a vulnerability scanner.
-    #[serde(default)]
-    pub vulnerability_scanning_enabled: bool,
-
-    /// Legacy live-enrichment toggle inherited from the source app. Retained
-    /// for settings-file compatibility; Agency Agents currently reads metadata
-    /// from the active AA catalog.
-    #[serde(default)]
-    pub live_enrichment_enabled: bool,
-
     /// Per-tool custom install base path (tool id → absolute base directory).
     /// When set for a tool, user-scope installs + detection resolve against
     /// this base instead of the OS home — e.g. pointing Claude Code at a WSL
@@ -157,6 +128,21 @@ pub struct Settings {
     #[serde(default)]
     pub mcp_destructive_access: bool,
 
+    /// Allow MCP clients to add, refresh, draft, or organize Agents.
+    /// Separate from Skills and off by default.
+    #[serde(default)]
+    pub mcp_agent_source_access: bool,
+
+    /// Allow MCP clients to install, update, or enable managed Agents.
+    /// Separate from Skills and off by default.
+    #[serde(default)]
+    pub mcp_agent_install_access: bool,
+
+    /// Allow MCP clients to request destructive Agent lifecycle changes.
+    /// Separate from Skills and off by default.
+    #[serde(default)]
+    pub mcp_agent_destructive_access: bool,
+
     /// Exact canonical project roots MCP mutations may target. User-scope
     /// mutations do not consult this list.
     #[serde(default)]
@@ -169,11 +155,14 @@ pub struct Settings {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct McpClientPolicy {
     pub source_access: bool,
     pub install_access: bool,
     pub destructive_access: bool,
+    pub agent_source_access: bool,
+    pub agent_install_access: bool,
+    pub agent_destructive_access: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,14 +170,9 @@ pub struct McpClientPolicy {
 pub struct GeneralSettingsPatch {
     pub paranoid_mode: Option<bool>,
     pub catalog_stale_banner_days: Option<u32>,
-    pub cask_icon_mode: Option<CaskIconMode>,
-    pub trending_ttl_minutes: Option<u32>,
     pub github_enabled: Option<bool>,
     pub ai_features_enabled: Option<bool>,
     pub update_auto_check: Option<bool>,
-    pub enhanced_trending_enabled: Option<bool>,
-    pub vulnerability_scanning_enabled: Option<bool>,
-    pub live_enrichment_enabled: Option<bool>,
     pub tool_paths: Option<HashMap<String, String>>,
 }
 
@@ -203,14 +187,9 @@ impl GeneralSettingsPatch {
         }
         apply!(paranoid_mode);
         apply!(catalog_stale_banner_days);
-        apply!(cask_icon_mode);
-        apply!(trending_ttl_minutes);
         apply!(github_enabled);
         apply!(ai_features_enabled);
         apply!(update_auto_check);
-        apply!(enhanced_trending_enabled);
-        apply!(vulnerability_scanning_enabled);
-        apply!(live_enrichment_enabled);
         apply!(tool_paths);
     }
 }
@@ -227,8 +206,6 @@ impl Default for Settings {
         Self {
             paranoid_mode: false,
             catalog_stale_banner_days: 14,
-            cask_icon_mode: CaskIconMode::All,
-            trending_ttl_minutes: 60,
             // Off by default per Phase 12c plan: anonymous GitHub probes
             // are opt-in so first-launch posture stays "zero outbound
             // beyond what the user has already consented to".
@@ -244,18 +221,15 @@ impl Default for Settings {
             // Empty by default — populated as the user dismisses
             // individual versions via the title-bar indicator's `×`.
             skipped_update_versions: Vec::new(),
-            // Off by default; retained legacy field.
-            enhanced_trending_enabled: false,
-            // Off by default; retained legacy field.
-            vulnerability_scanning_enabled: false,
-            // Off by default; retained legacy field.
-            live_enrichment_enabled: false,
             // Empty by default — user opts a tool into a custom base path
             // (e.g. a WSL home) from the Tools panel.
             tool_paths: HashMap::new(),
             mcp_source_access: false,
             mcp_install_access: false,
             mcp_destructive_access: false,
+            mcp_agent_source_access: false,
+            mcp_agent_install_access: false,
+            mcp_agent_destructive_access: false,
             mcp_project_allowlist: Vec::new(),
             mcp_client_policies: HashMap::new(),
         }
@@ -267,10 +241,6 @@ impl Settings {
     pub const CATALOG_STALE_DAYS_MIN: u32 = 1;
     /// Inclusive upper bound for `catalog_stale_banner_days`.
     pub const CATALOG_STALE_DAYS_MAX: u32 = 365;
-    /// Inclusive lower bound for `trending_ttl_minutes`.
-    pub const TRENDING_TTL_MIN: u32 = 5;
-    /// Inclusive upper bound for `trending_ttl_minutes`.
-    pub const TRENDING_TTL_MAX: u32 = 1440;
     /// Phase 15 — maximum entries kept in [`Self::skipped_update_versions`].
     /// Push beyond this evicts the oldest entry (FIFO) so the list
     /// can't grow without bound across decades of releases.
@@ -284,9 +254,6 @@ impl Settings {
         self.catalog_stale_banner_days = self
             .catalog_stale_banner_days
             .clamp(Self::CATALOG_STALE_DAYS_MIN, Self::CATALOG_STALE_DAYS_MAX);
-        self.trending_ttl_minutes = self
-            .trending_ttl_minutes
-            .clamp(Self::TRENDING_TTL_MIN, Self::TRENDING_TTL_MAX);
         self.mcp_client_policies
             .retain(|client, _| matches!(client.as_str(), "claude" | "codex"));
         // Enforce the cap on every load/save in addition to the push
@@ -384,17 +351,6 @@ pub(crate) fn canonical_mcp_project_path(path: &str) -> Result<PathBuf, AppError
         .ok_or_else(|| AppError::InvalidArgument {
             message: "MCP project path has no resolvable absolute ancestor".into(),
         })
-}
-
-/// Cask icon fetching mode. `All` preserves the current behaviour from
-/// Phase 8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum CaskIconMode {
-    Off,
-    InstalledOnly,
-    #[default]
-    All,
 }
 
 /// Three-state container for the in-memory settings cache.
@@ -666,6 +622,30 @@ pub(crate) async fn mcp_policy_set_inner(
     Ok(clamped)
 }
 
+pub(crate) async fn mcp_agent_policy_set_inner(
+    state: &AppState,
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+) -> Result<Settings, AppError> {
+    let mut cache = state.settings.write().await;
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            })
+        }
+    };
+    latest.mcp_agent_source_access = source_access;
+    latest.mcp_agent_install_access = install_access;
+    latest.mcp_agent_destructive_access = destructive_access;
+    let saved = persist(&state.app_data_dir, latest).await?;
+    *cache = SettingsLoadState::Loaded(saved.clone());
+    Ok(saved)
+}
+
 /// Read the current settings.
 ///
 /// Always returns the *currently-loaded* state — does not re-read from
@@ -717,6 +697,16 @@ pub async fn mcp_policy_set(
 }
 
 #[tauri::command]
+pub async fn mcp_agent_policy_set(
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+    state: State<'_, AppState>,
+) -> Result<Settings, AppError> {
+    mcp_agent_policy_set_inner(&state, source_access, install_access, destructive_access).await
+}
+
+#[tauri::command]
 pub async fn mcp_client_policy_set(
     client: String,
     source_access: bool,
@@ -739,14 +729,42 @@ pub async fn mcp_client_policy_set(
             })
         }
     };
-    latest.mcp_client_policies.insert(
-        client,
-        McpClientPolicy {
-            source_access,
-            install_access,
-            destructive_access,
-        },
-    );
+    let policy = latest.mcp_client_policies.entry(client).or_default();
+    policy.source_access = source_access;
+    policy.install_access = install_access;
+    policy.destructive_access = destructive_access;
+    let saved = persist(&state.app_data_dir, latest).await?;
+    *cache = SettingsLoadState::Loaded(saved.clone());
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn mcp_agent_client_policy_set(
+    client: String,
+    source_access: bool,
+    install_access: bool,
+    destructive_access: bool,
+    state: State<'_, AppState>,
+) -> Result<Settings, AppError> {
+    if !matches!(client.as_str(), "claude" | "codex") {
+        return Err(AppError::InvalidArgument {
+            message: "MCP client must be claude or codex".into(),
+        });
+    }
+    let mut cache = state.settings.write().await;
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            })
+        }
+    };
+    let policy = latest.mcp_client_policies.entry(client).or_default();
+    policy.agent_source_access = source_access;
+    policy.agent_install_access = install_access;
+    policy.agent_destructive_access = destructive_access;
     let saved = persist(&state.app_data_dir, latest).await?;
     *cache = SettingsLoadState::Loaded(saved.clone());
     Ok(saved)
@@ -837,19 +855,17 @@ mod tests {
         let s = Settings {
             paranoid_mode: true,
             catalog_stale_banner_days: 21,
-            cask_icon_mode: CaskIconMode::InstalledOnly,
-            trending_ttl_minutes: 120,
             github_enabled: true,
             ai_features_enabled: false,
             update_auto_check: true,
             skipped_update_versions: vec!["0.3.0".into(), "0.3.1".into()],
-            enhanced_trending_enabled: true,
-            vulnerability_scanning_enabled: true,
-            live_enrichment_enabled: true,
             tool_paths: HashMap::from([("claudeCode".to_string(), "/wsl/home/me".to_string())]),
             mcp_source_access: true,
             mcp_install_access: true,
             mcp_destructive_access: true,
+            mcp_agent_source_access: true,
+            mcp_agent_install_access: true,
+            mcp_agent_destructive_access: true,
             mcp_project_allowlist: vec!["/projects/allowed".into()],
             mcp_client_policies: HashMap::new(),
         };
@@ -903,19 +919,17 @@ mod tests {
         let s = Settings {
             paranoid_mode: false,
             catalog_stale_banner_days: 9999, // way above 365
-            cask_icon_mode: CaskIconMode::All,
-            trending_ttl_minutes: 1, // below the 5-minute floor
             github_enabled: false,
             ai_features_enabled: true,
             update_auto_check: false,
             skipped_update_versions: Vec::new(),
-            enhanced_trending_enabled: false,
-            vulnerability_scanning_enabled: false,
-            live_enrichment_enabled: false,
             tool_paths: HashMap::new(),
             mcp_source_access: false,
             mcp_install_access: false,
             mcp_destructive_access: false,
+            mcp_agent_source_access: false,
+            mcp_agent_install_access: false,
+            mcp_agent_destructive_access: false,
             mcp_project_allowlist: Vec::new(),
             mcp_client_policies: HashMap::new(),
         };
@@ -924,7 +938,6 @@ mod tests {
             written.catalog_stale_banner_days,
             Settings::CATALOG_STALE_DAYS_MAX
         );
-        assert_eq!(written.trending_ttl_minutes, Settings::TRENDING_TTL_MIN);
     }
 
     /// Out-of-range numerics get clamped on read too (defense against
@@ -949,46 +962,9 @@ mod tests {
                     s.catalog_stale_banner_days,
                     Settings::CATALOG_STALE_DAYS_MAX
                 );
-                assert_eq!(s.trending_ttl_minutes, Settings::TRENDING_TTL_MIN);
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
-    }
-
-    /// Unknown enum variant → serde rejects the parse → fail closed
-    /// (intentional; we don't want a typo'd field to silently pick a
-    /// default the user didn't write).
-    ///
-    /// The plan asks for "default substituted", but serde's parser is
-    /// all-or-nothing on a single field — we can't selectively recover
-    /// one unknown variant while keeping the rest. The fail-closed
-    /// behaviour is the strictly safer interpretation: the user's
-    /// "deny network until repaired" gate kicks in, the UI surfaces
-    /// the parse error, and the user hits Reset to defaults. The doc
-    /// comment on `SettingsLoadState::Corrupt` explains this.
-    #[tokio::test]
-    async fn unknown_enum_variant_is_corrupt() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = settings_path(tmp.path());
-        let raw = br#"{
-            "paranoidMode": false,
-            "catalogStaleBannerDays": 14,
-            "caskIconMode": "every-blue-moon",
-            "trendingTtlMinutes": 60
-        }"#;
-        tokio::fs::write(&path, raw).await.unwrap();
-
-        let state = load_at_startup(tmp.path());
-        match &state {
-            SettingsLoadState::Corrupt { message } => {
-                assert!(
-                    message.contains("parse"),
-                    "expected parse failure in corrupt message, got {message}"
-                );
-            }
-            other => panic!("expected Corrupt, got {other:?}"),
-        }
-        assert!(state.effective_settings().is_none(), "must fail closed");
     }
 
     /// Missing optional fields take their defaults (forward compat).
@@ -1005,8 +981,6 @@ mod tests {
             SettingsLoadState::Loaded(s) => {
                 assert!(s.paranoid_mode);
                 assert_eq!(s.catalog_stale_banner_days, 14);
-                assert_eq!(s.cask_icon_mode, CaskIconMode::All);
-                assert_eq!(s.trending_ttl_minutes, 60);
                 // `github_enabled` was added in 12c — must default to false
                 // for forward compat with pre-12c settings files.
                 assert!(!s.github_enabled);
@@ -1026,12 +1000,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn legacy_settings_load_and_are_pruned_on_rewrite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = settings_path(tmp.path());
+        tokio::fs::write(
+            &path,
+            br#"{
+                "paranoidMode": true,
+                "catalogStaleBannerDays": 30,
+                "caskIconMode": "installed-only",
+                "trendingTtlMinutes": 120,
+                "enhancedTrendingEnabled": true,
+                "vulnerabilityScanningEnabled": true,
+                "liveEnrichmentEnabled": true
+            }"#,
+        )
+        .await
+        .expect("write legacy settings");
+
+        let loaded = match load_async(tmp.path()).await {
+            SettingsLoadState::Loaded(settings) => settings,
+            other => panic!("expected Loaded, got {other:?}"),
+        };
+        assert!(loaded.paranoid_mode);
+        assert_eq!(loaded.catalog_stale_banner_days, 30);
+
+        persist(tmp.path(), loaded).await.expect("rewrite settings");
+        let rewritten = tokio::fs::read_to_string(path)
+            .await
+            .expect("read rewritten settings");
+        for legacy_key in [
+            "caskIconMode",
+            "trendingTtlMinutes",
+            "enhancedTrendingEnabled",
+            "vulnerabilityScanningEnabled",
+            "liveEnrichmentEnabled",
+        ] {
+            assert!(
+                !rewritten.contains(legacy_key),
+                "{legacy_key} was resurrected"
+            );
+        }
+    }
+
     #[test]
     fn mcp_mutation_permissions_default_off_and_allowlist_is_bounded_and_deduped() {
         let mut settings = Settings::default();
         assert!(!settings.mcp_source_access);
         assert!(!settings.mcp_install_access);
         assert!(!settings.mcp_destructive_access);
+        assert!(!settings.mcp_agent_source_access);
+        assert!(!settings.mcp_agent_install_access);
+        assert!(!settings.mcp_agent_destructive_access);
         assert!(settings.mcp_project_allowlist.is_empty());
 
         let project = tempfile::tempdir().expect("project");
@@ -1055,6 +1076,31 @@ mod tests {
             settings.mcp_project_allowlist[63],
             format!("{canonical}/project-63")
         );
+    }
+
+    #[test]
+    fn old_skill_mcp_policy_does_not_enable_agent_mutations() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "mcpSourceAccess": true,
+            "mcpInstallAccess": true,
+            "mcpDestructiveAccess": true,
+            "mcpClientPolicies": {
+                "claude": {
+                    "sourceAccess": true,
+                    "installAccess": true,
+                    "destructiveAccess": true
+                }
+            }
+        }))
+        .expect("old settings remain readable");
+
+        assert!(!settings.mcp_agent_source_access);
+        assert!(!settings.mcp_agent_install_access);
+        assert!(!settings.mcp_agent_destructive_access);
+        let claude = settings.mcp_client_policies.get("claude").expect("policy");
+        assert!(!claude.agent_source_access);
+        assert!(!claude.agent_install_access);
+        assert!(!claude.agent_destructive_access);
     }
 
     // ---------- Phase 15 — skip-list cap + helpers ----------
@@ -1218,149 +1264,6 @@ mod tests {
         let reloaded = load_async(tmp.path()).await;
         match reloaded {
             SettingsLoadState::Loaded(loaded) => assert!(!loaded.ai_features_enabled),
-            other => panic!("expected Loaded, got {other:?}"),
-        }
-    }
-
-    /// Legacy `enhanced_trending_enabled` defaults to false. This is retained
-    /// so old settings files do not accidentally enable unused network paths.
-    #[test]
-    fn enhanced_trending_defaults_to_false() {
-        let s = Settings::default();
-        assert!(
-            !s.enhanced_trending_enabled,
-            "enhanced trending must be OFF by default — endpoint is opt-in"
-        );
-    }
-
-    /// v0.4.0 — older `settings.json` files written before the field
-    /// existed must read cleanly with the field absent → false. Locks
-    /// the forward-compat behaviour so a v0.3.x user upgrading to
-    /// v0.4.0 gets the opt-in posture, not a silent enable.
-    #[tokio::test]
-    async fn missing_enhanced_trending_field_defaults_to_false() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = settings_path(tmp.path());
-        // Write a v0.3.x-shape settings.json with the new field absent.
-        tokio::fs::write(
-            &path,
-            br#"{"paranoidMode": false, "catalogStaleBannerDays": 14}"#,
-        )
-        .await
-        .unwrap();
-
-        let state = load_at_startup(tmp.path());
-        match state {
-            SettingsLoadState::Loaded(s) => {
-                assert!(
-                    !s.enhanced_trending_enabled,
-                    "missing field must default to false (opt-in posture)"
-                );
-            }
-            other => panic!("expected Loaded, got {other:?}"),
-        }
-    }
-
-    /// v0.4.0 — `enhanced_trending_enabled` round-trips on the wire as
-    /// camelCase `enhancedTrendingEnabled`. Pin the wire shape so a
-    /// future serde rename doesn't silently break the frontend store.
-    #[tokio::test]
-    async fn enhanced_trending_round_trips_with_camel_case_key() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let s = Settings {
-            enhanced_trending_enabled: true,
-            ..Settings::default()
-        };
-        persist(tmp.path(), s.clone()).await.expect("persist");
-
-        let raw = tokio::fs::read_to_string(settings_path(tmp.path()))
-            .await
-            .expect("read raw");
-        assert!(
-            raw.contains("\"enhancedTrendingEnabled\""),
-            "expected camelCase key in raw JSON, got: {raw}"
-        );
-        assert!(
-            !raw.contains("\"enhanced_trending_enabled\""),
-            "must not emit snake_case key"
-        );
-
-        let reloaded = load_async(tmp.path()).await;
-        match reloaded {
-            SettingsLoadState::Loaded(loaded) => assert!(loaded.enhanced_trending_enabled),
-            other => panic!("expected Loaded, got {other:?}"),
-        }
-    }
-
-    /// Legacy `vulnerability_scanning_enabled` defaults to false. Load-bearing:
-    /// no scanner subprocess or enrichment traffic unless the user explicitly
-    /// opts in to a future reworked feature.
-    #[test]
-    fn vulnerability_scanning_defaults_to_false() {
-        let s = Settings::default();
-        assert!(
-            !s.vulnerability_scanning_enabled,
-            "vulnerability scanning must be OFF by default — feature is opt-in"
-        );
-    }
-
-    /// v0.5.0 — older `settings.json` files written before the field
-    /// existed must read cleanly with the field absent → false. Locks the
-    /// forward-compat behaviour so a v0.4.x user upgrading to v0.5.0 gets
-    /// the opt-in posture, not a silent enable.
-    #[tokio::test]
-    async fn missing_vulnerability_scanning_field_defaults_to_false() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = settings_path(tmp.path());
-        // Write a v0.4.x-shape settings.json with the new field absent.
-        tokio::fs::write(
-            &path,
-            br#"{"paranoidMode": false, "catalogStaleBannerDays": 14, "enhancedTrendingEnabled": true}"#,
-        )
-        .await
-        .unwrap();
-
-        let state = load_at_startup(tmp.path());
-        match state {
-            SettingsLoadState::Loaded(s) => {
-                assert!(
-                    !s.vulnerability_scanning_enabled,
-                    "missing field must default to false (opt-in posture)"
-                );
-                // Sanity: the field present in the source file still loaded.
-                assert!(s.enhanced_trending_enabled);
-            }
-            other => panic!("expected Loaded, got {other:?}"),
-        }
-    }
-
-    /// v0.5.0 — `vulnerability_scanning_enabled` round-trips on the wire
-    /// as camelCase `vulnerabilityScanningEnabled`. Pin the wire shape so
-    /// a future serde rename doesn't silently break the frontend store.
-    #[tokio::test]
-    async fn vulnerability_scanning_round_trips_with_camel_case_key() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let s = Settings {
-            vulnerability_scanning_enabled: true,
-            ..Settings::default()
-        };
-        persist(tmp.path(), s.clone()).await.expect("persist");
-
-        let raw = tokio::fs::read_to_string(settings_path(tmp.path()))
-            .await
-            .expect("read raw");
-        assert!(
-            raw.contains("\"vulnerabilityScanningEnabled\""),
-            "expected camelCase key in raw JSON, got: {raw}"
-        );
-        assert!(
-            !raw.contains("\"vulnerability_scanning_enabled\""),
-            "must not emit snake_case key"
-        );
-
-        let reloaded = load_async(tmp.path()).await;
-        match reloaded {
-            SettingsLoadState::Loaded(loaded) => assert!(loaded.vulnerability_scanning_enabled),
             other => panic!("expected Loaded, got {other:?}"),
         }
     }

@@ -4,10 +4,9 @@
 # Tauri 2 builds all three Linux bundle targets via `npm run tauri build`
 # (which runs the SvelteKit frontend build first via beforeBuildCommand).
 #
-# Signing: Linux desktop has no code-signing requirement for v0.1.0 — AppImage
-# ships unsigned (the common convention); .deb/.rpm GPG signing is a future
-# optional step. Updater artifacts are disabled here (v0.1.0 ships with
-# SKIP_UPDATER; auto-update is deferred), so no signing key is needed.
+# Linux bundles ship unsigned (the common AppImage convention); .deb/.rpm GPG
+# signing remains optional. Updater artifacts are produced by the signed macOS
+# release flow, so these platform builds disable them.
 #
 # Output: .deb / .rpm / .AppImage uploaded to the workflow run. Cutting the
 # GitHub Release + attaching artifacts remains a deliberate human step.
@@ -45,6 +44,8 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -63,11 +64,29 @@ jobs:
       - name: Check frontend
         run: npm run check
 
+      - name: Test frontend
+        run: npm run test:frontend
+
       - name: Build frontend
         run: npm run build
 
+      - name: Audit npm dependencies
+        run: npm audit
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: src-tauri
 
   build:
     name: Build Linux bundles (.deb / .rpm / .AppImage)
@@ -119,7 +138,7 @@ jobs:
         run: npm ci
 
       # Builds the frontend, compiles the Rust binary, and bundles
-      # .deb / .rpm / .AppImage. Updater artifacts disabled (v0.1.0).
+      # .deb / .rpm / .AppImage. Updater artifacts belong to the macOS release.
       - name: Build Tauri app
         run: npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'
 

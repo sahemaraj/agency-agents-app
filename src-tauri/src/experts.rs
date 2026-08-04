@@ -1307,6 +1307,7 @@ pub(crate) async fn mcp_request(
     Ok(request)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn mcp_request_creation(
     state: &AppState,
     client_request_id: String,
@@ -1783,7 +1784,7 @@ async fn plan(
         return Err(invalid("unsupported client"));
     }
     let client_detected = crate::install::tool_detected(state, &client).await?;
-    let installed = crate::install::load_ledger(app).await?;
+    let installed = crate::install::load_ledger(app, state).await?;
     let corpus = crate::corpus::ensure_corpus(app, state).await?;
     let tool_home = crate::install::tool_home(state, &client).await?;
     let project_root = Path::new(&project_path);
@@ -1964,7 +1965,7 @@ pub async fn expert_activate(
     let mut installed_agents = Vec::new();
     for agent in &plan.agents {
         if agent.status == "missing" {
-            match crate::install::do_install(
+            match crate::install::do_install_legacy(
                 &app,
                 &state,
                 agent.slug.clone(),
@@ -1976,7 +1977,7 @@ pub async fn expert_activate(
                 Ok(_) => installed_agents.push(agent.slug.clone()),
                 Err(error) => {
                     for slug in installed_agents.iter().rev() {
-                        let _ = crate::install::do_uninstall(
+                        let _ = crate::install::do_uninstall_legacy(
                             &app,
                             &state,
                             slug.clone(),
@@ -2026,7 +2027,7 @@ pub async fn expert_activate(
                         .await;
                     }
                     for slug in installed_agents.iter().rev() {
-                        let _ = crate::install::do_uninstall(
+                        let _ = crate::install::do_uninstall_legacy(
                             &app,
                             &state,
                             slug.clone(),
@@ -2070,7 +2071,7 @@ pub async fn expert_activate(
                 .await;
             }
             for slug in installed_agents.iter().rev() {
-                let _ = crate::install::do_uninstall(
+                let _ = crate::install::do_uninstall_legacy(
                     &app,
                     &state,
                     slug.clone(),

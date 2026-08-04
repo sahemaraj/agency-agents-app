@@ -57,7 +57,7 @@
     for (const a of corpus.agents) bySlug.set(a.slug, a.category);
     const seen = new Set<string>(); // distinct agent slugs with any live install
     for (const r of install.installed) {
-      if (r.state !== "removed") seen.add(r.slug);
+      if (r.state !== "missing") seen.add(r.slug);
     }
     const m = new Map<string, number>();
     for (const slug of seen) {

@@ -43,7 +43,9 @@
     if (state === "outdated") return i18n.t("state.outdated");
     if (state === "modified") return i18n.t("state.modified");
     if (state === "foreign") return i18n.t("state.foreign");
-    return i18n.t("state.removed");
+    if (state === "missing") return i18n.t("state.missing");
+    if (state === "disabled") return i18n.t("state.disabled");
+    return i18n.t("state.sourceUnavailable");
   }
   function pillTitle(tool: string, project: string | null, state: InstallState, diffable: boolean): string {
     const target = `${tool}${project ? " · " + basename(project) : ""} · ${stateLabel(state)}`;
@@ -64,7 +66,7 @@
         onclick={() => diffable && onDiff({ slug: r.slug, tool: r.tool, projectPath: r.projectPath, name: agent.name })}
       >
         <span class="pdot" data-tone={tone(r.state)}></span>
-        <span class="plabel">{install.toolLabel(r.tool)}{#if r.projectPath}<span class="pproj">{basename(r.projectPath)}</span>{/if}</span>
+        <span class="plabel">{install.toolLabel(r.tool)}{#if r.projectPath}<span class="pproj">{basename(r.projectPath)}</span>{/if}<span class="pstate">{stateLabel(r.state)}</span></span>
       </button>
     {/each}
   </div>
@@ -91,4 +93,5 @@
   .pdot[data-tone="danger"] { background: var(--color-danger); }
   .plabel { display: inline-flex; align-items: center; gap: 5px; font-weight: var(--fw-medium); color: var(--color-text-primary); }
   .pproj { font-size: var(--text-caption); color: var(--color-text-muted); }
+  .pstate { font-size: var(--text-caption); color: var(--color-text-muted); }
 </style>

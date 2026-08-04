@@ -292,6 +292,7 @@ async fn acquire_client_lock(client: McpClient) -> Result<File, AppError> {
     tokio::task::spawn_blocking(move || {
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -645,7 +646,7 @@ async fn connect_at(
     command: &str,
     args: &[String],
 ) -> Result<McpClientStatus, AppError> {
-    let (before, _) = inspect_at(client, &client_path, &command, &args).await?;
+    let (before, _) = inspect_at(client, client_path, command, args).await?;
     match before.state {
         McpClientState::Exact => return Ok(before),
         McpClientState::Conflict => {
@@ -656,18 +657,18 @@ async fn connect_at(
         McpClientState::Unavailable => return Err(invalid(before.detail)),
         McpClientState::Missing => {}
     }
-    let added = run(&client_path, &add_args(client, &command, &args))
+    let added = run(client_path, &add_args(client, command, args))
         .await
         .is_ok_and(|result| result.success);
     let verified = added
-        && inspect_at(client, &client_path, &command, &args)
+        && inspect_at(client, client_path, command, args)
             .await
             .is_ok_and(|(status, _)| status.state == McpClientState::Exact);
     if !verified {
-        let restored = restore_registration(client, &client_path, &command, &args, None).await;
+        let restored = restore_registration(client, client_path, command, args, None).await;
         return Err(mutation_failed(client, "connection", restored));
     }
-    inspect_at(client, &client_path, &command, &args)
+    inspect_at(client, client_path, command, args)
         .await
         .map(|(status, _)| status)
 }
@@ -688,7 +689,7 @@ async fn disconnect_at(
     command: &str,
     args: &[String],
 ) -> Result<McpClientStatus, AppError> {
-    let (before, previous) = inspect_at(client, &client_path, &command, &args).await?;
+    let (before, previous) = inspect_at(client, client_path, command, args).await?;
     match before.state {
         McpClientState::Missing => return Ok(before),
         McpClientState::Unavailable => return Err(invalid(before.detail)),
@@ -699,19 +700,19 @@ async fn disconnect_at(
         }
         McpClientState::Exact => {}
     }
-    let removed = run(&client_path, &remove_args(client))
+    let removed = run(client_path, &remove_args(client))
         .await
         .is_ok_and(|result| result.success);
     let verified = removed
-        && inspect_at(client, &client_path, &command, &args)
+        && inspect_at(client, client_path, command, args)
             .await
             .is_ok_and(|(status, _)| status.state == McpClientState::Missing);
     if !verified {
         let restored =
-            restore_registration(client, &client_path, &command, &args, previous.as_ref()).await;
+            restore_registration(client, client_path, command, args, previous.as_ref()).await;
         return Err(mutation_failed(client, "disconnection", restored));
     }
-    inspect_at(client, &client_path, &command, &args)
+    inspect_at(client, client_path, command, args)
         .await
         .map(|(status, _)| status)
 }
@@ -732,23 +733,22 @@ async fn repair_at(
     command: &str,
     args: &[String],
 ) -> Result<McpClientStatus, AppError> {
-    let (before, previous) = inspect_at(client, &client_path, &command, &args).await?;
+    let (before, previous) = inspect_at(client, client_path, command, args).await?;
     match before.state {
         McpClientState::Exact => return Ok(before),
         McpClientState::Missing => {
-            let added = run(&client_path, &add_args(client, &command, &args))
+            let added = run(client_path, &add_args(client, command, args))
                 .await
                 .is_ok_and(|result| result.success);
             let verified = added
-                && inspect_at(client, &client_path, &command, &args)
+                && inspect_at(client, client_path, command, args)
                     .await
                     .is_ok_and(|(status, _)| status.state == McpClientState::Exact);
             if !verified {
-                let restored =
-                    restore_registration(client, &client_path, &command, &args, None).await;
+                let restored = restore_registration(client, client_path, command, args, None).await;
                 return Err(mutation_failed(client, "repair", restored));
             }
-            return inspect_at(client, &client_path, &command, &args)
+            return inspect_at(client, client_path, command, args)
                 .await
                 .map(|(status, _)| status);
         }
@@ -764,23 +764,23 @@ async fn repair_at(
             "only user-scoped Claude registrations can be repaired safely",
         ));
     }
-    let removed = run(&client_path, &remove_args(client))
+    let removed = run(client_path, &remove_args(client))
         .await
         .is_ok_and(|result| result.success);
     let added = removed
-        && run(&client_path, &add_args(client, &command, &args))
+        && run(client_path, &add_args(client, command, args))
             .await
             .is_ok_and(|output| output.success);
     let verified = added
-        && inspect_at(client, &client_path, &command, &args)
+        && inspect_at(client, client_path, command, args)
             .await
             .is_ok_and(|(status, _)| status.state == McpClientState::Exact);
     if !verified {
         let restored =
-            restore_registration(client, &client_path, &command, &args, Some(&previous)).await;
+            restore_registration(client, client_path, command, args, Some(&previous)).await;
         return Err(mutation_failed(client, "repair", restored));
     }
-    inspect_at(client, &client_path, &command, &args)
+    inspect_at(client, client_path, command, args)
         .await
         .map(|(status, _)| status)
 }

@@ -1,7 +1,7 @@
 {
   "name": "agency-agents-app",
   "version": "0.3.0",
-  "description": "Agency Agents — a native macOS app store for AI agents. Browse, install, and track 251+ specialized agents across every AI coding tool.",
+  "description": "Agency Agents — a native app for browsing, installing, and tracking specialized AI agents across coding tools.",
   "type": "module",
   "author": "Michael Sitarzewski",
   "repository": "github:msitarzewski/agency-agents-app",
@@ -13,6 +13,8 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "test:frontend": "svelte-kit sync && vitest run",
+    "verify:frontend": "npm run check && npm run test:frontend && npm run build",
     "tauri": "tauri"
   },
   "license": "MIT",
@@ -28,9 +30,14 @@
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tauri-apps/cli": "^2",
     "@types/node": "^26.1.2",
+    "jsdom": "^26.1.0",
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
     "typescript": "~5.6.2",
-    "vite": "^6.0.3"
+    "vite": "^6.0.3",
+    "vitest": "^4.1.0"
+  },
+  "overrides": {
+    "cookie": "^0.7.0"
   }
 }

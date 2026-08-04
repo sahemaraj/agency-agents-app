@@ -53,6 +53,27 @@ Enable refuses any occupied destination before moving it back. Uninstall removes
 tracked row and exact directory, copying modified trees to `skill-backups/` first. Source removal
 only unregisters the source, so installed content survives as SourceUnavailable.
 
+### Agent sources and personal library
+
+Agent packages use canonical `(sourceId, relativePath)` identity. The stable built-in source
+`builtin:agency-agents` is backed by the existing corpus; local folders, GitHub checkouts, and the
+app-owned published source use the same bounded registry facade. Exact reads reject links, special
+entries, invalid portable paths, oversized files, ambiguous legacy slugs, and source roots replaced
+with links. Refresh publishes a validated generation atomically; unregistering a local source never
+deletes its directory.
+
+Agent drafts remain separate from source content until desktop publication. Personal-library folders
+are logical paths only: folder rewrites update assignments and profiles but never move source files.
+Collections, smart folders, favorites, policies, trust, usage, and approvals all store exact Agent
+references so identical names from different sources remain independent.
+
+Agent lifecycle records extend the existing install ledger with the same exact reference plus tool,
+scope, canonical project, and destination identity. Legacy rows migrate by matching only one
+validated built-in Agent and never rewrite destination content. Reconciliation uses the same seven
+states as Skills. Install/update and rollback are backup-first transactions; disable/enable are
+same-filesystem moves; uninstall removes only the exact tracked destination and preserves modified
+content. Version history is bounded per exact install identity.
+
 ## 3. Deterministic renderer (Plan B — load-bearing)
 
 Install = **transform frontmatter + write file**, done natively in Rust (no shell/python

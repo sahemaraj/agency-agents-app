@@ -568,9 +568,11 @@ pub enum Scope {
 /// discriminated union.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[derive(Default)]
 pub enum CatalogSource {
     /// App-managed copy seeded from the bundled baseline (`<app_data>/corpus`).
     /// The always-works default; never touches anything outside app data.
+    #[default]
     Bundled,
     /// A clone the app provisioned and owns (default `~/.agency-agents`). The
     /// app may pull/refresh it; it's shared with the CLI.
@@ -579,12 +581,6 @@ pub enum CatalogSource {
     /// granted permission to pull it (manage-with-permission); when false we
     /// only ever read from it.
     UserClone { path: String, manage: bool },
-}
-
-impl Default for CatalogSource {
-    fn default() -> Self {
-        CatalogSource::Bundled
-    }
 }
 
 /// A catalog directory discovered on disk (for the first-run / Settings picker).
@@ -661,6 +657,63 @@ pub struct CatalogUpdateCheck {
 
 // ---------- Agent (parsed from the corpus) ----------
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReference {
+    pub source_id: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentSourceKind {
+    BuiltIn,
+    Local {
+        root: String,
+    },
+    Github {
+        repository: String,
+        git_ref: Option<String>,
+        subdirectory: Option<String>,
+        active_checkout: Option<String>,
+    },
+    Published {
+        root: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSource {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub kind: AgentSourceKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentValidationCode {
+    InvalidMetadata,
+    InvalidPath,
+    DuplicateIdentity,
+    UnsafeEntry,
+    Oversize,
+    Io,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentValidationError {
+    pub code: AgentValidationCode,
+    pub path: String,
+    pub message: String,
+}
+
 /// An agent as parsed from a single corpus `.md` file. `body` is the
 /// markdown persona and is omitted/empty in list views (`corpus_list`)
 /// to keep payloads small; `corpus_get` returns it populated.
@@ -683,6 +736,279 @@ pub struct Agent {
     pub vibe: Option<String>,
     /// Markdown body (persona) — lazy/optional in list views.
     pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPackageResult {
+    pub reference: AgentReference,
+    pub agent: Option<Agent>,
+    pub source_hash: String,
+    pub frontmatter_hash: String,
+    pub body_hash: String,
+    pub version: Option<String>,
+    pub channel: Option<String>,
+    pub changelog: Option<String>,
+    pub publisher: Option<String>,
+    pub publisher_key: Option<String>,
+    pub publisher_verified: bool,
+    pub required_agents: Vec<String>,
+    pub recommended_agents: Vec<String>,
+    pub groups: Vec<String>,
+    pub tags: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub permissions: Vec<String>,
+    pub quality_score: u8,
+    pub quality_checks: Vec<String>,
+    pub diagnostics: Vec<AgentValidationError>,
+    pub installable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSourceResult {
+    pub source: AgentSource,
+    pub agents: Vec<AgentPackageResult>,
+    pub errors: Vec<AgentValidationError>,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentDraftState {
+    Pending,
+    Published,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDraft {
+    pub id: String,
+    pub submitted_at: String,
+    pub state: AgentDraftState,
+    pub relative_path: String,
+    pub source_hash: String,
+    pub validation: AgentPackageResult,
+    pub published_source_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDraftInput {
+    pub relative_path: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFolderAssignment {
+    pub source_id: String,
+    pub relative_path: String,
+    pub folder_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRecent {
+    pub agent: AgentReference,
+    pub viewed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCollection {
+    pub name: String,
+    #[serde(default)]
+    pub agents: Vec<AgentReference>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSmartFolderRule {
+    pub query: Option<String>,
+    pub division: Option<String>,
+    pub source_id: Option<String>,
+    pub capability: Option<String>,
+    pub lifecycle_state: Option<String>,
+    pub installable: Option<bool>,
+    pub favorite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSmartFolder {
+    pub name: String,
+    pub rule: AgentSmartFolderRule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentWorkspaceProfile {
+    pub name: String,
+    #[serde(default)]
+    pub folders: Vec<String>,
+    #[serde(default)]
+    pub collections: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentUpdatePolicy {
+    Notify,
+    AutoTrusted,
+    Pin,
+    ReviewScripts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUpdatePolicyRecord {
+    pub agent: AgentReference,
+    pub policy: AgentUpdatePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPublisherTrust {
+    pub name: String,
+    pub public_key: String,
+    pub trusted: bool,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPreferredSource {
+    pub agent_name: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsage {
+    pub agent: AgentReference,
+    pub fetches: u64,
+    pub publishes: u64,
+    pub rejections: u64,
+    pub last_used_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentApprovalAction {
+    SourceRemove {
+        source_id: String,
+    },
+    FolderDelete {
+        path: String,
+        recursive: bool,
+    },
+    CollectionDelete {
+        name: String,
+    },
+    SmartFolderDelete {
+        name: String,
+    },
+    ProfileDelete {
+        name: String,
+    },
+    UpdatePolicySet {
+        reference: AgentReference,
+        policy: AgentUpdatePolicy,
+    },
+    PublisherTrustSet {
+        name: String,
+        public_key: String,
+        trusted: bool,
+        revoked: bool,
+    },
+    Install {
+        reference: AgentReference,
+        tool: Tool,
+        project_path: Option<String>,
+        include_dependencies: bool,
+        plan_revision: String,
+    },
+    Update {
+        reference: AgentReference,
+        tool: Tool,
+        project_path: Option<String>,
+        plan_revision: String,
+    },
+    Uninstall {
+        reference: AgentReference,
+        tool: Tool,
+        project_path: Option<String>,
+        plan_revision: String,
+    },
+    Rollback {
+        reference: AgentReference,
+        tool: Tool,
+        project_path: Option<String>,
+        snapshot_id: String,
+        plan_revision: String,
+    },
+    BatchCollection {
+        collection_name: String,
+        operation: String,
+        tool: Tool,
+        project_path: Option<String>,
+        plan_revision: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentApprovalState {
+    Pending,
+    Running,
+    Approved,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentApproval {
+    pub id: String,
+    pub submitted_at: String,
+    pub state: AgentApprovalState,
+    pub requested_by: String,
+    pub request: AgentApprovalAction,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLibraryState {
+    #[serde(default)]
+    pub folders: Vec<String>,
+    #[serde(default)]
+    pub assignments: Vec<AgentFolderAssignment>,
+    #[serde(default)]
+    pub favorites: Vec<AgentReference>,
+    #[serde(default)]
+    pub recent: Vec<AgentRecent>,
+    #[serde(default)]
+    pub collections: Vec<AgentCollection>,
+    #[serde(default)]
+    pub smart_folders: Vec<AgentSmartFolder>,
+    #[serde(default)]
+    pub profiles: Vec<AgentWorkspaceProfile>,
+    #[serde(default)]
+    pub update_policies: Vec<AgentUpdatePolicyRecord>,
+    #[serde(default)]
+    pub publisher_trust: Vec<AgentPublisherTrust>,
+    #[serde(default)]
+    pub preferred_sources: Vec<AgentPreferredSource>,
+    #[serde(default)]
+    pub usage: Vec<AgentUsage>,
+    #[serde(default)]
+    pub approvals: Vec<AgentApproval>,
 }
 
 // ---------- Corpus index ----------
@@ -729,6 +1055,12 @@ pub struct CorpusMeta {
 #[serde(rename_all = "camelCase")]
 pub struct InstallRecord {
     pub slug: String,
+    /// Stable package source. Empty only while reading a pre-migration ledger.
+    #[serde(default)]
+    pub source_id: String,
+    /// Portable source-relative Agent path. Empty only for a pre-migration row.
+    #[serde(default)]
+    pub relative_path: String,
     pub tool: Tool,
     pub scope: Scope,
     pub project_path: Option<String>,
@@ -741,13 +1073,25 @@ pub struct InstallRecord {
     #[serde(default)]
     pub body_hash: String,
     pub rendered_hash: String,
+    /// Same-parent hidden destination while the install is disabled.
+    #[serde(default)]
+    pub disabled_path: Option<String>,
+    /// Exact source bytes selected for the installed version.
+    #[serde(default)]
+    pub source_snapshot_hash: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub publisher_key: Option<String>,
+    #[serde(default)]
+    pub publisher_verified: bool,
     pub installed_at: String,
     pub corpus_version: String,
 }
 
 // ---------- Reconciliation ----------
 
-/// The five reconciliation states (like a package manager's installed /
+/// The seven reconciliation states (like a package manager's installed /
 /// outdated states). See systemPatterns.md §4 for the disk ↔ ledger ↔ corpus
 /// test that classifies each on-disk agent file.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -756,8 +1100,11 @@ pub enum InstallState {
     Current,
     Outdated,
     Modified,
-    Removed,
+    #[serde(alias = "removed")]
+    Missing,
     Foreign,
+    Disabled,
+    SourceUnavailable,
 }
 
 /// Whether an available update is cosmetic (frontmatter/metadata only,
@@ -777,6 +1124,8 @@ pub enum UpdateKind {
 pub struct InstalledAgent {
     pub slug: String,
     pub name: String,
+    pub source_id: String,
+    pub relative_path: String,
     pub tool: Tool,
     pub scope: Scope,
     pub project_path: Option<String>,
@@ -788,6 +1137,51 @@ pub struct InstalledAgent {
     /// UI distinguish "tracked by the app" from "present from other tools"
     /// instead of claiming every recognized file as "installed by you".
     pub tracked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInstallIdentity {
+    pub reference: AgentReference,
+    pub tool: Tool,
+    pub scope: Scope,
+    pub project_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentVersionSnapshot {
+    pub id: String,
+    pub created_at: String,
+    pub source_hash: String,
+    pub rendered_hash: String,
+    pub content_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlanItem {
+    pub reference: AgentReference,
+    pub name: String,
+    pub source_hash: String,
+    pub dependency: bool,
+    pub destination: String,
+    pub rendered_file_count: u32,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMutationPlan {
+    pub revision: String,
+    pub operation: String,
+    pub tool: Tool,
+    pub scope: Scope,
+    pub project_path: Option<String>,
+    pub agents: Vec<AgentPlanItem>,
+    pub warnings: Vec<String>,
+    pub blockers: Vec<String>,
+    pub rollback_available: bool,
 }
 
 /// Result of `agent_diff` — what's on disk now vs the canonical render the app
@@ -902,6 +1296,8 @@ mod tests {
         let a = InstalledAgent {
             slug: "frontend-developer".into(),
             name: "Frontend Developer".into(),
+            source_id: "builtin:agency-agents".into(),
+            relative_path: "engineering/frontend-developer.md".into(),
             tool: "claudeCode".to_string(),
             scope: Scope::User,
             project_path: None,
@@ -914,6 +1310,8 @@ mod tests {
         for k in [
             "slug",
             "name",
+            "sourceId",
+            "relativePath",
             "tool",
             "scope",
             "projectPath",
@@ -968,5 +1366,51 @@ mod tests {
                 snake
             );
         }
+    }
+
+    #[test]
+    fn agent_source_identity_serializes_without_slug_coupling() {
+        let reference = AgentReference {
+            source_id: "source-a".into(),
+            relative_path: "engineering/ui.md".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&reference).unwrap(),
+            serde_json::json!({
+                "sourceId": "source-a",
+                "relativePath": "engineering/ui.md"
+            })
+        );
+
+        let source = AgentSource {
+            id: "source-a".into(),
+            label: "Agents".into(),
+            enabled: true,
+            kind: AgentSourceKind::Github {
+                repository: "https://github.com/example/agents.git".into(),
+                git_ref: Some("main".into()),
+                subdirectory: Some("catalog".into()),
+                active_checkout: None,
+            },
+        };
+        let value = serde_json::to_value(&source).unwrap();
+        assert_eq!(value["kind"]["kind"], "github");
+        assert_eq!(value["kind"]["gitRef"], "main");
+        assert_eq!(value["kind"]["subdirectory"], "catalog");
+    }
+
+    #[test]
+    fn agent_draft_wire_shape_keeps_validation_and_publication_state() {
+        let input = AgentDraftInput {
+            relative_path: "engineering/reviewer.md".into(),
+            text: "---\nname: Reviewer\ndescription: Reviews code.\n---\n".into(),
+        };
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value["relativePath"], "engineering/reviewer.md");
+        assert!(value.get("text").is_some());
+        assert_eq!(
+            serde_json::to_value(AgentDraftState::Published).unwrap(),
+            "published"
+        );
     }
 }

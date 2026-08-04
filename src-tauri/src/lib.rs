@@ -4,6 +4,7 @@
 //! Tauri Builder + invoke_handler registration; every command lives
 //! in `commands::*`.
 
+mod agents;
 mod commands;
 mod corpus;
 mod error;
@@ -11,6 +12,7 @@ mod expert_runs;
 mod experts;
 mod github;
 mod install;
+mod library;
 mod registry;
 mod render;
 mod skills;
@@ -79,8 +81,9 @@ pub fn run() {
     // Best-effort tracing setup — silent if RUST_LOG is unset.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,agency_agents_app=info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("warn,agency_agents_app=info")
+            }),
         )
         .try_init();
 
@@ -110,7 +113,10 @@ pub fn run() {
         .on_window_event(|window, event| {
             use tauri::Manager;
             use tauri_plugin_window_state::{AppHandleExt, StateFlags};
-            if matches!(event, tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_)) {
+            if matches!(
+                event,
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_)
+            ) {
                 let _ = window.app_handle().save_window_state(StateFlags::all());
             }
         })
@@ -131,7 +137,9 @@ pub fn run() {
                 // sidebar and main panes; the WebView background must be set
                 // transparent in CSS (see app.css :root) for the blur to show.
                 use tauri::Manager;
-                use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+                use window_vibrancy::{
+                    apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState,
+                };
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = apply_vibrancy(
                         &window,
@@ -149,6 +157,8 @@ pub fn run() {
             settings_set,
             mcp_policy_set,
             mcp_client_policy_set,
+            mcp_agent_policy_set,
+            mcp_agent_client_policy_set,
             mcp_clients_status,
             mcp_client_connect,
             mcp_client_disconnect,
@@ -205,6 +215,46 @@ pub fn run() {
             expert_runs::expert_runs_list,
             expert_runs::expert_run_get,
             expert_runs::expert_run_review,
+            agents::agent_sources_list,
+            agents::agent_sources_inspect,
+            agents::agent_source_add_local,
+            agents::agent_source_add_github,
+            agents::agent_source_refresh,
+            agents::agent_source_remove,
+            agents::agent_source_status,
+            agents::agent_get,
+            agents::agent_text_read,
+            agents::agent_render_preview,
+            agents::drafts::agent_drafts_list,
+            agents::drafts::agent_draft_get,
+            agents::drafts::agent_draft_create,
+            agents::drafts::agent_draft_edit,
+            agents::drafts::agent_draft_publish,
+            agents::drafts::agent_draft_reject,
+            agents::drafts::agent_draft_duplicate,
+            agents::organize::agent_library_list,
+            agents::organize::agent_folder_create,
+            agents::organize::agent_folder_rename,
+            agents::organize::agent_folder_move,
+            agents::organize::agent_folder_delete,
+            agents::organize::agent_folder_assign,
+            agents::organize::agent_favorite_set,
+            agents::organize::agent_recent_touch,
+            agents::organize::agent_collection_save,
+            agents::organize::agent_collection_delete,
+            agents::organize::agent_smart_folder_save,
+            agents::organize::agent_smart_folder_delete,
+            agents::organize::agent_profile_save,
+            agents::organize::agent_profile_delete,
+            agents::organize::agent_library_replace,
+            agents::organize::agent_library_export,
+            agents::organize::agent_library_import,
+            agents::organize::agent_update_policy_set,
+            agents::organize::agent_publisher_trust_set,
+            agents::organize::agent_preferred_source_set,
+            agents::organize::agent_usage_record,
+            agents::organize::agent_approval_approve,
+            agents::organize::agent_approval_reject,
             skills::skill_sources_list,
             skills::skill_sources_inspect,
             skills::skill_trust_grant,
@@ -259,6 +309,18 @@ pub fn run() {
             // agent state layer: render/ledger/reconcile/tools/projects.
             install::install_agent,
             install::update_agent,
+            install::agent_install_plan,
+            install::agent_update_plan,
+            install::agent_uninstall_plan,
+            install::agent_install_with_dependencies,
+            install::agent_collection_install_plan,
+            install::agent_collection_update_plan,
+            install::agent_collection_uninstall_plan,
+            install::agent_collection_apply,
+            install::agent_version_history,
+            install::agent_version_rollback,
+            install::disable_agent,
+            install::enable_agent,
             install::track_agent,
             install::agent_diff,
             install::uninstall_agent,
@@ -354,10 +416,7 @@ fn build_app_menu<R: tauri::Runtime>(
         .build()
 }
 
-fn handle_menu_event<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    event: tauri::menu::MenuEvent,
-) {
+fn handle_menu_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::menu::MenuEvent) {
     use tauri::Emitter;
     match event.id().as_ref() {
         MENU_EVENT_ABOUT => {

@@ -1,4 +1,13 @@
-import { DEFAULT_LOCALE, LOCALES, isLocale, messages, type Locale, type MessageKey } from "$lib/i18n/messages";
+import {
+  DEFAULT_LOCALE,
+  LOCALES,
+  defaultMessages,
+  isLocale,
+  loadMessages,
+  type Locale,
+  type MessageKey,
+  type Messages,
+} from "$lib/i18n/messages";
 
 const STORAGE_KEY = "agency-agents:locale";
 
@@ -38,25 +47,37 @@ function format(template: string, vars?: Record<string, string | number>): strin
 
 class I18nStore {
   locale: Locale = $state(DEFAULT_LOCALE);
+  private messages: Messages = $state(defaultMessages);
+  private loadRequest = 0;
 
   init() {
-    this.locale = detectLocale();
-    applyLocale(this.locale);
+    void this.setLocale(detectLocale());
   }
 
-  setLocale(locale: Locale) {
-    this.locale = locale;
-    applyLocale(locale);
+  async setLocale(locale: Locale): Promise<void> {
+    const request = ++this.loadRequest;
     if (typeof localStorage !== "undefined") localStorage.setItem(STORAGE_KEY, locale);
+    try {
+      const messages = await loadMessages(locale);
+      if (request !== this.loadRequest) return;
+      this.messages = messages;
+      this.locale = locale;
+      applyLocale(locale);
+    } catch {
+      if (request !== this.loadRequest) return;
+      this.messages = defaultMessages;
+      this.locale = DEFAULT_LOCALE;
+      applyLocale(DEFAULT_LOCALE);
+    }
   }
 
   t(key: MessageKey, vars?: Record<string, string | number>): string {
-    return format(messages[this.locale][key] ?? messages[DEFAULT_LOCALE][key], vars);
+    return format(this.messages[key] ?? defaultMessages[key], vars);
   }
 
   optional(key: string, fallback: string, vars?: Record<string, string | number>): string {
-    const local = messages[this.locale] as Record<string, string>;
-    const en = messages[DEFAULT_LOCALE] as Record<string, string>;
+    const local = this.messages as Record<string, string>;
+    const en = defaultMessages as Record<string, string>;
     return format(local[key] ?? en[key] ?? fallback, vars);
   }
 

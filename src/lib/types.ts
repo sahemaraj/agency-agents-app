@@ -10,26 +10,18 @@
 // =========================================================
 
 /**
- * Legacy icon-fetching mode inherited from the source app. Kept in the
- * settings schema for compatibility until the settings model is pruned.
- */
-export type CaskIconMode = "off" | "installed-only" | "all";
-
-/**
  * Persisted user settings (Phase 12d). Lives at
  * `~/Library/Application Support/com.zerologic.agency-agents-app/settings.json` and is
  * round-tripped via `settingsGet` / `settingsSet`.
  *
  * Bounds (enforced server-side, also re-checked client-side for snappier
- * UX): `catalogStaleBannerDays` ∈ [1, 365]; `trendingTtlMinutes` ∈ [5, 1440].
+ * UX): `catalogStaleBannerDays` ∈ [1, 365].
  */
 export interface Settings {
   /** Master switch — when true, every outbound command fails with
       `paranoid_mode_blocked`. */
   paranoidMode: boolean;
   catalogStaleBannerDays: number;
-  caskIconMode: CaskIconMode;
-  trendingTtlMinutes: number;
   /** Phase 12c — when true, PackageDetail probes `api.github.com` for
       repo stats whenever the package's homepage is a GitHub URL. Off
       by default; the user opts in via Settings → GitHub. Independent
@@ -45,15 +37,6 @@ export interface Settings {
       opts in via Settings → Network → Updates. Suppressed (no fetch)
       while Offline Mode is on, regardless of this flag. */
   updateAutoCheck: boolean;
-  /** Legacy enhanced-trending toggle inherited from the source app.
-      Retained for settings-file compatibility. */
-  enhancedTrendingEnabled: boolean;
-  /** Legacy vulnerability-scanning toggle inherited from the source app.
-      Agency Agents does not currently run a vulnerability scanner. */
-  vulnerabilityScanningEnabled: boolean;
-  /** Legacy live-enrichment toggle inherited from the source app. Agency
-      Agents currently reads metadata from the active AA catalog. */
-  liveEnrichmentEnabled: boolean;
   /** Per-tool custom install base path (tool id → absolute base dir). When set,
       user-scope installs + detection resolve against it instead of the OS home
       (e.g. pointing Claude Code at a WSL home). Absent/empty = OS home. */
@@ -62,6 +45,9 @@ export interface Settings {
   mcpSourceAccess: boolean;
   mcpInstallAccess: boolean;
   mcpDestructiveAccess: boolean;
+  mcpAgentSourceAccess: boolean;
+  mcpAgentInstallAccess: boolean;
+  mcpAgentDestructiveAccess: boolean;
   /** Exact canonical project roots MCP mutations may target. */
   mcpProjectAllowlist: string[];
   mcpClientPolicies: Partial<Record<McpClient, McpClientPolicy>>;
@@ -71,6 +57,9 @@ export interface McpClientPolicy {
   sourceAccess: boolean;
   installAccess: boolean;
   destructiveAccess: boolean;
+  agentSourceAccess: boolean;
+  agentInstallAccess: boolean;
+  agentDestructiveAccess: boolean;
 }
 
 export type GeneralSettingsPatch = Partial<
@@ -78,14 +67,9 @@ export type GeneralSettingsPatch = Partial<
     Settings,
     | "paranoidMode"
     | "catalogStaleBannerDays"
-    | "caskIconMode"
-    | "trendingTtlMinutes"
     | "githubEnabled"
     | "aiFeaturesEnabled"
     | "updateAutoCheck"
-    | "enhancedTrendingEnabled"
-    | "vulnerabilityScanningEnabled"
-    | "liveEnrichmentEnabled"
     | "toolPaths"
   >
 >;
@@ -96,8 +80,6 @@ export type GeneralSettingsPatch = Partial<
 export const SETTINGS_DEFAULTS: Settings = {
   paranoidMode: false,
   catalogStaleBannerDays: 14,
-  caskIconMode: "all",
-  trendingTtlMinutes: 60,
   // Phase 12c — anonymous GitHub stats opt-in. Off by default per the
   // "zero outbound unless user consented" posture.
   githubEnabled: false,
@@ -107,18 +89,14 @@ export const SETTINGS_DEFAULTS: Settings = {
   // Auto-check for new Agency Agents releases. Off by
   // default per the "zero outbound unless user consented" posture.
   updateAutoCheck: false,
-  // Legacy retained field. Off by default.
-  enhancedTrendingEnabled: false,
-  // Legacy retained field. Off by default.
-  vulnerabilityScanningEnabled: false,
-  // Opt-in live refresh of categories + descriptions. Off by default; same
-  // legacy live enrichment path.
-  liveEnrichmentEnabled: false,
   // Per-tool custom install base paths. Empty by default (all tools use ~).
   toolPaths: {},
   mcpSourceAccess: false,
   mcpInstallAccess: false,
   mcpDestructiveAccess: false,
+  mcpAgentSourceAccess: false,
+  mcpAgentInstallAccess: false,
+  mcpAgentDestructiveAccess: false,
   mcpProjectAllowlist: [],
   mcpClientPolicies: {},
 };
@@ -620,7 +598,15 @@ export interface McpAuditEntry {
   timestamp: string;
   client: string | null;
   tool: string;
-  action: "read" | "source" | "install" | "destructive" | "unknown";
+  action:
+    | "read"
+    | "source"
+    | "install"
+    | "destructive"
+    | "agent_source"
+    | "agent_install"
+    | "agent_destructive"
+    | "unknown";
   phase: "attempt" | "terminal";
   success: boolean;
   projectPath: string | null;
@@ -648,6 +634,191 @@ export interface Agent {
   vibe: string | null;
   /** Markdown body (persona) — empty in list views. */
   body: string;
+}
+
+export interface AgentReference {
+  sourceId: string;
+  relativePath: string;
+}
+
+export type AgentSourceKind =
+  | { kind: "builtIn" }
+  | { kind: "local"; root: string }
+  | {
+      kind: "github";
+      repository: string;
+      gitRef: string | null;
+      subdirectory: string | null;
+      activeCheckout: string | null;
+    }
+  | { kind: "published"; root: string };
+
+export interface AgentSource {
+  id: string;
+  label: string;
+  enabled: boolean;
+  kind: AgentSourceKind;
+}
+
+export type AgentValidationCode =
+  | "invalidMetadata"
+  | "invalidPath"
+  | "duplicateIdentity"
+  | "unsafeEntry"
+  | "oversize"
+  | "io";
+
+export interface AgentValidationError {
+  code: AgentValidationCode;
+  path: string;
+  message: string;
+}
+
+export interface AgentPackageResult {
+  reference: AgentReference;
+  agent: Agent | null;
+  sourceHash: string;
+  frontmatterHash: string;
+  bodyHash: string;
+  version: string | null;
+  channel: string | null;
+  changelog: string | null;
+  publisher: string | null;
+  publisherKey: string | null;
+  publisherVerified: boolean;
+  requiredAgents: string[];
+  recommendedAgents: string[];
+  groups: string[];
+  tags: string[];
+  capabilities: string[];
+  permissions: string[];
+  qualityScore: number;
+  qualityChecks: string[];
+  diagnostics: AgentValidationError[];
+  installable: boolean;
+}
+
+export interface AgentSourceResult {
+  source: AgentSource;
+  agents: AgentPackageResult[];
+  errors: AgentValidationError[];
+  revision: string;
+}
+
+export type AgentDraftState = "pending" | "published" | "rejected";
+
+export interface AgentDraftInput {
+  relativePath: string;
+  text: string;
+}
+
+export interface AgentDraft {
+  id: string;
+  submittedAt: string;
+  state: AgentDraftState;
+  relativePath: string;
+  sourceHash: string;
+  validation: AgentPackageResult;
+  publishedSourceId: string | null;
+}
+
+export interface AgentFolderAssignment extends AgentReference {
+  folderPath: string;
+}
+
+export interface AgentRecent {
+  agent: AgentReference;
+  viewedAt: string;
+}
+
+export interface AgentCollection {
+  name: string;
+  agents: AgentReference[];
+}
+
+export interface AgentSmartFolderRule {
+  query: string | null;
+  division: string | null;
+  sourceId: string | null;
+  capability: string | null;
+  lifecycleState: string | null;
+  installable: boolean | null;
+  favorite: boolean | null;
+}
+
+export interface AgentSmartFolder {
+  name: string;
+  rule: AgentSmartFolderRule;
+}
+
+export interface AgentWorkspaceProfile {
+  name: string;
+  folders: string[];
+  collections: string[];
+}
+
+export type AgentUpdatePolicy = "notify" | "autoTrusted" | "pin" | "reviewScripts";
+
+export interface AgentUpdatePolicyRecord {
+  agent: AgentReference;
+  policy: AgentUpdatePolicy;
+}
+
+export interface AgentPublisherTrust {
+  name: string;
+  publicKey: string;
+  trusted: boolean;
+  revoked: boolean;
+}
+
+export interface AgentPreferredSource {
+  agentName: string;
+  sourceId: string;
+}
+
+export interface AgentUsage {
+  agent: AgentReference;
+  fetches: number;
+  publishes: number;
+  rejections: number;
+  lastUsedAt: string;
+}
+
+export interface AgentApproval {
+  id: string;
+  submittedAt: string;
+  state: "pending" | "running" | "approved" | "rejected";
+  requestedBy: string;
+  request: AgentApprovalAction;
+  result: string | null;
+}
+
+export type AgentApprovalAction =
+  | { action: "sourceRemove"; sourceId: string }
+  | { action: "folderDelete"; path: string; recursive: boolean }
+  | { action: "collectionDelete"; name: string }
+  | { action: "smartFolderDelete"; name: string }
+  | { action: "profileDelete"; name: string }
+  | { action: "updatePolicySet"; reference: AgentReference; policy: AgentUpdatePolicy }
+  | { action: "publisherTrustSet"; name: string; publicKey: string; trusted: boolean; revoked: boolean }
+  | { action: "install"; reference: AgentReference; tool: Tool; projectPath: string | null; includeDependencies: boolean; planRevision: string }
+  | { action: "update" | "uninstall"; reference: AgentReference; tool: Tool; projectPath: string | null; planRevision: string }
+  | { action: "rollback"; reference: AgentReference; tool: Tool; projectPath: string | null; snapshotId: string; planRevision: string }
+  | { action: "batchCollection"; collectionName: string; operation: "install" | "update" | "uninstall"; tool: Tool; projectPath: string | null; planRevision: string };
+
+export interface AgentLibraryState {
+  folders: string[];
+  assignments: AgentFolderAssignment[];
+  favorites: AgentReference[];
+  recent: AgentRecent[];
+  collections: AgentCollection[];
+  smartFolders: AgentSmartFolder[];
+  profiles: AgentWorkspaceProfile[];
+  updatePolicies: AgentUpdatePolicyRecord[];
+  publisherTrust: AgentPublisherTrust[];
+  preferredSources: AgentPreferredSource[];
+  usage: AgentUsage[];
+  approvals: AgentApproval[];
 }
 
 /**
@@ -921,6 +1092,8 @@ export interface CatalogDetection {
  */
 export interface InstallRecord {
   slug: string;
+  sourceId: string;
+  relativePath: string;
   tool: Tool;
   scope: Scope;
   projectPath: string | null;
@@ -930,12 +1103,17 @@ export interface InstallRecord {
   /** SHA-256 of the agent body at install time (cosmetic vs substantive updates). */
   bodyHash: string;
   renderedHash: string;
+  disabledPath: string | null;
+  sourceSnapshotHash: string;
+  capabilities: string[];
+  publisherKey: string | null;
+  publisherVerified: boolean;
   installedAt: string;
   corpusVersion: string;
 }
 
 /**
- * The five reconciliation states (like a package manager's installed /
+ * The seven reconciliation states (like a package manager's installed /
  * outdated states). See systemPatterns.md §4 for the disk ↔ ledger ↔ corpus
  * classification.
  */
@@ -943,8 +1121,10 @@ export type InstallState =
   | "current"
   | "outdated"
   | "modified"
-  | "removed"
-  | "foreign";
+  | "missing"
+  | "foreign"
+  | "disabled"
+  | "sourceUnavailable";
 
 /** Whether an available update is cosmetic (frontmatter/metadata only,
     `bodyHash` unchanged) or substantive (prompt body changed). */
@@ -958,6 +1138,8 @@ export type UpdateKind = "cosmetic" | "substantive";
 export interface InstalledAgent {
   slug: string;
   name: string;
+  sourceId: string;
+  relativePath: string;
   tool: Tool;
   scope: Scope;
   projectPath: string | null;
@@ -968,6 +1150,36 @@ export interface InstalledAgent {
       reconcile found it on disk from another source (e.g. a CLI `install.sh`
       run). Lets the UI separate "tracked by the app" from "total present". */
   tracked: boolean;
+}
+
+export interface AgentPlanItem {
+  reference: AgentReference;
+  name: string;
+  sourceHash: string;
+  dependency: boolean;
+  destination: string;
+  renderedFileCount: number;
+  capabilities: string[];
+}
+
+export interface AgentMutationPlan {
+  revision: string;
+  operation: string;
+  tool: Tool;
+  scope: Scope;
+  projectPath: string | null;
+  agents: AgentPlanItem[];
+  warnings: string[];
+  blockers: string[];
+  rollbackAvailable: boolean;
+}
+
+export interface AgentVersionSnapshot {
+  id: string;
+  createdAt: string;
+  sourceHash: string;
+  renderedHash: string;
+  contentPath: string;
 }
 
 /** Result of `agent_diff` — current on-disk contents vs the canonical render

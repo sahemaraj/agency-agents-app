@@ -15,4 +15,4 @@
 - `tasks/2026-06/` — monthly README + per-task docs (Phase 0 fork, Phase 1 corpus+discover, etc.).
 - `tasks/2026-07/` — Skills library inspection, transactional installation, managed lifecycle,
   project/application integration, and the MCP Skills Platform.
-- `tasks/2026-08/` — Expert MCP lifecycle Release 1.
+- `tasks/2026-08/` — Expert MCP Release 1 and completed Agent–Skills feature parity.

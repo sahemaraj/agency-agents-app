@@ -29,6 +29,11 @@ SKIP_MAC_BUILD="${PHASE_C_SKIP_MAC_BUILD:-0}"
 STRICT_TAURI="${PHASE_C_STRICT_TAURI:-0}"
 UBUNTU_VM="${PHASE_C_UBUNTU_VM:-Scratch}"
 WINDOWS_VM="${PHASE_C_WINDOWS_VM:-Windows 11}"
+WINDOWS_SHARE="${PHASE_C_WINDOWS_SHARE:-\\\\Mac\\agency-agents-app}"
+WINDOWS_NODE_BIN="${PHASE_C_WINDOWS_NODE_BIN:-C:\\Program Files\\nodejs}"
+WINDOWS_CARGO_HOME="${PHASE_C_WINDOWS_CARGO_HOME:-C:\\CargoSystem}"
+WINDOWS_RUSTUP_HOME="${PHASE_C_WINDOWS_RUSTUP_HOME:-C:\\Windows\\System32\\config\\systemprofile\\.rustup}"
+WINDOWS_BUILD_TOOLS="${PHASE_C_WINDOWS_BUILD_TOOLS:-C:\\BuildTools}"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -101,6 +106,7 @@ run_step() {
     emit_jsonl "fail" "$name" "logs/$(basename "$log")" "$((end - start))"
     printf '    FAIL — see %s\n' "$log"
   fi
+  return "$status"
 }
 
 skip_step() {
@@ -112,17 +118,21 @@ skip_step() {
   printf '==> %s\n    SKIP — %s\n' "$name" "$reason"
 }
 
+vm_exists() {
+  prlctl list -a -o name --no-header 2>/dev/null | grep -Fxq "$1"
+}
+
 run_local_phase_c() {
   run_step "git status baseline" git status --short
   run_step "phase c config validation" node tools/phase-c/validate-config.mjs
 
   if [[ -d "$PARITY_ROOT" && ( -x "$PARITY_ROOT/convert.sh" || -x "$PARITY_ROOT/scripts/convert.sh" ) ]]; then
-    run_step "renderer parity against active catalog" env AGENCY_AGENTS_PARITY_ROOT="$PARITY_ROOT" cargo test --manifest-path src-tauri/Cargo.toml --lib upstream_convert_sh_is_byte_identical_for_transform_tools -- --ignored --nocapture
+    run_step "renderer parity against active catalog" env AGENCY_AGENTS_PARITY_ROOT="$PARITY_ROOT" TAURI_CONFIG='{"app":{"macOSPrivateApi":false}}' cargo test --manifest-path src-tauri/Cargo.toml --lib upstream_convert_sh_is_byte_identical_for_transform_tools -- --ignored --nocapture
   else
     skip_step "renderer parity against active catalog" "missing executable convert.sh at $PARITY_ROOT"
   fi
 
-  run_step "rust library tests" cargo test --manifest-path src-tauri/Cargo.toml --lib
+  run_step "rust library tests" env TAURI_CONFIG='{"app":{"macOSPrivateApi":false}}' cargo test --manifest-path src-tauri/Cargo.toml --lib
   run_step "frontend type check" npm run check
   run_step "frontend production build" npm run build
 
@@ -133,7 +143,11 @@ run_local_phase_c() {
   fi
 
   if [[ "$STRICT_TAURI" == "1" ]]; then
-    run_step "macOS tauri no-bundle build strict" env CARGO_TARGET_DIR="$OUT_DIR/target/macos-tauri-release" npm run tauri -- build --no-bundle
+    # Tauri rewrites the base dependency for the macOS private API even though
+    # this repo intentionally keeps that feature in the macOS target block.
+    cp src-tauri/Cargo.toml "$OUT_DIR/Cargo.toml.before-tauri"
+    run_step "macOS tauri no-bundle build strict" env CARGO_TARGET_DIR="$OUT_DIR/target/macos-tauri-release" npm run tauri -- build --no-bundle --config '{"app":{"macOSPrivateApi":true}}'
+    cp "$OUT_DIR/Cargo.toml.before-tauri" src-tauri/Cargo.toml
   else
     skip_step "macOS tauri no-bundle build strict" "set PHASE_C_STRICT_TAURI=1"
   fi
@@ -142,6 +156,10 @@ run_local_phase_c() {
 run_ubuntu_vm() {
   if ! command -v prlctl >/dev/null 2>&1; then
     skip_step "ubuntu parallels smoke" "prlctl not found"
+    return
+  fi
+  if ! vm_exists "$UBUNTU_VM"; then
+    skip_step "ubuntu parallels smoke" "VM not configured: $UBUNTU_VM"
     return
   fi
 
@@ -163,16 +181,25 @@ run_windows_vm() {
     skip_step "windows parallels matrix" "prlctl not found"
     return
   fi
+  if ! vm_exists "$WINDOWS_VM"; then
+    skip_step "windows parallels matrix" "VM not configured: $WINDOWS_VM"
+    return
+  fi
 
-  local win_env='set "CARGO_HOME=C:\CargoSystem" & set "RUSTUP_HOME=C:\Windows\System32\config\systemprofile\.rustup" & set "PATH=C:\Users\michael\.nvm\versions\node\v24.11.1\bin;C:\BuildTools\VC\Tools\Llvm\bin;C:\Windows\System32\config\systemprofile\.cargo\bin;%PATH%"'
+  local win_env="set \"CARGO_HOME=$WINDOWS_CARGO_HOME\" & set \"RUSTUP_HOME=$WINDOWS_RUSTUP_HOME\" & set \"PATH=$WINDOWS_NODE_BIN;$WINDOWS_BUILD_TOOLS\\VC\\Tools\\Llvm\\bin;$WINDOWS_CARGO_HOME\\bin;%PATH%\""
 
-  run_step "windows vm sync repo" prlctl exec "$WINDOWS_VM" cmd.exe /c 'robocopy \\Mac\agency-agents-app C:\AgencyAgentsWinTest /MIR /XD .git node_modules .svelte-kit build .phase-c target src-tauri\target /XF .DS_Store Thumbs.db /NFL /NDL /NJH /NJS /NP & if %ERRORLEVEL% LEQ 7 exit /B 0 else exit /B %ERRORLEVEL%'
-  run_step "windows vm rust target setup" prlctl exec "$WINDOWS_VM" cmd.exe /c "set \"PATH=C:\\Windows\\System32\\config\\systemprofile\\.cargo\\bin;%PATH%\" & rustup target add x86_64-pc-windows-msvc"
-  run_step "windows vm npm install" prlctl exec "$WINDOWS_VM" cmd.exe /c "set \"PATH=C:\\Users\\michael\\.nvm\\versions\\node\\v24.11.1\\bin;%PATH%\" & cd /d C:\\AgencyAgentsWinTest & npm ci"
-  run_step "windows arm64 build" prlctl exec "$WINDOWS_VM" cmd.exe /c "call C:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat arm64 & $win_env & set \"CARGO_TARGET_DIR=C:\\AgencyAgentsWinTarget\" & cd /d C:\\AgencyAgentsWinTest & npm run tauri -- build --no-bundle"
-  run_step "windows x64 build" prlctl exec "$WINDOWS_VM" cmd.exe /c "call C:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat x64 & $win_env & set \"CARGO_TARGET_DIR=C:\\AgencyAgentsWinTargetX64\" & cd /d C:\\AgencyAgentsWinTest & npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc"
-  run_step "windows pe header verification" prlctl exec "$WINDOWS_VM" cmd.exe /c "call C:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat x64 & dumpbin /headers C:\\AgencyAgentsWinTarget\\release\\agency-agents-app.exe | findstr /C:\"AA64 machine\" & dumpbin /headers C:\\AgencyAgentsWinTargetX64\\x86_64-pc-windows-msvc\\release\\agency-agents-app.exe | findstr /C:\"8664 machine\""
-  run_step "windows named artifacts" prlctl exec "$WINDOWS_VM" cmd.exe /c "if not exist C:\\AgencyAgentsArtifacts mkdir C:\\AgencyAgentsArtifacts & copy /Y C:\\AgencyAgentsWinTarget\\release\\agency-agents-app.exe \"C:\\AgencyAgentsArtifacts\\Agency Agents-0.1.0-windows-arm64.exe\" & copy /Y C:\\AgencyAgentsWinTargetX64\\x86_64-pc-windows-msvc\\release\\agency-agents-app.exe \"C:\\AgencyAgentsArtifacts\\Agency Agents-0.1.0-windows-x64.exe\" & dir C:\\AgencyAgentsArtifacts"
+  if ! run_step "windows vm prerequisites" prlctl exec "$WINDOWS_VM" cmd.exe /c "if not exist \"$WINDOWS_SHARE\\package.json\" exit /B 2 & if not exist \"$WINDOWS_NODE_BIN\\npm.cmd\" exit /B 3 & if not exist \"$WINDOWS_CARGO_HOME\\bin\\rustup.exe\" exit /B 4 & if not exist \"$WINDOWS_BUILD_TOOLS\\VC\\Auxiliary\\Build\\vcvarsall.bat\" exit /B 5"; then
+    skip_step "windows build matrix" "prepared share/toolchain prerequisites unavailable"
+    return
+  fi
+
+  run_step "windows vm sync repo" prlctl exec "$WINDOWS_VM" cmd.exe /v:on /c "robocopy \"$WINDOWS_SHARE\" C:\\AgencyAgentsWinTest /MIR /XD .git node_modules .svelte-kit build .phase-c target src-tauri\\target /XF .DS_Store Thumbs.db /NFL /NDL /NJH /NJS /NP & if !ERRORLEVEL! LEQ 7 (exit /B 0) else (exit /B !ERRORLEVEL!)"
+  run_step "windows vm rust target setup" prlctl exec "$WINDOWS_VM" cmd.exe /c "$win_env & rustup target add x86_64-pc-windows-msvc"
+  run_step "windows vm npm install" prlctl exec "$WINDOWS_VM" cmd.exe /c "$win_env & cd /d C:\\AgencyAgentsWinTest & npm ci"
+  run_step "windows arm64 build" prlctl exec "$WINDOWS_VM" cmd.exe /c "call \"$WINDOWS_BUILD_TOOLS\\VC\\Auxiliary\\Build\\vcvarsall.bat\" arm64 & $win_env & set \"CARGO_TARGET_DIR=C:\\AgencyAgentsWinTarget\" & cd /d C:\\AgencyAgentsWinTest & npm run tauri -- build --no-bundle"
+  run_step "windows x64 build" prlctl exec "$WINDOWS_VM" cmd.exe /c "call \"$WINDOWS_BUILD_TOOLS\\VC\\Auxiliary\\Build\\vcvarsall.bat\" x64 & $win_env & set \"CARGO_TARGET_DIR=C:\\AgencyAgentsWinTargetX64\" & cd /d C:\\AgencyAgentsWinTest & npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc"
+  run_step "windows pe header verification" prlctl exec "$WINDOWS_VM" cmd.exe /c "call \"$WINDOWS_BUILD_TOOLS\\VC\\Auxiliary\\Build\\vcvarsall.bat\" x64 & dumpbin /headers C:\\AgencyAgentsWinTarget\\release\\agency-agents-app.exe | findstr /C:\"AA64 machine\" & dumpbin /headers C:\\AgencyAgentsWinTargetX64\\x86_64-pc-windows-msvc\\release\\agency-agents-app.exe | findstr /C:\"8664 machine\""
+  run_step "windows named artifacts" prlctl exec "$WINDOWS_VM" cmd.exe /c "if not exist C:\\AgencyAgentsWinTarget\\release\\agency-agents-app.exe exit /B 1 & if not exist C:\\AgencyAgentsWinTargetX64\\x86_64-pc-windows-msvc\\release\\agency-agents-app.exe exit /B 1 & if not exist C:\\AgencyAgentsArtifacts mkdir C:\\AgencyAgentsArtifacts & copy /Y C:\\AgencyAgentsWinTarget\\release\\agency-agents-app.exe \"C:\\AgencyAgentsArtifacts\\Agency Agents-0.1.0-windows-arm64.exe\" & copy /Y C:\\AgencyAgentsWinTargetX64\\x86_64-pc-windows-msvc\\release\\agency-agents-app.exe \"C:\\AgencyAgentsArtifacts\\Agency Agents-0.1.0-windows-x64.exe\" & dir C:\\AgencyAgentsArtifacts"
 
   if prlctl capture "$WINDOWS_VM" --file "$SCREEN_DIR/windows.png" >"$LOG_DIR/windows-capture.log" 2>&1; then
     append_md "- ARTIFACT: Windows screenshot [windows.png](screenshots/windows.png)"

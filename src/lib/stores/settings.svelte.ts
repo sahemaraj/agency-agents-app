@@ -7,8 +7,7 @@
  * is unreadable on disk.
  *
  * **Single source of truth.** Everywhere the frontend needs to react to
- * a settings value (catalog stale banner threshold, cask icon mode,
- * etc.) it should read from `settings.data` and `$effect`-subscribe
+ * a settings value should read from `settings.data` and `$effect`-subscribe
  * rather than re-deriving from localStorage. The on-disk JSON is
  * authoritative; localStorage was only ever a 12b-era stopgap.
  */

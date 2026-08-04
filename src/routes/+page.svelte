@@ -3,14 +3,8 @@
 
   import Sidebar from "$lib/components/Sidebar.svelte";
   import ResizeHandle from "$lib/components/ResizeHandle.svelte";
-  import AgencyDashboard from "$lib/components/AgencyDashboard.svelte";
-  import Teams from "$lib/components/Teams.svelte";
-  import Projects from "$lib/components/Projects.svelte";
-  import AgentsWorkspace from "$lib/components/AgentsWorkspace.svelte";
-  import SkillsWorkspace from "$lib/components/SkillsWorkspace.svelte";
-  import ToolsView from "$lib/components/ToolsView.svelte";
-  import ActivityHistory from "$lib/components/ActivityHistory.svelte";
   import Experts from "$lib/components/Experts.svelte";
+  import LoadingState from "$lib/components/LoadingState.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import Settings from "$lib/components/Settings.svelte";
   import AboutModal from "$lib/components/AboutModal.svelte";
@@ -225,21 +219,63 @@
     <main class="content">
         <div class="section-pane">
           {#if ui.section === "dashboard"}
-            <AgencyDashboard />
+            {#await import("$lib/components/AgencyDashboard.svelte")}
+              <LoadingState />
+            {:then { default: AgencyDashboard }}
+              <AgencyDashboard />
+            {:catch}
+              <p role="alert">Could not load Dashboard.</p>
+            {/await}
           {:else if ui.section === "skills"}
-            <SkillsWorkspace />
+            {#await import("$lib/components/SkillsWorkspace.svelte")}
+              <LoadingState />
+            {:then { default: SkillsWorkspace }}
+              <SkillsWorkspace />
+            {:catch}
+              <p role="alert">Could not load Skills.</p>
+            {/await}
           {:else if ui.section === "tools"}
-            <ToolsView />
+            {#await import("$lib/components/ToolsView.svelte")}
+              <LoadingState />
+            {:then { default: ToolsView }}
+              <ToolsView />
+            {:catch}
+              <p role="alert">Could not load Tools.</p>
+            {/await}
           {:else if ui.section === "teams"}
-            <Teams />
+            {#await import("$lib/components/Teams.svelte")}
+              <LoadingState />
+            {:then { default: Teams }}
+              <Teams />
+            {:catch}
+              <p role="alert">Could not load Teams.</p>
+            {/await}
           {:else if ui.section === "projects"}
-            <Projects />
+            {#await import("$lib/components/Projects.svelte")}
+              <LoadingState />
+            {:then { default: Projects }}
+              <Projects />
+            {:catch}
+              <p role="alert">Could not load Projects.</p>
+            {/await}
           {:else if ui.section === "personas"}
-            <AgentsWorkspace />
+            {#await import("$lib/components/AgentsWorkspace.svelte")}
+              <LoadingState />
+            {:then { default: AgentsWorkspace }}
+              <AgentsWorkspace />
+            {:catch}
+              <p role="alert">Could not load Personas.</p>
+            {/await}
           {:else if ui.section === "experts"}
             <Experts />
           {:else if ui.section === "activity"}
-            <ActivityHistory />
+            {#await import("$lib/components/ActivityHistory.svelte")}
+              <LoadingState />
+            {:then { default: ActivityHistory }}
+              <ActivityHistory />
+            {:catch}
+              <p role="alert">Could not load Activity.</p>
+            {/await}
           {/if}
         </div>
     </main>

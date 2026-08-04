@@ -4,7 +4,6 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,7 +25,7 @@ use crate::types::{
 use crate::util::fs::atomic_write;
 
 pub mod drafts;
-mod install;
+pub(crate) mod install;
 pub mod mcp;
 pub mod organize;
 
@@ -292,6 +291,7 @@ fn lock_skill_sources(app_data_dir: &Path) -> Result<File, AppError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|error| AppError::Io {
             message: format!("open skill source lock {}: {error}", path.display()),
@@ -312,6 +312,7 @@ fn lock_skill_installs(app_data_dir: &Path) -> Result<File, AppError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|error| AppError::Io {
             message: format!("open skill install lock {}: {error}", path.display()),
@@ -441,7 +442,7 @@ pub(crate) async fn remove_skill_source(
     Ok(true)
 }
 
-fn canonical_github_repository(repository: &str) -> Result<String, AppError> {
+pub(crate) fn canonical_github_repository(repository: &str) -> Result<String, AppError> {
     let trimmed = repository.trim();
     let authority = trimmed
         .split_once("://")
@@ -461,7 +462,7 @@ fn canonical_github_repository(repository: &str) -> Result<String, AppError> {
     ))
 }
 
-fn validated_git_ref(git_ref: Option<&str>) -> Result<Option<String>, AppError> {
+pub(crate) fn validated_git_ref(git_ref: Option<&str>) -> Result<Option<String>, AppError> {
     let Some(value) = git_ref else {
         return Ok(None);
     };
@@ -483,7 +484,9 @@ fn validated_git_ref(git_ref: Option<&str>) -> Result<Option<String>, AppError> 
     Ok(Some(value.to_string()))
 }
 
-fn validated_subdirectory(subdirectory: Option<&str>) -> Result<Option<String>, AppError> {
+pub(crate) fn validated_subdirectory(
+    subdirectory: Option<&str>,
+) -> Result<Option<String>, AppError> {
     let Some(value) = subdirectory else {
         return Ok(None);
     };
@@ -1875,7 +1878,7 @@ fn parse_skill_metadata(bytes: &[u8]) -> Result<SkillMetadata, String> {
         .find("\n---")
         .ok_or_else(|| "SKILL.md frontmatter must end with '---'.".to_string())?;
     let yaml = &rest[..end];
-    let metadata: SkillMetadata = serde_yaml::from_str(&yaml)
+    let metadata: SkillMetadata = serde_yaml::from_str(yaml)
         .map_err(|error| format!("SKILL.md frontmatter is invalid: {error}"))?;
     if !valid_skill_name(&metadata.name) {
         return Err(
@@ -1984,48 +1987,26 @@ fn verify_publisher(
     skill_text: &str,
     files: &[SkillPackageFile],
 ) -> bool {
-    if publisher.name.trim().is_empty() || publisher.name.chars().count() > 128 {
-        return false;
-    }
-    let Ok(public_key) = base64::engine::general_purpose::STANDARD.decode(&publisher.public_key)
-    else {
-        return false;
-    };
-    let Ok(signature) = base64::engine::general_purpose::STANDARD.decode(&publisher.signature)
-    else {
-        return false;
-    };
-    let Ok(public_key) = <[u8; 32]>::try_from(public_key) else {
-        return false;
-    };
-    let Ok(signature) = <[u8; 64]>::try_from(signature) else {
-        return false;
-    };
-    let Ok(key) = VerifyingKey::from_bytes(&public_key) else {
-        return false;
-    };
     let body = skill_text
         .strip_prefix("---\n")
         .and_then(|rest| rest.find("\n---").map(|end| &rest[end + 4..]))
         .unwrap_or(skill_text);
-    let mut hasher = Sha256::new();
-    hasher.update(publisher.name.as_bytes());
-    hasher.update([0]);
-    hasher.update(name.as_bytes());
-    hasher.update([0]);
-    hasher.update(version.as_bytes());
-    hasher.update([0]);
-    hasher.update(channel.as_bytes());
-    hasher.update([0]);
-    hasher.update(body.as_bytes());
+    let mut signed_parts = vec![
+        name.as_bytes(),
+        version.as_bytes(),
+        channel.as_bytes(),
+        body.as_bytes(),
+    ];
     for file in files.iter().filter(|file| file.relative_path != "SKILL.md") {
-        hasher.update([0]);
-        hasher.update(file.relative_path.as_bytes());
-        hasher.update([0]);
-        hasher.update(file.sha256.as_bytes());
+        signed_parts.push(file.relative_path.as_bytes());
+        signed_parts.push(file.sha256.as_bytes());
     }
-    key.verify(&hasher.finalize(), &Signature::from_bytes(&signature))
-        .is_ok()
+    crate::library::verify_publisher_signature(
+        &publisher.name,
+        &publisher.public_key,
+        &publisher.signature,
+        &signed_parts,
+    )
 }
 
 fn valid_taxonomy_segment(value: &str) -> bool {
@@ -2770,7 +2751,7 @@ pub(crate) async fn install_skill_authorized(
         Some(project) => project.to_path_buf(),
         None => canonical_target_base(&home)?,
     };
-    let destination = install::target_path(&base, project.as_deref(), &runtime, &name)?;
+    let destination = install::target_path(&base, project.as_deref(), runtime, &name)?;
     if project_authorization.is_none() {
         reject_linked_destination_ancestors(&base, &destination)?;
         if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
@@ -4480,8 +4461,10 @@ mod tests {
             .is_ok());
         }
 
-        let mut paranoid = Settings::default();
-        paranoid.paranoid_mode = true;
+        let paranoid = Settings {
+            paranoid_mode: true,
+            ..Settings::default()
+        };
         for settings in [
             SettingsLoadState::Loaded(paranoid),
             SettingsLoadState::Corrupt {
@@ -5591,9 +5574,10 @@ mod tests {
             Path::new(&canonical_project).join(".agents/skills/reviewer")
         );
 
-        let reconciled = super::reconcile_skill_installs(&state, &[project_path.clone()])
-            .await
-            .expect("reconcile current skill");
+        let reconciled =
+            super::reconcile_skill_installs(&state, std::slice::from_ref(&project_path))
+                .await
+                .expect("reconcile current skill");
         assert!(reconciled.iter().any(|skill| {
             skill.path == installed.path && skill.state == SkillInstallState::Current
         }));

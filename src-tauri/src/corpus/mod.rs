@@ -27,7 +27,7 @@
 //! carries a timestamp; the only timestamp is [`CorpusMeta::fetched_at`],
 //! which lives in a separate meta file, not the index.
 
-mod parse;
+pub(crate) mod parse;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -136,7 +136,7 @@ const MAX_TARBALL_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Cap on a single decompressed agent `.md`. Personas run a few KiB;
 /// 1 MiB is absurdly generous and still bounds memory.
-const MAX_AGENT_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_AGENT_BYTES: u64 = 1024 * 1024;
 
 /// Version string recorded for the bundled baseline before any refresh
 /// has resolved a commit SHA.
@@ -199,7 +199,7 @@ pub struct Corpus {
 impl Corpus {
     /// Number of indexed agents.
     pub fn count(&self) -> u32 {
-        self.index.len() as u32
+        self.agents.len() as u32
     }
 
     /// [`CorpusMeta`] for `corpus_status`.
@@ -222,17 +222,21 @@ impl Corpus {
 
     /// Full agent (incl. body) by slug, or `None` if unknown.
     pub fn get(&self, slug: &str) -> Option<Agent> {
-        self.agents.iter().find(|a| a.slug == slug).cloned()
+        let mut matches = self.agents.iter().filter(|agent| agent.slug == slug);
+        let agent = matches.next()?;
+        matches.next().is_none().then(|| agent.clone())
     }
 
     /// Resolve a filename emitted by `convert.sh` back to the catalog's
     /// filename-based identity. Most upstream filenames include a division
     /// prefix while transformed installs use `slugify(frontmatter.name)`.
     pub fn get_by_conversion_slug(&self, slug: &str) -> Option<Agent> {
-        self.agents
+        let mut matches = self
+            .agents
             .iter()
-            .find(|a| crate::render::slugify(&a.name) == slug)
-            .cloned()
+            .filter(|agent| crate::render::slugify(&agent.name) == slug);
+        let agent = matches.next()?;
+        matches.next().is_none().then(|| agent.clone())
     }
 
     /// Index row (hashes + category) by slug, for the install/reconcile layer.
@@ -555,20 +559,32 @@ fn collect_md_files(root: &Path) -> Vec<PathBuf> {
 /// to resolve a nested agent's canonical file when the flat path doesn't exist.
 fn find_md_under(dir: &Path, file_name: &str) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
+    let mut found = None;
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
         };
         for ent in rd.flatten() {
             let path = ent.path();
-            if path.is_dir() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink()
+                || crate::skills::metadata_is_reparse_point(&metadata)
+            {
+                continue;
+            }
+            if metadata.is_dir() {
                 stack.push(path);
             } else if path.file_name().and_then(|n| n.to_str()) == Some(file_name) {
-                return Some(path);
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(path);
             }
         }
     }
-    None
+    found
 }
 
 /// Build an in-memory [`Corpus`] by walking `<dir>/<category>/**/<slug>.md`
@@ -627,7 +643,7 @@ async fn build_from_dir(
         agents.push(agent);
     }
 
-    let count = index.len() as u32;
+    let count = agents.len() as u32;
     Ok(Corpus {
         agents,
         index,
@@ -1258,7 +1274,7 @@ pub(crate) async fn active_catalog_root(app: &AppHandle) -> Result<PathBuf, AppE
 }
 
 pub(crate) async fn active_catalog_root_at(adir: &Path) -> PathBuf {
-    let source = load_catalog_source(&adir).await;
+    let source = load_catalog_source(adir).await;
     catalog_root(adir, &source)
 }
 
@@ -1762,6 +1778,47 @@ mod tests {
             "category is the top-level dir, not the subdir"
         );
         assert!(corpus.get("flat-one").is_some(), "flat agent still indexed");
+    }
+
+    #[tokio::test]
+    async fn nested_agents_with_the_same_slug_do_not_collapse_the_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for group in ["godot", "unity"] {
+            let nested = dir.join("game-development").join(group);
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(
+                nested.join("shader-developer.md"),
+                format!("---\nname: {group} Shader Developer\ndescription: d\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+
+        let corpus = build_from_dir(dir, "v", &discover_categories(dir))
+            .await
+            .unwrap();
+
+        assert_eq!(corpus.agents.len(), 2);
+        assert_eq!(
+            corpus.count(),
+            2,
+            "distinct nested files are distinct agents"
+        );
+        assert!(
+            corpus.get("shader-developer").is_none(),
+            "legacy slug lookup must not choose silently between identities"
+        );
+    }
+
+    #[test]
+    fn legacy_recursive_source_lookup_refuses_ambiguous_filenames() {
+        let tmp = tempfile::tempdir().unwrap();
+        for group in ["godot", "unity"] {
+            let nested = tmp.path().join(group);
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::write(nested.join("reviewer.md"), "agent").unwrap();
+        }
+        assert!(find_md_under(tmp.path(), "reviewer.md").is_none());
     }
 
     #[tokio::test]

@@ -1,13 +1,4 @@
 import en, { type MessageKey, type Messages } from "./locales/en";
-import zhCN from "./locales/zh-CN";
-import zhTW from "./locales/zh-TW";
-import ja from "./locales/ja";
-import ko from "./locales/ko";
-import es from "./locales/es";
-import fr from "./locales/fr";
-import de from "./locales/de";
-import ptBR from "./locales/pt-BR";
-import ru from "./locales/ru";
 
 export const LOCALES = ["en", "zh-CN", "zh-TW", "ja", "ko", "es", "fr", "de", "pt-BR", "ru"] as const;
 export type Locale = (typeof LOCALES)[number];
@@ -31,21 +22,22 @@ export const localeLabels: Record<Locale, string> = {
   ru: "Русский",
 };
 
-const overrides = {
-  en: {},
-  "zh-CN": zhCN,
-  "zh-TW": zhTW,
-  ja,
-  ko,
-  es,
-  fr,
-  de,
-  "pt-BR": ptBR,
-  ru,
-} satisfies Record<Locale, Partial<Messages>>;
+const loaders = {
+  en: async () => ({}),
+  "zh-CN": async () => (await import("./locales/zh-CN")).default,
+  "zh-TW": async () => (await import("./locales/zh-TW")).default,
+  ja: async () => (await import("./locales/ja")).default,
+  ko: async () => (await import("./locales/ko")).default,
+  es: async () => (await import("./locales/es")).default,
+  fr: async () => (await import("./locales/fr")).default,
+  de: async () => (await import("./locales/de")).default,
+  "pt-BR": async () => (await import("./locales/pt-BR")).default,
+  ru: async () => (await import("./locales/ru")).default,
+} satisfies Record<Locale, () => Promise<Partial<Messages>>>;
 
-export const messages: Record<Locale, Messages> = Object.fromEntries(
-  LOCALES.map((locale) => [locale, { ...en, ...overrides[locale] }]),
-) as Record<Locale, Messages>;
+export async function loadMessages(locale: Locale): Promise<Messages> {
+  return { ...en, ...(await loaders[locale]()) };
+}
 
+export { en as defaultMessages };
 export type { MessageKey, Messages };

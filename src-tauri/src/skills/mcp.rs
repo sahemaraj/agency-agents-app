@@ -28,7 +28,8 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, ErrorData, ListResourceTemplatesResult,
         ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-        Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo,
+        Resource, ResourceContents, ResourceTemplate, ResourceUpdatedNotificationParam,
+        ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
     },
     schemars,
     service::RequestContext,
@@ -46,13 +47,14 @@ const MAX_RECOMMEND_TASK_BYTES: usize = 2_048;
 const MAX_RECOMMEND_LANGUAGES: usize = 32;
 const MAX_RECOMMEND_LANGUAGE_BYTES: usize = 64;
 const MIN_HTTP_TOKEN_BYTES: usize = 43;
+const MAX_RESOURCE_SUBSCRIPTIONS: usize = 128;
 
 #[derive(Clone)]
 struct HttpAuth([u8; 32]);
 
 impl HttpAuth {
     fn new(token: &str) -> Result<Self, String> {
-        if token.as_bytes().len() < MIN_HTTP_TOKEN_BYTES {
+        if token.len() < MIN_HTTP_TOKEN_BYTES {
             return Err(format!(
                 "AGENCY_AGENTS_MCP_TOKEN must be at least {MIN_HTTP_TOKEN_BYTES} bytes"
             ));
@@ -636,12 +638,19 @@ struct RemoveSourceResponse {
     catalog_revision: String,
 }
 
-#[derive(Clone)]
 pub struct SkillMcpServer {
     state: Arc<AppState>,
     client_identity: String,
     #[allow(dead_code, reason = "tool_handler macro reads the generated router")]
     tool_router: ToolRouter<Self>,
+    resource_subscriptions:
+        Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>>,
+}
+
+impl Clone for SkillMcpServer {
+    fn clone(&self) -> Self {
+        Self::new_with_client(Arc::clone(&self.state), self.client_identity.clone())
+    }
 }
 
 impl SkillMcpServer {
@@ -651,11 +660,22 @@ impl SkillMcpServer {
     }
 
     fn new_with_client(state: Arc<AppState>, client_identity: impl Into<String>) -> Self {
+        let mut tool_router = Self::skills_tool_router();
+        tool_router.merge(Self::agents_tool_router());
         Self {
             state,
             client_identity: client_identity.into(),
-            tool_router: Self::tool_router(),
+            tool_router,
+            resource_subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    pub(crate) fn client_identity(&self) -> &str {
+        &self.client_identity
     }
 
     async fn submit_approval_json(
@@ -706,7 +726,7 @@ impl SkillMcpServer {
         serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
     }
 
-    async fn run_tool<T, F>(
+    pub(crate) async fn run_tool<T, F>(
         &self,
         _tool: &'static str,
         _action: McpAction,
@@ -827,6 +847,55 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         "skills_disable" | "skills_uninstall" | "skills_remove_source" | "skills_delete_folder" => {
             Some(McpAction::Destructive)
         }
+        "agents_search"
+        | "agents_get"
+        | "agents_list_files"
+        | "agents_get_file"
+        | "agents_installed"
+        | "agents_list_sources"
+        | "agents_source_status"
+        | "agents_recommend"
+        | "agents_list_drafts"
+        | "agents_get_draft"
+        | "agents_get_insights"
+        | "agents_get_library"
+        | "agents_list_folders"
+        | "agents_list_approvals"
+        | "agents_plan_install"
+        | "agents_version_history" => Some(McpAction::Read),
+        "agents_add_local_source"
+        | "agents_add_github_source"
+        | "agents_refresh_source"
+        | "agents_refresh_all"
+        | "agents_submit_draft"
+        | "agents_create_draft"
+        | "agents_edit_draft"
+        | "agents_create_folder"
+        | "agents_rename_folder"
+        | "agents_move_folder"
+        | "agents_assign_folder"
+        | "agents_set_favorite"
+        | "agents_save_collection"
+        | "agents_save_smart_folder"
+        | "agents_save_profile"
+        | "agents_set_update_policy"
+        | "agents_set_preferred_source" => Some(McpAction::AgentSource),
+        "agents_install"
+        | "agents_install_with_dependencies"
+        | "agents_find_and_install"
+        | "agents_update"
+        | "agents_enable" => Some(McpAction::AgentInstall),
+        "agents_remove_source"
+        | "agents_delete_folder"
+        | "agents_delete_collection"
+        | "agents_delete_smart_folder"
+        | "agents_delete_profile"
+        | "agents_request_publisher_trust"
+        | "agents_submit_approval"
+        | "agents_disable"
+        | "agents_uninstall"
+        | "agents_request_rollback"
+        | "agents_request_batch_collection" => Some(McpAction::AgentDestructive),
         _ => None,
     }
 }
@@ -839,7 +908,90 @@ fn tool_call_succeeded(result: &Result<CallToolResponse, ErrorData>) -> bool {
     }
 }
 
-#[tool_router]
+fn requested_project_path<'a>(
+    tool: &str,
+    arguments: Option<&'a serde_json::Map<String, serde_json::Value>>,
+) -> Option<&'a str> {
+    let arguments = arguments?;
+    arguments
+        .get("project_path")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            matches!(tool, "skills_submit_approval" | "agents_submit_approval")
+                .then(|| arguments.get("request")?.get("projectPath")?.as_str())
+                .flatten()
+        })
+}
+
+fn set_authorized_project(
+    tool: &str,
+    arguments: &mut Option<serde_json::Map<String, serde_json::Value>>,
+    project: &str,
+) {
+    let arguments = arguments.get_or_insert_default();
+    if matches!(tool, "skills_submit_approval" | "agents_submit_approval") {
+        if let Some(request) = arguments
+            .get_mut("request")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            request.insert("projectPath".into(), project.into());
+            return;
+        }
+    }
+    arguments.insert("project_path".into(), project.into());
+}
+
+async fn read_resource_content(state: &AppState, uri: &str) -> Result<ResourceContents, ErrorData> {
+    if uri.starts_with("agents://") {
+        return crate::agents::mcp::read_agent_resource(state, uri).await;
+    }
+    if uri == "skills://catalog" {
+        let catalog = super::inspect_skill_sources(state)
+            .await
+            .map_err(mcp_invalid)?;
+        return Ok(ResourceContents::text(
+            serde_json::to_string_pretty(&catalog).map_err(mcp_invalid)?,
+            uri,
+        )
+        .with_mime_type("application/json"));
+    }
+    let (source_id, relative_path, file_path) = parse_package_resource_uri(uri)?;
+    let content = super::read_skill_file(state, &source_id, &relative_path, &file_path)
+        .await
+        .map_err(mcp_invalid)?;
+    match (content.text, content.base64) {
+        (Some(text), None) => {
+            Ok(ResourceContents::text(text, uri).with_mime_type(content.mime_type))
+        }
+        (None, Some(blob)) => {
+            Ok(ResourceContents::blob(blob, uri).with_mime_type(content.mime_type))
+        }
+        _ => Err(ErrorData::invalid_params(
+            "invalid skill file content",
+            None,
+        )),
+    }
+}
+
+async fn resource_fingerprint(state: &AppState, uri: &str) -> Result<String, ErrorData> {
+    if uri == "skills://catalog" {
+        let catalog = super::inspect_skill_sources(state)
+            .await
+            .map_err(mcp_invalid)?;
+        return Ok(catalog_revision(&catalog));
+    }
+    if uri == crate::agents::mcp::AGENT_CATALOG_URI {
+        let catalog = crate::agents::inspect_agent_sources(&state.app_data_dir)
+            .await
+            .map_err(mcp_invalid)?;
+        return Ok(crate::agents::mcp::agent_catalog_revision(&catalog));
+    }
+    let content = read_resource_content(state, uri).await?;
+    let bytes = serde_json::to_vec(&content).map_err(mcp_invalid)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[tool_router(router = skills_tool_router, vis = "pub(crate)")]
 impl SkillMcpServer {
     #[tool(description = "Search validated skills by name or description")]
     async fn skills_search(
@@ -2664,9 +2816,97 @@ impl ServerHandler for SkillMcpServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_resources_subscribe()
                 .enable_resources_list_changed()
                 .build(),
         )
+    }
+
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let uri = request.uri;
+        let mut fingerprint = resource_fingerprint(&self.state, &uri).await?;
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(());
+        {
+            let mut subscriptions = self.resource_subscriptions.lock().await;
+            if !subscriptions.contains_key(&uri)
+                && subscriptions.len() == MAX_RESOURCE_SUBSCRIPTIONS
+            {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "resource subscription limit is {MAX_RESOURCE_SUBSCRIPTIONS} per connection"
+                    ),
+                    None,
+                ));
+            }
+            if let Some(previous) = subscriptions.insert(uri.clone(), cancel.clone()) {
+                let _ = previous.send(());
+            }
+        }
+        let state = Arc::clone(&self.state);
+        let subscriptions = Arc::clone(&self.resource_subscriptions);
+        let peer = context.peer;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    changed = cancelled.changed() => {
+                        let _ = changed;
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let next = resource_fingerprint(&state, &uri)
+                            .await
+                            .unwrap_or_else(|_| "missing".into());
+                        if next != fingerprint {
+                            fingerprint = next;
+                            if peer
+                                .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri.clone()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if matches!(uri.as_str(), "skills://catalog" | crate::agents::mcp::AGENT_CATALOG_URI)
+                                && peer.notify_resource_list_changed().await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let mut active = subscriptions.lock().await;
+            if active
+                .get(&uri)
+                .is_some_and(|sender| sender.same_channel(&cancel))
+            {
+                active.remove(&uri);
+            }
+        });
+        Ok(())
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        if let Some(cancel) = self
+            .resource_subscriptions
+            .lock()
+            .await
+            .remove(&request.uri)
+        {
+            let _ = cancel.send(());
+        }
+        Ok(())
     }
 
     async fn call_tool(
@@ -2679,27 +2919,15 @@ impl ServerHandler for SkillMcpServer {
             let id = uuid::Uuid::new_v4().to_string();
             self.append_tool_audit(&id, &tool, "unknown", "attempt", false, None)
                 .await?;
-            if let Err(audit_error) = self
-                .append_tool_audit(&id, &tool, "unknown", "terminal", false, None)
-                .await
-            {
-                tracing::error!(
-                    tool,
-                    error = %audit_error,
-                    "MCP terminal unclassified-tool audit failed"
-                );
-            }
+            self.append_tool_audit(&id, &tool, "unknown", "terminal", false, None)
+                .await?;
             return Err(ErrorData::invalid_params(
                 "unclassified MCP tool; request denied before dispatch",
                 None,
             ));
         };
         let action_name = action.as_str();
-        let requested_project = request
-            .arguments
-            .as_ref()
-            .and_then(|arguments| arguments.get("project_path"))
-            .and_then(serde_json::Value::as_str);
+        let requested_project = requested_project_path(&tool, request.arguments.as_ref());
         let authorization = self
             .state
             .authorize_mcp_client(&self.client_identity, action, requested_project)
@@ -2711,16 +2939,8 @@ impl ServerHandler for SkillMcpServer {
                 let id = uuid::Uuid::new_v4().to_string();
                 self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
                     .await?;
-                if let Err(audit_error) = self
-                    .append_tool_audit(&id, &tool, action_name, "terminal", false, None)
-                    .await
-                {
-                    tracing::error!(
-                        tool,
-                        error = %audit_error,
-                        "MCP terminal denial audit failed"
-                    );
-                }
+                self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                    .await?;
                 return Err(ErrorData::invalid_params(error, None));
             }
         };
@@ -2728,10 +2948,7 @@ impl ServerHandler for SkillMcpServer {
             .as_ref()
             .map(|project| project.identity().to_owned());
         if let Some(project) = &authorized_project {
-            request.arguments.get_or_insert_default().insert(
-                "project_path".into(),
-                serde_json::Value::String(project.clone()),
-            );
+            set_authorized_project(&tool, &mut request.arguments, project);
         }
         context
             .extensions
@@ -2748,23 +2965,13 @@ impl ServerHandler for SkillMcpServer {
         )
         .await?;
 
-        let catalog_before = if is_source_catalog_mutation(&tool) {
-            super::inspect_skill_sources(&self.state)
-                .await
-                .ok()
-                .map(|results| catalog_revision(&results))
-        } else {
-            None
-        };
+        let catalog_before = source_catalog_revision(&self.state, &tool).await;
         let peer = context.peer.clone();
         let tool_context = ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(tool_context).await;
         let success = tool_call_succeeded(&result);
         let catalog_after = if catalog_before.is_some() {
-            super::inspect_skill_sources(&self.state)
-                .await
-                .ok()
-                .map(|results| catalog_revision(&results))
+            source_catalog_revision(&self.state, &tool).await
         } else {
             None
         };
@@ -2778,23 +2985,15 @@ impl ServerHandler for SkillMcpServer {
                 tracing::debug!(tool, %error, "MCP peer does not accept resource list changes");
             }
         }
-        if let Err(error) = self
-            .append_tool_audit(
-                &id,
-                &tool,
-                action_name,
-                "terminal",
-                success,
-                authorized_project.as_deref(),
-            )
-            .await
-        {
-            // The durable attempt proves the mutation was admitted. Returning
-            // the completed tool result unchanged is deliberately retry-safe:
-            // reporting an audit error after a successful mutation could make
-            // an MCP client repeat a non-idempotent operation.
-            tracing::error!(tool, error = %error, "MCP terminal audit failed");
-        }
+        self.append_tool_audit(
+            &id,
+            &tool,
+            action_name,
+            "terminal",
+            success,
+            authorized_project.as_deref(),
+        )
+        .await?;
         result
     }
 
@@ -2830,6 +3029,7 @@ impl ServerHandler for SkillMcpServer {
                 }
             }
         }
+        resources.extend(crate::agents::mcp::list_agent_resources(&self.state).await?);
         Ok(ListResourcesResult::with_all_items(resources))
     }
 
@@ -2838,13 +3038,13 @@ impl ServerHandler for SkillMcpServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult::with_all_items(vec![
-            ResourceTemplate::new(
-                "skills://packages/~{source_id}/~{relative_path}/~{file_path}",
-                "Skill package file",
-            )
-            .with_description("A validated file from a registered skill package"),
-        ]))
+        let mut templates = vec![ResourceTemplate::new(
+            "skills://packages/~{source_id}/~{relative_path}/~{file_path}",
+            "Skill package file",
+        )
+        .with_description("A validated file from a registered skill package")];
+        templates.extend(crate::agents::mcp::agent_resource_templates());
+        Ok(ListResourceTemplatesResult::with_all_items(templates))
     }
 
     async fn read_resource(
@@ -2853,36 +3053,7 @@ impl ServerHandler for SkillMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let uri = request.uri;
-        let content = if uri == "skills://catalog" {
-            let catalog = super::inspect_skill_sources(&self.state)
-                .await
-                .map_err(mcp_invalid)?;
-            ResourceContents::text(
-                serde_json::to_string_pretty(&catalog).map_err(mcp_invalid)?,
-                &uri,
-            )
-            .with_mime_type("application/json")
-        } else {
-            let (source_id, relative_path, file_path) = parse_package_resource_uri(&uri)?;
-            let content =
-                super::read_skill_file(&self.state, &source_id, &relative_path, &file_path)
-                    .await
-                    .map_err(mcp_invalid)?;
-            match (content.text, content.base64) {
-                (Some(text), None) => {
-                    ResourceContents::text(text, &uri).with_mime_type(content.mime_type)
-                }
-                (None, Some(blob)) => {
-                    ResourceContents::blob(blob, &uri).with_mime_type(content.mime_type)
-                }
-                _ => {
-                    return Err(ErrorData::invalid_params(
-                        "invalid skill file content",
-                        None,
-                    ))
-                }
-            }
-        };
+        let content = read_resource_content(&self.state, &uri).await?;
         Ok(ReadResourceResult::new(vec![content]).into())
     }
 }
@@ -3186,10 +3357,32 @@ fn is_source_catalog_mutation(tool: &str) -> bool {
             | "skills_refresh_source"
             | "skills_refresh_all"
             | "skills_remove_source"
+            | "agents_add_local_source"
+            | "agents_add_github_source"
+            | "agents_refresh_source"
+            | "agents_refresh_all"
+            | "agents_remove_source"
     )
 }
 
-fn normalize_skill_name(value: &str) -> String {
+async fn source_catalog_revision(state: &AppState, tool: &str) -> Option<String> {
+    if !is_source_catalog_mutation(tool) {
+        return None;
+    }
+    if tool.starts_with("agents_") {
+        crate::agents::inspect_agent_sources(&state.app_data_dir)
+            .await
+            .ok()
+            .map(|results| crate::agents::mcp::agent_catalog_revision(&results))
+    } else {
+        super::inspect_skill_sources(state)
+            .await
+            .ok()
+            .map(|results| catalog_revision(&results))
+    }
+}
+
+pub(crate) fn normalize_skill_name(value: &str) -> String {
     let mut normalized = String::new();
     let mut separator = false;
     for character in value.trim().chars() {
@@ -3253,7 +3446,7 @@ fn parse_package_resource_uri(uri: &str) -> Result<(String, String, String), Err
     Ok((source_id, relative_path, file_path))
 }
 
-fn encode_resource_component(value: &str) -> String {
+pub(crate) fn encode_resource_component(value: &str) -> String {
     let mut output = String::from("~");
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -3267,7 +3460,7 @@ fn encode_resource_component(value: &str) -> String {
     output
 }
 
-fn decode_resource_component(value: &str) -> Result<String, ErrorData> {
+pub(crate) fn decode_resource_component(value: &str) -> Result<String, ErrorData> {
     let value = value
         .strip_prefix('~')
         .ok_or_else(|| ErrorData::invalid_params("invalid skill resource component", None))?;
@@ -3439,6 +3632,15 @@ mod tests {
     #[tokio::test]
     async fn http_transport_authenticates_and_enforces_http_boundaries() {
         let app = tempfile::tempdir().expect("app data");
+        let agent_source = tempfile::tempdir().expect("Agent source");
+        std::fs::write(
+            agent_source.path().join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: Reviews code\n---\nReview carefully.\n",
+        )
+        .expect("Agent markdown");
+        let registered_agent = crate::agents::add_local_source(app.path(), agent_source.path())
+            .await
+            .expect("register Agent source");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -3567,6 +3769,48 @@ mod tests {
                 .is_empty()
         );
 
+        for (id, uri, expected) in [
+            (
+                3,
+                crate::agents::mcp::AGENT_CATALOG_URI.to_string(),
+                "catalogRevision",
+            ),
+            (
+                4,
+                crate::agents::mcp::agent_resource_uri(&registered_agent.id, "reviewer.md"),
+                "Review carefully.",
+            ),
+            (
+                5,
+                crate::agents::mcp::render_resource_uri(
+                    &registered_agent.id,
+                    "reviewer.md",
+                    "codex",
+                ),
+                "name = \"Reviewer\"",
+            ),
+        ] {
+            let resource = client
+                .post(&url)
+                .bearer_auth(&token)
+                .header("Accept", "application/json, text/event-stream")
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "resources/read",
+                    "params": {"uri": uri}
+                }))
+                .send()
+                .await
+                .expect("Agent resource read");
+            assert_eq!(resource.status(), reqwest::StatusCode::OK);
+            let resource = resource.json::<serde_json::Value>().await.unwrap();
+            assert!(resource["result"]["contents"][0]["text"]
+                .as_str()
+                .expect("Agent resource text")
+                .contains(expected));
+        }
+
         shutdown_tx.send(()).expect("shutdown");
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -3579,7 +3823,7 @@ mod tests {
         calls: Vec<serde_json::Value>,
     ) -> Vec<serde_json::Value> {
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
-        let server = SkillMcpServer::new(state);
+        let server = SkillMcpServer::new_with_client(state, "test");
         let server_task = tokio::spawn(async move {
             server
                 .serve(server_transport)
@@ -3623,12 +3867,19 @@ mod tests {
                 .await
                 .expect("tool request");
             write.write_all(b"\n").await.expect("tool newline");
-            tokio::time::timeout(Duration::from_secs(2), read.read_line(&mut line))
-                .await
-                .expect("tool response timeout")
-                .expect("tool response");
-            responses.push(serde_json::from_str(&line).expect("tool response JSON"));
-            line.clear();
+            loop {
+                tokio::time::timeout(Duration::from_secs(2), read.read_line(&mut line))
+                    .await
+                    .expect("tool response timeout")
+                    .expect("tool response");
+                let response: serde_json::Value =
+                    serde_json::from_str(&line).expect("tool response JSON");
+                line.clear();
+                if response["id"] == index + 2 {
+                    responses.push(response);
+                    break;
+                }
+            }
         }
         server_task.abort();
         responses
@@ -3960,6 +4211,8 @@ mod tests {
         let app = tempfile::tempdir().expect("app data");
         let source = tempfile::tempdir().expect("skill source");
         let additional_source = tempfile::tempdir().expect("additional source");
+        let agent_source = tempfile::tempdir().expect("Agent source");
+        let additional_agent_source = tempfile::tempdir().expect("additional Agent source");
         let project = tempfile::tempdir().expect("project");
         let skill = source.path().join("reviewer");
         std::fs::create_dir(&skill).expect("skill package");
@@ -3968,6 +4221,11 @@ mod tests {
             "---\nname: reviewer\ndescription: Reviews changes\n---\n# never-audit-this-content\n",
         )
         .expect("skill markdown");
+        std::fs::write(
+            agent_source.path().join("reviewer.md"),
+            "---\nname: Agent Reviewer\ndescription: Reviews agents\n---\n# Agent reviewer\n",
+        )
+        .expect("Agent markdown");
         let state = Arc::new(AppState {
             app_data_dir: app.path().to_path_buf(),
             corpus_cache: Arc::new(Mutex::new(None)),
@@ -3990,6 +4248,9 @@ mod tests {
         )
         .await
         .expect("seed managed install");
+        let registered_agent = crate::agents::add_local_source(app.path(), agent_source.path())
+            .await
+            .expect("register Agent source");
         let responses = call_tools_over_stdio(
             Arc::clone(&state),
             vec![
@@ -4018,29 +4279,61 @@ mod tests {
                         "project_path": installed.project_path,
                     },
                 }),
+                serde_json::json!({
+                    "name": "agents_search",
+                    "arguments": {
+                        "query": "Bearer audit-secret password=hunter2 -----BEGIN PRIVATE KEY-----"
+                    },
+                }),
+                serde_json::json!({
+                    "name": "agents_add_local_source",
+                    "arguments": {"root": additional_agent_source.path()},
+                }),
+                serde_json::json!({
+                    "name": "agents_install",
+                    "arguments": {
+                        "source_id": registered_agent.id,
+                        "relative_path": "reviewer.md",
+                        "tool": "codex",
+                    },
+                }),
+                serde_json::json!({
+                    "name": "agents_disable",
+                    "arguments": {
+                        "source_id": registered_agent.id,
+                        "relative_path": "reviewer.md",
+                        "tool": "codex",
+                    },
+                }),
             ],
         )
         .await;
         assert!(responses[0].get("error").is_none(), "{}", responses[0]);
         assert_ne!(responses[0]["result"]["isError"], true, "{}", responses[0]);
-        assert!(responses[1..]
+        assert!(responses[4].get("error").is_none(), "{}", responses[4]);
+        assert_ne!(responses[4]["result"]["isError"], true, "{}", responses[4]);
+        assert!(responses[1..4]
             .iter()
+            .chain(responses[5..].iter())
             .all(|response| response["error"].is_object()));
 
         let audit = crate::state::load_mcp_audit(app.path())
             .await
             .expect("load audit");
-        assert_eq!(audit.len(), 8);
+        assert_eq!(audit.len(), 16);
         assert_eq!(
             audit
                 .iter()
                 .filter(|entry| entry.phase == "terminal" && entry.success)
                 .count(),
-            1
+            2
         );
         let raw =
             std::fs::read_to_string(app.path().join("state/mcp-audit.jsonl")).expect("audit jsonl");
         assert!(!raw.contains("never-audit-this-content"), "{raw}");
+        for secret in ["audit-secret", "hunter2", "BEGIN PRIVATE KEY"] {
+            assert!(!raw.contains(secret), "audit leaked {secret}: {raw}");
+        }
     }
 
     #[tokio::test]
@@ -4183,6 +4476,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)
             .expect("open audit lock");
         lock.lock().expect("hold audit lock");
@@ -4207,7 +4501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_audit_failure_returns_the_completed_result_to_prevent_a_retry() {
+    async fn terminal_audit_failure_never_reports_mutation_success() {
         let app = tempfile::tempdir().expect("app data");
         let source = tempfile::tempdir().expect("source");
         crate::commands::settings::persist(
@@ -4239,8 +4533,11 @@ mod tests {
             })],
         )
         .await;
-        assert!(responses[0].get("error").is_none(), "{}", responses[0]);
-        assert_ne!(responses[0]["result"]["isError"], true, "{}", responses[0]);
+        assert!(
+            responses[0].get("error").is_some() || responses[0]["result"]["isError"] == true,
+            "{}",
+            responses[0]
+        );
         assert_eq!(
             super::super::load_skill_sources(app.path())
                 .await
@@ -4357,7 +4654,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_exposes_the_skill_catalog_and_source_tools() {
+    fn mcp_exposes_all_skill_agent_and_expert_tools() {
         let root = tempfile::tempdir().expect("app data");
         let server = SkillMcpServer::new(Arc::new(AppState {
             app_data_dir: root.path().to_path_buf(),
@@ -4381,89 +4678,46 @@ mod tests {
             "every routed tool must have an explicit audit/policy class"
         );
 
+        assert_eq!(names.len(), 127);
         assert_eq!(
-            names,
-            [
-                "expert_runs_get",
-                "expert_runs_get_contract",
-                "expert_runs_get_review",
-                "expert_runs_list",
-                "expert_runs_report_blocker",
-                "expert_runs_request_review",
-                "expert_runs_submit_evidence",
-                "experts_cancel_activation_request",
-                "experts_cancel_change_request",
-                "experts_capabilities",
-                "experts_creation_context",
-                "experts_get",
-                "experts_get_activation_request",
-                "experts_get_change_request",
-                "experts_get_creation_request",
-                "experts_list",
-                "experts_list_activation_requests",
-                "experts_list_change_requests",
-                "experts_list_creation_requests",
-                "experts_plan_activation",
-                "experts_request_activation",
-                "experts_request_archive",
-                "experts_request_clone",
-                "experts_request_creation",
-                "experts_request_delete",
-                "experts_request_update",
-                "experts_revise_change_request",
-                "experts_search",
-                "experts_validate_proposal",
-                "skills_add_github_source",
-                "skills_add_local_source",
-                "skills_assign_folder",
-                "skills_create_draft",
-                "skills_create_folder",
-                "skills_delete_collection",
-                "skills_delete_folder",
-                "skills_delete_profile",
-                "skills_delete_smart_folder",
-                "skills_disable",
-                "skills_edit_draft",
-                "skills_enable",
-                "skills_find_and_install",
-                "skills_get",
-                "skills_get_draft",
-                "skills_get_file",
-                "skills_get_insights",
-                "skills_get_library",
-                "skills_install",
-                "skills_install_with_dependencies",
-                "skills_installed",
-                "skills_list_approvals",
-                "skills_list_drafts",
-                "skills_list_files",
-                "skills_list_folders",
-                "skills_list_sources",
-                "skills_move_folder",
-                "skills_plan_install",
-                "skills_recommend",
-                "skills_refresh_all",
-                "skills_refresh_source",
-                "skills_remove_source",
-                "skills_rename_folder",
-                "skills_request_batch_collection",
-                "skills_request_publisher_trust",
-                "skills_request_rollback",
-                "skills_save_collection",
-                "skills_save_profile",
-                "skills_save_smart_folder",
-                "skills_search",
-                "skills_set_favorite",
-                "skills_set_preferred_source",
-                "skills_set_update_policy",
-                "skills_source_status",
-                "skills_submit_approval",
-                "skills_submit_draft",
-                "skills_uninstall",
-                "skills_update",
-                "skills_version_history",
-            ]
+            names
+                .iter()
+                .filter(|name| name.starts_with("skills_"))
+                .count(),
+            49
         );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("agents_"))
+                .count(),
+            49
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("experts_") || name.starts_with("expert_runs_"))
+                .count(),
+            29
+        );
+    }
+
+    #[test]
+    fn tool_routers_compose_without_losing_or_duplicating_skills() {
+        let skill_names = SkillMcpServer::skills_tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<std::collections::HashSet<_>>();
+        let agent_names = SkillMcpServer::agents_tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(skill_names.len(), 78);
+        assert_eq!(agent_names.len(), 49);
+        assert!(skill_names.is_disjoint(&agent_names));
     }
 
     #[tokio::test]
@@ -4494,6 +4748,232 @@ mod tests {
         assert_eq!(response["state"], "pending");
         assert_eq!(response["request"]["action"], "collectionDelete");
         assert_eq!(response["request"]["name"], "Review set");
+    }
+
+    #[tokio::test]
+    async fn agent_folder_delete_stays_pending_and_uses_authenticated_client_identity() {
+        let root = tempfile::tempdir().expect("app data");
+        let state = Arc::new(AppState {
+            app_data_dir: root.path().to_path_buf(),
+            corpus_cache: Arc::new(Mutex::new(None)),
+            corpus_refresh_in_flight: Arc::new(Mutex::new(())),
+            skill_sources_write_lock: Arc::new(Mutex::new(())),
+            skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
+            settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
+            updater_state: crate::commands::updater::empty_state(),
+        });
+        crate::commands::settings::mcp_agent_policy_set_inner(&state, true, false, true)
+            .await
+            .expect("enable Agent MCP mutations");
+
+        let responses = call_tools_over_stdio(
+            Arc::clone(&state),
+            vec![
+                serde_json::json!({
+                    "name": "agents_create_folder",
+                    "arguments": {"path": "teams"},
+                }),
+                serde_json::json!({
+                    "name": "agents_create_folder",
+                    "arguments": {"path": "teams/review"},
+                }),
+                serde_json::json!({
+                    "name": "agents_delete_folder",
+                    "arguments": {"path": "teams/review", "recursive": false},
+                }),
+            ],
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .all(|response| response.get("error").is_none()),
+            "{responses:#?}"
+        );
+        assert!(responses
+            .iter()
+            .all(|response| response["result"]["isError"] != true));
+        let approval: serde_json::Value = serde_json::from_str(
+            responses[2]["result"]["content"][0]["text"]
+                .as_str()
+                .expect("approval text"),
+        )
+        .expect("approval JSON");
+        assert_eq!(approval["state"], "pending");
+        assert_eq!(approval["requestedBy"], "test");
+
+        let library = crate::agents::organize::list(&state)
+            .await
+            .expect("Agent library");
+        assert!(library.folders.contains(&"teams/review".into()));
+        assert_eq!(library.approvals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nested_agent_approval_project_path_cannot_bypass_allowlist() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let state = test_state(app.path());
+        crate::commands::settings::mcp_agent_policy_set_inner(&state, false, false, true)
+            .await
+            .expect("enable Agent approvals");
+
+        let responses = call_tools_over_stdio(
+            Arc::clone(&state),
+            vec![serde_json::json!({
+                "name": "agents_submit_approval",
+                "arguments": {
+                    "request": {
+                        "action": "install",
+                        "sourceId": "local:source",
+                        "relativePath": "reviewer.md",
+                        "tool": "codex",
+                        "projectPath": project.path(),
+                        "includeDependencies": false,
+                        "planRevision": "revision"
+                    }
+                },
+            })],
+        )
+        .await;
+        assert!(responses[0]["error"].is_object(), "{}", responses[0]);
+        assert!(crate::agents::organize::list(&state)
+            .await
+            .expect("Agent library")
+            .approvals
+            .is_empty());
+        let audit = crate::state::load_mcp_audit(app.path())
+            .await
+            .expect("audit");
+        assert_eq!(audit.len(), 2);
+        assert!(audit.iter().all(|entry| entry.project_path.is_none()));
+    }
+
+    #[tokio::test]
+    async fn agent_mcp_project_lifecycle_installs_cleanly_and_approves_replacement() {
+        let app = tempfile::tempdir().expect("app data");
+        let source = tempfile::tempdir().expect("Agent source");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            source.path().join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: Reviews code\n---\nReview carefully.\n",
+        )
+        .expect("Agent markdown");
+        let registered = crate::agents::add_local_source(app.path(), source.path())
+            .await
+            .expect("register Agent source");
+        let canonical_project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        let state = test_state(app.path());
+        crate::commands::settings::mcp_policy_set_inner(
+            &state,
+            false,
+            false,
+            false,
+            vec![canonical_project.clone()],
+        )
+        .await
+        .expect("allowlist project");
+        crate::commands::settings::mcp_agent_policy_set_inner(&state, false, true, true)
+            .await
+            .expect("enable Agent lifecycle");
+        let reference = crate::types::AgentReference {
+            source_id: registered.id.clone(),
+            relative_path: "reviewer.md".into(),
+        };
+        let request = serde_json::json!({
+            "source_id": reference.source_id,
+            "relative_path": reference.relative_path,
+            "tool": "codex",
+            "project_path": canonical_project,
+        });
+
+        let responses = call_tools_over_stdio(
+            Arc::clone(&state),
+            vec![
+                serde_json::json!({
+                    "name": "agents_plan_install",
+                    "arguments": request.clone(),
+                }),
+                serde_json::json!({
+                    "name": "agents_install",
+                    "arguments": request.clone(),
+                }),
+                serde_json::json!({
+                    "name": "agents_install",
+                    "arguments": request.clone(),
+                }),
+                serde_json::json!({
+                    "name": "agents_disable",
+                    "arguments": request.clone(),
+                }),
+                serde_json::json!({
+                    "name": "agents_enable",
+                    "arguments": request.clone(),
+                }),
+                serde_json::json!({
+                    "name": "agents_version_history",
+                    "arguments": request,
+                }),
+            ],
+        )
+        .await;
+        assert!(
+            responses.iter().all(|response| {
+                response.get("error").is_none() && response["result"]["isError"] != true
+            }),
+            "{responses:#?}"
+        );
+        let output = |index: usize| {
+            serde_json::from_str::<serde_json::Value>(
+                responses[index]["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("tool text"),
+            )
+            .expect("tool JSON")
+        };
+        let plan = output(0);
+        let destination = plan["agents"][0]["destination"]
+            .as_str()
+            .expect("Agent destination");
+        assert!(std::path::Path::new(destination).is_file());
+        assert_eq!(output(2)["state"], "pending");
+        assert!(!output(5).as_array().expect("history").is_empty());
+
+        std::fs::write(
+            source.path().join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: Reviews code\n---\nReview the changed source.\n",
+        )
+        .expect("change Agent source");
+        let authorization = state
+            .authorize_mcp_client(
+                "test",
+                crate::state::McpAction::AgentInstall,
+                Some(&canonical_project),
+            )
+            .await
+            .expect("authorize project");
+        let changed_plan = crate::install::mcp_agent_plan(
+            &state,
+            reference,
+            "codex".into(),
+            Some(canonical_project),
+            "update",
+            false,
+            authorization.as_ref(),
+        )
+        .await
+        .expect("changed source plan");
+        assert_ne!(plan["revision"], changed_plan.revision);
+
+        let library = crate::agents::organize::list(&state)
+            .await
+            .expect("Agent library");
+        assert_eq!(library.approvals.len(), 1);
+        assert_eq!(library.approvals[0].requested_by, "test");
     }
 
     #[test]
@@ -4971,6 +5451,11 @@ mod tests {
             "---\nname: root-skill\ndescription: Reads root resources\n---\n# Root Skill\n",
         )
         .expect("root skill markdown");
+        std::fs::write(
+            source.join("agent.md"),
+            "---\nname: Reviewer\ndescription: Reviews code\n---\nReview carefully.\n",
+        )
+        .expect("Agent markdown");
         std::fs::write(source.join("blob.png"), [0, 159, 146, 150]).expect("binary file");
         let nested = source.join("nested/reviewer");
         std::fs::create_dir_all(nested.join("references")).expect("nested package");
@@ -4994,6 +5479,9 @@ mod tests {
         let registered = super::super::add_local_source(&state, &source)
             .await
             .expect("register source");
+        let registered_agent = crate::agents::add_local_source(app.path(), &source)
+            .await
+            .expect("register Agent source");
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let server = SkillMcpServer::new(Arc::clone(&state));
         let server_task = tokio::spawn(async move {
@@ -5049,6 +5537,19 @@ mod tests {
             .iter()
             .any(|resource| {
                 resource["uri"] == package_resource_uri(&registered.id, ".", "SKILL.md")
+            }));
+        assert!(resources["result"]["resources"]
+            .as_array()
+            .expect("resources array")
+            .iter()
+            .any(|resource| resource["uri"] == crate::agents::mcp::AGENT_CATALOG_URI));
+        assert!(resources["result"]["resources"]
+            .as_array()
+            .expect("resources array")
+            .iter()
+            .any(|resource| {
+                resource["uri"]
+                    == crate::agents::mcp::agent_resource_uri(&registered_agent.id, "agent.md")
             }));
         line.clear();
 
@@ -5171,6 +5672,48 @@ mod tests {
         let traversal: serde_json::Value =
             serde_json::from_str(&line).expect("traversal resource JSON");
         assert!(traversal["error"].is_object());
+        line.clear();
+
+        for (id, uri, expected) in [
+            (
+                8,
+                crate::agents::mcp::AGENT_CATALOG_URI.to_string(),
+                "catalogRevision",
+            ),
+            (
+                9,
+                crate::agents::mcp::agent_resource_uri(&registered_agent.id, "agent.md"),
+                "Review carefully.",
+            ),
+            (
+                10,
+                crate::agents::mcp::render_resource_uri(&registered_agent.id, "agent.md", "codex"),
+                "name = \"Reviewer\"",
+            ),
+        ] {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "resources/read",
+                "params": {"uri": uri},
+            });
+            write
+                .write_all(request.to_string().as_bytes())
+                .await
+                .expect("Agent resource read request");
+            write.write_all(b"\n").await.expect("Agent read newline");
+            tokio::time::timeout(Duration::from_secs(2), read.read_line(&mut line))
+                .await
+                .expect("Agent resource read timeout")
+                .expect("Agent resource read response");
+            let response: serde_json::Value =
+                serde_json::from_str(&line).expect("Agent resource read JSON");
+            assert!(response["result"]["contents"][0]["text"]
+                .as_str()
+                .expect("Agent resource text")
+                .contains(expected));
+            line.clear();
+        }
 
         server_task.abort();
     }
