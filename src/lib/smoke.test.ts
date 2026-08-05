@@ -1,4 +1,5 @@
 import { createRawSnippet, mount, tick, unmount } from "svelte";
+import { invoke } from "@tauri-apps/api/core";
 import { describe, expect, it, vi } from "vitest";
 import Modal from "$lib/components/Modal.svelte";
 import { mergeActivityEntries, safeActivityDetail, selectMcpAuditEntries } from "$lib/stores/activity.svelte";
@@ -88,6 +89,80 @@ describe("frontend test harness", () => {
       approvalInbox.open = true;
       document.body.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       expect(approvalInbox.open).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("shows one inbox card when a pending draft already has an exact approval request", async () => {
+    const draft = {
+      id: "draft-1",
+      submittedAt: "2026-08-05T13:00:00Z",
+      state: "pending",
+      treeHash: "a".repeat(64),
+      files: [{ relativePath: "SKILL.md", sizeBytes: 10, sha256: "b".repeat(64) }],
+      validation: {
+        sourceId: "draft",
+        relativePath: "reviewer",
+        name: "reviewer",
+        description: "Reviews code",
+        skillType: "ai",
+        group: [],
+        tags: ["review"],
+        dependencies: [],
+        recommendedSkills: [],
+        version: null,
+        channel: "stable",
+        changelog: null,
+        publisher: null,
+        publisherKey: null,
+        publisherVerified: false,
+        validationResults: [],
+        permissions: [],
+        qualityScore: 100,
+        qualityChecks: [],
+        files: [{ relativePath: "SKILL.md", sizeBytes: 10, sha256: "b".repeat(64) }],
+        trustFingerprint: null,
+        errors: [],
+        installable: true,
+      },
+      publishedSourceId: null,
+    };
+    const folders = {
+      folders: [], assignments: [], favorites: [], recent: [], collections: [], smartFolders: [],
+      profiles: [], updatePolicies: [], publisherTrust: [], preferredSources: [], usage: [],
+      approvals: [{
+        id: "approval-1",
+        submittedAt: "2026-08-05T13:01:00Z",
+        state: "pending",
+        requestedBy: "codex",
+        request: { action: "draftPublish", id: draft.id, planRevision: draft.treeHash },
+        result: null,
+      }],
+    };
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "skill_drafts_list") return [draft] as never;
+      if (command === "skill_folders_list") return folders as never;
+      return [] as never;
+    });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      removeItem: () => undefined,
+    });
+    const { default: SkillsWorkspace } = await import("$lib/components/SkillsWorkspace.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SkillsWorkspace, { target });
+    try {
+      await vi.waitFor(() => {
+        expect(target.querySelector("details.draft-inbox summary")?.textContent).toContain("1");
+      });
+      expect(target.querySelectorAll("details.draft-inbox article.draft")).toHaveLength(1);
+      expect(target.querySelector("details.draft-inbox article.draft strong")?.textContent)
+        .toBe("Publish Skill draft draft-1");
     } finally {
       unmount(component);
       target.remove();

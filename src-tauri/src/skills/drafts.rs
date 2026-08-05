@@ -674,13 +674,40 @@ pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError>
         }
     };
     let destination = published.join(name);
-    if destination.exists() {
-        let _ = tokio::fs::rename(&claim, &draft_root).await;
-        return Err(AppError::InvalidArgument {
-            message: format!("published skill already exists: {name}"),
-        });
-    }
+    let previous = match tokio::fs::symlink_metadata(&destination).await {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && !super::metadata_is_reparse_point(&metadata) =>
+        {
+            let backups = state.app_data_dir.join("skill-backups");
+            if let Err(error) = tokio::fs::create_dir_all(&backups).await {
+                let _ = tokio::fs::rename(&claim, &draft_root).await;
+                return Err(io("create published skill backup directory")(error));
+            }
+            let backup = backups.join(format!("{name}-{}", Uuid::new_v4()));
+            if let Err(error) = tokio::fs::rename(&destination, &backup).await {
+                let _ = tokio::fs::rename(&claim, &draft_root).await;
+                return Err(io("back up published skill")(error));
+            }
+            Some(backup)
+        }
+        Ok(_) => {
+            let _ = tokio::fs::rename(&claim, &draft_root).await;
+            return Err(AppError::InvalidArgument {
+                message: format!("published skill is not a real directory: {name}"),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            let _ = tokio::fs::rename(&claim, &draft_root).await;
+            return Err(io("inspect published skill")(error));
+        }
+    };
     if let Err(error) = tokio::fs::rename(&source, &destination).await {
+        if let Some(previous) = &previous {
+            let _ = tokio::fs::rename(previous, &destination).await;
+        }
         let _ = tokio::fs::rename(&claim, &draft_root).await;
         return Err(io("publish skill draft atomically")(error));
     }
@@ -689,6 +716,9 @@ pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError>
         Ok(source) => source,
         Err(error) => {
             let _ = tokio::fs::rename(&destination, &source).await;
+            if let Some(previous) = &previous {
+                let _ = tokio::fs::rename(previous, &destination).await;
+            }
             let _ = tokio::fs::rename(&claim, &draft_root).await;
             return Err(error);
         }
@@ -710,6 +740,11 @@ pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError>
         }
         if let Err(error) = tokio::fs::rename(&destination, &source).await {
             rollback_errors.push(format!("restore claimed package: {error}"));
+        }
+        if let Some(previous) = &previous {
+            if let Err(error) = tokio::fs::rename(previous, &destination).await {
+                rollback_errors.push(format!("restore previous published skill: {error}"));
+            }
         }
         if let Err(error) = tokio::fs::rename(&claim, &draft_root).await {
             rollback_errors.push(format!("restore draft directory: {error}"));
@@ -888,6 +923,82 @@ mod tests {
         let rejected = reject(&app, &pending.id).await.unwrap();
         assert_eq!(rejected.state, SkillDraftState::Rejected);
         assert!(!drafts_root(root.path()).join(pending.id).exists());
+    }
+
+    #[tokio::test]
+    async fn publishing_a_new_revision_replaces_and_backs_up_the_published_skill() {
+        let root = tempfile::tempdir().unwrap();
+        let app = state(root.path());
+        let first = submit(&app, valid_files()).await.unwrap();
+        publish(&app, &first.id).await.unwrap();
+
+        let replacement_text =
+            "---\nname: reviewer\ndescription: Reviews code\ntype: ai\ntags:\n  - review\n---\n";
+        let replacement = submit(
+            &app,
+            vec![DraftInputFile {
+                relative_path: "SKILL.md".into(),
+                text: Some(replacement_text.into()),
+                base64: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let published = publish(&app, &replacement.id).await.unwrap();
+
+        assert_eq!(published.state, SkillDraftState::Published);
+        assert_eq!(
+            std::fs::read_to_string(published_root(root.path()).join("reviewer/SKILL.md")).unwrap(),
+            replacement_text
+        );
+        let backups = std::fs::read_dir(root.path().join("skill-backups"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path().join("SKILL.md")).unwrap(),
+            valid_files()[0].text.as_deref().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_index_commit_restores_both_skill_revisions() {
+        let root = tempfile::tempdir().unwrap();
+        let app = state(root.path());
+        let first = submit(&app, valid_files()).await.unwrap();
+        publish(&app, &first.id).await.unwrap();
+        let original =
+            std::fs::read_to_string(published_root(root.path()).join("reviewer/SKILL.md")).unwrap();
+        let replacement = submit(
+            &app,
+            vec![DraftInputFile {
+                relative_path: "SKILL.md".into(),
+                text: Some(
+                    "---\nname: reviewer\ndescription: Updated review\ntype: ai\n---\n".into(),
+                ),
+                base64: None,
+            }],
+        )
+        .await
+        .unwrap();
+        schedule_index_saves(root.path(), [true]);
+
+        let error = publish(&app, &replacement.id)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("injected draft index save failure"));
+        assert_eq!(
+            std::fs::read_to_string(published_root(root.path()).join("reviewer/SKILL.md")).unwrap(),
+            original
+        );
+        assert!(drafts_root(root.path())
+            .join(replacement.id)
+            .join("reviewer/SKILL.md")
+            .is_file());
     }
 
     #[tokio::test]

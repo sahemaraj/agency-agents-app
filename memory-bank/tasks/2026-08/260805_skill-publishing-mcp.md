@@ -15,6 +15,9 @@ popover and filter-layout behavior.
 - Accepted legitimate root-level Skill references while retaining source ID and path validation.
 - Made Manage Sources and Approval Inbox close on outside clicks while preserving inside clicks.
 - Kept the search and filter controls inside the fixed-width package-list column.
+- Allowed an approved draft to replace the same app-owned published Skill with a rollback backup.
+- Reconciled exact pending publication approvals after their draft was published directly.
+- Deduplicated publication approvals and their exact draft revision in the approval inbox.
 - Published the 59-file `primavera-p6-eppm-hybrid` package through the approved MCP-to-desktop
   workflow in 2.61 seconds.
 
@@ -22,13 +25,14 @@ popover and filter-layout behavior.
 
 - `src-tauri/src/types.rs` — typed Skill draft-publication approval action.
 - `src-tauri/src/skills/mcp.rs` — MCP request tool, policy classification, inventory, and stdio test.
+- `src-tauri/src/skills/drafts.rs` — backup-first replacement of app-owned published Skills.
 - `src-tauri/src/skills/organize.rs` — revision validation, desktop execution, stale-request recovery,
-  and root Skill reference validation.
+  exact published-request reconciliation, and root Skill reference validation.
 - `src-tauri/src/library.rs` — reused source ID validation.
 - `src/lib/types.ts` — frontend approval union.
-- `src/lib/components/SkillsWorkspace.svelte` — approval label, outside-click dismissal, and filter
-  width containment.
-- `src/lib/smoke.test.ts` — real-component popover regression coverage.
+- `src/lib/components/SkillsWorkspace.svelte` — approval label, outside-click dismissal, filter
+  width containment, and exact draft/approval deduplication.
+- `src/lib/smoke.test.ts` — real-component popover and approval deduplication regression coverage.
 
 ## Patterns Applied
 
@@ -48,8 +52,8 @@ popover and filter-layout behavior.
 
 ## Verification
 
-- Rust library: 477 passed, 0 failed, 2 intentional ignores.
-- Frontend: 0 check errors/warnings, 21 tests passed, production build passed.
+- Rust library: 480 passed, 0 failed, 2 intentional ignores; 2 CLI tests passed.
+- Frontend: 0 check errors/warnings, 22 tests passed, production build passed.
 - Quality: strict Clippy, Rust format, and `git diff --check` passed.
 - Live UI: inside clicks preserved each popover; outside clicks closed Manage Sources and Approval
   Inbox; opening one closed the other; search and filter controls stayed inside the package list.

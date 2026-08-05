@@ -42,4 +42,6 @@ Added deterministic editable Skill-to-Agent drafts in the desktop app and MCP, s
 
 Added revision-bound Skill publication requests through the existing desktop approval boundary,
 published the 59-file Primavera hybrid, made Skills popovers dismiss on outside clicks, and
-contained filters within the package-list column. See [260805_skill-publishing-mcp.md](./260805_skill-publishing-mcp.md).
+contained filters within the package-list column. Same-name app-owned revisions now replace with a
+rollback backup, stale exact approvals reconcile, and the inbox shows one action per revision. See
+[260805_skill-publishing-mcp.md](./260805_skill-publishing-mcp.md).

@@ -2,16 +2,18 @@
 
 ## ✅ Skill Publishing MCP and Skills UI Fixes [COMPLETE] (2026-08-05)
 
-The local `feat/create-agent-from-skill` branch now exposes revision-bound Skill draft publication
+Local `main` now exposes revision-bound Skill draft publication
 requests through the existing authenticated MCP server and desktop approval inbox. It accepts
 validated root-level Skill references, rejects stale revisions without leaving approvals Running,
 and keeps Agent and Expert publishing on their existing endpoints. The Skills Manage Sources and
 Approval Inbox popovers now remain open for inside interactions and close on outside clicks. The
-search and filter controls remain inside the package-list column. The approved flow published all
-59 files of `primavera-p6-eppm-hybrid` in 2.61 seconds. Verification: 477 Rust library tests passed
-with 2 intentional ignores, strict Clippy and format checks passed, frontend check reported 0
-errors and warnings, 21 frontend tests and the production build passed, and `git diff --check`
-passed. Record: `tasks/2026-08/260805_skill-publishing-mcp.md`.
+search and filter controls remain inside the package-list column. Same-name app-owned revisions now
+replace with a rollback backup, exact approvals reconcile after direct publication, and the inbox
+shows one action per revision. The approved flow published all 59 files of
+`primavera-p6-eppm-hybrid` in 2.61 seconds. Verification: 480 Rust library tests passed with 2
+intentional ignores, 2 CLI tests passed, strict Clippy and format checks passed, frontend check
+reported 0 errors and warnings, 22 frontend tests and the production build passed, and
+`git diff --check` passed. Record: `tasks/2026-08/260805_skill-publishing-mcp.md`.
 
 ## ✅ Create Agent from Skill [COMPLETE] (2026-08-05)
 

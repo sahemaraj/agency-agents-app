@@ -383,7 +383,37 @@ fn relocate(state: &mut SkillFolderState, path: &str, destination: String) -> Re
 }
 
 pub async fn list(state: &AppState) -> Result<SkillFolderState, AppError> {
-    load(&state.app_data_dir).await
+    let library = load(&state.app_data_dir).await?;
+    if !library.approvals.iter().any(|approval| {
+        approval.state == SkillApprovalState::Pending
+            && matches!(approval.request, SkillApprovalAction::DraftPublish { .. })
+    }) {
+        return Ok(library);
+    }
+    let drafts = super::drafts::list(state).await?;
+    let _guard = state.skill_folders_write_lock.lock().await;
+    let mut library = load(&state.app_data_dir).await?;
+    let mut changed = false;
+    for approval in &mut library.approvals {
+        let SkillApprovalAction::DraftPublish { id, plan_revision } = &approval.request else {
+            continue;
+        };
+        if approval.state == SkillApprovalState::Pending
+            && drafts.iter().any(|draft| {
+                draft.id == *id
+                    && draft.tree_hash == *plan_revision
+                    && draft.state == crate::types::SkillDraftState::Published
+            })
+        {
+            approval.state = SkillApprovalState::Approved;
+            approval.result = Some("completed".into());
+            changed = true;
+        }
+    }
+    if changed {
+        save(&state.app_data_dir, &library).await?;
+    }
+    Ok(library)
 }
 
 pub async fn create_folder(state: &AppState, path: String) -> Result<SkillFolderState, AppError> {
@@ -1377,6 +1407,46 @@ mod tests {
                 .state,
             crate::types::SkillDraftState::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn listing_approvals_completes_a_request_whose_exact_draft_was_published_directly() {
+        let root = tempfile::tempdir().expect("app data");
+        let app = app_state(root.path());
+        let draft = crate::skills::drafts::create(
+            &app,
+            "reviewer".into(),
+            "Reviews changes.".into(),
+            crate::types::SkillType::Other,
+            Vec::new(),
+            Vec::new(),
+            "# Reviewer".into(),
+        )
+        .await
+        .expect("create Skill draft");
+        let approval = submit_approval(
+            &app,
+            "Codex".into(),
+            SkillApprovalAction::DraftPublish {
+                id: draft.id.clone(),
+                plan_revision: draft.tree_hash.clone(),
+            },
+        )
+        .await
+        .expect("submit publication approval");
+        crate::skills::drafts::publish(&app, &draft.id)
+            .await
+            .expect("publish directly");
+
+        let library = list(&app).await.expect("list reconciled approvals");
+        let reconciled = library
+            .approvals
+            .iter()
+            .find(|entry| entry.id == approval.id)
+            .expect("approval remains auditable");
+
+        assert_eq!(reconciled.state, SkillApprovalState::Approved);
+        assert_eq!(reconciled.result.as_deref(), Some("completed"));
     }
 
     #[tokio::test]

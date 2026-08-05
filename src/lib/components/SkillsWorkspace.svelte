@@ -136,8 +136,15 @@
   const unavailableInstalls = $derived(
     skillSources.installed.filter((record) => record.state === "sourceUnavailable"),
   );
-  const pendingDrafts = $derived(skillSources.drafts.filter((draft) => draft.state === "pending"));
   const pendingApprovals = $derived(skillSources.folderState.approvals.filter((approval) => approval.state === "pending"));
+  const pendingDrafts = $derived(skillSources.drafts.filter((draft) =>
+    draft.state === "pending"
+    && !pendingApprovals.some((approval) =>
+      approval.request.action === "draftPublish"
+      && approval.request.id === draft.id
+      && approval.request.planRevision === draft.treeHash,
+    )
+  ));
   const metrics = $derived(libraryMetrics(packages, skillSources.installed, skillSources.folderState));
   const installedCount = $derived(metrics.installed);
   const trustedCount = $derived(metrics.trusted);
