@@ -34,7 +34,8 @@ popover and filter-layout behavior.
 
 - Extended the existing draft publisher and typed desktop approval boundary.
 - Reused the existing document-click popover behavior from the Agents workspace.
-- Reused the existing `min-width: 0` flex/grid containment pattern from the Agents workspace.
+- Constrained the filter grid's internal track with `minmax(0, 1fr)` so intrinsic control widths
+  cannot extend into the detail pane.
 - Kept publication human-approved and revision-bound; MCP cannot bypass desktop review.
 - Added no dependency or production abstraction.
 

@@ -1662,7 +1662,7 @@
   .named-views button.active { background: color-mix(in srgb, var(--color-brand) 14%, transparent); color: var(--color-text-primary); }
   .named-views button span:last-child { color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
   .taxonomy-tree { padding-bottom: var(--space-3); }
-  .filters { min-width: 0; display: grid; gap: var(--space-2); padding: var(--space-3); border-bottom: 1px solid var(--color-border); }
+  .filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2); padding: var(--space-3); border-bottom: 1px solid var(--color-border); }
   .search { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-text-muted); background: var(--color-surface-raised); }
   .search:focus-within { border-color: var(--color-brand); }
   .search input { flex: 1; min-width: 0; background: transparent; color: var(--color-text-primary); }
