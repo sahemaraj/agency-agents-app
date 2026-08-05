@@ -483,6 +483,7 @@ export type SkillApprovalAction =
   | { action: "updatePolicySet"; sourceId: string; relativePath: string; policy: SkillUpdatePolicy }
   | { action: "rollback"; sourceId: string; relativePath: string; runtime: string; projectPath: string | null; snapshotPath: string }
   | { action: "publisherTrustSet"; name: string; publicKey: string; trusted: boolean; revoked: boolean }
+  | { action: "draftPublish"; id: string; planRevision: string }
   | { action: "batchCollection"; collectionName: string; operation: string; runtime: string; projectPath: string | null };
 
 export interface SkillApproval {

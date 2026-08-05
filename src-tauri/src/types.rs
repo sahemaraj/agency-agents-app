@@ -366,6 +366,10 @@ pub enum SkillApprovalAction {
         trusted: bool,
         revoked: bool,
     },
+    DraftPublish {
+        id: String,
+        plan_revision: String,
+    },
     BatchCollection {
         collection_name: String,
         operation: String,

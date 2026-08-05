@@ -55,6 +55,8 @@
   let githubRegistrationRejected = $state(false);
   let query = $state("");
   let searchInput: HTMLInputElement | undefined = $state();
+  let sourceManager: HTMLDetailsElement | undefined = $state();
+  let approvalInbox: HTMLDetailsElement | undefined = $state();
   let statusFilter: StatusFilter = $state("all");
   let sourceFilter = $state("all");
   let libraryFilter = $state("all");
@@ -178,14 +180,24 @@
       event.preventDefault();
       searchInput?.focus();
     };
+    const closePopovers = (event: MouseEvent): void => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (sourceManager?.open && !sourceManager.contains(target)) sourceManager.open = false;
+      if (approvalInbox?.open && !approvalInbox.contains(target)) approvalInbox.open = false;
+    };
     document.addEventListener("keydown", focusSearch);
+    document.addEventListener("click", closePopovers);
     void (async () => {
       await projects.refresh();
       await skillSources.load();
       await migratePersonalFolders();
       await skillSources.reconcileInstalls(projects.list.map((project) => project.path));
     })();
-    return () => document.removeEventListener("keydown", focusSearch);
+    return () => {
+      document.removeEventListener("keydown", focusSearch);
+      document.removeEventListener("click", closePopovers);
+    };
   });
 
   function sourceKind(source: SkillSource): string {
@@ -495,6 +507,7 @@
     if (action.action === "profileDelete") return `Delete profile ${action.name}`;
     if (action.action === "updatePolicySet") return `Set ${action.relativePath} policy to ${action.policy}`;
     if (action.action === "publisherTrustSet") return `${action.revoked ? "Revoke" : "Trust"} publisher ${action.name}`;
+    if (action.action === "draftPublish") return `Publish Skill draft ${action.id}`;
     if (action.action === "batchCollection") return `${action.operation} collection ${action.collectionName} in ${action.runtime}`;
     return `Roll back ${action.relativePath} in ${action.runtime}`;
   }
@@ -752,7 +765,7 @@
     </div>
     <div class="header-actions">
     <Button size="sm" onclick={() => (creatorOpen = true)}>{i18n.t("skills.createSkill")}</Button>
-    <details class="source-manager">
+    <details class="source-manager" bind:this={sourceManager}>
       <summary>{i18n.t("skills.manageSources")} <span>{skillSources.sources.length}</span></summary>
       <div class="source-popover">
         <section class="local-add" aria-label={i18n.t("skills.addLocalAria")} aria-busy={skillSources.loading || skillSources.adding}>
@@ -817,7 +830,7 @@
         </div>
       </div>
     </details>
-    <details class="draft-inbox">
+    <details class="draft-inbox" bind:this={approvalInbox}>
       <summary>{i18n.t("skills.approvalInbox")} <span>{pendingDrafts.length + pendingApprovals.length}</span></summary>
       <div class="draft-popover" aria-label={i18n.t("skills.draftInboxAria")}>
         {#if pendingDrafts.length === 0 && pendingApprovals.length === 0}

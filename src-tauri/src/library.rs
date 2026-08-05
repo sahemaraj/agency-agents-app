@@ -106,7 +106,7 @@ pub(crate) fn portable_path_key(value: &str) -> Result<String, AppError> {
     Ok(normalize_relative_path(value)?.to_lowercase())
 }
 
-pub(crate) fn validate_reference(source_id: &str, relative_path: &str) -> Result<(), AppError> {
+pub(crate) fn validate_source_id(source_id: &str) -> Result<(), AppError> {
     if source_id.trim() != source_id
         || source_id.is_empty()
         || source_id.len() > 128
@@ -114,6 +114,11 @@ pub(crate) fn validate_reference(source_id: &str, relative_path: &str) -> Result
     {
         return Err(invalid("library source identity is invalid"));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_reference(source_id: &str, relative_path: &str) -> Result<(), AppError> {
+    validate_source_id(source_id)?;
     normalize_relative_path(relative_path)?;
     Ok(())
 }

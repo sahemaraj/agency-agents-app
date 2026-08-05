@@ -261,6 +261,15 @@ fn validate_approval_action(action: &SkillApprovalAction) -> Result<(), AppError
             }
             Ok(())
         }
+        SkillApprovalAction::DraftPublish { id, plan_revision } => {
+            uuid::Uuid::parse_str(id).map_err(|_| invalid("Skill draft id is invalid"))?;
+            if plan_revision.len() != 64
+                || !plan_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(invalid("Skill draft revision is invalid"));
+            }
+            Ok(())
+        }
         SkillApprovalAction::BatchCollection {
             collection_name,
             operation,
@@ -282,6 +291,9 @@ fn validate_approval_action(action: &SkillApprovalAction) -> Result<(), AppError
 }
 
 fn validate_reference(value: &SkillReference) -> Result<(), AppError> {
+    if value.relative_path == "." {
+        return library::validate_source_id(&value.source_id);
+    }
     library::validate_reference(&value.source_id, &value.relative_path)
 }
 
@@ -945,6 +957,17 @@ pub async fn approve(state: &AppState, id: String) -> Result<SkillApproval, AppE
         )
         .await
         .map(|_| ()),
+        SkillApprovalAction::DraftPublish { id, plan_revision } => {
+            let draft = super::drafts::get(state, &id).await?;
+            if draft.state != crate::types::SkillDraftState::Pending
+                || !draft.validation.installable
+                || draft.tree_hash != plan_revision
+            {
+                Err(invalid("Skill draft is not a current valid pending draft"))
+            } else {
+                super::drafts::publish(state, &id).await.map(|_| ())
+            }
+        }
         SkillApprovalAction::BatchCollection {
             collection_name,
             operation,
@@ -1261,6 +1284,22 @@ mod tests {
     }
 
     #[test]
+    fn persisted_state_accepts_a_root_skill_reference() {
+        let folders = SkillFolderState {
+            recent: vec![crate::types::SkillRecent {
+                skill: SkillReference {
+                    source_id: "source".into(),
+                    relative_path: ".".into(),
+                },
+                viewed_at: "2026-08-05T00:00:00Z".into(),
+            }],
+            ..Default::default()
+        };
+
+        assert!(validate_state(&folders).is_ok());
+    }
+
+    #[test]
     fn folder_boundaries_and_case_collisions_are_enforced() {
         let deepest = (0..MAX_FOLDER_DEPTH)
             .map(|index| format!("f{index}"))
@@ -1293,6 +1332,50 @@ mod tests {
                 project_path: None,
             })
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_publish_approval_rejects_a_stale_revision_without_staying_running() {
+        let root = tempfile::tempdir().expect("app data");
+        let app = app_state(root.path());
+        let draft = crate::skills::drafts::create(
+            &app,
+            "reviewer".into(),
+            "Reviews changes.".into(),
+            crate::types::SkillType::Other,
+            Vec::new(),
+            Vec::new(),
+            "# Reviewer".into(),
+        )
+        .await
+        .expect("create Skill draft");
+        let approval = submit_approval(
+            &app,
+            "Codex".into(),
+            SkillApprovalAction::DraftPublish {
+                id: draft.id.clone(),
+                plan_revision: "0".repeat(64),
+            },
+        )
+        .await
+        .expect("submit publication approval");
+
+        let rejected = approve(&app, approval.id)
+            .await
+            .expect("record stale publication result");
+
+        assert_eq!(rejected.state, SkillApprovalState::Pending);
+        assert!(rejected
+            .result
+            .as_deref()
+            .is_some_and(|result| result.contains("current valid pending draft")));
+        assert_eq!(
+            crate::skills::drafts::get(&app, &draft.id)
+                .await
+                .expect("read draft")
+                .state,
+            crate::types::SkillDraftState::Pending
         );
     }
 

@@ -37,3 +37,9 @@ security rehearsals, and the evidence-backed Skills-to-Agents parity audit. See
 Added deterministic editable Skill-to-Agent drafts in the desktop app and MCP, structured
 `required-skills` metadata, and hash-bound desktop approval for MCP publication requests. See
 [260805_create-agent-from-skill.md](./260805_create-agent-from-skill.md).
+
+### 2026-08-05: Skill Publishing MCP and Popover Dismissal
+
+Added revision-bound Skill publication requests through the existing desktop approval boundary,
+published the 59-file Primavera hybrid, and made Skills popovers dismiss on outside clicks. See
+[260805_skill-publishing-mcp.md](./260805_skill-publishing-mcp.md).

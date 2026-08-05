@@ -392,6 +392,10 @@ enum ApprovalActionRequest {
         trusted: bool,
         revoked: bool,
     },
+    DraftPublish {
+        id: String,
+        plan_revision: String,
+    },
     BatchCollection {
         collection_name: String,
         operation: String,
@@ -471,6 +475,9 @@ impl TryFrom<ApprovalActionRequest> for SkillApprovalAction {
                 trusted,
                 revoked,
             },
+            ApprovalActionRequest::DraftPublish { id, plan_revision } => {
+                Self::DraftPublish { id, plan_revision }
+            }
             ApprovalActionRequest::BatchCollection {
                 collection_name,
                 operation,
@@ -810,6 +817,7 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         "skills_submit_draft"
         | "skills_create_draft"
         | "skills_edit_draft"
+        | "skills_request_publish_draft"
         | "skills_create_folder"
         | "skills_rename_folder"
         | "skills_move_folder"
@@ -1592,6 +1600,37 @@ impl SkillMcpServer {
                 .map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&draft).map_err(|error| error.to_string())
         })
+        .await
+    }
+
+    #[tool(description = "Request desktop approval to publish one current valid Skill draft")]
+    async fn skills_request_publish_draft(
+        &self,
+        Parameters(DraftRequest { id }): Parameters<DraftRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "skills_request_publish_draft",
+            McpAction::Source,
+            None,
+            async {
+                let draft = super::drafts::get(&self.state, &id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if draft.state != crate::types::SkillDraftState::Pending
+                    || !draft.validation.installable
+                {
+                    return Err("Skill draft is not a current valid pending draft".into());
+                }
+                self.submit_approval_json(
+                    self.client_identity.clone(),
+                    SkillApprovalAction::DraftPublish {
+                        id,
+                        plan_revision: draft.tree_hash,
+                    },
+                )
+                .await
+            },
+        )
         .await
     }
 
@@ -4680,13 +4719,13 @@ mod tests {
             "every routed tool must have an explicit audit/policy class"
         );
 
-        assert_eq!(names.len(), 129);
+        assert_eq!(names.len(), 130);
         assert_eq!(
             names
                 .iter()
                 .filter(|name| name.starts_with("skills_"))
                 .count(),
-            49
+            50
         );
         assert_eq!(
             names
@@ -4717,7 +4756,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<std::collections::HashSet<_>>();
 
-        assert_eq!(skill_names.len(), 78);
+        assert_eq!(skill_names.len(), 79);
         assert_eq!(agent_names.len(), 51);
         assert!(skill_names.is_disjoint(&agent_names));
     }
@@ -4875,6 +4914,48 @@ mod tests {
         assert_eq!(approval["requestedBy"], "test");
         assert_eq!(approval["request"]["action"], "draftPublish");
         assert!(!root.path().join("agents/published").exists());
+    }
+
+    #[tokio::test]
+    async fn skill_draft_stdio_flow_requests_revision_bound_desktop_publication() {
+        let root = tempfile::tempdir().expect("app data");
+        let state = test_state(root.path());
+        crate::commands::settings::mcp_policy_set_inner(&state, true, false, false, Vec::new())
+            .await
+            .expect("enable Skill source mutations");
+        let draft = crate::skills::drafts::create(
+            &state,
+            "primavera-p6-eppm-hybrid".into(),
+            "Evidence-backed Primavera P6 guidance.".into(),
+            crate::types::SkillType::Other,
+            Vec::new(),
+            Vec::new(),
+            "# Primavera P6 EPPM Hybrid".into(),
+        )
+        .await
+        .expect("create Skill draft");
+
+        let requested = call_tools_over_stdio(
+            Arc::clone(&state),
+            vec![serde_json::json!({
+                "name": "skills_request_publish_draft",
+                "arguments": {"id": draft.id},
+            })],
+        )
+        .await;
+
+        assert_ne!(requested[0]["result"]["isError"], true, "{requested:#?}");
+        let approval: serde_json::Value = serde_json::from_str(
+            requested[0]["result"]["content"][0]["text"]
+                .as_str()
+                .expect("approval text"),
+        )
+        .expect("approval JSON");
+        assert_eq!(approval["state"], "pending");
+        assert_eq!(approval["requestedBy"], "test");
+        assert_eq!(approval["request"]["action"], "draftPublish");
+        assert_eq!(approval["request"]["planRevision"], draft.tree_hash);
+        assert!(!root.path().join("skills/published").exists());
     }
 
     #[tokio::test]
