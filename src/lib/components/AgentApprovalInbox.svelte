@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import Button from "./Button.svelte";
   import Modal from "./Modal.svelte";
   import { agentApprovalFacts } from "$lib/agents/libraryModel";
@@ -29,6 +30,10 @@
   const approvals = $derived([...agentLibrary.library.approvals].sort((left, right) =>
     Date.parse(right.submittedAt) - Date.parse(left.submittedAt)
   ));
+
+  $effect(() => {
+    if (open) untrack(() => void agentLibrary.load(true));
+  });
 
   function stale(result: string | null): boolean {
     return !!result && /stale|revision|changed since/i.test(result);

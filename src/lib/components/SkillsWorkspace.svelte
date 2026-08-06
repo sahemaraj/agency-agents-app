@@ -837,7 +837,9 @@
         </div>
       </div>
     </details>
-    <details class="draft-inbox" bind:this={approvalInbox}>
+    <details class="draft-inbox" bind:this={approvalInbox} ontoggle={(event) => {
+      if (event.currentTarget.open) void skillSources.load();
+    }}>
       <summary>{i18n.t("skills.approvalInbox")} <span>{pendingDrafts.length + pendingApprovals.length}</span></summary>
       <div class="draft-popover" aria-label={i18n.t("skills.draftInboxAria")}>
         {#if pendingDrafts.length === 0 && pendingApprovals.length === 0}

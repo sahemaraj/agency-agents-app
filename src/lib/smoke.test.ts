@@ -235,14 +235,18 @@ describe("frontend test harness", () => {
     }
   });
 
-  it("refreshes Skills data without closing the inbox, stealing focus, or resetting scroll", async () => {
+  it("refreshes Skills when the inbox opens without closing it, stealing focus, or resetting scroll", async () => {
+    let folderLoads = 0;
     const folders = {
       folders: [], assignments: [], favorites: [], recent: [], collections: [], smartFolders: [],
       profiles: [], updatePolicies: [], publisherTrust: [], preferredSources: [], usage: [], approvals: [],
     };
     const invokeMock = vi.mocked(invoke);
     invokeMock.mockImplementation(async (command: string) => {
-      if (command === "skill_folders_list") return folders as never;
+      if (command === "skill_folders_list") {
+        folderLoads += 1;
+        return folders as never;
+      }
       return [] as never;
     });
     vi.stubGlobal("localStorage", {
@@ -250,38 +254,78 @@ describe("frontend test harness", () => {
       removeItem: () => undefined,
     });
     const { default: SkillsWorkspace } = await import("$lib/components/SkillsWorkspace.svelte");
-    const { skillSources } = await import("$lib/stores/skillSources.svelte");
     const target = document.createElement("div");
     document.body.append(target);
     const component = mount(SkillsWorkspace, { target });
     try {
-      await vi.waitFor(() => expect(target.querySelector("details.draft-inbox")).not.toBeNull());
+      await vi.waitFor(() => {
+        expect(folderLoads).toBeGreaterThan(0);
+        expect(target.querySelector("details.draft-inbox summary")?.textContent).toContain("0");
+      });
       const inbox = target.querySelector<HTMLDetailsElement>("details.draft-inbox")!;
       const popover = inbox.querySelector<HTMLElement>(".draft-popover")!;
       const summary = inbox.querySelector<HTMLElement>("summary")!;
       inbox.open = true;
       popover.scrollTop = 37;
       summary.focus();
-
       folders.approvals = [{
-        id: "approval-refresh",
-        submittedAt: "2026-08-06T08:00:00Z",
+        id: "skill-approval-live",
+        submittedAt: "2026-08-06T03:35:47Z",
         state: "pending",
         requestedBy: "codex",
-        request: { action: "sourceRemove", sourceId: "source-1" },
+        request: { action: "draftPublish", id: "skill-draft-live", planRevision: "revision-live" },
         result: null,
       }] as never;
-      await skillSources.load();
-      await tick();
+      const loadsBeforeOpen = folderLoads;
+      inbox.dispatchEvent(new Event("toggle"));
 
+      await vi.waitFor(() => {
+        expect(folderLoads).toBeGreaterThan(loadsBeforeOpen);
+        expect(summary.textContent).toContain("1");
+      });
       expect(inbox.open).toBe(true);
       expect(document.activeElement).toBe(summary);
       expect(popover.scrollTop).toBe(37);
-      expect(summary.textContent).toContain("1");
+      expect(target.textContent).toContain("skill-draft-live");
     } finally {
       unmount(component);
       target.remove();
       vi.unstubAllGlobals();
+    }
+  });
+
+  it("refreshes persisted Agent approvals when the inbox opens", async () => {
+    const library = {
+      folders: [], assignments: [], favorites: [], recent: [], collections: [], smartFolders: [],
+      profiles: [], updatePolicies: [], publisherTrust: [], preferredSources: [], usage: [],
+      approvals: [{
+        id: "agent-approval-1",
+        submittedAt: "2026-08-05T15:54:33Z",
+        state: "pending",
+        requestedBy: "codex",
+        request: { action: "draftPublish", id: "agent-draft-1", planRevision: "revision-1" },
+        result: null,
+      }],
+    };
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "agent_library_list") return library as never;
+      return [] as never;
+    });
+    const { default: AgentApprovalInbox } = await import("$lib/components/AgentApprovalInbox.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(AgentApprovalInbox, {
+      target,
+      props: { open: true, onClose: vi.fn() },
+    });
+    try {
+      await vi.waitFor(() => {
+        expect(target.textContent).toContain("agent-draft-1");
+      });
+    } finally {
+      unmount(component);
+      target.remove();
     }
   });
 });
