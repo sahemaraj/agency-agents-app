@@ -255,3 +255,20 @@ a new lifecycle database or slug-only migration (rejected because both split own
 identity collisions). **Consequences**: desktop and future MCP operations share one recoverable
 source of truth and same-name Agents remain independent. **Reference**:
 `tasks/2026-08/260804_agent-lifecycle-parity.md`.
+
+### 2026-08-06: SQLite is the control-plane authority
+
+**Status**: Approved. **Context**: desktop and MCP processes previously coordinated mutable Skills,
+Agents, Experts, settings, projects, installs, catalog configuration, and audit state through
+separate JSON files and locks. Multi-document operations and filesystem publication could not share
+one durable transaction boundary. **Decision**: after an explicit verified migration, a bundled
+SQLite database is the sole control-plane source of truth. Existing domain documents remain bounded,
+versioned JSON payloads inside SQLite; a visible revision drives foreground refresh. Filesystem
+effects use a durable prepared/filesystem-applied/committed journal. Package/source artifacts and
+Keychain secrets remain outside SQLite. **Alternatives**: retain file locks and JSON, normalize every
+domain relationally now, or adopt a document database (rejected respectively for weak cross-process
+transactions, excessive migration risk, and unnecessary dependency/operational cost).
+**Consequences**: cutover requires an exclusive process lease and verified private backup; legacy
+files never auto-merge after completion; newer schemas fail closed; document normalization, FTS,
+cloud synchronization, and SQLCipher remain deferred until measured needs justify them.
+**Reference**: `tasks/2026-08/260806_sqlite-control-plane.md`.

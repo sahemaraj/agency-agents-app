@@ -45,3 +45,10 @@ published the 59-file Primavera hybrid, made Skills popovers dismiss on outside 
 contained filters within the package-list column. Same-name app-owned revisions now replace with a
 rollback backup, stale exact approvals reconcile, and the inbox shows one action per revision. See
 [260805_skill-publishing-mcp.md](./260805_skill-publishing-mcp.md).
+
+### 2026-08-06: SQLite Control Plane
+
+Moved the desktop and MCP mutable control plane to a shared transactional SQLite authority with a
+verified one-time migration, private backups, crash-recoverable filesystem journals, exact approval
+reconciliation, and foreground revision refresh. Package artifacts and Keychain secrets remain
+outside the database. See [260806_sqlite-control-plane.md](./260806_sqlite-control-plane.md).

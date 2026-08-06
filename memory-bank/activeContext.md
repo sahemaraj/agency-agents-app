@@ -1,5 +1,17 @@
 # Active Context — Agency Agents
 
+## ✅ SQLite Control Plane [COMPLETE] (2026-08-06)
+
+The approved `feat/sqlite-control-plane` branch now uses a shared transactional SQLite authority
+for 17 bounded control-plane documents across the desktop app and MCP processes. Cutover is an
+explicit one-time maintenance event with an exclusive process lease, verified private backup,
+semantic and cryptographic validation, integrity checking, persistent legacy conflict detection,
+and foreground revision refresh. Filesystem mutations use durable recovery journals; package
+artifacts and Keychain secrets remain outside SQLite. Verification: 521 backend and 25 frontend
+tests passed, strict Clippy/format/Svelte checks and production build passed, and a copied-state
+rehearsal preserved all 2,311 package/artifact hashes while importing 17/17 documents. Commit:
+`3d3a838`. Record: `tasks/2026-08/260806_sqlite-control-plane.md`.
+
 ## ✅ Skill Publishing MCP and Skills UI Fixes [COMPLETE] (2026-08-05)
 
 Local `main` now exposes revision-bound Skill draft publication
