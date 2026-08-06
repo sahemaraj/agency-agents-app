@@ -251,6 +251,9 @@ export type AppErrorPayload =
   | { code: "http_status";        url: string; status: number }
   | { code: "invalid_argument";   message: string }
   | { code: "internal";           message: string }
+  | { code: "storage_busy" }
+  | { code: "storage_corrupt";    message: string }
+  | { code: "storage_unsupported"; found: number; supported: number }
   | { code: "paranoid_mode_blocked"; feature: string }
   | { code: "github_rate_limited"; resetAt: number }
   | { code: "keychain_unavailable"; message: string }
@@ -279,6 +282,9 @@ export function appErrorMessage(e: AppErrorPayload): string {
     case "http_status":         return `HTTP ${e.status} from ${e.url}`;
     case "invalid_argument":    return `Invalid argument: ${e.message}`;
     case "internal":            return `Internal error: ${e.message}`;
+    case "storage_busy":        return "Agency Agents is busy in another desktop or MCP session. Close it and try again.";
+    case "storage_corrupt":     return `Stored data needs attention: ${e.message}`;
+    case "storage_unsupported": return `This data requires schema ${e.found}; this Agency Agents version supports ${e.supported}.`;
     case "paranoid_mode_blocked":
       return `Offline Mode is on — ${e.feature} is blocked. Disable it in Settings → Network.`;
     case "github_rate_limited": {
@@ -1260,6 +1266,15 @@ export interface McpClientStatus {
   state: McpClientState;
   command: string;
   detail: string;
+}
+
+export type StorageMigrationState = "legacy" | "inProgress" | "complete" | "corrupt" | "unsupported";
+
+export interface StorageMigrationStatus {
+  state: StorageMigrationState;
+  stage: string | null;
+  detail: string | null;
+  legacyConflicts: string[];
 }
 
 // =========================================================

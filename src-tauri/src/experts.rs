@@ -414,7 +414,7 @@ pub struct ExpertActivationPlan {
     pub rollback_scope: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExpertActivationRecord {
     pub id: String,
@@ -427,6 +427,16 @@ pub struct ExpertActivationRecord {
     pub installed_skills: Vec<String>,
     #[serde(default)]
     pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpertActivationOperation {
+    record: ExpertActivationRecord,
+    run_id: String,
+    run: crate::expert_runs::ExpertRunCreate,
+    agent_slugs: Vec<String>,
+    skill_packages: Vec<crate::types::SkillPlanPackage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,6 +722,17 @@ fn parse_file(raw: &str, custom: bool) -> Result<Vec<ExpertDefinition>, AppError
 }
 
 async fn custom_state(state: &AppState) -> Result<ExpertFile, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        let mut file =
+            database
+                .read(experts_spec())
+                .await?
+                .ok_or_else(|| AppError::StorageCorrupt {
+                    message: "Expert state is missing after SQLite migration".into(),
+                })?;
+        normalize_expert_file(&mut file)?;
+        return Ok(file);
+    }
     let path = state_path(state, "experts.json");
     if !path.exists() {
         return Ok(ExpertFile {
@@ -725,6 +746,16 @@ async fn custom_state(state: &AppState) -> Result<ExpertFile, AppError> {
     let text = String::from_utf8(raw).map_err(|_| invalid("custom experts must be UTF-8"))?;
     let mut file: ExpertFile =
         serde_json::from_str(&text).map_err(|error| invalid(format!("parse experts: {error}")))?;
+    normalize_expert_file(&mut file)?;
+    Ok(file)
+}
+
+fn validate_expert_file(file: &ExpertFile) -> Result<(), AppError> {
+    let mut normalized = file.clone();
+    normalize_expert_file(&mut normalized)
+}
+
+fn normalize_expert_file(file: &mut ExpertFile) -> Result<(), AppError> {
     if file.schema_version != SCHEMA_VERSION
         || file.experts.len() > MAX_EXPERTS
         || file.creation_requests.len() > MAX_CREATION_REQUESTS
@@ -738,7 +769,23 @@ async fn custom_state(state: &AppState) -> Result<ExpertFile, AppError> {
             return Err(invalid(format!("duplicate expert id: {}", expert.id)));
         }
     }
-    Ok(file)
+    Ok(())
+}
+
+fn experts_spec() -> crate::state_db::DocumentSpec<ExpertFile> {
+    crate::state_db::DocumentSpec::new("experts", 1, MAX_EXPERT_STATE_BYTES, validate_expert_file)
+}
+
+pub(crate) fn experts_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(
+        experts_spec(),
+        ExpertFile {
+            schema_version: SCHEMA_VERSION,
+            experts: Vec::new(),
+            creation_requests: Vec::new(),
+            archived_experts: Vec::new(),
+        },
+    )
 }
 
 async fn custom_list(state: &AppState) -> Result<Vec<ExpertDefinition>, AppError> {
@@ -752,8 +799,28 @@ async fn save_custom(state: &AppState, experts: Vec<ExpertDefinition>) -> Result
 }
 
 async fn save_expert_state(state: &AppState, file: &ExpertFile) -> Result<(), AppError> {
+    let mut file = file.clone();
+    normalize_expert_file(&mut file)?;
+    if let Some(database) = state.completed_state_database().await? {
+        let replacement = file;
+        return database
+            .mutate(
+                experts_spec(),
+                ExpertFile {
+                    schema_version: SCHEMA_VERSION,
+                    experts: Vec::new(),
+                    creation_requests: Vec::new(),
+                    archived_experts: Vec::new(),
+                },
+                move |current| {
+                    *current = replacement;
+                    Ok(())
+                },
+            )
+            .await;
+    }
     let bytes =
-        serde_json::to_vec_pretty(file).map_err(|e| invalid(format!("serialize experts: {e}")))?;
+        serde_json::to_vec_pretty(&file).map_err(|e| invalid(format!("serialize experts: {e}")))?;
     atomic_write(&state_path(state, "experts.json"), &bytes).await
 }
 
@@ -1258,12 +1325,73 @@ pub(crate) async fn mcp_creation_context(
 }
 
 async fn requests(state: &AppState) -> Result<Vec<ExpertActivationRequest>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(activation_requests_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Expert activation requests are missing after SQLite migration".into(),
+            });
+    }
     let path = state_path(state, "expert-activation-requests.json");
     if !path.exists() {
         return Ok(Vec::new());
     }
     let raw = read_capped(&path, MAX_FILE_BYTES).await?;
     serde_json::from_slice(&raw).map_err(|e| invalid(format!("parse activation requests: {e}")))
+}
+
+fn validate_activation_requests(items: &[ExpertActivationRequest]) -> Result<(), AppError> {
+    if items.len() > MAX_CREATION_REQUESTS
+        || items.iter().any(|item| {
+            uuid::Uuid::parse_str(&item.id).is_err()
+                || item.expert_id.is_empty()
+                || !Path::new(&item.project_path).is_absolute()
+                || !matches!(
+                    item.state.as_str(),
+                    "pending" | "approved" | "rejected" | "cancelled"
+                )
+        })
+    {
+        return Err(invalid("Expert activation request state is invalid"));
+    }
+    Ok(())
+}
+
+fn activation_requests_spec() -> crate::state_db::DocumentSpec<Vec<ExpertActivationRequest>> {
+    crate::state_db::DocumentSpec::new("expert_activation_requests", 1, MAX_FILE_BYTES, |items| {
+        validate_activation_requests(items)
+    })
+}
+
+pub(crate) fn activation_requests_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(activation_requests_spec(), Vec::new())
+}
+
+async fn mutate_activation_requests<R>(
+    state: &AppState,
+    mutation: impl FnOnce(&mut Vec<ExpertActivationRequest>) -> Result<R, AppError> + Send + 'static,
+) -> Result<R, AppError>
+where
+    R: Send + 'static,
+{
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .mutate(activation_requests_spec(), Vec::new(), mutation)
+            .await;
+    }
+    let _lock = lock_expert_state(state)?;
+    let mut items = requests(state).await?;
+    let result = mutation(&mut items)?;
+    validate_activation_requests(&items)?;
+    let bytes = serde_json::to_vec_pretty(&items)
+        .map_err(|error| invalid(format!("serialize activation requests: {error}")))?;
+    atomic_write(
+        &state_path(state, "expert-activation-requests.json"),
+        &bytes,
+    )
+    .await?;
+    Ok(result)
 }
 
 pub(crate) async fn mcp_request(
@@ -1277,34 +1405,30 @@ pub(crate) async fn mcp_request(
     let canonical = tokio::fs::canonicalize(project_path)
         .await
         .map_err(|e| invalid(format!("invalid project: {e}")))?;
-    let mut items = requests(state).await?;
-    if items.iter().any(|item| {
-        item.expert_id == expert_id
-            && item.project_path == canonical.to_string_lossy()
-            && item.state == "pending"
-    }) {
-        return Err(invalid(
-            "an identical activation request is already pending",
-        ));
-    }
-    let request = ExpertActivationRequest {
-        id: uuid::Uuid::new_v4().to_string(),
-        expert_id,
-        project_path: canonical.to_string_lossy().into_owned(),
-        client,
-        requested_by: requested_by.chars().take(128).collect(),
-        requested_at: chrono::Utc::now().to_rfc3339(),
-        state: "pending".into(),
-    };
-    items.push(request.clone());
-    let bytes = serde_json::to_vec_pretty(&items)
-        .map_err(|e| invalid(format!("serialize activation requests: {e}")))?;
-    atomic_write(
-        &state_path(state, "expert-activation-requests.json"),
-        &bytes,
-    )
-    .await?;
-    Ok(request)
+    let project_path = canonical.to_string_lossy().into_owned();
+    mutate_activation_requests(state, move |items| {
+        if items.iter().any(|item| {
+            item.expert_id == expert_id
+                && item.project_path == project_path
+                && item.state == "pending"
+        }) {
+            return Err(invalid(
+                "an identical activation request is already pending",
+            ));
+        }
+        let request = ExpertActivationRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            expert_id,
+            project_path,
+            client,
+            requested_by: requested_by.chars().take(128).collect(),
+            requested_at: chrono::Utc::now().to_rfc3339(),
+            state: "pending".into(),
+        };
+        items.push(request.clone());
+        Ok(request)
+    })
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1484,22 +1608,17 @@ pub(crate) async fn mcp_cancel_activation_request(
     id: &str,
     requested_by: &str,
 ) -> Result<ExpertActivationRequest, AppError> {
-    let _lock = lock_expert_state(state)?;
-    let mut items = requests(state).await?;
-    let request = items
-        .iter_mut()
-        .find(|request| request.id == id)
-        .ok_or_else(|| invalid("Expert activation request does not exist"))?;
-    cancel_pending_activation_request(request, requested_by)?;
-    let request = request.clone();
-    let bytes = serde_json::to_vec_pretty(&items)
-        .map_err(|error| invalid(format!("serialize activation requests: {error}")))?;
-    atomic_write(
-        &state_path(state, "expert-activation-requests.json"),
-        &bytes,
-    )
-    .await?;
-    Ok(request)
+    let id = id.to_owned();
+    let requested_by = requested_by.to_owned();
+    mutate_activation_requests(state, move |items| {
+        let request = items
+            .iter_mut()
+            .find(|request| request.id == id)
+            .ok_or_else(|| invalid("Expert activation request does not exist"))?;
+        cancel_pending_activation_request(request, &requested_by)?;
+        Ok(request.clone())
+    })
+    .await
 }
 
 pub(crate) async fn mcp_list_creation_requests(
@@ -1962,6 +2081,81 @@ pub async fn expert_activate(
     if !plan.blockers.is_empty() {
         return Err(invalid(plan.blockers.join("; ")));
     }
+    let database = state.completed_state_database().await?;
+    let prepared = if let Some(database) = &database {
+        let before = crate::skills::install::load_ledger_for_state(&state).await?;
+        let mut installed_skills = Vec::new();
+        let mut skill_packages = Vec::new();
+        for skill in &plan.skills {
+            for package in &skill.packages {
+                let already_managed = before.iter().any(|record| {
+                    record.source_id == package.source_id
+                        && record.relative_path == package.relative_path
+                        && record.runtime == plan.client
+                        && record.project_path.as_deref() == Some(plan.project_path.as_str())
+                });
+                if !(package.dependency && already_managed)
+                    && !installed_skills.contains(&package.name)
+                {
+                    installed_skills.push(package.name.clone());
+                }
+                if !package.dependency
+                    && !skill_packages
+                        .iter()
+                        .any(|existing: &crate::types::SkillPlanPackage| {
+                            existing.source_id == package.source_id
+                                && existing.relative_path == package.relative_path
+                        })
+                {
+                    skill_packages.push(package.clone());
+                }
+            }
+        }
+        let agent_slugs = plan
+            .agents
+            .iter()
+            .filter(|agent| agent.status == "missing")
+            .map(|agent| agent.slug.clone())
+            .collect::<Vec<_>>();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let run = crate::expert_runs::ExpertRunCreate {
+            expert_id: plan.expert.definition.id.clone(),
+            expert_version: plan.expert.definition.version,
+            project_path: plan.project_path.clone(),
+            client: plan.client.clone(),
+            lead_agent: plan.expert.definition.lead_agent.clone(),
+            supporting_agents: plan.expert.definition.supporting_agents.clone(),
+            required_skills: plan.expert.definition.required_skills.clone(),
+            optional_skills: plan.expert.definition.optional_skills.clone(),
+            runbook: plan.expert.definition.runbook.clone(),
+            contract: plan.expert.definition.quality_contract.clone(),
+        };
+        let payload = ExpertActivationOperation {
+            record: ExpertActivationRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                expert_id: run.expert_id.clone(),
+                expert_version: run.expert_version,
+                project_path: run.project_path.clone(),
+                client: run.client.clone(),
+                activated_at: chrono::Utc::now().to_rfc3339(),
+                installed_agents: agent_slugs.clone(),
+                installed_skills,
+                run_id: Some(run_id.clone()),
+            },
+            run_id,
+            run,
+            agent_slugs,
+            skill_packages,
+        };
+        Some((
+            database
+                .prepare_filesystem_operation("expert_activate", &payload)
+                .await?,
+            payload,
+        ))
+    } else {
+        None
+    };
     let mut installed_agents = Vec::new();
     for agent in &plan.agents {
         if agent.status == "missing" {
@@ -1985,6 +2179,13 @@ pub async fn expert_activate(
                             Some(plan.project_path.clone()),
                         )
                         .await;
+                    }
+                    if let Some((operation, _)) = &prepared {
+                        database
+                            .as_ref()
+                            .expect("prepared operation has database")
+                            .abort_filesystem_operation(&operation.id)
+                            .await?;
                     }
                     return Err(error);
                 }
@@ -2036,28 +2237,38 @@ pub async fn expert_activate(
                         )
                         .await;
                     }
+                    if let Some((operation, _)) = &prepared {
+                        database
+                            .as_ref()
+                            .expect("prepared operation has database")
+                            .abort_filesystem_operation(&operation.id)
+                            .await?;
+                    }
                     return Err(error);
                 }
             }
         }
     }
-    let run = match crate::expert_runs::create_run(
-        &state,
-        crate::expert_runs::ExpertRunCreate {
-            expert_id: plan.expert.definition.id.clone(),
-            expert_version: plan.expert.definition.version,
-            project_path: plan.project_path.clone(),
-            client: plan.client.clone(),
-            lead_agent: plan.expert.definition.lead_agent.clone(),
-            supporting_agents: plan.expert.definition.supporting_agents.clone(),
-            required_skills: plan.expert.definition.required_skills.clone(),
-            optional_skills: plan.expert.definition.optional_skills.clone(),
-            runbook: plan.expert.definition.runbook.clone(),
-            contract: plan.expert.definition.quality_contract.clone(),
-        },
-    )
-    .await
-    {
+    let run_create = crate::expert_runs::ExpertRunCreate {
+        expert_id: plan.expert.definition.id.clone(),
+        expert_version: plan.expert.definition.version,
+        project_path: plan.project_path.clone(),
+        client: plan.client.clone(),
+        lead_agent: plan.expert.definition.lead_agent.clone(),
+        supporting_agents: plan.expert.definition.supporting_agents.clone(),
+        required_skills: plan.expert.definition.required_skills.clone(),
+        optional_skills: plan.expert.definition.optional_skills.clone(),
+        runbook: plan.expert.definition.runbook.clone(),
+        contract: plan.expert.definition.quality_contract.clone(),
+    };
+    let run_result = match &prepared {
+        Some((_, payload)) => {
+            crate::expert_runs::create_run_with_id(&state, &payload.run_id, payload.run.clone())
+                .await
+        }
+        None => crate::expert_runs::create_run(&state, run_create).await,
+    };
+    let run = match run_result {
         Ok(run) => run,
         Err(error) => {
             for (source_id, relative_path) in installed_skill_refs.iter().rev() {
@@ -2080,35 +2291,237 @@ pub async fn expert_activate(
                 )
                 .await;
             }
+            if let Some((operation, _)) = &prepared {
+                database
+                    .as_ref()
+                    .expect("prepared operation has database")
+                    .abort_filesystem_operation(&operation.id)
+                    .await?;
+            }
             return Err(error);
         }
     };
-    let record = ExpertActivationRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        expert_id: plan.expert.definition.id,
-        expert_version: plan.expert.definition.version,
-        project_path: plan.project_path,
-        client: plan.client,
-        activated_at: chrono::Utc::now().to_rfc3339(),
-        installed_agents,
-        installed_skills,
-        run_id: Some(run.id),
+    let record = prepared
+        .as_ref()
+        .map(|(_, payload)| payload.record.clone())
+        .unwrap_or_else(|| ExpertActivationRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            expert_id: plan.expert.definition.id,
+            expert_version: plan.expert.definition.version,
+            project_path: plan.project_path,
+            client: plan.client,
+            activated_at: chrono::Utc::now().to_rfc3339(),
+            installed_agents,
+            installed_skills,
+            run_id: Some(run.id),
+        });
+    if let Some((operation, _)) = prepared {
+        apply_activation_metadata(&state, &operation.id, &record).await?;
+        database
+            .expect("prepared operation has database")
+            .commit_filesystem_operation(&operation.id)
+            .await?;
+        return Ok(record);
+    }
+    mutate_activation_history(&state, move |history| {
+        history.push(record.clone());
+        Ok(record)
+    })
+    .await
+}
+
+async fn apply_activation_metadata(
+    state: &AppState,
+    operation_id: &str,
+    record: &ExpertActivationRecord,
+) -> Result<(), AppError> {
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Expert activation operation lost its SQLite database".into(),
+            })?;
+    if let Some(history) = database.read(activations_spec()).await? {
+        if let Some(existing) = history.iter().find(|existing| existing.id == record.id) {
+            return if existing == record {
+                Ok(())
+            } else {
+                Err(AppError::StorageCorrupt {
+                    message: "Expert activation id conflicts with another activation".into(),
+                })
+            };
+        }
+    }
+    let record = record.clone();
+    database
+        .mutate_after_filesystem(
+            activations_spec(),
+            Vec::new(),
+            operation_id,
+            move |history| {
+                history.push(record);
+                Ok(())
+            },
+        )
+        .await
+}
+
+async fn recover_activation_operation(
+    app: &AppHandle,
+    state: &AppState,
+    operation: &crate::state_db::FilesystemOperation,
+) -> Result<(), AppError> {
+    let payload: ExpertActivationOperation = serde_json::from_value(operation.payload.clone())
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Expert activation recovery payload is invalid".into(),
+        })?;
+    if payload.record.run_id.as_deref() != Some(payload.run_id.as_str())
+        || payload.record.expert_id != payload.run.expert_id
+        || payload.record.expert_version != payload.run.expert_version
+        || payload.record.project_path != payload.run.project_path
+        || payload.record.client != payload.run.client
+        || payload.record.installed_agents != payload.agent_slugs
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Expert activation recovery payload is inconsistent".into(),
+        });
+    }
+    if operation.phase == crate::state_db::FilesystemOperationPhase::Prepared {
+        for slug in &payload.agent_slugs {
+            crate::install::do_install_legacy(
+                app,
+                state,
+                slug.clone(),
+                payload.run.client.clone(),
+                Some(payload.run.project_path.clone()),
+            )
+            .await?;
+        }
+        for package in &payload.skill_packages {
+            crate::skills::install_skill_with_dependencies(
+                state,
+                &package.source_id,
+                &package.relative_path,
+                &payload.run.client,
+                Some(&payload.run.project_path),
+            )
+            .await?;
+        }
+        crate::expert_runs::create_run_with_id(state, &payload.run_id, payload.run.clone()).await?;
+        apply_activation_metadata(state, &operation.id, &payload.record).await?;
+    } else {
+        let history = activation_history(state).await?;
+        if !history.iter().any(|record| record == &payload.record) {
+            return Err(AppError::StorageCorrupt {
+                message: "Applied Expert activation is missing its exact history record".into(),
+            });
+        }
+        let runs = crate::expert_runs::list_runs(
+            state,
+            &payload.run.client,
+            Some(&payload.run.project_path),
+        )
+        .await?;
+        if !runs
+            .iter()
+            .any(|run| run.id == payload.run_id && run.snapshot == payload.run)
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Applied Expert activation is missing its exact run".into(),
+            });
+        }
+    }
+    state
+        .completed_state_database()
+        .await?
+        .expect("recovery requires completed SQLite database")
+        .commit_filesystem_operation(&operation.id)
+        .await
+}
+
+pub(crate) async fn recover_activation_operations(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<(), AppError> {
+    let Some(database) = state.completed_state_database().await? else {
+        return Ok(());
     };
-    let mut history = activation_history(&state).await?;
-    history.push(record.clone());
-    let bytes = serde_json::to_vec_pretty(&history)
-        .map_err(|e| invalid(format!("serialize activation history: {e}")))?;
-    atomic_write(&state_path(&state, "expert-activations.json"), &bytes).await?;
-    Ok(record)
+    for operation in database
+        .pending_filesystem_operations()
+        .await?
+        .into_iter()
+        .filter(|operation| operation.kind == "expert_activate")
+    {
+        if let Err(error) = recover_activation_operation(app, state, &operation).await {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn activation_history(state: &AppState) -> Result<Vec<ExpertActivationRecord>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(activations_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Expert activation history is missing after SQLite migration".into(),
+            });
+    }
     let path = state_path(state, "expert-activations.json");
     if !path.exists() {
         return Ok(Vec::new());
     }
     let raw = read_capped(&path, MAX_FILE_BYTES).await?;
     serde_json::from_slice(&raw).map_err(|e| invalid(format!("parse activation history: {e}")))
+}
+
+fn validate_activation_history(items: &[ExpertActivationRecord]) -> Result<(), AppError> {
+    if items.iter().any(|item| {
+        uuid::Uuid::parse_str(&item.id).is_err()
+            || item.expert_id.is_empty()
+            || item.expert_version == 0
+            || !Path::new(&item.project_path).is_absolute()
+            || !matches!(item.client.as_str(), "claudeCode" | "codex")
+    }) {
+        return Err(invalid("Expert activation history is invalid"));
+    }
+    Ok(())
+}
+
+fn activations_spec() -> crate::state_db::DocumentSpec<Vec<ExpertActivationRecord>> {
+    crate::state_db::DocumentSpec::new("expert_activations", 1, MAX_FILE_BYTES, |items| {
+        validate_activation_history(items)
+    })
+}
+
+pub(crate) fn activations_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(activations_spec(), Vec::new())
+}
+
+async fn mutate_activation_history<R>(
+    state: &AppState,
+    mutation: impl FnOnce(&mut Vec<ExpertActivationRecord>) -> Result<R, AppError> + Send + 'static,
+) -> Result<R, AppError>
+where
+    R: Send + 'static,
+{
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .mutate(activations_spec(), Vec::new(), mutation)
+            .await;
+    }
+    let _lock = lock_expert_state(state)?;
+    let mut items = activation_history(state).await?;
+    let result = mutation(&mut items)?;
+    validate_activation_history(&items)?;
+    let bytes = serde_json::to_vec_pretty(&items)
+        .map_err(|error| invalid(format!("serialize activation history: {error}")))?;
+    atomic_write(&state_path(state, "expert-activations.json"), &bytes).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2136,18 +2549,14 @@ pub async fn expert_activation_request_resolve(
     request_id: String,
     approved: bool,
 ) -> Result<(), AppError> {
-    let mut items = requests(&state).await?;
-    let item = items
-        .iter_mut()
-        .find(|item| item.id == request_id && item.state == "pending")
-        .ok_or_else(|| invalid("pending activation request does not exist"))?;
-    item.state = if approved { "approved" } else { "rejected" }.into();
-    let bytes = serde_json::to_vec_pretty(&items)
-        .map_err(|e| invalid(format!("serialize activation requests: {e}")))?;
-    atomic_write(
-        &state_path(&state, "expert-activation-requests.json"),
-        &bytes,
-    )
+    mutate_activation_requests(&state, move |items| {
+        let item = items
+            .iter_mut()
+            .find(|item| item.id == request_id && item.state == "pending")
+            .ok_or_else(|| invalid("pending activation request does not exist"))?;
+        item.state = if approved { "approved" } else { "rejected" }.into();
+        Ok(())
+    })
     .await
 }
 
@@ -2852,5 +3261,49 @@ mod tests {
         let mcp_json = crate::expert_runs::mcp_view(&accepted).to_string();
         assert!(!mcp_json.contains("Approved emergency exception"));
         assert!(mcp_json.contains("security"));
+    }
+
+    #[tokio::test]
+    async fn activation_metadata_commit_is_atomic_and_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let operation = database
+            .prepare_filesystem_operation("expert_activate", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let record = ExpertActivationRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            expert_id: "expert-1".into(),
+            expert_version: 1,
+            project_path: "/project".into(),
+            client: "codex".into(),
+            activated_at: "2026-08-06T00:00:00Z".into(),
+            installed_agents: vec!["lead".into()],
+            installed_skills: vec!["review".into()],
+            run_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+
+        apply_activation_metadata(&state, &operation.id, &record)
+            .await
+            .unwrap();
+        database
+            .commit_filesystem_operation(&operation.id)
+            .await
+            .unwrap();
+        apply_activation_metadata(&state, &operation.id, &record)
+            .await
+            .unwrap();
+
+        assert_eq!(activation_history(&state).await.unwrap(), [record]);
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

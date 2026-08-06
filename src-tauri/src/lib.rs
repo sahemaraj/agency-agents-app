@@ -17,6 +17,8 @@ mod registry;
 mod render;
 mod skills;
 mod state;
+#[allow(dead_code, reason = "Checkpoint A API is consumed by Tasks 4-8")]
+mod state_db;
 mod types;
 mod util;
 
@@ -122,6 +124,12 @@ pub fn run() {
         })
         .setup(|app| {
             state::initialize(app)?;
+            use tauri::Manager;
+            if let Err(error) = tauri::async_runtime::block_on(
+                state::recover_filesystem_operations(app.handle(), &app.state::<state::AppState>()),
+            ) {
+                tracing::error!("{error}");
+            }
             // Phase 15 — spawn the auto-check scheduler. The task
             // sleeps for 24h between wakes, re-reads the live settings
             // on each cycle (so a user toggling auto-check off mid-run
@@ -165,6 +173,13 @@ pub fn run() {
             mcp_client_repair,
             settings_reset,
             state::mcp_audit_list,
+            state::storage_migration_status,
+            state::storage_migration_start,
+            state::storage_migration_retry,
+            state::storage_visible_revision,
+            state::storage_backup,
+            state::storage_open_data_directory,
+            state::storage_legacy_conflicts_dismiss,
             github_repo_stats,
             github_status,
             github_signin_start,

@@ -61,6 +61,28 @@ struct UnsignedSkillTrustRecord<'a> {
     granted_at: &'a str,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillInstallOperation {
+    previous: Option<SkillInstallRecord>,
+    next: SkillInstallRecord,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillMoveOperation {
+    previous: SkillInstallRecord,
+    next: SkillInstallRecord,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillUninstallOperation {
+    previous: SkillInstallRecord,
+    target_hash: String,
+    quarantine: String,
+}
+
 #[cfg(test)]
 type RefreshFsProbe = Vec<(&'static str, std::thread::ThreadId)>;
 
@@ -199,6 +221,127 @@ async fn save_skill_trust(
         message: format!("serialize skill-trust.json: {error}"),
     })?;
     atomic_write(&skill_trust_path(app_data_dir), &bytes).await
+}
+
+fn validate_skill_trust(records: &[SkillTrustRecord]) -> Result<(), AppError> {
+    let mut identities = HashSet::new();
+    if records.iter().any(|record| {
+        record.source_id.is_empty()
+            || record.relative_path.is_empty()
+            || record.tree_hash.len() != 64
+            || record.signature.len() != 64
+            || !identities.insert((&record.source_id, &record.relative_path))
+    }) {
+        return Err(AppError::InvalidArgument {
+            message: "persisted skill trust records are invalid".into(),
+        });
+    }
+    Ok(())
+}
+
+fn skill_trust_spec() -> crate::state_db::DocumentSpec<Vec<SkillTrustRecord>> {
+    crate::state_db::DocumentSpec::new("skill_trust", 1, 1_048_576, |records| {
+        validate_skill_trust(records)
+    })
+}
+
+pub(crate) fn skill_trust_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::new("skill_trust", "[]", parse_skill_trust_import)
+}
+
+fn validate_imported_skill_trust(
+    records: &[SkillTrustRecord],
+    keychain: &dyn KeychainSlot,
+) -> Result<(), AppError> {
+    validate_skill_trust(records).map_err(|_| AppError::StorageCorrupt {
+        message: "skill trust legacy state is invalid".into(),
+    })?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let key = read_trust_key_with(keychain)
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "skill trust key could not be verified".into(),
+        })?
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "skill trust key is missing".into(),
+        })?;
+    if records
+        .iter()
+        .any(|record| !verify_trust_record(record, &key))
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "skill trust signature verification failed".into(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_skill_trust_import(raw: &[u8]) -> Result<String, AppError> {
+    let records = serde_json::from_slice::<Vec<SkillTrustRecord>>(raw).map_err(|_| {
+        AppError::StorageCorrupt {
+            message: "skill trust legacy state is malformed".into(),
+        }
+    })?;
+    validate_imported_skill_trust(&records, &SystemKeychain)?;
+    serde_json::to_string(&records).map_err(|_| AppError::Internal {
+        message: "serialize skill trust migration state".into(),
+    })
+}
+
+async fn load_skill_trust_for_state(state: &AppState) -> Result<Vec<SkillTrustRecord>, AppError> {
+    let records = if let Some(database) = state.completed_state_database().await? {
+        database
+            .read(skill_trust_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "skill trust is missing after SQLite migration".into(),
+            })?
+    } else {
+        load_skill_trust(&state.app_data_dir).await?
+    };
+    validate_skill_trust(&records)?;
+    if records.is_empty() {
+        return Ok(records);
+    }
+    let key = tokio::task::spawn_blocking(|| read_trust_key_with(&SystemKeychain))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("skill trust key task failed: {error}"),
+        })??
+        .ok_or_else(|| AppError::KeychainUnavailable {
+            message: "skill trust key is missing".into(),
+        })?;
+    if records
+        .iter()
+        .any(|record| !verify_trust_record(record, &key))
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "skill trust signature verification failed".into(),
+        });
+    }
+    Ok(records)
+}
+
+async fn mutate_skill_trust<R>(
+    state: &AppState,
+    mutation: impl FnOnce(&mut Vec<SkillTrustRecord>) -> Result<R, AppError> + Send + 'static,
+) -> Result<R, AppError>
+where
+    R: Send + 'static,
+{
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .mutate(skill_trust_spec(), Vec::new(), mutation)
+            .await;
+    }
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
+    let mut records = load_skill_trust(&state.app_data_dir).await?;
+    let result = mutation(&mut records)?;
+    validate_skill_trust(&records)?;
+    save_skill_trust(&state.app_data_dir, &records).await?;
+    Ok(result)
 }
 
 fn decode_trust_key(value: &str) -> Result<Vec<u8>, AppError> {
@@ -354,6 +497,87 @@ pub(crate) async fn load_skill_sources(app_data_dir: &Path) -> Result<Vec<SkillS
     }
 }
 
+fn validate_skill_sources(sources: &[SkillSource]) -> Result<(), AppError> {
+    let mut ids = HashSet::new();
+    for source in sources {
+        if source.id.is_empty() || source.id.len() > 128 || !ids.insert(source.id.as_str()) {
+            return Err(AppError::InvalidArgument {
+                message: "skill source ids must be non-empty, unique, and at most 128 bytes".into(),
+            });
+        }
+        match &source.kind {
+            SkillSourceKind::Local { root } => {
+                if root.len() > 4096 || !Path::new(root).is_absolute() {
+                    return Err(AppError::InvalidArgument {
+                        message: "local skill source root must be an absolute path".into(),
+                    });
+                }
+            }
+            SkillSourceKind::Github {
+                repository,
+                git_ref,
+                subdirectory,
+                active_checkout,
+            } => {
+                if canonical_github_repository(repository)? != *repository
+                    || validated_git_ref(git_ref.as_deref())? != *git_ref
+                    || validated_subdirectory(subdirectory.as_deref())? != *subdirectory
+                    || active_checkout
+                        .as_ref()
+                        .is_some_and(|path| path.len() > 4096 || !Path::new(path).is_absolute())
+                {
+                    return Err(AppError::InvalidArgument {
+                        message: "persisted GitHub skill source is invalid".into(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn skill_sources_spec() -> crate::state_db::DocumentSpec<Vec<SkillSource>> {
+    crate::state_db::DocumentSpec::new("skill_sources", 1, 1_048_576, |sources| {
+        validate_skill_sources(sources)
+    })
+}
+
+pub(crate) fn skill_sources_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(skill_sources_spec(), Vec::new())
+}
+
+async fn load_skill_sources_for_state(state: &AppState) -> Result<Vec<SkillSource>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database.read(skill_sources_spec()).await?.ok_or_else(|| {
+            AppError::StorageCorrupt {
+                message: "skill sources are missing after SQLite migration".into(),
+            }
+        });
+    }
+    load_skill_sources(&state.app_data_dir).await
+}
+
+async fn mutate_skill_sources<R>(
+    state: &AppState,
+    mutation: impl FnOnce(&mut Vec<SkillSource>) -> Result<R, AppError> + Send + 'static,
+) -> Result<R, AppError>
+where
+    R: Send + 'static,
+{
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .mutate(skill_sources_spec(), Vec::new(), mutation)
+            .await;
+    }
+    let _guard = state.skill_sources_write_lock.lock().await;
+    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
+    let mut sources = load_skill_sources(&state.app_data_dir).await?;
+    let result = mutation(&mut sources)?;
+    validate_skill_sources(&sources)?;
+    save_skill_sources(&state.app_data_dir, &sources).await?;
+    Ok(result)
+}
+
 async fn save_skill_sources(app_data_dir: &Path, sources: &[SkillSource]) -> Result<(), AppError> {
     let directory = state_dir(app_data_dir);
     tokio::fs::create_dir_all(&directory)
@@ -408,38 +632,33 @@ pub(crate) async fn ensure_local_source(
         })?;
     let root_string = canonical_root.to_string_lossy().into_owned();
 
-    let _guard = state.skill_sources_write_lock.lock().await;
-    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
-    let mut sources = load_skill_sources(&state.app_data_dir).await?;
-    if let Some(existing) = sources.iter().find(
-        |source| matches!(&source.kind, SkillSourceKind::Local { root } if root == &root_string),
-    ) {
-        return Ok((existing.clone(), false));
-    }
-
-    let source = SkillSource {
-        id: Uuid::new_v4().to_string(),
-        kind: SkillSourceKind::Local { root: root_string },
-    };
-    sources.push(source.clone());
-    save_skill_sources(&state.app_data_dir, &sources).await?;
-    Ok((source, true))
+    mutate_skill_sources(state, move |sources| {
+        if let Some(existing) = sources.iter().find(
+            |source| matches!(&source.kind, SkillSourceKind::Local { root } if root == &root_string),
+        ) {
+            return Ok((existing.clone(), false));
+        }
+        let source = SkillSource {
+            id: Uuid::new_v4().to_string(),
+            kind: SkillSourceKind::Local { root: root_string },
+        };
+        sources.push(source.clone());
+        Ok((source, true))
+    })
+    .await
 }
 
 pub(crate) async fn remove_skill_source(
     state: &AppState,
     source_id: &str,
 ) -> Result<bool, AppError> {
-    let _guard = state.skill_sources_write_lock.lock().await;
-    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
-    let mut sources = load_skill_sources(&state.app_data_dir).await?;
-    let original_len = sources.len();
-    sources.retain(|source| source.id != source_id);
-    if sources.len() == original_len {
-        return Ok(false);
-    }
-    save_skill_sources(&state.app_data_dir, &sources).await?;
-    Ok(true)
+    let source_id = source_id.to_owned();
+    mutate_skill_sources(state, move |sources| {
+        let original_len = sources.len();
+        sources.retain(|source| source.id != source_id);
+        Ok(sources.len() != original_len)
+    })
+    .await
 }
 
 pub(crate) fn canonical_github_repository(repository: &str) -> Result<String, AppError> {
@@ -521,37 +740,35 @@ pub(crate) async fn add_github_source(
     let git_ref = validated_git_ref(git_ref)?;
     let subdirectory = validated_subdirectory(subdirectory)?;
 
-    let _guard = state.skill_sources_write_lock.lock().await;
-    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
-    let mut sources = load_skill_sources(&state.app_data_dir).await?;
-    if let Some(existing) = sources.iter().find(|source| {
-        matches!(
-            &source.kind,
-            SkillSourceKind::Github {
-                repository: existing_repository,
-                git_ref: existing_ref,
-                subdirectory: existing_subdirectory,
-                ..
-            } if existing_repository == &repository
-                && existing_ref == &git_ref
-                && existing_subdirectory == &subdirectory
-        )
-    }) {
-        return Ok(existing.clone());
-    }
-
-    let source = SkillSource {
-        id: Uuid::new_v4().to_string(),
-        kind: SkillSourceKind::Github {
-            repository,
-            git_ref,
-            subdirectory,
-            active_checkout: None,
-        },
-    };
-    sources.push(source.clone());
-    save_skill_sources(&state.app_data_dir, &sources).await?;
-    Ok(source)
+    mutate_skill_sources(state, move |sources| {
+        if let Some(existing) = sources.iter().find(|source| {
+            matches!(
+                &source.kind,
+                SkillSourceKind::Github {
+                    repository: existing_repository,
+                    git_ref: existing_ref,
+                    subdirectory: existing_subdirectory,
+                    ..
+                } if existing_repository == &repository
+                    && existing_ref == &git_ref
+                    && existing_subdirectory == &subdirectory
+            )
+        }) {
+            return Ok(existing.clone());
+        }
+        let source = SkillSource {
+            id: Uuid::new_v4().to_string(),
+            kind: SkillSourceKind::Github {
+                repository,
+                git_ref,
+                subdirectory,
+                active_checkout: None,
+            },
+        };
+        sources.push(source.clone());
+        Ok(source)
+    })
+    .await
 }
 
 async fn refresh_fs<T, F>(event: &'static str, operation: F) -> Result<T, AppError>
@@ -587,7 +804,7 @@ pub(crate) async fn refresh_git_source(
     state: &AppState,
     source_id: &str,
 ) -> Result<SkillSourceResult, AppError> {
-    let source = load_skill_sources(&state.app_data_dir)
+    let source = load_skill_sources_for_state(state)
         .await?
         .into_iter()
         .find(|source| source.id == source_id)
@@ -611,9 +828,7 @@ async fn refresh_git_source_from(
     clone_source: &str,
 ) -> Result<SkillSourceResult, AppError> {
     state.require_network("skill_source_refresh").await?;
-    let _guard = state.skill_sources_write_lock.lock().await;
-    let _file_guard = lock_skill_sources_async(state.app_data_dir.clone()).await?;
-    let mut sources = load_skill_sources(&state.app_data_dir).await?;
+    let sources = load_skill_sources_for_state(state).await?;
     let source_index = sources
         .iter()
         .position(|source| source.id == source_id)
@@ -769,18 +984,18 @@ async fn refresh_git_source_from(
     {
         *active = Some(active_checkout.to_string_lossy().into_owned());
     }
-    sources[source_index] = active_source.clone();
-    let bytes = serde_json::to_vec_pretty(&sources).map_err(|error| AppError::Internal {
-        message: format!("serialize skill-sources.json: {error}"),
-    })?;
-    let state_directory = state_dir(&state.app_data_dir);
-    let state_path = skill_sources_path(&state.app_data_dir);
-    let runtime = tokio::runtime::Handle::current();
-    if let Err(error) = refresh_fs("state_persist", move || {
-        std::fs::create_dir_all(&state_directory).map_err(|error| AppError::Io {
-            message: format!("create state dir {}: {error}", state_directory.display()),
-        })?;
-        runtime.block_on(atomic_write(&state_path, &bytes))
+    refresh_fs("state_persist", || Ok(())).await?;
+    let source_id = source_id.to_owned();
+    let persisted_source = active_source.clone();
+    if let Err(error) = mutate_skill_sources(state, move |sources| {
+        let source = sources
+            .iter_mut()
+            .find(|source| source.id == source_id)
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: format!("unknown skill source id: {source_id}"),
+            })?;
+        *source = persisted_source;
+        Ok(())
     })
     .await
     {
@@ -815,7 +1030,7 @@ async fn apply_persisted_trust(
     state: &AppState,
     result: &mut SkillSourceResult,
 ) -> Result<(), AppError> {
-    let Ok(records) = load_skill_trust(&state.app_data_dir).await else {
+    let Ok(records) = load_skill_trust_for_state(state).await else {
         return Ok(());
     };
     if records.is_empty() {
@@ -830,7 +1045,7 @@ async fn apply_persisted_trust(
 pub(crate) async fn inspect_skill_sources(
     state: &AppState,
 ) -> Result<Vec<SkillSourceResult>, AppError> {
-    let sources = load_skill_sources(&state.app_data_dir).await?;
+    let sources = load_skill_sources_for_state(state).await?;
     let mut results = Vec::with_capacity(sources.len());
     for source in sources {
         match discover_source(source.clone()).await {
@@ -856,7 +1071,7 @@ pub(crate) async fn refresh_skill_source(
     state: &AppState,
     source_id: &str,
 ) -> Result<SkillSourceResult, AppError> {
-    let source = load_skill_sources(&state.app_data_dir)
+    let source = load_skill_sources_for_state(state)
         .await?
         .into_iter()
         .find(|source| source.id == source_id)
@@ -874,7 +1089,7 @@ pub(crate) async fn refresh_skill_source(
 pub(crate) async fn refresh_all_skill_sources(
     state: &AppState,
 ) -> Result<Vec<SkillSourceResult>, AppError> {
-    let sources = load_skill_sources(&state.app_data_dir).await?;
+    let sources = load_skill_sources_for_state(state).await?;
     let mut results = Vec::with_capacity(sources.len());
     for source in sources {
         match refresh_skill_source(state, &source.id).await {
@@ -1109,7 +1324,7 @@ pub(crate) async fn resolve_skill_package(
     source_id: &str,
     relative_path: &str,
 ) -> Result<ResolvedSkillPackage, AppError> {
-    let source = load_skill_sources(&state.app_data_dir)
+    let source = load_skill_sources_for_state(state)
         .await?
         .into_iter()
         .find(|source| source.id == source_id)
@@ -2257,7 +2472,7 @@ fn metadata_is_executable(_: &Metadata) -> bool {
 
 #[tauri::command]
 pub async fn skill_sources_list(state: State<'_, AppState>) -> Result<Vec<SkillSource>, AppError> {
-    load_skill_sources(&state.app_data_dir).await
+    load_skill_sources_for_state(&state).await
 }
 
 #[tauri::command]
@@ -2273,9 +2488,7 @@ pub async fn skill_trust_grant(
     source_id: String,
     relative_path: String,
 ) -> Result<SkillPackageResult, AppError> {
-    let _guard = state.skill_installs_write_lock.lock().await;
-    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
-    let source = load_skill_sources(&state.app_data_dir)
+    let source = load_skill_sources_for_state(&state)
         .await?
         .into_iter()
         .find(|source| source.id == source_id)
@@ -2305,7 +2518,7 @@ pub async fn skill_trust_grant(
         });
     }
     let (tree_hash, executables) = trust_fingerprint(&source_root.join(&relative_path), package)?;
-    let mut records = load_skill_trust(&state.app_data_dir).await?;
+    let records = load_skill_trust_for_state(&state).await?;
     let has_existing_records = !records.is_empty();
     let key = tokio::task::spawn_blocking(move || {
         load_or_create_trust_key_with(&SystemKeychain, has_existing_records)
@@ -2323,16 +2536,20 @@ pub async fn skill_trust_grant(
         signature: String::new(),
     };
     record.signature = sign_trust_record(&record, &key)?;
-    records.retain(|existing| {
-        existing.source_id != source_id || existing.relative_path != relative_path
-    });
-    records.push(record);
-    records.sort_by(|left, right| {
-        left.source_id
-            .cmp(&right.source_id)
-            .then_with(|| left.relative_path.cmp(&right.relative_path))
-    });
-    save_skill_trust(&state.app_data_dir, &records).await?;
+    let retained_relative_path = relative_path.clone();
+    let records = mutate_skill_trust(&state, move |records| {
+        records.retain(|existing| {
+            existing.source_id != source_id || existing.relative_path != retained_relative_path
+        });
+        records.push(record);
+        records.sort_by(|left, right| {
+            left.source_id
+                .cmp(&right.source_id)
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        Ok(records.clone())
+    })
+    .await?;
     apply_skill_trust(&source_root, &mut result, &records, Some(&key));
     result
         .packages
@@ -2349,16 +2566,14 @@ pub async fn skill_trust_revoke(
     source_id: String,
     relative_path: String,
 ) -> Result<bool, AppError> {
-    let _guard = state.skill_installs_write_lock.lock().await;
-    let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
-    let mut records = load_skill_trust(&state.app_data_dir).await?;
-    let before = records.len();
-    records.retain(|record| record.source_id != source_id || record.relative_path != relative_path);
-    if records.len() == before {
-        return Ok(false);
-    }
-    save_skill_trust(&state.app_data_dir, &records).await?;
-    Ok(true)
+    mutate_skill_trust(&state, move |records| {
+        let before = records.len();
+        records.retain(|record| {
+            record.source_id != source_id || record.relative_path != relative_path
+        });
+        Ok(records.len() != before)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2505,7 +2720,7 @@ pub(crate) async fn plan_skill_install(
         .flatten()
         .map(PathBuf::from);
     let base = project.as_deref().unwrap_or(&home);
-    let records = install::load_ledger(&state.app_data_dir).await?;
+    let records = install::load_ledger_for_state(state).await?;
     let mut planned = Vec::new();
     for package in ordered {
         let name = package.name.clone().unwrap_or_default();
@@ -2577,7 +2792,7 @@ pub(crate) async fn install_skill_with_dependencies_authorized(
             message: plan.blockers.join("; "),
         });
     }
-    let before = install::load_ledger(&state.app_data_dir).await?;
+    let before = install::load_ledger_for_state(state).await?;
     let mut installed = Vec::new();
     let mut created = Vec::new();
     for package in &plan.packages {
@@ -2763,7 +2978,7 @@ pub(crate) async fn install_skill_authorized(
         }
     }
 
-    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let mut records = install::load_ledger_for_state(state).await?;
     let old_records = records.clone();
     let project_string = project
         .as_ref()
@@ -2819,38 +3034,462 @@ pub(crate) async fn install_skill_authorized(
         installed_at: chrono::Utc::now().to_rfc3339(),
         disabled_path: None,
     };
+    let previous_record = existing_index.map(|index| records[index].clone());
     if let Some(index) = existing_index {
         records[index] = record.clone();
     } else {
         records.push(record.clone());
     }
 
-    install::save_ledger(&state.app_data_dir, &records).await?;
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    if previous_record.is_some() {
+                        "skill_update"
+                    } else {
+                        "skill_install"
+                    },
+                    &SkillInstallOperation {
+                        previous: previous_record,
+                        next: record.clone(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        install::save_ledger_for_state(state, &records).await?;
+        None
+    };
     let backups = state.app_data_dir.join("skill-backups");
     let install_result = match project_authorization {
-        Some(authorization) => install::install_validated_directory_in_project(
-            authorization.root(),
-            package.root(),
-            package.files(),
-            &install::project_target_path(runtime, &record.name)?,
-            &backups,
-            replace_managed,
-        ),
-        None => install::install_validated_directory(
-            package.root(),
-            package.files(),
-            &destination,
-            &backups,
-            replace_managed,
-        ),
+        Some(authorization) => match &operation {
+            Some(operation) => install::install_validated_directory_in_project_with_id(
+                authorization.root(),
+                package.root(),
+                package.files(),
+                &install::project_target_path(runtime, &record.name)?,
+                &backups,
+                replace_managed,
+                &operation.id,
+            ),
+            None => install::install_validated_directory_in_project(
+                authorization.root(),
+                package.root(),
+                package.files(),
+                &install::project_target_path(runtime, &record.name)?,
+                &backups,
+                replace_managed,
+            ),
+        },
+        None => match &operation {
+            Some(operation) => install::install_validated_directory_with_id(
+                package.root(),
+                package.files(),
+                &destination,
+                &backups,
+                replace_managed,
+                &operation.id,
+            ),
+            None => install::install_validated_directory(
+                package.root(),
+                package.files(),
+                &destination,
+                &backups,
+                replace_managed,
+            ),
+        },
     };
     if let Err(error) = install_result {
-        return match install::save_ledger(&state.app_data_dir, &old_records).await {
+        if let (Some(database), Some(operation)) = (&database, &operation) {
+            database.abort_filesystem_operation(&operation.id).await?;
+            return Err(error);
+        }
+        return match install::save_ledger_for_state(state, &old_records).await {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("install skill", error, rollback)),
         };
     }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        install::save_ledger_after_filesystem(state, &records, &operation.id).await?;
+        database.commit_filesystem_operation(&operation.id).await?;
+    }
     Ok(installed_view(&record, SkillInstallState::Current))
+}
+
+fn same_skill_install(left: &SkillInstallRecord, right: &SkillInstallRecord) -> bool {
+    left.source_id == right.source_id
+        && left.relative_path == right.relative_path
+        && left.runtime == right.runtime
+        && left.project_path == right.project_path
+}
+
+fn remove_recovery_directory(path: &Path, expected_hash: &str) -> Result<(), AppError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if skill_tree_hash(path)?.as_deref() != Some(expected_hash) {
+        return Err(AppError::StorageCorrupt {
+            message: "Skill install recovery found changed staged content".into(),
+        });
+    }
+    std::fs::remove_dir_all(path).map_err(|error| AppError::Io {
+        message: format!("clean Skill install recovery directory: {error}"),
+    })
+}
+
+async fn apply_recovered_install(
+    state: &AppState,
+    operation_id: &str,
+    payload: &SkillInstallOperation,
+) -> Result<(), AppError> {
+    let mut records = install::load_ledger_for_state(state).await?;
+    match records
+        .iter()
+        .position(|record| same_skill_install(record, &payload.next))
+    {
+        Some(index) if records[index] == payload.next => {}
+        Some(index)
+            if payload
+                .previous
+                .as_ref()
+                .is_some_and(|previous| records[index] == *previous) =>
+        {
+            records[index] = payload.next.clone();
+        }
+        Some(_) => {
+            return Err(AppError::StorageCorrupt {
+                message: "Skill install recovery found changed ledger metadata".into(),
+            });
+        }
+        None if payload.previous.is_none() => records.push(payload.next.clone()),
+        None => {
+            return Err(AppError::StorageCorrupt {
+                message: "Skill install recovery lost its previous ledger metadata".into(),
+            });
+        }
+    }
+    install::save_ledger_after_filesystem(state, &records, operation_id).await
+}
+
+async fn apply_recovered_move(
+    state: &AppState,
+    operation_id: &str,
+    payload: &SkillMoveOperation,
+) -> Result<(), AppError> {
+    let mut records = install::load_ledger_for_state(state).await?;
+    let index = records
+        .iter()
+        .position(|record| same_skill_install(record, &payload.next))
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "Skill move recovery lost its ledger metadata".into(),
+        })?;
+    if records[index] == payload.previous {
+        records[index] = payload.next.clone();
+    } else if records[index] != payload.next {
+        return Err(AppError::StorageCorrupt {
+            message: "Skill move recovery found changed ledger metadata".into(),
+        });
+    }
+    install::save_ledger_after_filesystem(state, &records, operation_id).await
+}
+
+async fn recover_move_operation(
+    state: &AppState,
+    database: &crate::state_db::StateDatabase,
+    operation: &crate::state_db::FilesystemOperation,
+) -> Result<(), AppError> {
+    let payload =
+        serde_json::from_value::<SkillMoveOperation>(operation.payload.clone()).map_err(|_| {
+            AppError::StorageCorrupt {
+                message: "Skill move recovery payload is invalid".into(),
+            }
+        })?;
+    if !same_skill_install(&payload.previous, &payload.next)
+        || payload.previous.installed_hash != payload.next.installed_hash
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Skill move recovery identity changed".into(),
+        });
+    }
+    let (base, destination) = record_destination(&payload.next)?;
+    let disabled_record = if payload.next.disabled_path.is_some() {
+        &payload.next
+    } else {
+        &payload.previous
+    };
+    let disabled = disabled_destination(disabled_record, &base, &destination)?;
+    let (source, target) = match operation.kind.as_str() {
+        "skill_disable"
+            if payload.previous.disabled_path.is_none() && payload.next.disabled_path.is_some() =>
+        {
+            (&destination, &disabled)
+        }
+        "skill_enable"
+            if payload.previous.disabled_path.is_some() && payload.next.disabled_path.is_none() =>
+        {
+            (&disabled, &destination)
+        }
+        _ => {
+            return Err(AppError::StorageCorrupt {
+                message: "Skill move recovery transition is invalid".into(),
+            });
+        }
+    };
+    let source_hash = skill_tree_hash(source)?;
+    let target_hash = skill_tree_hash(target)?;
+    match operation.phase {
+        crate::state_db::FilesystemOperationPhase::Prepared => {
+            if target_hash.as_deref() == Some(&payload.next.installed_hash) && source_hash.is_none()
+            {
+                apply_recovered_move(state, &operation.id, &payload).await?;
+                database.commit_filesystem_operation(&operation.id).await
+            } else if source_hash.as_deref() == Some(&payload.previous.installed_hash)
+                && target_hash.is_none()
+            {
+                database.abort_filesystem_operation(&operation.id).await
+            } else {
+                Err(AppError::StorageCorrupt {
+                    message: "Skill move recovery found changed or duplicate content".into(),
+                })
+            }
+        }
+        crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+            let records = install::load_ledger_for_state(state).await?;
+            if target_hash.as_deref() != Some(&payload.next.installed_hash)
+                || source_hash.is_some()
+                || !records.iter().any(|record| record == &payload.next)
+            {
+                Err(AppError::StorageCorrupt {
+                    message: "Skill move recovery found changed committed state".into(),
+                })
+            } else {
+                database.commit_filesystem_operation(&operation.id).await
+            }
+        }
+        crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+    }
+}
+
+async fn apply_recovered_uninstall(
+    state: &AppState,
+    operation_id: &str,
+    previous: &SkillInstallRecord,
+) -> Result<(), AppError> {
+    let mut records = install::load_ledger_for_state(state).await?;
+    if let Some(index) = records
+        .iter()
+        .position(|record| same_skill_install(record, previous))
+    {
+        if records[index] != *previous {
+            return Err(AppError::StorageCorrupt {
+                message: "Skill uninstall recovery found changed ledger metadata".into(),
+            });
+        }
+        records.remove(index);
+    }
+    install::save_ledger_after_filesystem(state, &records, operation_id).await
+}
+
+async fn recover_uninstall_operation(
+    state: &AppState,
+    database: &crate::state_db::StateDatabase,
+    operation: &crate::state_db::FilesystemOperation,
+) -> Result<(), AppError> {
+    let payload = serde_json::from_value::<SkillUninstallOperation>(operation.payload.clone())
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Skill uninstall recovery payload is invalid".into(),
+        })?;
+    let (base, destination) = record_destination(&payload.previous)?;
+    let target = if payload.previous.disabled_path.is_some() {
+        disabled_destination(&payload.previous, &base, &destination)?
+    } else {
+        destination
+    };
+    let quarantine = PathBuf::from(&payload.quarantine);
+    if quarantine.parent() != target.parent()
+        || !quarantine
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".agency-uninstall-"))
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Skill uninstall recovery quarantine is invalid".into(),
+        });
+    }
+    let target_hash = skill_tree_hash(&target)?;
+    let quarantine_hash = skill_tree_hash(&quarantine)?;
+    match operation.phase {
+        crate::state_db::FilesystemOperationPhase::Prepared => {
+            if target_hash.as_deref() == Some(&payload.target_hash) && quarantine_hash.is_none() {
+                database.abort_filesystem_operation(&operation.id).await
+            } else if target_hash.is_none()
+                && quarantine_hash.as_deref() == Some(&payload.target_hash)
+            {
+                mutation_uninstall(
+                    None,
+                    &quarantine,
+                    &state.app_data_dir.join("skill-backups"),
+                    payload.target_hash != payload.previous.installed_hash,
+                )?;
+                apply_recovered_uninstall(state, &operation.id, &payload.previous).await?;
+                database.commit_filesystem_operation(&operation.id).await
+            } else if target_hash.is_none() && quarantine_hash.is_none() {
+                apply_recovered_uninstall(state, &operation.id, &payload.previous).await?;
+                database.commit_filesystem_operation(&operation.id).await
+            } else {
+                Err(AppError::StorageCorrupt {
+                    message: "Skill uninstall recovery found changed or duplicate content".into(),
+                })
+            }
+        }
+        crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+            let records = install::load_ledger_for_state(state).await?;
+            if target_hash.is_some()
+                || quarantine_hash.is_some()
+                || records
+                    .iter()
+                    .any(|record| same_skill_install(record, &payload.previous))
+            {
+                Err(AppError::StorageCorrupt {
+                    message: "Skill uninstall recovery found changed committed state".into(),
+                })
+            } else {
+                database.commit_filesystem_operation(&operation.id).await
+            }
+        }
+        crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+    }
+}
+
+pub(crate) async fn recover_install_operations(state: &AppState) -> Result<(), AppError> {
+    let Some(database) = state.completed_state_database().await? else {
+        return Ok(());
+    };
+    for operation in database.pending_filesystem_operations().await? {
+        if !matches!(operation.kind.as_str(), "skill_install" | "skill_update") {
+            continue;
+        }
+        let payload = serde_json::from_value::<SkillInstallOperation>(operation.payload.clone())
+            .map_err(|_| AppError::StorageCorrupt {
+                message: "Skill install recovery payload is invalid".into(),
+            })?;
+        if payload
+            .previous
+            .as_ref()
+            .is_some_and(|previous| !same_skill_install(previous, &payload.next))
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Skill install recovery identity changed".into(),
+            });
+        }
+        let (_, destination) = record_destination(&payload.next)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Skill install recovery destination has no parent".into(),
+            })?;
+        let stage = parent.join(format!(".agency-skill-{}.stage", operation.id));
+        let retired = parent.join(format!(".agency-skill-{}.previous", operation.id));
+        let result = match operation.phase {
+            crate::state_db::FilesystemOperationPhase::Prepared => {
+                let destination_hash = skill_tree_hash(&destination)?;
+                if destination_hash.as_deref() == Some(&payload.next.installed_hash) {
+                    apply_recovered_install(state, &operation.id, &payload).await?;
+                    if let Some(previous) = &payload.previous {
+                        remove_recovery_directory(&retired, &previous.installed_hash)?;
+                    } else if retired.exists() {
+                        return Err(AppError::StorageCorrupt {
+                            message: "Skill install recovery found an unexpected retired tree"
+                                .into(),
+                        });
+                    }
+                    remove_recovery_directory(&stage, &payload.next.installed_hash)?;
+                    database.commit_filesystem_operation(&operation.id).await
+                } else if let Some(previous) = &payload.previous {
+                    if destination_hash.as_deref() == Some(&previous.installed_hash) {
+                        remove_recovery_directory(&stage, &payload.next.installed_hash)?;
+                        database.abort_filesystem_operation(&operation.id).await
+                    } else if destination_hash.is_none()
+                        && skill_tree_hash(&retired)?.as_deref() == Some(&previous.installed_hash)
+                    {
+                        std::fs::rename(&retired, &destination).map_err(|error| AppError::Io {
+                            message: format!("restore retired Skill install: {error}"),
+                        })?;
+                        remove_recovery_directory(&stage, &payload.next.installed_hash)?;
+                        database.abort_filesystem_operation(&operation.id).await
+                    } else {
+                        Err(AppError::StorageCorrupt {
+                            message: "Skill install recovery found changed destination content"
+                                .into(),
+                        })
+                    }
+                } else if destination_hash.is_none() && stage.exists() {
+                    if skill_tree_hash(&stage)?.as_deref() != Some(&payload.next.installed_hash) {
+                        Err(AppError::StorageCorrupt {
+                            message: "Skill install recovery found changed staged content".into(),
+                        })
+                    } else {
+                        std::fs::rename(&stage, &destination).map_err(|error| AppError::Io {
+                            message: format!("publish recovered Skill install: {error}"),
+                        })?;
+                        apply_recovered_install(state, &operation.id, &payload).await?;
+                        database.commit_filesystem_operation(&operation.id).await
+                    }
+                } else if destination_hash.is_none() {
+                    database.abort_filesystem_operation(&operation.id).await
+                } else {
+                    Err(AppError::StorageCorrupt {
+                        message: "Skill install recovery found changed destination content".into(),
+                    })
+                }
+            }
+            crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+                if skill_tree_hash(&destination)?.as_deref() != Some(&payload.next.installed_hash) {
+                    Err(AppError::StorageCorrupt {
+                        message: "Skill install recovery found changed committed content".into(),
+                    })
+                } else {
+                    let records = install::load_ledger_for_state(state).await?;
+                    if !records.iter().any(|record| record == &payload.next) {
+                        Err(AppError::StorageCorrupt {
+                            message: "Skill install recovery lost committed ledger metadata".into(),
+                        })
+                    } else {
+                        if let Some(previous) = &payload.previous {
+                            remove_recovery_directory(&retired, &previous.installed_hash)?;
+                        }
+                        remove_recovery_directory(&stage, &payload.next.installed_hash)?;
+                        database.commit_filesystem_operation(&operation.id).await
+                    }
+                }
+            }
+            crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+        };
+        if let Err(error) = result {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+            return Err(error);
+        }
+    }
+    for operation in database.pending_filesystem_operations().await? {
+        let result = match operation.kind.as_str() {
+            "skill_disable" | "skill_enable" => {
+                recover_move_operation(state, &database, &operation).await
+            }
+            "skill_uninstall" => recover_uninstall_operation(state, &database, &operation).await,
+            _ => continue,
+        };
+        if let Err(error) = result {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn skill_record_index(
@@ -3233,7 +3872,7 @@ pub(crate) async fn disable_skill_authorized(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
     let project = canonical_project_string_authorized(project_path, project_authorization)?;
-    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let mut records = install::load_ledger_for_state(state).await?;
     let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
     if records[index].disabled_path.is_some() {
         let (base, destination) =
@@ -3278,6 +3917,24 @@ pub(crate) async fn disable_skill_authorized(
             Uuid::new_v4(),
             records[index].name
         ));
+    let previous = records[index].clone();
+    records[index].disabled_path = Some(disabled.to_string_lossy().into_owned());
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "skill_disable",
+                    &SkillMoveOperation {
+                        previous,
+                        next: records[index].clone(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     mutation_rename(project_authorization, &destination, &disabled)?;
     let disabled_hash = match mutation_tree_hash(project_authorization, &disabled)? {
         Some(hash) => hash,
@@ -3303,12 +3960,20 @@ pub(crate) async fn disable_skill_authorized(
     if project_authorization.is_none() {
         reject_linked_destination_ancestors(&base, &disabled)?;
     }
-    records[index].disabled_path = Some(disabled.to_string_lossy().into_owned());
-    if let Err(error) = install::save_ledger(&state.app_data_dir, &records).await {
+    let save = match &operation {
+        Some(operation) => {
+            install::save_ledger_after_filesystem(state, &records, &operation.id).await
+        }
+        None => install::save_ledger_for_state(state, &records).await,
+    };
+    if let Err(error) = save {
         return match mutation_rename(project_authorization, &disabled, &destination) {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("disable skill", error, rollback)),
         };
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     Ok(installed_view(
         &records[index],
@@ -3343,7 +4008,7 @@ pub(crate) async fn enable_skill_authorized(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
     let project = canonical_project_string_authorized(project_path, project_authorization)?;
-    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let mut records = install::load_ledger_for_state(state).await?;
     let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
     let (base, destination) =
         record_destination_authorized(&records[index], project_authorization)?;
@@ -3358,6 +4023,24 @@ pub(crate) async fn enable_skill_authorized(
             message: "disabled skill is missing".into(),
         }
     })?;
+    let previous = records[index].clone();
+    records[index].disabled_path = None;
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "skill_enable",
+                    &SkillMoveOperation {
+                        previous,
+                        next: records[index].clone(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     mutation_rename(project_authorization, &disabled, &destination)?;
     let disk_hash = match mutation_tree_hash(project_authorization, &destination)? {
         Some(hash) => hash,
@@ -3371,12 +4054,20 @@ pub(crate) async fn enable_skill_authorized(
             };
         }
     };
-    records[index].disabled_path = None;
-    if let Err(error) = install::save_ledger(&state.app_data_dir, &records).await {
+    let save = match &operation {
+        Some(operation) => {
+            install::save_ledger_after_filesystem(state, &records, &operation.id).await
+        }
+        None => install::save_ledger_for_state(state, &records).await,
+    };
+    if let Err(error) = save {
         return match mutation_rename(project_authorization, &destination, &disabled) {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("enable skill", error, rollback)),
         };
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     let (source_available, source_current) = source_status(state, &records[index]).await;
     Ok(installed_view(
@@ -3412,7 +4103,7 @@ pub(crate) async fn uninstall_skill_authorized(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
     let project = canonical_project_string_authorized(project_path, project_authorization)?;
-    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let mut records = install::load_ledger_for_state(state).await?;
     let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
     let record = records[index].clone();
     let (base, destination) = record_destination_authorized(&record, project_authorization)?;
@@ -3431,15 +4122,17 @@ pub(crate) async fn uninstall_skill_authorized(
         .transpose()?;
     let old_records = records.clone();
     records.remove(index);
+    before_uninstall_quarantine(&target);
     let target_hash = match project_target.as_ref() {
         Some(capability) => install::project_capability_tree_hash(capability)?,
         None => mutation_tree_hash(None, &target)?,
     };
     if target_hash.is_none() {
         after_missing_uninstall_validation(&target);
-        install::save_ledger(&state.app_data_dir, &records).await?;
+        install::save_ledger_for_state(state, &records).await?;
         return Ok(true);
     }
+    let expected_target_hash = target_hash.expect("checked present Skill target hash");
     let quarantine = target
         .parent()
         .ok_or_else(|| AppError::InvalidArgument {
@@ -3450,7 +4143,23 @@ pub(crate) async fn uninstall_skill_authorized(
             Uuid::new_v4(),
             record.name
         ));
-    before_uninstall_quarantine(&target);
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "skill_uninstall",
+                    &SkillUninstallOperation {
+                        previous: record.clone(),
+                        target_hash: expected_target_hash.clone(),
+                        quarantine: quarantine.to_string_lossy().into_owned(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     if let Some(capability) = project_target.as_mut() {
         install::rename_project_capability(
             capability,
@@ -3504,8 +4213,10 @@ pub(crate) async fn uninstall_skill_authorized(
             };
         }
     };
-    let modified = disk_hash != record.installed_hash;
-    if let Err(error) = install::save_ledger(&state.app_data_dir, &records).await {
+    if disk_hash != expected_target_hash {
+        let error = AppError::StorageCorrupt {
+            message: "skill changed while it was being quarantined".into(),
+        };
         let restore = match project_target.as_mut() {
             Some(capability) => install::rename_project_capability(
                 capability,
@@ -3520,6 +4231,25 @@ pub(crate) async fn uninstall_skill_authorized(
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("uninstall skill", error, rollback)),
         };
+    }
+    let modified = disk_hash != record.installed_hash;
+    if operation.is_none() {
+        if let Err(error) = install::save_ledger_for_state(state, &records).await {
+            let restore = match project_target.as_mut() {
+                Some(capability) => install::rename_project_capability(
+                    capability,
+                    target
+                        .file_name()
+                        .expect("skill target has a name")
+                        .to_os_string(),
+                ),
+                None => mutation_rename(None, &quarantine, &target),
+            };
+            return match restore {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("uninstall skill", error, rollback)),
+            };
+        }
     }
     let removal = match project_target.as_ref() {
         Some(capability) => install::uninstall_project_capability(
@@ -3539,7 +4269,11 @@ pub(crate) async fn uninstall_skill_authorized(
         if project_target.is_some() {
             return Err(error);
         }
-        let ledger = install::save_ledger(&state.app_data_dir, &old_records).await;
+        let ledger = if operation.is_some() {
+            Ok(())
+        } else {
+            install::save_ledger_for_state(state, &old_records).await
+        };
         let restore = match project_target.as_mut() {
             Some(capability) => install::rename_project_capability(
                 capability,
@@ -3561,6 +4295,10 @@ pub(crate) async fn uninstall_skill_authorized(
                 ),
             }),
         };
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        install::save_ledger_after_filesystem(state, &records, &operation.id).await?;
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     Ok(true)
 }
@@ -3592,7 +4330,7 @@ pub(crate) async fn skill_version_history(
     project_path: Option<&str>,
 ) -> Result<Vec<SkillVersionSnapshot>, AppError> {
     let project = canonical_project_string(project_path)?;
-    let records = install::load_ledger(&state.app_data_dir).await?;
+    let records = install::load_ledger_for_state(state).await?;
     let record =
         &records[skill_record_index(&records, source_id, relative_path, runtime, &project)?];
     let directory = state.app_data_dir.join("skill-backups");
@@ -3637,7 +4375,7 @@ pub(crate) async fn rollback_skill_authorized(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
     let project = canonical_project_string_authorized(project_path, project_authorization)?;
-    let mut records = install::load_ledger(&state.app_data_dir).await?;
+    let mut records = install::load_ledger_for_state(state).await?;
     let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
     let old_records = records.clone();
     let record = records[index].clone();
@@ -3674,7 +4412,7 @@ pub(crate) async fn rollback_skill_authorized(
     records[index].source_hash = source_hash.clone();
     records[index].installed_hash = source_hash;
     records[index].installed_at = chrono::Utc::now().to_rfc3339();
-    install::save_ledger(&state.app_data_dir, &records).await?;
+    install::save_ledger_for_state(state, &records).await?;
 
     let destination = PathBuf::from(&record.dest);
     let install_result = match project_authorization {
@@ -3695,7 +4433,7 @@ pub(crate) async fn rollback_skill_authorized(
         ),
     };
     if let Err(error) = install_result {
-        return match install::save_ledger(&state.app_data_dir, &old_records).await {
+        return match install::save_ledger_for_state(state, &old_records).await {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("rollback skill", error, rollback)),
         };
@@ -3825,7 +4563,7 @@ pub(crate) async fn reconcile_skill_installs(
         .iter()
         .map(|path| canonical_target_base(Path::new(path)))
         .collect::<Result<Vec<_>, _>>()?;
-    let records = install::load_ledger(&state.app_data_dir).await?;
+    let records = install::load_ledger_for_state(state).await?;
     let mut output = Vec::new();
     let mut tracked_destinations = HashSet::new();
     for record in &records {
@@ -4065,9 +4803,10 @@ mod tests {
         add_github_source, add_local_source, apply_skill_trust, discover_source,
         discover_source_blocking, ensure_local_source, inspect_skill_sources,
         is_windows_reparse_point, load_or_create_trust_key_with, load_skill_sources,
-        read_skill_file, refresh_git_source_from, remove_skill_source, reset_refresh_fs_probe,
-        resolve_skill_package, sign_trust_record, skill_destination_presence, skill_sources_path,
-        take_refresh_fs_probe, trust_fingerprint, validate_package, verify_publisher,
+        load_skill_sources_for_state, read_skill_file, refresh_git_source_from,
+        remove_skill_source, reset_refresh_fs_probe, resolve_skill_package, sign_trust_record,
+        skill_destination_presence, skill_sources_path, skill_sources_spec, take_refresh_fs_probe,
+        trust_fingerprint, validate_imported_skill_trust, validate_package, verify_publisher,
         SkillPublisherMetadata, SkillTrustRecord, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
     };
 
@@ -4123,6 +4862,206 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(2))
             .expect("second writer acquires after release");
         waiter.join().expect("waiter");
+    }
+
+    #[tokio::test]
+    async fn sqlite_sources_preserve_independent_state_updates() {
+        let app = tempdir().expect("app data");
+        let left_root = tempdir().expect("left source");
+        let right_root = tempdir().expect("right source");
+        let database = crate::state_db::StateDatabase::open(app.path()).expect("open database");
+        database
+            .mutate(skill_sources_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .expect("seed skill sources");
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .expect("complete migration");
+        let left = test_state(app.path());
+        let right = test_state(app.path());
+
+        let (left_result, right_result) = tokio::join!(
+            add_local_source(&left, left_root.path()),
+            add_local_source(&right, right_root.path()),
+        );
+        left_result.expect("add left source");
+        right_result.expect("add right source");
+
+        assert_eq!(
+            load_skill_sources_for_state(&left)
+                .await
+                .expect("load shared sources")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_skill_install_commits_a_filesystem_operation() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let database = crate::state_db::StateDatabase::open(app.path()).expect("open database");
+        database
+            .mutate(skill_sources_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .expect("seed skill sources");
+        let installs = crate::state_db::DocumentSpec::<Vec<crate::types::SkillInstallRecord>>::new(
+            "skill_installs",
+            1,
+            16_777_216,
+            |_| Ok(()),
+        );
+        database
+            .mutate(installs, Vec::new(), |_| Ok(()))
+            .await
+            .expect("seed skill installs");
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .expect("complete migration");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path())
+            .await
+            .expect("register source");
+
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(project.path().to_string_lossy().as_ref()),
+        )
+        .await
+        .expect("install skill");
+        super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(project.path().to_string_lossy().as_ref()),
+        )
+        .await
+        .expect("disable skill");
+        super::enable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(project.path().to_string_lossy().as_ref()),
+        )
+        .await
+        .expect("enable skill");
+        super::uninstall_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(project.path().to_string_lossy().as_ref()),
+        )
+        .await
+        .expect("uninstall skill");
+
+        let connection =
+            rusqlite::Connection::open(app.path().join("state/agency-agents.sqlite3")).unwrap();
+        for kind in [
+            "skill_install",
+            "skill_disable",
+            "skill_enable",
+            "skill_uninstall",
+        ] {
+            let count: u32 = connection
+                .query_row(
+                    "SELECT count(*) FROM filesystem_operations \
+                     WHERE kind = ?1 AND phase = 'committed'",
+                    [kind],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing {kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_skill_install_recovery_rolls_forward_exact_content_once() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let database = crate::state_db::StateDatabase::open(app.path()).expect("open database");
+        database
+            .mutate(skill_sources_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        let installs = crate::state_db::DocumentSpec::<Vec<crate::types::SkillInstallRecord>>::new(
+            "skill_installs",
+            1,
+            16_777_216,
+            |_| Ok(()),
+        );
+        database
+            .mutate(installs, Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let package = resolve_skill_package(&state, &registered.id, "reviewer")
+            .await
+            .unwrap();
+        let hash = super::install::validated_tree_hash(package.root(), package.files()).unwrap();
+        let project_root = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project_root.join(".agents/skills/reviewer");
+        let record = crate::types::SkillInstallRecord {
+            source_id: registered.id,
+            relative_path: "reviewer".into(),
+            name: "reviewer".into(),
+            runtime: "codex".into(),
+            scope: "project".into(),
+            project_path: Some(project_root.to_string_lossy().into_owned()),
+            dest: destination.to_string_lossy().into_owned(),
+            source_hash: hash.clone(),
+            installed_hash: hash,
+            installed_at: chrono::Utc::now().to_rfc3339(),
+            disabled_path: None,
+        };
+        let operation = database
+            .prepare_filesystem_operation(
+                "skill_install",
+                &super::SkillInstallOperation {
+                    previous: None,
+                    next: record.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        super::install::install_validated_directory_with_id(
+            package.root(),
+            package.files(),
+            &destination,
+            &app.path().join("skill-backups"),
+            false,
+            &operation.id,
+        )
+        .unwrap();
+
+        super::recover_install_operations(&state).await.unwrap();
+        super::recover_install_operations(&state).await.unwrap();
+
+        assert_eq!(
+            super::install::load_ledger_for_state(&state).await.unwrap(),
+            [record]
+        );
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
     }
     use crate::commands::settings::{Settings, SettingsLoadState};
     use crate::error::AppError;
@@ -5319,6 +6258,26 @@ mod tests {
         assert!(matches!(
             load_or_create_trust_key_with(&missing, true),
             Err(AppError::KeychainUnavailable { .. })
+        ));
+
+        let mut record = SkillTrustRecord {
+            source_id: "source-id".into(),
+            relative_path: "skill".into(),
+            tree_hash: "a".repeat(64),
+            executables: Vec::new(),
+            granted_at: "2026-08-06T00:00:00Z".into(),
+            signature: String::new(),
+        };
+        record.signature = sign_trust_record(&record, &key).expect("sign record");
+        assert!(validate_imported_skill_trust(&[record.clone()], &keychain).is_ok());
+        assert!(matches!(
+            validate_imported_skill_trust(&[record.clone()], &missing),
+            Err(AppError::StorageCorrupt { .. })
+        ));
+        record.signature.replace_range(..2, "00");
+        assert!(matches!(
+            validate_imported_skill_trust(&[record], &keychain),
+            Err(AppError::StorageCorrupt { .. })
         ));
     }
 

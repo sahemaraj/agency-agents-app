@@ -2,6 +2,7 @@ import { createRawSnippet, mount, tick, unmount } from "svelte";
 import { invoke } from "@tauri-apps/api/core";
 import { describe, expect, it, vi } from "vitest";
 import Modal from "$lib/components/Modal.svelte";
+import StorageMigrationGate from "$lib/components/StorageMigrationGate.svelte";
 import { mergeActivityEntries, safeActivityDetail, selectMcpAuditEntries } from "$lib/stores/activity.svelte";
 import type { JournalEntry } from "$lib/stores/activity.svelte";
 import type { McpAuditEntry } from "$lib/types";
@@ -96,6 +97,70 @@ describe("frontend test harness", () => {
     }
   });
 
+  it("explains the one-time storage update and exposes named stages", async () => {
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(StorageMigrationGate, {
+      target,
+      props: {
+        status: { state: "legacy", stage: "checkingData", detail: null, legacyConflicts: [] },
+        busy: false,
+        error: null,
+        onStart: vi.fn(),
+        onRetry: vi.fn(),
+        onOpenData: vi.fn(),
+      },
+    });
+    await tick();
+    expect(target.textContent).toContain("Agency Agents needs a one-time data update");
+    expect(target.textContent).toContain("Checking data");
+    expect(target.textContent).toContain("Verifying backup");
+    expect(target.textContent).toContain("Moving records");
+    expect(target.querySelector("[aria-busy='false']")).not.toBeNull();
+    expect(document.activeElement).toBe(target.querySelector("button.btn-primary"));
+    unmount(component);
+    target.remove();
+  });
+
+  it("keeps migration failures reassuring and retryable but blocks unsupported data", async () => {
+    const target = document.createElement("div");
+    document.body.append(target);
+    const retry = vi.fn();
+    const component = mount(StorageMigrationGate, {
+      target,
+      props: {
+        status: { state: "corrupt", stage: "failed", detail: "Invalid settings", legacyConflicts: [] },
+        busy: false,
+        error: "Invalid settings",
+        onStart: vi.fn(),
+        onRetry: retry,
+        onOpenData: vi.fn(),
+      },
+    });
+    await tick();
+    expect(target.textContent).toContain("Nothing was lost");
+    target.querySelector<HTMLButtonElement>("button.btn-primary")!.click();
+    expect(retry).toHaveBeenCalledOnce();
+    unmount(component);
+
+    const unsupported = mount(StorageMigrationGate, {
+      target,
+      props: {
+        status: { state: "unsupported", stage: "unsupported", detail: null, legacyConflicts: [] },
+        busy: false,
+        error: null,
+        onStart: vi.fn(),
+        onRetry: vi.fn(),
+        onOpenData: vi.fn(),
+      },
+    });
+    await tick();
+    expect(target.textContent).toContain("newer Agency Agents version");
+    expect(target.querySelector("button.btn-primary")).toBeNull();
+    unmount(unsupported);
+    target.remove();
+  });
+
   it("shows one inbox card when a pending draft already has an exact approval request", async () => {
     const draft = {
       id: "draft-1",
@@ -163,6 +228,56 @@ describe("frontend test harness", () => {
       expect(target.querySelectorAll("details.draft-inbox article.draft")).toHaveLength(1);
       expect(target.querySelector("details.draft-inbox article.draft strong")?.textContent)
         .toBe("Publish Skill draft draft-1");
+    } finally {
+      unmount(component);
+      target.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("refreshes Skills data without closing the inbox, stealing focus, or resetting scroll", async () => {
+    const folders = {
+      folders: [], assignments: [], favorites: [], recent: [], collections: [], smartFolders: [],
+      profiles: [], updatePolicies: [], publisherTrust: [], preferredSources: [], usage: [], approvals: [],
+    };
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "skill_folders_list") return folders as never;
+      return [] as never;
+    });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      removeItem: () => undefined,
+    });
+    const { default: SkillsWorkspace } = await import("$lib/components/SkillsWorkspace.svelte");
+    const { skillSources } = await import("$lib/stores/skillSources.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SkillsWorkspace, { target });
+    try {
+      await vi.waitFor(() => expect(target.querySelector("details.draft-inbox")).not.toBeNull());
+      const inbox = target.querySelector<HTMLDetailsElement>("details.draft-inbox")!;
+      const popover = inbox.querySelector<HTMLElement>(".draft-popover")!;
+      const summary = inbox.querySelector<HTMLElement>("summary")!;
+      inbox.open = true;
+      popover.scrollTop = 37;
+      summary.focus();
+
+      folders.approvals = [{
+        id: "approval-refresh",
+        submittedAt: "2026-08-06T08:00:00Z",
+        state: "pending",
+        requestedBy: "codex",
+        request: { action: "sourceRemove", sourceId: "source-1" },
+        result: null,
+      }] as never;
+      await skillSources.load();
+      await tick();
+
+      expect(inbox.open).toBe(true);
+      expect(document.activeElement).toBe(summary);
+      expect(popover.scrollTop).toBe(37);
+      expect(summary.textContent).toContain("1");
     } finally {
       unmount(component);
       target.remove();

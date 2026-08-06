@@ -34,6 +34,18 @@ struct CreatorMetadata {
     tags: Vec<String>,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishOperation {
+    draft_id: String,
+    name: String,
+    expected_hash: String,
+    #[serde(default)]
+    previous_hash: Option<String>,
+    #[serde(default)]
+    approval_id: Option<String>,
+}
+
 #[cfg(test)]
 fn drafts_root(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("skills").join("drafts")
@@ -136,6 +148,81 @@ async fn save_index(app_data_dir: &Path, drafts: &[SkillDraft]) -> Result<(), Ap
         message: format!("serialize skill draft index: {error}"),
     })?;
     atomic_write(&index_path(app_data_dir), &bytes).await
+}
+
+fn validate_index(drafts: &[SkillDraft]) -> Result<(), AppError> {
+    let mut ids = HashSet::new();
+    if drafts.len() > MAX_DRAFTS
+        || drafts.iter().any(|draft| {
+            draft.id.is_empty() || draft.tree_hash.len() != 64 || !ids.insert(draft.id.as_str())
+        })
+    {
+        return Err(AppError::InvalidArgument {
+            message: "persisted skill draft index is invalid".into(),
+        });
+    }
+    Ok(())
+}
+
+fn document_spec() -> crate::state_db::DocumentSpec<Vec<SkillDraft>> {
+    crate::state_db::DocumentSpec::new("skill_drafts", 1, 16_777_216, |drafts| {
+        validate_index(drafts)
+    })
+}
+
+pub(crate) fn import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(document_spec(), Vec::new())
+}
+
+async fn load_index_for_state(state: &AppState) -> Result<Vec<SkillDraft>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(document_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "skill drafts are missing after SQLite migration".into(),
+            });
+    }
+    load_index(&state.app_data_dir).await
+}
+
+async fn save_index_for_state(state: &AppState, drafts: &[SkillDraft]) -> Result<(), AppError> {
+    validate_index(drafts)?;
+    if let Some(database) = state.completed_state_database().await? {
+        let replacement = drafts.to_vec();
+        return database
+            .mutate(document_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await;
+    }
+    save_index(&state.app_data_dir, drafts).await
+}
+
+async fn save_index_after_filesystem(
+    state: &AppState,
+    drafts: &[SkillDraft],
+    operation_id: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(operation_id) = operation_id else {
+        return save_index_for_state(state, drafts).await;
+    };
+    validate_index(drafts)?;
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "filesystem operation lost its SQLite database".into(),
+            })?;
+    let replacement = drafts.to_vec();
+    database
+        .mutate_after_filesystem(document_spec(), Vec::new(), operation_id, move |current| {
+            *current = replacement;
+            Ok(())
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -397,7 +484,7 @@ pub async fn submit(state: &AppState, files: Vec<DraftInputFile>) -> Result<Skil
 
     let _lock = lock_drafts(&state.app_data_dir)?;
     let root = ensure_owned_root(&state.app_data_dir, "drafts")?;
-    let mut drafts = load_index(&state.app_data_dir).await?;
+    let mut drafts = load_index_for_state(state).await?;
     let mut eviction = None;
     let mut evicted_record = None;
     if drafts.len() >= MAX_DRAFTS {
@@ -486,7 +573,7 @@ pub async fn submit(state: &AppState, files: Vec<DraftInputFile>) -> Result<Skil
         published_source_id: None,
     };
     drafts.push(draft.clone());
-    if let Err(error) = save_index(&state.app_data_dir, &drafts).await {
+    if let Err(error) = save_index_for_state(state, &drafts).await {
         let _ = tokio::fs::remove_dir_all(&final_root).await;
         return Err(error);
     }
@@ -496,7 +583,7 @@ pub async fn submit(state: &AppState, files: Vec<DraftInputFile>) -> Result<Skil
             if let Some((index, evicted)) = evicted_record {
                 drafts.insert(index, evicted);
             }
-            let rollback = save_index(&state.app_data_dir, &drafts).await;
+            let rollback = save_index_for_state(state, &drafts).await;
             if let Err(rollback) = rollback {
                 guard.retain_quarantine();
                 return Err(AppError::Io {
@@ -579,7 +666,7 @@ pub async fn edit(
 
 pub async fn list(state: &AppState) -> Result<Vec<SkillDraft>, AppError> {
     let _lock = lock_drafts(&state.app_data_dir)?;
-    load_index(&state.app_data_dir).await
+    load_index_for_state(state).await
 }
 
 pub async fn get(state: &AppState, id: &str) -> Result<SkillDraft, AppError> {
@@ -609,11 +696,212 @@ async fn ensure_published_source(
     super::ensure_local_source(state, root).await
 }
 
+fn recovery_package_hash(root: &Path, name: &str) -> Result<String, AppError> {
+    let validation = super::validate_package("recovery", root, &root.join(name));
+    let files = validation
+        .files
+        .iter()
+        .map(|file| SkillDraftFile {
+            relative_path: file.relative_path.clone(),
+            size_bytes: file.size_bytes,
+            sha256: file.sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    if validation.files.is_empty() {
+        return Err(AppError::StorageCorrupt {
+            message: "published Skill recovery found changed content".into(),
+        });
+    }
+    Ok(tree_hash(&files))
+}
+
+fn validate_recovery_package(root: &Path, name: &str, expected_hash: &str) -> Result<(), AppError> {
+    if recovery_package_hash(root, name)? != expected_hash {
+        return Err(AppError::StorageCorrupt {
+            message: "published Skill recovery found changed content".into(),
+        });
+    }
+    Ok(())
+}
+
+async fn recover_prepared_publish(
+    state: &AppState,
+    operation: &crate::state_db::FilesystemOperation,
+    payload: &PublishOperation,
+) -> Result<(), AppError> {
+    let drafts = load_index_for_state(state).await?;
+    let draft = drafts
+        .iter()
+        .find(|draft| draft.id == payload.draft_id)
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "published Skill recovery lost its draft metadata".into(),
+        })?;
+    if draft.tree_hash != payload.expected_hash || draft.state != SkillDraftState::Pending {
+        return Err(AppError::StorageCorrupt {
+            message: "published Skill recovery found changed draft metadata".into(),
+        });
+    }
+    let drafts_root = ensure_owned_root(&state.app_data_dir, "drafts")?;
+    let published_root = ensure_owned_root(&state.app_data_dir, "published")?;
+    let draft_root = drafts_root.join(&payload.draft_id);
+    let claim = drafts_root.join(format!(".publishing-{}-{}", payload.draft_id, operation.id));
+    let source = claim.join(&payload.name);
+    let destination = published_root.join(&payload.name);
+    if claim.exists() {
+        validate_claim(&drafts_root, &claim)?;
+    }
+    if destination.exists() {
+        let destination_hash = recovery_package_hash(&published_root, &payload.name)?;
+        if destination_hash == payload.expected_hash {
+            if source.exists() {
+                return Err(AppError::StorageCorrupt {
+                    message: "published Skill recovery found both source and destination".into(),
+                });
+            }
+            if !claim.exists() {
+                std::fs::create_dir(&claim).map_err(io("recreate published Skill claim"))?;
+            }
+            std::fs::rename(&destination, &source)
+                .map_err(io("restore published Skill into its claim"))?;
+        } else if payload.previous_hash.as_deref() != Some(destination_hash.as_str()) {
+            return Err(AppError::StorageCorrupt {
+                message: "published Skill recovery found changed published content".into(),
+            });
+        }
+    }
+    let backup = state
+        .app_data_dir
+        .join("skill-backups")
+        .join(format!("{}-{}", payload.name, operation.id));
+    if backup.exists() {
+        let previous_hash =
+            payload
+                .previous_hash
+                .as_deref()
+                .ok_or_else(|| AppError::StorageCorrupt {
+                    message: "published Skill recovery found an unexpected backup".into(),
+                })?;
+        let backup_root = backup.parent().expect("published backup has parent");
+        validate_recovery_package(
+            backup_root,
+            backup
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default(),
+            previous_hash,
+        )?;
+        if destination.exists() {
+            return Err(AppError::StorageCorrupt {
+                message: "published Skill recovery found an occupied restore destination".into(),
+            });
+        }
+        std::fs::rename(&backup, &destination).map_err(io("restore previous published Skill"))?;
+    }
+    if claim.exists() {
+        validate_recovery_package(&claim, &payload.name, &payload.expected_hash)?;
+        if draft_root.exists() {
+            return Err(AppError::StorageCorrupt {
+                message: "published Skill recovery found an occupied draft path".into(),
+            });
+        }
+        std::fs::rename(&claim, &draft_root).map_err(io("restore published Skill draft"))?;
+    } else if !draft_root.exists() {
+        return Err(AppError::StorageCorrupt {
+            message: "published Skill recovery found no recoverable package".into(),
+        });
+    }
+    validate_recovery_package(&draft_root, &payload.name, &payload.expected_hash)?;
+    Ok(())
+}
+
+pub(crate) async fn recover_publish_operations(state: &AppState) -> Result<(), AppError> {
+    let Some(database) = state.completed_state_database().await? else {
+        return Ok(());
+    };
+    for operation in database.pending_filesystem_operations().await? {
+        if operation.kind != "skill_publish" {
+            continue;
+        }
+        let payload = serde_json::from_value::<PublishOperation>(operation.payload.clone())
+            .map_err(|_| AppError::StorageCorrupt {
+                message: "published Skill recovery payload is invalid".into(),
+            })?;
+        let result = match operation.phase {
+            crate::state_db::FilesystemOperationPhase::Prepared => {
+                recover_prepared_publish(state, &operation, &payload).await
+            }
+            crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+                let drafts = load_index_for_state(state).await?;
+                let draft = drafts
+                    .iter()
+                    .find(|draft| draft.id == payload.draft_id)
+                    .ok_or_else(|| AppError::StorageCorrupt {
+                        message: "published Skill recovery lost committed metadata".into(),
+                    })?;
+                if draft.state != SkillDraftState::Published
+                    || draft.tree_hash != payload.expected_hash
+                {
+                    Err(AppError::StorageCorrupt {
+                        message: "published Skill recovery found changed committed metadata".into(),
+                    })
+                } else {
+                    let published = ensure_owned_root(&state.app_data_dir, "published")?;
+                    validate_recovery_package(&published, &payload.name, &payload.expected_hash)?;
+                    let claim = ensure_owned_root(&state.app_data_dir, "drafts")?
+                        .join(format!(".publishing-{}-{}", payload.draft_id, operation.id));
+                    if claim.exists() {
+                        validate_claim(
+                            claim.parent().expect("published claim has parent"),
+                            &claim,
+                        )?;
+                        std::fs::remove_dir(&claim)
+                            .map_err(io("clean published Skill recovery claim"))?;
+                    }
+                    Ok(())
+                }
+            }
+            crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+        };
+        if let Err(error) = result {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+            super::organize::reconcile_draft_publish_approval(
+                state,
+                payload.approval_id.as_deref(),
+                &payload.draft_id,
+                &payload.expected_hash,
+                false,
+                Some(error.to_string()),
+            )
+            .await?;
+            return Err(error);
+        }
+        let completed =
+            operation.phase == crate::state_db::FilesystemOperationPhase::FilesystemApplied;
+        super::organize::reconcile_draft_publish_approval(
+            state,
+            payload.approval_id.as_deref(),
+            &payload.draft_id,
+            &payload.expected_hash,
+            completed,
+            None,
+        )
+        .await?;
+        if completed {
+            database.commit_filesystem_operation(&operation.id).await?;
+        } else {
+            database.abort_filesystem_operation(&operation.id).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError> {
     validate_id(id)?;
     let _lock = lock_drafts(&state.app_data_dir)?;
     let root = ensure_owned_root(&state.app_data_dir, "drafts")?;
-    let mut drafts = load_index(&state.app_data_dir).await?;
+    let mut drafts = load_index_for_state(state).await?;
     let index = drafts
         .iter()
         .position(|draft| draft.id == id)
@@ -635,8 +923,62 @@ pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError>
         })?
         .to_owned();
     let expected_hash = draft.tree_hash.clone();
+    let published = ensure_owned_root(&state.app_data_dir, "published")?;
+    let destination = published.join(&persisted_name);
+    let previous_hash = match std::fs::symlink_metadata(&destination) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && !super::metadata_is_reparse_point(&metadata) =>
+        {
+            Some(recovery_package_hash(&published, &persisted_name)?)
+        }
+        Ok(_) => {
+            return Err(AppError::InvalidArgument {
+                message: format!("published skill is not a real directory: {persisted_name}"),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(io("inspect published skill")(error)),
+    };
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        let approval_id = super::organize::list(state)
+            .await?
+            .approvals
+            .into_iter()
+            .find(|approval| {
+                approval.state == crate::types::SkillApprovalState::Running
+                    && approval.request
+                        == (crate::types::SkillApprovalAction::DraftPublish {
+                            id: id.to_owned(),
+                            plan_revision: expected_hash.clone(),
+                        })
+            })
+            .map(|approval| approval.id);
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "skill_publish",
+                    &PublishOperation {
+                        draft_id: id.to_owned(),
+                        name: persisted_name.clone(),
+                        expected_hash: expected_hash.clone(),
+                        previous_hash: previous_hash.clone(),
+                        approval_id,
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     let draft_root = root.join(id);
-    let claim = root.join(format!(".publishing-{id}-{}", Uuid::new_v4()));
+    let transaction_id = operation
+        .as_ref()
+        .map(|operation| operation.id.as_str())
+        .map_or_else(|| Uuid::new_v4().to_string(), str::to_owned);
+    let claim = root.join(format!(".publishing-{id}-{transaction_id}"));
     tokio::fs::rename(&draft_root, &claim)
         .await
         .map_err(io("claim skill draft for publication"))?;
@@ -666,13 +1008,6 @@ pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError>
         .as_deref()
         .expect("validated skill name");
     let source = claim.join(name);
-    let published = match ensure_owned_root(&state.app_data_dir, "published") {
-        Ok(root) => root,
-        Err(error) => {
-            let _ = tokio::fs::rename(&claim, &draft_root).await;
-            return Err(error);
-        }
-    };
     let destination = published.join(name);
     let previous = match tokio::fs::symlink_metadata(&destination).await {
         Ok(metadata)
@@ -685,7 +1020,7 @@ pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError>
                 let _ = tokio::fs::rename(&claim, &draft_root).await;
                 return Err(io("create published skill backup directory")(error));
             }
-            let backup = backups.join(format!("{name}-{}", Uuid::new_v4()));
+            let backup = backups.join(format!("{name}-{transaction_id}"));
             if let Err(error) = tokio::fs::rename(&destination, &backup).await {
                 let _ = tokio::fs::rename(&claim, &draft_root).await;
                 return Err(io("back up published skill")(error));
@@ -729,7 +1064,13 @@ pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError>
     draft.state = SkillDraftState::Published;
     draft.published_source_id = Some(published_source.id.clone());
     let result = draft.clone();
-    if let Err(error) = save_index(&state.app_data_dir, &drafts).await {
+    if let Err(error) = save_index_after_filesystem(
+        state,
+        &drafts,
+        operation.as_ref().map(|operation| operation.id.as_str()),
+    )
+    .await
+    {
         let mut rollback_errors = Vec::new();
         if source_created {
             match super::remove_skill_source(state, &published_source.id).await {
@@ -760,6 +1101,9 @@ pub async fn publish(state: &AppState, id: &str) -> Result<SkillDraft, AppError>
         return Err(error);
     }
     let _ = tokio::fs::remove_dir(&claim).await;
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
+    }
     Ok(result)
 }
 
@@ -767,7 +1111,7 @@ pub async fn reject(state: &AppState, id: &str) -> Result<SkillDraft, AppError> 
     validate_id(id)?;
     let _lock = lock_drafts(&state.app_data_dir)?;
     let root = ensure_owned_root(&state.app_data_dir, "drafts")?;
-    let mut drafts = load_index(&state.app_data_dir).await?;
+    let mut drafts = load_index_for_state(state).await?;
     let draft = drafts
         .iter_mut()
         .find(|draft| draft.id == id)
@@ -786,7 +1130,7 @@ pub async fn reject(state: &AppState, id: &str) -> Result<SkillDraft, AppError> 
         .map_err(io("quarantine rejected draft"))?;
     draft.state = SkillDraftState::Rejected;
     let result = draft.clone();
-    if let Err(error) = save_index(&state.app_data_dir, &drafts).await {
+    if let Err(error) = save_index_for_state(state, &drafts).await {
         let _ = tokio::fs::rename(&quarantine, &directory).await;
         return Err(error);
     }
@@ -795,7 +1139,7 @@ pub async fn reject(state: &AppState, id: &str) -> Result<SkillDraft, AppError> 
             draft.state = SkillDraftState::Pending;
         }
         let _ = tokio::fs::rename(&quarantine, &directory).await;
-        let _ = save_index(&state.app_data_dir, &drafts).await;
+        let _ = save_index_for_state(state, &drafts).await;
         return Err(io("remove rejected draft")(error));
     }
     Ok(result)
@@ -887,6 +1231,249 @@ mod tests {
             text: Some("---\nname: reviewer\ndescription: Reviews code\n---\n".into()),
             base64: None,
         }]
+    }
+
+    async fn enable_sqlite(root: &Path) {
+        let database = crate::state_db::StateDatabase::open(root).unwrap();
+        database
+            .mutate(document_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .mutate(super::super::skill_sources_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        super::super::organize::replace_library(
+            &state(root),
+            crate::types::SkillFolderState::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_publish_commits_a_filesystem_operation() {
+        let root = tempfile::tempdir().unwrap();
+        enable_sqlite(root.path()).await;
+        let app = state(root.path());
+        let draft = submit(&app, valid_files()).await.unwrap();
+
+        publish(&app, &draft.id).await.unwrap();
+
+        let connection =
+            rusqlite::Connection::open(root.path().join("state/agency-agents.sqlite3")).unwrap();
+        let phases = connection
+            .prepare("SELECT phase FROM filesystem_operations WHERE kind = 'skill_publish'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(phases, ["committed"]);
+    }
+
+    #[tokio::test]
+    async fn prepared_publish_recovery_is_safe_and_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        enable_sqlite(root.path()).await;
+        let app = state(root.path());
+        let draft = submit(&app, valid_files()).await.unwrap();
+        let database = crate::state_db::StateDatabase::completed(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = database
+            .prepare_filesystem_operation(
+                "skill_publish",
+                &PublishOperation {
+                    draft_id: draft.id.clone(),
+                    name: "reviewer".into(),
+                    expected_hash: draft.tree_hash.clone(),
+                    previous_hash: None,
+                    approval_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let draft_root = drafts_root(root.path()).join(&draft.id);
+        let claim =
+            drafts_root(root.path()).join(format!(".publishing-{}-{}", draft.id, operation.id));
+        std::fs::rename(&draft_root, &claim).unwrap();
+
+        recover_publish_operations(&app).await.unwrap();
+        recover_publish_operations(&app).await.unwrap();
+
+        assert!(draft_root.join("reviewer/SKILL.md").is_file());
+        assert!(!claim.exists());
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_replacement_recovery_restores_both_skill_revisions() {
+        let root = tempfile::tempdir().unwrap();
+        enable_sqlite(root.path()).await;
+        let app = state(root.path());
+        let original = submit(&app, valid_files()).await.unwrap();
+        publish(&app, &original.id).await.unwrap();
+        let original_text =
+            std::fs::read_to_string(published_root(root.path()).join("reviewer/SKILL.md")).unwrap();
+        let replacement_text = "---\nname: reviewer\ndescription: Updated review\ntype: ai\n---\n";
+        let replacement = submit(
+            &app,
+            vec![DraftInputFile {
+                relative_path: "SKILL.md".into(),
+                text: Some(replacement_text.into()),
+                base64: None,
+            }],
+        )
+        .await
+        .unwrap();
+        let database = crate::state_db::StateDatabase::completed(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = database
+            .prepare_filesystem_operation(
+                "skill_publish",
+                &PublishOperation {
+                    draft_id: replacement.id.clone(),
+                    name: "reviewer".into(),
+                    expected_hash: replacement.tree_hash.clone(),
+                    previous_hash: Some(original.tree_hash.clone()),
+                    approval_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let drafts = drafts_root(root.path());
+        let claim = drafts.join(format!(".publishing-{}-{}", replacement.id, operation.id));
+        std::fs::rename(drafts.join(&replacement.id), &claim).unwrap();
+        let destination = published_root(root.path()).join("reviewer");
+        let backups = root.path().join("skill-backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let backup = backups.join(format!("reviewer-{}", operation.id));
+        std::fs::rename(&destination, &backup).unwrap();
+        std::fs::rename(claim.join("reviewer"), &destination).unwrap();
+
+        recover_publish_operations(&app).await.unwrap();
+        recover_publish_operations(&app).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            original_text
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                drafts_root(root.path())
+                    .join(&replacement.id)
+                    .join("reviewer/SKILL.md")
+            )
+            .unwrap(),
+            replacement_text
+        );
+        assert!(!backup.exists());
+    }
+
+    #[tokio::test]
+    async fn publish_recovery_retains_changed_content_without_moving_it() {
+        let root = tempfile::tempdir().unwrap();
+        enable_sqlite(root.path()).await;
+        let app = state(root.path());
+        let draft = submit(&app, valid_files()).await.unwrap();
+        let database = crate::state_db::StateDatabase::completed(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = database
+            .prepare_filesystem_operation(
+                "skill_publish",
+                &PublishOperation {
+                    draft_id: draft.id.clone(),
+                    name: "reviewer".into(),
+                    expected_hash: draft.tree_hash.clone(),
+                    previous_hash: None,
+                    approval_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let draft_root = drafts_root(root.path()).join(&draft.id);
+        let claim =
+            drafts_root(root.path()).join(format!(".publishing-{}-{}", draft.id, operation.id));
+        std::fs::rename(&draft_root, &claim).unwrap();
+        std::fs::write(claim.join("reviewer/SKILL.md"), "changed").unwrap();
+
+        assert!(matches!(
+            recover_publish_operations(&app).await,
+            Err(AppError::StorageCorrupt { .. })
+        ));
+        assert!(claim.is_dir());
+        assert!(!draft_root.exists());
+        let pending = database.pending_filesystem_operations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].recovery_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn applied_publish_recovery_finishes_cleanup_once() {
+        let root = tempfile::tempdir().unwrap();
+        enable_sqlite(root.path()).await;
+        let app = state(root.path());
+        let draft = submit(&app, valid_files()).await.unwrap();
+        let database = crate::state_db::StateDatabase::completed(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = database
+            .prepare_filesystem_operation(
+                "skill_publish",
+                &PublishOperation {
+                    draft_id: draft.id.clone(),
+                    name: "reviewer".into(),
+                    expected_hash: draft.tree_hash.clone(),
+                    previous_hash: None,
+                    approval_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let draft_root = drafts_root(root.path()).join(&draft.id);
+        let claim =
+            drafts_root(root.path()).join(format!(".publishing-{}-{}", draft.id, operation.id));
+        std::fs::rename(&draft_root, &claim).unwrap();
+        let published = published_root(root.path());
+        std::fs::create_dir_all(&published).unwrap();
+        std::fs::rename(claim.join("reviewer"), published.join("reviewer")).unwrap();
+        let operation_id = operation.id.clone();
+        let draft_id = draft.id.clone();
+        database
+            .mutate_after_filesystem(document_spec(), Vec::new(), &operation_id, move |drafts| {
+                let current = drafts.iter_mut().find(|item| item.id == draft_id).unwrap();
+                current.state = SkillDraftState::Published;
+                current.published_source_id = Some("local:published".into());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        recover_publish_operations(&app).await.unwrap();
+        recover_publish_operations(&app).await.unwrap();
+
+        assert!(!claim.exists());
+        assert!(published.join("reviewer/SKILL.md").is_file());
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

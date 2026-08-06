@@ -5,6 +5,25 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum StorageMigrationState {
+    Legacy,
+    InProgress,
+    Complete,
+    Corrupt,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StorageMigrationStatus {
+    pub state: StorageMigrationState,
+    pub stage: Option<String>,
+    pub detail: Option<String>,
+    pub legacy_conflicts: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum McpClient {

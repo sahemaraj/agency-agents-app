@@ -13,6 +13,7 @@
   import Toast from "$lib/components/Toast.svelte";
   import TitlebarControls from "$lib/components/TitlebarControls.svelte";
   import UpdateIndicator from "$lib/components/UpdateIndicator.svelte";
+  import StorageMigrationGate from "$lib/components/StorageMigrationGate.svelte";
   import PanelLeftClose from "@lucide/svelte/icons/panel-left-close";
   import PanelLeftOpen from "@lucide/svelte/icons/panel-left-open";
   import ArrowLeft from "@lucide/svelte/icons/arrow-left";
@@ -25,9 +26,90 @@
     SIDEBAR_DEFAULT_WIDTH,
   } from "$lib/stores/ui.svelte";
   import { toast } from "$lib/stores/toast.svelte";
+  import { skillSources } from "$lib/stores/skillSources.svelte";
+  import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
+  import { experts } from "$lib/stores/experts.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
+  import {
+    storageMigrationRetry,
+    storageMigrationStart,
+    storageMigrationStatus,
+    storageLegacyConflictsDismiss,
+    storageOpenDataDirectory,
+    storageVisibleRevision,
+  } from "$lib/api";
   import { isMac, shortcut } from "$lib/util/platform";
-  import type { SidebarSection, ThemePreference } from "$lib/types";
+  import { appErrorMessage, isAppError, type SidebarSection, type StorageMigrationStatus, type ThemePreference } from "$lib/types";
+
+  let migrationStatus = $state<StorageMigrationStatus | null>(null);
+  let migrationBusy = $state(false);
+  let migrationError = $state<string | null>(null);
+  let showMigrationCompletion = $state(false);
+  let visibleRevision = 0;
+  const needsMigrationGate = $derived(
+    migrationStatus !== null
+      && (migrationStatus.state !== "complete"
+        || migrationStatus.stage === "recovery"
+        || showMigrationCompletion),
+  );
+
+  async function loadMigrationStatus() {
+    try {
+      migrationStatus = await storageMigrationStatus();
+      if (migrationStatus.state === "complete") visibleRevision = await storageVisibleRevision();
+    } catch (error) {
+      migrationError = isAppError(error) ? appErrorMessage(error) : String(error);
+      if (isAppError(error) && error.code === "storage_unsupported") {
+        migrationStatus = { state: "unsupported", stage: "unsupported", detail: migrationError, legacyConflicts: [] };
+      } else {
+        migrationStatus = { state: "corrupt", stage: "failed", detail: migrationError, legacyConflicts: [] };
+      }
+    }
+  }
+
+  async function runMigration(retry: boolean) {
+    migrationBusy = true;
+    migrationError = null;
+    if (migrationStatus) migrationStatus = { ...migrationStatus, stage: "verifyingBackup" };
+    try {
+      migrationStatus = retry ? await storageMigrationRetry() : await storageMigrationStart();
+      showMigrationCompletion = migrationStatus.state === "complete";
+      visibleRevision = await storageVisibleRevision();
+    } catch (error) {
+      migrationError = isAppError(error) ? appErrorMessage(error) : String(error);
+      await loadMigrationStatus();
+    } finally {
+      migrationBusy = false;
+    }
+  }
+
+  async function refreshVisibleSurface() {
+    if (ui.section === "skills") await skillSources.load();
+    else if (ui.section === "personas") await agentLibrary.load(true);
+    else if (ui.section === "experts") await experts.load();
+  }
+
+  async function dismissLegacyConflicts() {
+    try {
+      await storageLegacyConflictsDismiss();
+      if (migrationStatus) migrationStatus = { ...migrationStatus, legacyConflicts: [] };
+    } catch {
+      // Keep the durable warning visible when acknowledgement fails.
+    }
+  }
+
+  async function refreshIfChanged() {
+    try {
+      if (document.visibilityState !== "visible" || migrationStatus?.state !== "complete") return;
+      if (!(["skills", "personas", "experts"] as SidebarSection[]).includes(ui.section)) return;
+      const revision = await storageVisibleRevision();
+      if (revision === visibleRevision) return;
+      visibleRevision = revision;
+      await refreshVisibleSurface();
+    } catch {
+      // A later focus/poll retries; foreground work must not be interrupted.
+    }
+  }
 
   function themeLabel(t: ThemePreference): string {
     return i18n.t(t === "light" ? "app.theme.light" : t === "dark" ? "app.theme.dark" : "app.theme.system");
@@ -130,15 +212,23 @@
   }
 
   onMount(() => {
+    void loadMigrationStatus();
     window.addEventListener("keydown", onKeydown);
     window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("focus", refreshIfChanged);
+    const revisionPoll = window.setInterval(() => void refreshIfChanged(), 750);
     return () => {
       window.removeEventListener("keydown", onKeydown);
       window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("focus", refreshIfChanged);
+      window.clearInterval(revisionPoll);
     };
   });
 </script>
 
+{#if migrationStatus === null}
+  <div class="storage-check"><LoadingState label="Checking data storage" /></div>
+{:else}
 <div
   class="app"
   class:macos={isMac}
@@ -286,9 +376,41 @@
   <PlaybookModal />
   <DeviceFlowModal />
   <Toast />
+  {#if migrationStatus.legacyConflicts.length > 0}
+    <aside class="legacy-warning" role="status">
+      Legacy data files changed after the update and were not merged.
+      <button type="button" onclick={() => void storageOpenDataDirectory()}>Open data folder</button>
+      <button type="button" onclick={() => void dismissLegacyConflicts()}>Dismiss</button>
+    </aside>
+  {/if}
+  {#if needsMigrationGate}
+    <StorageMigrationGate
+      status={migrationStatus}
+      busy={migrationBusy}
+      error={migrationError}
+      onStart={() => void runMigration(false)}
+      onRetry={() => void runMigration(true)}
+      onOpenData={() => void storageOpenDataDirectory()}
+    />
+  {/if}
 </div>
+{/if}
 
 <style>
+  .storage-check { position: fixed; inset: 0; display: grid; place-items: center; background: var(--color-surface); }
+  .legacy-warning {
+    position: fixed;
+    right: var(--space-4);
+    bottom: var(--space-4);
+    z-index: 900;
+    max-width: 440px;
+    padding: var(--space-3);
+    border: 1px solid var(--color-warning);
+    border-radius: var(--radius-md);
+    background: var(--color-surface-raised);
+    color: var(--color-text-primary);
+  }
+  .legacy-warning button { margin-left: var(--space-2); color: var(--color-text-link); }
   .app {
     display: flex;
     flex-direction: column;

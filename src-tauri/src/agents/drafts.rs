@@ -16,6 +16,16 @@ use crate::types::{
 const MAX_AGENT_DRAFTS: usize = 256;
 const PUBLISHED_AGENT_SOURCE_ID: &str = "published:agents";
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishOperation {
+    draft_id: String,
+    relative_path: String,
+    expected_hash: String,
+    #[serde(default)]
+    approval_id: Option<String>,
+}
+
 fn invalid(message: impl Into<String>) -> AppError {
     AppError::InvalidArgument {
         message: message.into(),
@@ -96,6 +106,14 @@ async fn lock_drafts_async(app_data_dir: PathBuf) -> Result<File, AppError> {
 }
 
 async fn load_index(app_data_dir: &Path) -> Result<Vec<AgentDraft>, AppError> {
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        return database
+            .read(document_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent drafts are missing after SQLite migration".into(),
+            });
+    }
     let drafts = match tokio::fs::read(index_path(app_data_dir)).await {
         Ok(bytes) => serde_json::from_slice::<Vec<AgentDraft>>(&bytes).map_err(|error| {
             AppError::JsonParse {
@@ -111,6 +129,11 @@ async fn load_index(app_data_dir: &Path) -> Result<Vec<AgentDraft>, AppError> {
             });
         }
     };
+    validate_index(&drafts)?;
+    Ok(drafts)
+}
+
+fn validate_index(drafts: &[AgentDraft]) -> Result<(), AppError> {
     if drafts.len() > MAX_AGENT_DRAFTS
         || drafts.iter().any(|draft| {
             Uuid::parse_str(&draft.id).is_err()
@@ -119,19 +142,57 @@ async fn load_index(app_data_dir: &Path) -> Result<Vec<AgentDraft>, AppError> {
     {
         return Err(invalid("Agent draft index is invalid or exceeds its limit"));
     }
-    Ok(drafts)
+    Ok(())
+}
+
+fn document_spec() -> crate::state_db::DocumentSpec<Vec<AgentDraft>> {
+    crate::state_db::DocumentSpec::new("agent_drafts", 1, 8_388_608, |drafts| {
+        validate_index(drafts)
+    })
+}
+
+pub(crate) fn import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(document_spec(), Vec::new())
 }
 
 async fn save_index(app_data_dir: &Path, drafts: &[AgentDraft]) -> Result<(), AppError> {
-    if drafts.len() > MAX_AGENT_DRAFTS {
-        return Err(invalid(format!(
-            "at most {MAX_AGENT_DRAFTS} Agent drafts are allowed"
-        )));
+    validate_index(drafts)?;
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        let replacement = drafts.to_vec();
+        return database
+            .mutate(document_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await;
     }
     let bytes = serde_json::to_vec_pretty(drafts).map_err(|error| AppError::Internal {
         message: format!("serialize Agent draft index: {error}"),
     })?;
     crate::util::fs::atomic_write(&index_path(app_data_dir), &bytes).await
+}
+
+async fn save_index_after_filesystem(
+    app_data_dir: &Path,
+    drafts: &[AgentDraft],
+    operation_id: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(operation_id) = operation_id else {
+        return save_index(app_data_dir, drafts).await;
+    };
+    validate_index(drafts)?;
+    let database = crate::state_db::StateDatabase::completed(app_data_dir)
+        .await?
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "Agent filesystem operation lost its SQLite database".into(),
+        })?;
+    let replacement = drafts.to_vec();
+    database
+        .mutate_after_filesystem(document_spec(), Vec::new(), operation_id, move |current| {
+            *current = replacement;
+            Ok(())
+        })
+        .await
 }
 
 fn empty_validation(id: &str, input: &AgentDraftInput) -> AgentPackageResult {
@@ -436,6 +497,178 @@ async fn remove_published_source(app_data_dir: &Path) {
     let _ = super::remove_agent_source(app_data_dir, PUBLISHED_AGENT_SOURCE_ID).await;
 }
 
+fn validate_recovery_file(path: &Path, expected_hash: &str) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| AppError::Io {
+        message: format!("inspect Agent recovery file: {error}"),
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+        || metadata.len() > super::corpus::MAX_AGENT_BYTES
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent publish recovery found an unsafe file".into(),
+        });
+    }
+    let bytes = std::fs::read(path).map_err(|error| AppError::Io {
+        message: format!("read Agent recovery file: {error}"),
+    })?;
+    if hex::encode(Sha256::digest(&bytes)) != expected_hash {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent publish recovery found changed content".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_recovery_tree(root: &Path) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|error| AppError::Io {
+        message: format!("inspect Agent recovery directory: {error}"),
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent publish recovery found an unsafe directory".into(),
+        });
+    }
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).map_err(|error| AppError::Io {
+            message: format!("scan Agent recovery directory: {error}"),
+        })? {
+            let entry = entry.map_err(|error| AppError::Io {
+                message: format!("scan Agent recovery entry: {error}"),
+            })?;
+            let metadata =
+                std::fs::symlink_metadata(entry.path()).map_err(|error| AppError::Io {
+                    message: format!("inspect Agent recovery entry: {error}"),
+                })?;
+            if metadata.file_type().is_symlink()
+                || crate::skills::metadata_is_reparse_point(&metadata)
+                || (!metadata.is_dir() && !metadata.is_file())
+            {
+                return Err(AppError::StorageCorrupt {
+                    message: "Agent publish recovery found an unsafe tree entry".into(),
+                });
+            }
+            if metadata.is_dir() {
+                directories.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn recover_publish_operations(state: &AppState) -> Result<(), AppError> {
+    let Some(database) = state.completed_state_database().await? else {
+        return Ok(());
+    };
+    for operation in database.pending_filesystem_operations().await? {
+        if operation.kind != "agent_publish" {
+            continue;
+        }
+        let payload = serde_json::from_value::<PublishOperation>(operation.payload.clone())
+            .map_err(|_| AppError::StorageCorrupt {
+                message: "Agent publish recovery payload is invalid".into(),
+            })?;
+        Uuid::parse_str(&payload.draft_id).map_err(|_| AppError::StorageCorrupt {
+            message: "Agent publish recovery draft id is invalid".into(),
+        })?;
+        let relative_path =
+            library::normalize_relative_path(&payload.relative_path).map_err(|_| {
+                AppError::StorageCorrupt {
+                    message: "Agent publish recovery path is invalid".into(),
+                }
+            })?;
+        let draft_root = ensure_owned_root(&state.app_data_dir, "drafts")?;
+        let published_root = ensure_owned_root(&state.app_data_dir, "published")?;
+        let source_root = draft_root.join(&payload.draft_id);
+        let source = source_root.join(&relative_path);
+        let destination = published_root.join(&relative_path);
+        let drafts = load_index(&state.app_data_dir).await?;
+        let draft = drafts
+            .iter()
+            .find(|draft| draft.id == payload.draft_id)
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent publish recovery lost its draft metadata".into(),
+            })?;
+        let result = match operation.phase {
+            crate::state_db::FilesystemOperationPhase::Prepared => {
+                if draft.state != AgentDraftState::Pending
+                    || draft.source_hash != payload.expected_hash
+                {
+                    Err(AppError::StorageCorrupt {
+                        message: "Agent publish recovery found changed draft metadata".into(),
+                    })
+                } else {
+                    validate_recovery_file(&source, &payload.expected_hash)?;
+                    if destination.exists() {
+                        validate_recovery_file(&destination, &payload.expected_hash)?;
+                        std::fs::remove_file(&destination).map_err(|error| AppError::Io {
+                            message: format!("remove recovered Agent duplicate: {error}"),
+                        })?;
+                    }
+                    Ok(())
+                }
+            }
+            crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+                if draft.state != AgentDraftState::Published
+                    || draft.source_hash != payload.expected_hash
+                {
+                    Err(AppError::StorageCorrupt {
+                        message: "Agent publish recovery found changed committed metadata".into(),
+                    })
+                } else {
+                    validate_recovery_file(&destination, &payload.expected_hash)?;
+                    if source_root.exists() {
+                        validate_recovery_tree(&source_root)?;
+                        validate_recovery_file(&source, &payload.expected_hash)?;
+                        std::fs::remove_dir_all(&source_root).map_err(|error| AppError::Io {
+                            message: format!("clean recovered Agent draft: {error}"),
+                        })?;
+                    }
+                    Ok(())
+                }
+            }
+            crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+        };
+        if let Err(error) = result {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+            super::organize::reconcile_draft_publish_approval(
+                state,
+                payload.approval_id.as_deref(),
+                &payload.draft_id,
+                &payload.expected_hash,
+                false,
+                Some(error.to_string()),
+            )
+            .await?;
+            return Err(error);
+        }
+        let completed =
+            operation.phase == crate::state_db::FilesystemOperationPhase::FilesystemApplied;
+        super::organize::reconcile_draft_publish_approval(
+            state,
+            payload.approval_id.as_deref(),
+            &payload.draft_id,
+            &payload.expected_hash,
+            completed,
+            None,
+        )
+        .await?;
+        if completed {
+            database.commit_filesystem_operation(&operation.id).await?;
+        } else {
+            database.abort_filesystem_operation(&operation.id).await?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_destination_parent(root: &Path, relative_path: &str) -> Result<(), AppError> {
     let mut current = root.to_path_buf();
     let parent = Path::new(relative_path)
@@ -486,6 +719,37 @@ pub async fn publish(state: &AppState, id: &str) -> Result<AgentDraft, AppError>
             "Agent draft changed after validation; edit it again",
         ));
     }
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        let approval_id = super::organize::list(state)
+            .await?
+            .approvals
+            .into_iter()
+            .find(|approval| {
+                approval.state == crate::types::AgentApprovalState::Running
+                    && approval.request
+                        == (crate::types::AgentApprovalAction::DraftPublish {
+                            id: id.to_owned(),
+                            plan_revision: current.source_hash.clone(),
+                        })
+            })
+            .map(|approval| approval.id);
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "agent_publish",
+                    &PublishOperation {
+                        draft_id: id.to_owned(),
+                        relative_path: relative_path.clone(),
+                        expected_hash: current.source_hash.clone(),
+                        approval_id,
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     ensure_destination_parent(&published_root, &relative_path)?;
     let destination = published_root.join(&relative_path);
     let bytes = std::fs::read(&source).map_err(|error| AppError::Io {
@@ -542,14 +806,32 @@ pub async fn publish(state: &AppState, id: &str) -> Result<AgentDraft, AppError>
     drafts[index].state = AgentDraftState::Published;
     drafts[index].published_source_id = Some(published_source.id);
     let result = drafts[index].clone();
-    if let Err(error) = save_index(&state.app_data_dir, &drafts).await {
+    if let Err(error) = save_index_after_filesystem(
+        &state.app_data_dir,
+        &drafts,
+        operation.as_ref().map(|operation| operation.id.as_str()),
+    )
+    .await
+    {
         if source_created {
             remove_published_source(&state.app_data_dir).await;
         }
         let _ = std::fs::remove_file(&destination);
         return Err(error);
     }
-    let _ = tokio::fs::remove_dir_all(draft_root.join(id)).await;
+    if let Err(error) = tokio::fs::remove_dir_all(draft_root.join(id)).await {
+        if let (Some(database), Some(operation)) = (&database, &operation) {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+            return Err(AppError::Io {
+                message: format!("clean published Agent draft: {error}"),
+            });
+        }
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
+    }
     Ok(result)
 }
 
@@ -682,6 +964,107 @@ mod tests {
             text: "---\nname: Reviewer\ndescription: Reviews code.\n---\nReview carefully.\n"
                 .into(),
         }
+    }
+
+    async fn enable_sqlite(root: &Path) {
+        let database = crate::state_db::StateDatabase::open(root).unwrap();
+        database
+            .mutate(document_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .mutate(super::super::agent_sources_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        super::super::organize::replace_library(
+            &state(root),
+            crate::types::AgentLibraryState::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_publish_commits_a_filesystem_operation() {
+        let root = tempfile::tempdir().unwrap();
+        enable_sqlite(root.path()).await;
+        let app = state(root.path());
+        let draft = create(&app, valid_input("engineering/reviewer.md"))
+            .await
+            .unwrap();
+
+        publish(&app, &draft.id).await.unwrap();
+
+        let connection =
+            rusqlite::Connection::open(root.path().join("state/agency-agents.sqlite3")).unwrap();
+        let count: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM filesystem_operations \
+                 WHERE kind = 'agent_publish' AND phase = 'committed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_publish_recovery_removes_only_the_verified_duplicate() {
+        let root = tempfile::tempdir().unwrap();
+        enable_sqlite(root.path()).await;
+        let app = state(root.path());
+        let draft = create(&app, valid_input("engineering/reviewer.md"))
+            .await
+            .unwrap();
+        let database = crate::state_db::StateDatabase::completed(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        database
+            .prepare_filesystem_operation(
+                "agent_publish",
+                &PublishOperation {
+                    draft_id: draft.id.clone(),
+                    relative_path: draft.relative_path.clone(),
+                    expected_hash: draft.source_hash.clone(),
+                    approval_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let destination = root
+            .path()
+            .join("agents/published")
+            .join(&draft.relative_path);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::copy(
+            root.path()
+                .join("agents/drafts")
+                .join(&draft.id)
+                .join(&draft.relative_path),
+            &destination,
+        )
+        .unwrap();
+
+        recover_publish_operations(&app).await.unwrap();
+        recover_publish_operations(&app).await.unwrap();
+
+        assert!(!destination.exists());
+        assert!(root
+            .path()
+            .join("agents/drafts")
+            .join(&draft.id)
+            .join(&draft.relative_path)
+            .is_file());
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

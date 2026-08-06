@@ -108,7 +108,7 @@ impl ExpertRunState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExpertRunCreate {
     pub expert_id: String,
@@ -171,6 +171,14 @@ fn lock(state: &AppState) -> Result<std::fs::File, AppError> {
 }
 
 async fn load(state: &AppState) -> Result<Vec<ExpertRun>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(document_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Expert runs are missing after SQLite migration".into(),
+            });
+    }
     let path = path(state);
     if !path.exists() {
         return Ok(Vec::new());
@@ -180,12 +188,50 @@ async fn load(state: &AppState) -> Result<Vec<ExpertRun>, AppError> {
 }
 
 async fn save(state: &AppState, runs: &[ExpertRun]) -> Result<(), AppError> {
+    validate_runs(runs)?;
+    if let Some(database) = state.completed_state_database().await? {
+        let replacement = runs.to_vec();
+        return database
+            .mutate(document_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await;
+    }
     let bytes = serde_json::to_vec_pretty(runs)
         .map_err(|error| invalid(format!("serialize Expert runs: {error}")))?;
     if bytes.len() as u64 > MAX_RUN_BYTES {
         return Err(invalid("Expert run state capacity reached"));
     }
     atomic_write(&path(state), &bytes).await
+}
+
+fn validate_runs(runs: &[ExpertRun]) -> Result<(), AppError> {
+    let mut ids = HashSet::new();
+    if runs.len() > MAX_RUNS {
+        return Err(invalid("Expert run state capacity reached"));
+    }
+    for run in runs {
+        if uuid::Uuid::parse_str(&run.id).is_err()
+            || !ids.insert(run.id.as_str())
+            || run.snapshot.expert_version == 0
+        {
+            return Err(invalid("Expert run identity is invalid"));
+        }
+        validate_text(&run.snapshot.expert_id, "expertId")?;
+        validate_text(&run.snapshot.project_path, "projectPath")?;
+        validate_text(&run.snapshot.client, "client")?;
+        validate_contract(&run.snapshot.contract)?;
+    }
+    Ok(())
+}
+
+fn document_spec() -> crate::state_db::DocumentSpec<Vec<ExpertRun>> {
+    crate::state_db::DocumentSpec::new("expert_runs", 1, MAX_RUN_BYTES, |runs| validate_runs(runs))
+}
+
+pub(crate) fn import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(document_spec(), Vec::new())
 }
 
 fn validate_text(value: &str, field: &str) -> Result<(), AppError> {
@@ -235,12 +281,27 @@ fn scoped<'a>(
 }
 
 pub async fn create_run(state: &AppState, create: ExpertRunCreate) -> Result<ExpertRun, AppError> {
+    create_run_with_id(state, &uuid::Uuid::new_v4().to_string(), create).await
+}
+
+pub(crate) async fn create_run_with_id(
+    state: &AppState,
+    id: &str,
+    create: ExpertRunCreate,
+) -> Result<ExpertRun, AppError> {
+    uuid::Uuid::parse_str(id).map_err(|_| invalid("Expert run id is invalid"))?;
     validate_text(&create.expert_id, "expertId")?;
     validate_text(&create.project_path, "projectPath")?;
     validate_text(&create.client, "client")?;
     validate_contract(&create.contract)?;
     let _lock = lock(state)?;
     let mut runs = load(state).await?;
+    if let Some(existing) = runs.iter().find(|run| run.id == id) {
+        if existing.snapshot == create {
+            return Ok(existing.clone());
+        }
+        return Err(invalid("Expert run id conflicts with another run"));
+    }
     if runs.len() >= MAX_RUNS {
         let index = runs
             .iter()
@@ -249,7 +310,7 @@ pub async fn create_run(state: &AppState, create: ExpertRunCreate) -> Result<Exp
         runs.remove(index);
     }
     let run = ExpertRun {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: id.to_owned(),
         snapshot: create,
         state: ExpertRunState::InProgress,
         started_at: chrono::Utc::now().to_rfc3339(),
@@ -500,4 +561,83 @@ pub async fn expert_run_review(
         _ => return Err(invalid("unsupported Expert run verdict")),
     };
     review_run_with_waivers(&state, &id, verdict, waivers).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_sqlite_persists_expert_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .mutate(document_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = root.path().to_path_buf();
+
+        let created = create_run(
+            &state,
+            ExpertRunCreate {
+                expert_id: "reviewer".into(),
+                expert_version: 1,
+                project_path: "/tmp/project".into(),
+                client: "codex".into(),
+                lead_agent: "reviewer".into(),
+                supporting_agents: Vec::new(),
+                required_skills: Vec::new(),
+                optional_skills: Vec::new(),
+                runbook: None,
+                contract: QualityContract::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(load(&state).await.unwrap()[0].id, created.id);
+        assert!(!path(&state).exists());
+    }
+
+    #[tokio::test]
+    async fn fixed_run_id_is_idempotent_for_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .mutate(document_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = root.path().to_path_buf();
+        let id = uuid::Uuid::new_v4().to_string();
+        let create = ExpertRunCreate {
+            expert_id: "reviewer".into(),
+            expert_version: 1,
+            project_path: "/tmp/project".into(),
+            client: "codex".into(),
+            lead_agent: "reviewer".into(),
+            supporting_agents: Vec::new(),
+            required_skills: Vec::new(),
+            optional_skills: Vec::new(),
+            runbook: None,
+            contract: QualityContract::default(),
+        };
+
+        let first = create_run_with_id(&state, &id, create.clone())
+            .await
+            .unwrap();
+        let second = create_run_with_id(&state, &id, create).await.unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(load(&state).await.unwrap().len(), 1);
+    }
 }

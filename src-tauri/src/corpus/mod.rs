@@ -424,6 +424,14 @@ fn catalog_source_path(app_data_dir: &Path) -> PathBuf {
     state_dir(app_data_dir).join("catalog.json")
 }
 
+fn catalog_source_spec() -> crate::state_db::DocumentSpec<CatalogSource> {
+    crate::state_db::DocumentSpec::new("catalog", 1, 65_536, |_| Ok(()))
+}
+
+pub(crate) fn catalog_source_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(catalog_source_spec(), CatalogSource::default())
+}
+
 // ---------- Catalog source (where the corpus content lives) ----------
 
 /// Load the persisted [`CatalogSource`], or [`CatalogSource::Bundled`] when no
@@ -431,6 +439,14 @@ fn catalog_source_path(app_data_dir: &Path) -> PathBuf {
 /// (content location) is distinct from the STATE dir (index/meta/ledger/backups
 /// always live under app data, regardless of source).
 pub(crate) async fn load_catalog_source(app_data_dir: &Path) -> CatalogSource {
+    if let Ok(Some(database)) = crate::state_db::StateDatabase::completed(app_data_dir).await {
+        return database
+            .read(catalog_source_spec())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    }
     let path = catalog_source_path(app_data_dir);
     match tokio::fs::read(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -443,6 +459,19 @@ pub(crate) async fn save_catalog_source(
     app_data_dir: &Path,
     source: &CatalogSource,
 ) -> Result<(), AppError> {
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        let source = source.clone();
+        return database
+            .mutate(
+                catalog_source_spec(),
+                CatalogSource::default(),
+                move |current| {
+                    *current = source;
+                    Ok(())
+                },
+            )
+            .await;
+    }
     let sdir = state_dir(app_data_dir);
     tokio::fs::create_dir_all(&sdir)
         .await

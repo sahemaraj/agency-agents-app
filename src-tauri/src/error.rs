@@ -37,6 +37,16 @@ pub enum AppError {
     #[error("internal error: {message}")]
     Internal { message: String },
 
+    #[error("Agency Agents is busy with another desktop or MCP operation. Nothing was changed. Try again.")]
+    StorageBusy,
+
+    #[error("stored application data is invalid: {message}")]
+    StorageCorrupt { message: String },
+
+    #[error("stored application data requires schema {found}; this version supports {supported}")]
+    #[serde(rename_all = "camelCase")]
+    StorageUnsupported { found: u32, supported: u32 },
+
     /// Paranoid/Offline mode is on (or settings are corrupt → fail closed).
     /// The `feature` field identifies which outbound command was
     /// rejected, so the UI can route the toast to the right setting.

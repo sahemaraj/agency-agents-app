@@ -338,6 +338,45 @@ async fn load(app_data_dir: &Path) -> Result<SkillFolderState, AppError> {
     Ok(state)
 }
 
+fn document_spec() -> crate::state_db::DocumentSpec<SkillFolderState> {
+    crate::state_db::DocumentSpec::new("skill_library", 1, 4_194_304, validate_state)
+}
+
+pub(crate) fn import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(document_spec(), SkillFolderState::default())
+}
+
+async fn load_for_state(state: &AppState) -> Result<SkillFolderState, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(document_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "skill library is missing after SQLite migration".into(),
+            });
+    }
+    load(&state.app_data_dir).await
+}
+
+async fn mutate<R>(
+    state: &AppState,
+    mutation: impl FnOnce(&mut SkillFolderState) -> Result<R, AppError> + Send + 'static,
+) -> Result<R, AppError>
+where
+    R: Send + 'static,
+{
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .mutate(document_spec(), SkillFolderState::default(), mutation)
+            .await;
+    }
+    let _guard = state.skill_folders_write_lock.lock().await;
+    let mut library = load(&state.app_data_dir).await?;
+    let result = mutation(&mut library)?;
+    save(&state.app_data_dir, &library).await?;
+    Ok(result)
+}
+
 async fn save(app_data_dir: &Path, state: &SkillFolderState) -> Result<(), AppError> {
     validate_state(state)?;
     let directory = state_dir(app_data_dir);
@@ -383,7 +422,7 @@ fn relocate(state: &mut SkillFolderState, path: &str, destination: String) -> Re
 }
 
 pub async fn list(state: &AppState) -> Result<SkillFolderState, AppError> {
-    let library = load(&state.app_data_dir).await?;
+    let library = load_for_state(state).await?;
     if !library.approvals.iter().any(|approval| {
         approval.state == SkillApprovalState::Pending
             && matches!(approval.request, SkillApprovalAction::DraftPublish { .. })
@@ -391,37 +430,33 @@ pub async fn list(state: &AppState) -> Result<SkillFolderState, AppError> {
         return Ok(library);
     }
     let drafts = super::drafts::list(state).await?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    let mut changed = false;
-    for approval in &mut library.approvals {
-        let SkillApprovalAction::DraftPublish { id, plan_revision } = &approval.request else {
-            continue;
-        };
-        if approval.state == SkillApprovalState::Pending
-            && drafts.iter().any(|draft| {
-                draft.id == *id
-                    && draft.tree_hash == *plan_revision
-                    && draft.state == crate::types::SkillDraftState::Published
-            })
-        {
-            approval.state = SkillApprovalState::Approved;
-            approval.result = Some("completed".into());
-            changed = true;
+    mutate(state, move |library| {
+        for approval in &mut library.approvals {
+            let SkillApprovalAction::DraftPublish { id, plan_revision } = &approval.request else {
+                continue;
+            };
+            if approval.state == SkillApprovalState::Pending
+                && drafts.iter().any(|draft| {
+                    draft.id == *id
+                        && draft.tree_hash == *plan_revision
+                        && draft.state == crate::types::SkillDraftState::Published
+                })
+            {
+                approval.state = SkillApprovalState::Approved;
+                approval.result = Some("completed".into());
+            }
         }
-    }
-    if changed {
-        save(&state.app_data_dir, &library).await?;
-    }
-    Ok(library)
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn create_folder(state: &AppState, path: String) -> Result<SkillFolderState, AppError> {
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut folders = load(&state.app_data_dir).await?;
-    create(&mut folders, path)?;
-    save(&state.app_data_dir, &folders).await?;
-    Ok(folders)
+    mutate(state, move |folders| {
+        create(folders, path)?;
+        Ok(folders.clone())
+    })
+    .await
 }
 
 pub async fn rename_folder(
@@ -434,11 +469,11 @@ pub async fn rename_folder(
     let destination = parent
         .map(|parent| format!("{parent}/{new_name}"))
         .unwrap_or(new_name);
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut folders = load(&state.app_data_dir).await?;
-    relocate(&mut folders, &path, destination)?;
-    save(&state.app_data_dir, &folders).await?;
-    Ok(folders)
+    mutate(state, move |folders| {
+        relocate(folders, &path, destination)?;
+        Ok(folders.clone())
+    })
+    .await
 }
 
 pub async fn move_folder(
@@ -457,16 +492,16 @@ pub async fn move_folder(
         .as_ref()
         .map(|parent| format!("{parent}/{name}"))
         .unwrap_or_else(|| name.to_owned());
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut folders = load(&state.app_data_dir).await?;
-    if let Some(parent) = &new_parent {
-        if !folders.folders.contains(parent) {
-            return Err(invalid(format!("parent folder does not exist: {parent}")));
+    mutate(state, move |folders| {
+        if let Some(parent) = &new_parent {
+            if !folders.folders.contains(parent) {
+                return Err(invalid(format!("parent folder does not exist: {parent}")));
+            }
         }
-    }
-    relocate(&mut folders, &path, destination)?;
-    save(&state.app_data_dir, &folders).await?;
-    Ok(folders)
+        relocate(folders, &path, destination)?;
+        Ok(folders.clone())
+    })
+    .await
 }
 
 pub async fn delete_folder(
@@ -475,29 +510,29 @@ pub async fn delete_folder(
     recursive: bool,
 ) -> Result<SkillFolderState, AppError> {
     validate_path(&path)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut folders = load(&state.app_data_dir).await?;
-    let prefix = format!("{path}/");
-    let assigned = folders.assignments.iter().any(|assignment| {
-        assignment.folder_path == path || assignment.folder_path.starts_with(&prefix)
-    });
-    if assigned && !recursive {
-        return Err(invalid(
-            "folder is not empty; set recursive=true to remove descendants and assignments",
-        ));
-    }
-    let removed = library::deleted_folder_paths(&folders.folders, &path, recursive)?;
-    folders.folders.retain(|folder| !removed.contains(folder));
-    folders.assignments.retain(|assignment| {
-        assignment.folder_path != path && !assignment.folder_path.starts_with(&prefix)
-    });
-    for profile in &mut folders.profiles {
-        profile
-            .folders
-            .retain(|folder| folder != &path && !folder.starts_with(&prefix));
-    }
-    save(&state.app_data_dir, &folders).await?;
-    Ok(folders)
+    mutate(state, move |folders| {
+        let prefix = format!("{path}/");
+        let assigned = folders.assignments.iter().any(|assignment| {
+            assignment.folder_path == path || assignment.folder_path.starts_with(&prefix)
+        });
+        if assigned && !recursive {
+            return Err(invalid(
+                "folder is not empty; set recursive=true to remove descendants and assignments",
+            ));
+        }
+        let removed = library::deleted_folder_paths(&folders.folders, &path, recursive)?;
+        folders.folders.retain(|folder| !removed.contains(folder));
+        folders.assignments.retain(|assignment| {
+            assignment.folder_path != path && !assignment.folder_path.starts_with(&prefix)
+        });
+        for profile in &mut folders.profiles {
+            profile
+                .folders
+                .retain(|folder| folder != &path && !folder.starts_with(&prefix));
+        }
+        Ok(folders.clone())
+    })
+    .await
 }
 
 pub async fn assign_folder(
@@ -509,27 +544,27 @@ pub async fn assign_folder(
     if source_id.trim().is_empty() || relative_path.trim().is_empty() {
         return Err(invalid("source_id and relative_path are required"));
     }
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut folders = load(&state.app_data_dir).await?;
-    folders.assignments.retain(|assignment| {
-        assignment.source_id != source_id || assignment.relative_path != relative_path
-    });
-    if let Some(folder_path) = folder_path {
-        validate_path(&folder_path)?;
-        if !folders.folders.contains(&folder_path) {
-            return Err(invalid(format!("folder does not exist: {folder_path}")));
-        }
-        folders.assignments.push(SkillFolderAssignment {
-            source_id,
-            relative_path,
-            folder_path,
+    mutate(state, move |folders| {
+        folders.assignments.retain(|assignment| {
+            assignment.source_id != source_id || assignment.relative_path != relative_path
         });
-    }
-    folders.assignments.sort_by(|left, right| {
-        (&left.source_id, &left.relative_path).cmp(&(&right.source_id, &right.relative_path))
-    });
-    save(&state.app_data_dir, &folders).await?;
-    Ok(folders)
+        if let Some(folder_path) = folder_path {
+            validate_path(&folder_path)?;
+            if !folders.folders.contains(&folder_path) {
+                return Err(invalid(format!("folder does not exist: {folder_path}")));
+            }
+            folders.assignments.push(SkillFolderAssignment {
+                source_id,
+                relative_path,
+                folder_path,
+            });
+        }
+        folders.assignments.sort_by(|left, right| {
+            (&left.source_id, &left.relative_path).cmp(&(&right.source_id, &right.relative_path))
+        });
+        Ok(folders.clone())
+    })
+    .await
 }
 
 pub async fn import_folders(
@@ -537,30 +572,30 @@ pub async fn import_folders(
     imported: SkillFolderState,
 ) -> Result<SkillFolderState, AppError> {
     validate_state(&imported)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut folders = load(&state.app_data_dir).await?;
-    for path in imported.folders {
-        if !folders
-            .folders
-            .iter()
-            .any(|current| current.eq_ignore_ascii_case(&path))
-        {
-            folders.folders.push(path);
+    mutate(state, move |folders| {
+        for path in imported.folders {
+            if !folders
+                .folders
+                .iter()
+                .any(|current| current.eq_ignore_ascii_case(&path))
+            {
+                folders.folders.push(path);
+            }
         }
-    }
-    for assignment in imported.assignments {
-        folders.assignments.retain(|current| {
-            current.source_id != assignment.source_id
-                || current.relative_path != assignment.relative_path
+        for assignment in imported.assignments {
+            folders.assignments.retain(|current| {
+                current.source_id != assignment.source_id
+                    || current.relative_path != assignment.relative_path
+            });
+            folders.assignments.push(assignment);
+        }
+        folders.folders.sort();
+        folders.assignments.sort_by(|left, right| {
+            (&left.source_id, &left.relative_path).cmp(&(&right.source_id, &right.relative_path))
         });
-        folders.assignments.push(assignment);
-    }
-    folders.folders.sort();
-    folders.assignments.sort_by(|left, right| {
-        (&left.source_id, &left.relative_path).cmp(&(&right.source_id, &right.relative_path))
-    });
-    save(&state.app_data_dir, &folders).await?;
-    Ok(folders)
+        Ok(folders.clone())
+    })
+    .await
 }
 
 pub async fn set_favorite(
@@ -569,17 +604,18 @@ pub async fn set_favorite(
     favorite: bool,
 ) -> Result<SkillFolderState, AppError> {
     validate_reference(&skill)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    library.favorites.retain(|current| current != &skill);
-    if favorite {
-        library.favorites.push(skill);
-        library.favorites.sort_by(|left, right| {
-            (&left.source_id, &left.relative_path).cmp(&(&right.source_id, &right.relative_path))
-        });
-    }
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        library.favorites.retain(|current| current != &skill);
+        if favorite {
+            library.favorites.push(skill);
+            library.favorites.sort_by(|left, right| {
+                (&left.source_id, &left.relative_path)
+                    .cmp(&(&right.source_id, &right.relative_path))
+            });
+        }
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn touch_recent(
@@ -587,19 +623,19 @@ pub async fn touch_recent(
     skill: SkillReference,
 ) -> Result<SkillFolderState, AppError> {
     validate_reference(&skill)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    library.recent.retain(|current| current.skill != skill);
-    library.recent.insert(
-        0,
-        SkillRecent {
-            skill,
-            viewed_at: chrono::Utc::now().to_rfc3339(),
-        },
-    );
-    library.recent.truncate(MAX_RECENT);
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        library.recent.retain(|current| current.skill != skill);
+        library.recent.insert(
+            0,
+            SkillRecent {
+                skill,
+                viewed_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        library.recent.truncate(MAX_RECENT);
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn save_collection(
@@ -610,17 +646,17 @@ pub async fn save_collection(
     for skill in &collection.skills {
         validate_reference(skill)?;
     }
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    library
-        .collections
-        .retain(|current| !current.name.eq_ignore_ascii_case(&collection.name));
-    library.collections.push(collection);
-    library
-        .collections
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        library
+            .collections
+            .retain(|current| !current.name.eq_ignore_ascii_case(&collection.name));
+        library.collections.push(collection);
+        library
+            .collections
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn delete_collection(
@@ -628,18 +664,18 @@ pub async fn delete_collection(
     name: String,
 ) -> Result<SkillFolderState, AppError> {
     validate_name(&name)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    let before = library.collections.len();
-    library.collections.retain(|current| current.name != name);
-    if library.collections.len() == before {
-        return Err(invalid(format!("collection does not exist: {name}")));
-    }
-    for profile in &mut library.profiles {
-        profile.collections.retain(|current| current != &name);
-    }
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        let before = library.collections.len();
+        library.collections.retain(|current| current.name != name);
+        if library.collections.len() == before {
+            return Err(invalid(format!("collection does not exist: {name}")));
+        }
+        for profile in &mut library.profiles {
+            profile.collections.retain(|current| current != &name);
+        }
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn save_smart_folder(
@@ -650,17 +686,17 @@ pub async fn save_smart_folder(
     if smart_folder.rule == Default::default() {
         return Err(invalid("a smart folder requires at least one rule"));
     }
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    library
-        .smart_folders
-        .retain(|current| !current.name.eq_ignore_ascii_case(&smart_folder.name));
-    library.smart_folders.push(smart_folder);
-    library
-        .smart_folders
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        library
+            .smart_folders
+            .retain(|current| !current.name.eq_ignore_ascii_case(&smart_folder.name));
+        library.smart_folders.push(smart_folder);
+        library
+            .smart_folders
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn delete_smart_folder(
@@ -668,15 +704,15 @@ pub async fn delete_smart_folder(
     name: String,
 ) -> Result<SkillFolderState, AppError> {
     validate_name(&name)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    let before = library.smart_folders.len();
-    library.smart_folders.retain(|current| current.name != name);
-    if library.smart_folders.len() == before {
-        return Err(invalid(format!("smart folder does not exist: {name}")));
-    }
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        let before = library.smart_folders.len();
+        library.smart_folders.retain(|current| current.name != name);
+        if library.smart_folders.len() == before {
+            return Err(invalid(format!("smart folder does not exist: {name}")));
+        }
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn save_profile(
@@ -684,30 +720,30 @@ pub async fn save_profile(
     profile: SkillWorkspaceProfile,
 ) -> Result<SkillFolderState, AppError> {
     validate_name(&profile.name)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    library
-        .profiles
-        .retain(|current| !current.name.eq_ignore_ascii_case(&profile.name));
-    library.profiles.push(profile);
-    library
-        .profiles
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        library
+            .profiles
+            .retain(|current| !current.name.eq_ignore_ascii_case(&profile.name));
+        library.profiles.push(profile);
+        library
+            .profiles
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn delete_profile(state: &AppState, name: String) -> Result<SkillFolderState, AppError> {
     validate_name(&name)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    let before = library.profiles.len();
-    library.profiles.retain(|current| current.name != name);
-    if library.profiles.len() == before {
-        return Err(invalid(format!("profile does not exist: {name}")));
-    }
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        let before = library.profiles.len();
+        library.profiles.retain(|current| current.name != name);
+        if library.profiles.len() == before {
+            return Err(invalid(format!("profile does not exist: {name}")));
+        }
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn replace_library(
@@ -715,9 +751,11 @@ pub async fn replace_library(
     replacement: SkillFolderState,
 ) -> Result<SkillFolderState, AppError> {
     validate_state(&replacement)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    save(&state.app_data_dir, &replacement).await?;
-    Ok(replacement)
+    mutate(state, move |library| {
+        *library = replacement;
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn set_update_policy(
@@ -726,20 +764,20 @@ pub async fn set_update_policy(
     policy: SkillUpdatePolicy,
 ) -> Result<SkillFolderState, AppError> {
     validate_reference(&skill)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    library
-        .update_policies
-        .retain(|record| record.skill != skill);
-    library
-        .update_policies
-        .push(SkillUpdatePolicyRecord { skill, policy });
-    library.update_policies.sort_by(|left, right| {
-        (&left.skill.source_id, &left.skill.relative_path)
-            .cmp(&(&right.skill.source_id, &right.skill.relative_path))
-    });
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        library
+            .update_policies
+            .retain(|record| record.skill != skill);
+        library
+            .update_policies
+            .push(SkillUpdatePolicyRecord { skill, policy });
+        library.update_policies.sort_by(|left, right| {
+            (&left.skill.source_id, &left.skill.relative_path)
+                .cmp(&(&right.skill.source_id, &right.skill.relative_path))
+        });
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn set_publisher_trust(
@@ -755,14 +793,14 @@ pub async fn set_publisher_trust(
     if trust.trusted && trust.revoked {
         return Err(invalid("a publisher key cannot be trusted and revoked"));
     }
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    library
-        .publisher_trust
-        .retain(|current| current.public_key != trust.public_key);
-    library.publisher_trust.push(trust);
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        library
+            .publisher_trust
+            .retain(|current| current.public_key != trust.public_key);
+        library.publisher_trust.push(trust);
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn set_preferred_source(
@@ -773,14 +811,14 @@ pub async fn set_preferred_source(
     if preference.source_id.trim().is_empty() || preference.source_id.len() > 128 {
         return Err(invalid("source_id must contain 1-128 characters"));
     }
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    library
-        .preferred_sources
-        .retain(|current| current.skill_name != preference.skill_name);
-    library.preferred_sources.push(preference);
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    mutate(state, move |library| {
+        library
+            .preferred_sources
+            .retain(|current| current.skill_name != preference.skill_name);
+        library.preferred_sources.push(preference);
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn record_usage(
@@ -792,33 +830,34 @@ pub async fn record_usage(
     if !matches!(event, "fetch" | "install" | "reject") {
         return Err(invalid("usage event must be fetch, install, or reject"));
     }
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    let usage = if let Some(usage) = library.usage.iter_mut().find(|item| item.skill == skill) {
-        usage
-    } else {
-        library.usage.push(SkillUsage {
-            skill,
-            fetches: 0,
-            installs: 0,
-            rejections: 0,
-            last_used_at: String::new(),
-        });
-        library.usage.last_mut().expect("usage was inserted")
-    };
-    match event {
-        "fetch" => usage.fetches = usage.fetches.saturating_add(1),
-        "install" => usage.installs = usage.installs.saturating_add(1),
-        "reject" => usage.rejections = usage.rejections.saturating_add(1),
-        _ => unreachable!(),
-    }
-    usage.last_used_at = chrono::Utc::now().to_rfc3339();
-    save(&state.app_data_dir, &library).await?;
-    Ok(library)
+    let event = event.to_owned();
+    mutate(state, move |library| {
+        let usage = if let Some(usage) = library.usage.iter_mut().find(|item| item.skill == skill) {
+            usage
+        } else {
+            library.usage.push(SkillUsage {
+                skill,
+                fetches: 0,
+                installs: 0,
+                rejections: 0,
+                last_used_at: String::new(),
+            });
+            library.usage.last_mut().expect("usage was inserted")
+        };
+        match event.as_str() {
+            "fetch" => usage.fetches = usage.fetches.saturating_add(1),
+            "install" => usage.installs = usage.installs.saturating_add(1),
+            "reject" => usage.rejections = usage.rejections.saturating_add(1),
+            _ => unreachable!(),
+        }
+        usage.last_used_at = chrono::Utc::now().to_rfc3339();
+        Ok(library.clone())
+    })
+    .await
 }
 
 pub async fn export_library(state: &AppState, path: String) -> Result<u32, AppError> {
-    let library = load(&state.app_data_dir).await?;
+    let library = load_for_state(state).await?;
     let bytes = serde_json::to_vec_pretty(&library).map_err(|error| AppError::Internal {
         message: format!("serialize skill library export: {error}"),
     })?;
@@ -855,49 +894,47 @@ pub async fn submit_approval(
         return Err(invalid("requested_by must contain 1-64 characters"));
     }
     validate_approval_action(&request)?;
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    if library.approvals.len() == MAX_NAMED_ITEMS {
-        if let Some(index) = library
-            .approvals
-            .iter()
-            .position(|approval| approval.state != SkillApprovalState::Pending)
-        {
-            library.approvals.remove(index);
-        } else {
-            return Err(invalid("approval inbox is full"));
+    mutate(state, move |library| {
+        if library.approvals.len() == MAX_NAMED_ITEMS {
+            if let Some(index) = library
+                .approvals
+                .iter()
+                .position(|approval| approval.state != SkillApprovalState::Pending)
+            {
+                library.approvals.remove(index);
+            } else {
+                return Err(invalid("approval inbox is full"));
+            }
         }
-    }
-    let approval = SkillApproval {
-        id: uuid::Uuid::new_v4().to_string(),
-        submitted_at: chrono::Utc::now().to_rfc3339(),
-        state: SkillApprovalState::Pending,
-        requested_by,
-        request,
-        result: None,
-    };
-    library.approvals.push(approval.clone());
-    save(&state.app_data_dir, &library).await?;
-    Ok(approval)
+        let approval = SkillApproval {
+            id: uuid::Uuid::new_v4().to_string(),
+            submitted_at: chrono::Utc::now().to_rfc3339(),
+            state: SkillApprovalState::Pending,
+            requested_by,
+            request,
+            result: None,
+        };
+        library.approvals.push(approval.clone());
+        Ok(approval)
+    })
+    .await
 }
 
 pub async fn approve(state: &AppState, id: String) -> Result<SkillApproval, AppError> {
-    let request = {
-        let _guard = state.skill_folders_write_lock.lock().await;
-        let mut library = load(&state.app_data_dir).await?;
+    let request_id = id.clone();
+    let request = mutate(state, move |library| {
         let approval = library
             .approvals
             .iter_mut()
-            .find(|approval| approval.id == id)
-            .ok_or_else(|| invalid(format!("approval does not exist: {id}")))?;
+            .find(|approval| approval.id == request_id)
+            .ok_or_else(|| invalid(format!("approval does not exist: {request_id}")))?;
         if approval.state != SkillApprovalState::Pending {
             return Err(invalid("only pending approvals can be approved"));
         }
         approval.state = SkillApprovalState::Running;
-        let request = approval.request.clone();
-        save(&state.app_data_dir, &library).await?;
-        request
-    };
+        Ok(approval.request.clone())
+    })
+    .await?;
 
     let operation = match request {
         SkillApprovalAction::FolderCreate { path } => create_folder(state, path).await.map(|_| ()),
@@ -1014,44 +1051,96 @@ pub async fn approve(state: &AppState, id: String) -> Result<SkillApproval, AppE
         .map(|_| ()),
     };
 
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    let approval = library
-        .approvals
-        .iter_mut()
-        .find(|approval| approval.id == id)
-        .ok_or_else(|| invalid(format!("approval disappeared: {id}")))?;
-    match operation {
-        Ok(()) => {
+    mutate(state, move |library| {
+        let approval = library
+            .approvals
+            .iter_mut()
+            .find(|approval| approval.id == id)
+            .ok_or_else(|| invalid(format!("approval disappeared: {id}")))?;
+        match operation {
+            Ok(()) => {
+                approval.state = SkillApprovalState::Approved;
+                approval.result = Some("completed".into());
+            }
+            Err(error) => {
+                approval.state = SkillApprovalState::Pending;
+                approval.result = Some(error.to_string());
+            }
+        }
+        Ok(approval.clone())
+    })
+    .await
+}
+
+pub(crate) async fn reconcile_draft_publish_approval(
+    state: &AppState,
+    approval_id: Option<&str>,
+    draft_id: &str,
+    plan_revision: &str,
+    completed: bool,
+    error: Option<String>,
+) -> Result<(), AppError> {
+    let Some(approval_id) = approval_id else {
+        return Ok(());
+    };
+    let approval_id = approval_id.to_owned();
+    let draft_id = draft_id.to_owned();
+    let plan_revision = plan_revision.to_owned();
+    mutate(state, move |library| {
+        let approval = library
+            .approvals
+            .iter_mut()
+            .find(|approval| approval.id == approval_id)
+            .ok_or_else(|| invalid("recovered Skill approval no longer exists"))?;
+        if approval.request
+            != (SkillApprovalAction::DraftPublish {
+                id: draft_id,
+                plan_revision,
+            })
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Recovered Skill approval revision does not match its operation".into(),
+            });
+        }
+        if approval.state == SkillApprovalState::Approved && completed {
+            return Ok(());
+        }
+        if !matches!(
+            approval.state,
+            SkillApprovalState::Running | SkillApprovalState::Pending
+        ) {
+            return Err(AppError::StorageCorrupt {
+                message: "Recovered Skill approval is in an incompatible state".into(),
+            });
+        }
+        if completed {
             approval.state = SkillApprovalState::Approved;
             approval.result = Some("completed".into());
-        }
-        Err(error) => {
+        } else {
             approval.state = SkillApprovalState::Pending;
-            approval.result = Some(error.to_string());
+            approval.result =
+                Some(error.unwrap_or_else(|| "publication recovery rolled back".into()));
         }
-    }
-    let result = approval.clone();
-    save(&state.app_data_dir, &library).await?;
-    Ok(result)
+        Ok(())
+    })
+    .await
 }
 
 pub async fn reject_approval(state: &AppState, id: String) -> Result<SkillApproval, AppError> {
-    let _guard = state.skill_folders_write_lock.lock().await;
-    let mut library = load(&state.app_data_dir).await?;
-    let approval = library
-        .approvals
-        .iter_mut()
-        .find(|approval| approval.id == id)
-        .ok_or_else(|| invalid(format!("approval does not exist: {id}")))?;
-    if approval.state != SkillApprovalState::Pending {
-        return Err(invalid("only pending approvals can be rejected"));
-    }
-    approval.state = SkillApprovalState::Rejected;
-    approval.result = Some("rejected by desktop user".into());
-    let result = approval.clone();
-    save(&state.app_data_dir, &library).await?;
-    Ok(result)
+    mutate(state, move |library| {
+        let approval = library
+            .approvals
+            .iter_mut()
+            .find(|approval| approval.id == id)
+            .ok_or_else(|| invalid(format!("approval does not exist: {id}")))?;
+        if approval.state != SkillApprovalState::Pending {
+            return Err(invalid("only pending approvals can be rejected"));
+        }
+        approval.state = SkillApprovalState::Rejected;
+        approval.result = Some("rejected by desktop user".into());
+        Ok(approval.clone())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1276,6 +1365,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn independent_states_do_not_lose_concurrent_folder_updates() {
+        let root = tempfile::tempdir().expect("app data");
+        let database = crate::state_db::StateDatabase::open(root.path()).expect("open database");
+        database
+            .mutate(document_spec(), SkillFolderState::default(), |_| Ok(()))
+            .await
+            .expect("seed skill library");
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .expect("complete migration");
+        let left = app_state(root.path());
+        let right = app_state(root.path());
+
+        let (left_result, right_result) = tokio::join!(
+            create_folder(&left, "Engineering".into()),
+            create_folder(&right, "Operations".into()),
+        );
+        left_result.expect("create Engineering");
+        right_result.expect("create Operations");
+
+        let persisted = load_for_state(&left).await.expect("load shared library");
+        assert_eq!(persisted.folders, ["Engineering", "Operations"]);
+    }
+
     #[test]
     fn rename_updates_descendants_and_assignments_once() {
         let mut folders = state();
@@ -1445,6 +1560,47 @@ mod tests {
             .find(|entry| entry.id == approval.id)
             .expect("approval remains auditable");
 
+        assert_eq!(reconciled.state, SkillApprovalState::Approved);
+        assert_eq!(reconciled.result.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
+    async fn recovery_reconciles_only_the_bound_running_draft_revision() {
+        let root = tempfile::tempdir().expect("app data");
+        let app = app_state(root.path());
+        let revision = "a".repeat(64);
+        let approval = submit_approval(
+            &app,
+            "Codex".into(),
+            SkillApprovalAction::DraftPublish {
+                id: uuid::Uuid::new_v4().to_string(),
+                plan_revision: revision.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let approval_id = approval.id.clone();
+        mutate(&app, move |library| {
+            library.approvals[0].state = SkillApprovalState::Running;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let SkillApprovalAction::DraftPublish { id, .. } = approval.request else {
+            unreachable!();
+        };
+
+        reconcile_draft_publish_approval(&app, Some(&approval_id), &id, &revision, true, None)
+            .await
+            .unwrap();
+
+        let reconciled = list(&app)
+            .await
+            .unwrap()
+            .approvals
+            .into_iter()
+            .find(|item| item.id == approval_id)
+            .unwrap();
         assert_eq!(reconciled.state, SkillApprovalState::Approved);
         assert_eq!(reconciled.result.as_deref(), Some("completed"));
     }

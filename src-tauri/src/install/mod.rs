@@ -39,6 +39,32 @@ const MAX_PROJECT_REGISTRY_BYTES: u64 = 64 * 1024;
 const MAX_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_AGENT_HISTORY_ENTRIES: usize = 10;
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInstallOperation {
+    previous: Option<InstallRecord>,
+    next: InstallRecord,
+    targets: Vec<String>,
+    rendered: String,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMoveOperation {
+    previous: InstallRecord,
+    next: InstallRecord,
+    active: Vec<String>,
+    disabled: Vec<String>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentUninstallOperation {
+    previous: InstallRecord,
+    paths: Vec<String>,
+    hashes: Vec<Option<String>>,
+}
+
 // ---------- Ledger persistence ----------
 
 fn ledger_path(app: &AppHandle) -> Result<PathBuf, AppError> {
@@ -83,12 +109,28 @@ pub(crate) async fn load_ledger(
     state: &AppState,
 ) -> Result<Vec<InstallRecord>, AppError> {
     corpus::ensure_corpus(app, state).await?;
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(installs_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent install ledger is missing after SQLite migration".into(),
+            });
+    }
     let built_in = crate::agents::inspect_builtin_agent_source(&state.app_data_dir).await?;
     let path = ledger_path(app)?;
     load_migrated_ledger_path(&path, Some(&built_in), &now_iso()).await
 }
 
 async fn load_ledger_for_state(state: &AppState) -> Result<Vec<InstallRecord>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(installs_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent install ledger is missing after SQLite migration".into(),
+            });
+    }
     let built_in = crate::agents::inspect_builtin_agent_source(&state.app_data_dir)
         .await
         .ok();
@@ -105,6 +147,16 @@ async fn save_ledger(app: &AppHandle, records: &[InstallRecord]) -> Result<(), A
 }
 
 async fn save_ledger_for(app_data_dir: &Path, records: &[InstallRecord]) -> Result<(), AppError> {
+    validate_install_ledger(records)?;
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        let replacement = records.to_vec();
+        return database
+            .mutate(installs_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await;
+    }
     let path = ledger_path_for(app_data_dir);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -117,6 +169,48 @@ async fn save_ledger_for(app_data_dir: &Path, records: &[InstallRecord]) -> Resu
         message: format!("serialize installs.json: {e}"),
     })?;
     atomic_write(&path, &bytes).await
+}
+
+async fn save_ledger_after_filesystem(
+    state: &AppState,
+    records: &[InstallRecord],
+    operation_id: &str,
+) -> Result<(), AppError> {
+    validate_install_ledger(records)?;
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent install operation lost its SQLite database".into(),
+            })?;
+    let replacement = records.to_vec();
+    database
+        .mutate_after_filesystem(installs_spec(), Vec::new(), operation_id, move |current| {
+            *current = replacement;
+            Ok(())
+        })
+        .await
+}
+
+fn validate_install_ledger(records: &[InstallRecord]) -> Result<(), AppError> {
+    let (_, changed) = migrate_install_records(records.to_vec(), None)?;
+    if changed {
+        return Err(AppError::InvalidArgument {
+            message: "Agent install ledger requires migration".into(),
+        });
+    }
+    Ok(())
+}
+
+fn installs_spec() -> crate::state_db::DocumentSpec<Vec<InstallRecord>> {
+    crate::state_db::DocumentSpec::new("installs", 1, MAX_LEDGER_BYTES, |records| {
+        validate_install_ledger(records)
+    })
+}
+
+pub(crate) fn installs_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(installs_spec(), Vec::new())
 }
 
 /// Upgrade pre-source ledgers entirely in memory. Existing source-aware rows
@@ -539,6 +633,50 @@ async fn do_install_locked(
         .filter(|path| !path.exists())
         .cloned()
         .collect::<Vec<_>>();
+    let installed_at = now_iso();
+    let (rendered, rendered_hash) = render::render_with_hash(&agent, &raw, &tool)?;
+    let mut planned_record = record_for(
+        &agent,
+        &targets[0],
+        &tool,
+        proot.as_deref(),
+        rendered_hash,
+        &package.source_hash,
+        &package.body_hash,
+        &revision,
+        &installed_at,
+    );
+    planned_record.source_id = reference.source_id.clone();
+    planned_record.relative_path = reference.relative_path.clone();
+    planned_record.source_snapshot_hash = package.source_hash.clone();
+    planned_record.capabilities = package.capabilities.clone();
+    planned_record.publisher_key = package.publisher_key.clone();
+    planned_record.publisher_verified = package.publisher_verified;
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    if existing_record.is_some() {
+                        "agent_update"
+                    } else {
+                        "agent_install"
+                    },
+                    &AgentInstallOperation {
+                        previous: existing_record.clone(),
+                        next: planned_record.clone(),
+                        targets: targets
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                        rendered,
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     let prior_snapshot = match (existing_record.as_ref(), prior_paths.is_empty()) {
         (Some(record), false) => Some(snapshot_record(state, record, &prior_paths).await?),
         _ => None,
@@ -553,23 +691,28 @@ async fn do_install_locked(
         &package.source_hash,
         &package.body_hash,
         &revision,
-        &now_iso(),
+        &installed_at,
         existing_dest.as_deref(),
     )
     .await;
     let mut record = match write_result {
         Ok(record) => record,
         Err(error) => {
-            return match restore_install_transaction(
+            let restore = restore_install_transaction(
                 state,
                 existing_record.as_ref(),
                 prior_snapshot.as_ref(),
                 &prior_paths,
                 &absent_paths,
             )
-            .await
-            {
-                Ok(()) => Err(error),
+            .await;
+            return match restore {
+                Ok(()) => {
+                    if let (Some(database), Some(operation)) = (&database, &operation) {
+                        database.abort_filesystem_operation(&operation.id).await?;
+                    }
+                    Err(error)
+                }
                 Err(rollback) => Err(rollback_error("install Agent", error, rollback)),
             };
         }
@@ -588,7 +731,14 @@ async fn do_install_locked(
             && existing.project_path == project_path)
     });
     ledger.push(record.clone());
-    if let Err(error) = save_ledger(app, &ledger).await {
+    let save = match &operation {
+        Some(operation) => save_ledger_after_filesystem(state, &ledger, &operation.id).await,
+        None => save_ledger(app, &ledger).await,
+    };
+    if let Err(error) = save {
+        if operation.is_some() {
+            return Err(error);
+        }
         return match restore_install_transaction(
             state,
             existing_record.as_ref(),
@@ -601,6 +751,9 @@ async fn do_install_locked(
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("save Agent install", error, rollback)),
         };
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     Ok(record)
 }
@@ -1098,6 +1251,471 @@ async fn resolved_record_paths(
         });
     }
     Ok(paths)
+}
+
+fn same_agent_install(left: &InstallRecord, right: &InstallRecord) -> bool {
+    left.source_id == right.source_id
+        && left.relative_path == right.relative_path
+        && left.tool == right.tool
+        && left.project_path == right.project_path
+}
+
+fn exact_agent_install(left: &InstallRecord, right: &InstallRecord) -> bool {
+    serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
+}
+
+fn ensure_agent_recovery_parent(base: &Path, target: &Path) -> Result<(), AppError> {
+    let base = std::fs::canonicalize(base).map_err(|error| AppError::Io {
+        message: format!("resolve Agent recovery base: {error}"),
+    })?;
+    let relative = target
+        .strip_prefix(&base)
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent recovery destination escaped its configured base".into(),
+        })?;
+    let mut current = base;
+    for component in relative
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .components()
+    {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && !crate::skills::metadata_is_reparse_point(&metadata) => {}
+            Ok(_) => {
+                return Err(AppError::StorageCorrupt {
+                    message: "Agent recovery destination contains an unsafe ancestor".into(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|error| AppError::Io {
+                    message: format!("create Agent recovery directory: {error}"),
+                })?;
+            }
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect Agent recovery directory: {error}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn apply_recovered_agent_install(
+    state: &AppState,
+    operation_id: &str,
+    payload: &AgentInstallOperation,
+) -> Result<(), AppError> {
+    let mut records = load_ledger_for_state(state).await?;
+    match records
+        .iter()
+        .position(|record| same_agent_install(record, &payload.next))
+    {
+        Some(index) if exact_agent_install(&records[index], &payload.next) => {}
+        Some(index)
+            if payload
+                .previous
+                .as_ref()
+                .is_some_and(|previous| exact_agent_install(&records[index], previous)) =>
+        {
+            records[index] = payload.next.clone();
+        }
+        Some(_) => {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent install recovery found changed ledger metadata".into(),
+            });
+        }
+        None if payload.previous.is_none() => records.push(payload.next.clone()),
+        None => {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent install recovery lost its previous ledger metadata".into(),
+            });
+        }
+    }
+    save_ledger_after_filesystem(state, &records, operation_id).await
+}
+
+async fn recover_agent_install_operation(
+    state: &AppState,
+    database: &crate::state_db::StateDatabase,
+    operation: &crate::state_db::FilesystemOperation,
+) -> Result<(), AppError> {
+    let payload = serde_json::from_value::<AgentInstallOperation>(operation.payload.clone())
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent install recovery payload is invalid".into(),
+        })?;
+    if payload.rendered.len() as u64 > MAX_INSTALLED_BYTES
+        || render::sha256_hex(payload.rendered.as_bytes()) != payload.next.rendered_hash
+        || payload
+            .previous
+            .as_ref()
+            .is_some_and(|previous| !same_agent_install(previous, &payload.next))
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent install recovery payload changed identity or content".into(),
+        });
+    }
+    let resolved = resolved_record_paths(state, &payload.next).await?;
+    let stored = payload
+        .targets
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if resolved != stored || resolved.is_empty() {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent install recovery destinations changed".into(),
+        });
+    }
+    let base = payload
+        .next
+        .project_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or(tool_home(state, &payload.next.tool).await?);
+    for target in &resolved {
+        ensure_agent_recovery_parent(&base, target)?;
+        match std::fs::symlink_metadata(target) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && !crate::skills::metadata_is_reparse_point(&metadata) =>
+            {
+                let bytes = std::fs::read(target).map_err(|error| AppError::Io {
+                    message: format!("read Agent recovery destination: {error}"),
+                })?;
+                let hash = render::sha256_hex(&bytes);
+                if hash != payload.next.rendered_hash {
+                    if payload
+                        .previous
+                        .as_ref()
+                        .is_none_or(|previous| hash != previous.rendered_hash)
+                    {
+                        return Err(AppError::StorageCorrupt {
+                            message: "Agent install recovery found changed destination content"
+                                .into(),
+                        });
+                    }
+                    backup_if_differs(
+                        target,
+                        payload.rendered.as_bytes(),
+                        &backups_dir_for(&state.app_data_dir),
+                        &operation.id,
+                    )
+                    .await?;
+                    atomic_write(target, payload.rendered.as_bytes()).await?;
+                }
+            }
+            Ok(_) => {
+                return Err(AppError::StorageCorrupt {
+                    message: "Agent install recovery found an unsafe destination".into(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                atomic_write(target, payload.rendered.as_bytes()).await?;
+            }
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect Agent recovery destination: {error}"),
+                });
+            }
+        }
+    }
+    match operation.phase {
+        crate::state_db::FilesystemOperationPhase::Prepared => {
+            apply_recovered_agent_install(state, &operation.id, &payload).await?;
+            database.commit_filesystem_operation(&operation.id).await
+        }
+        crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+            let records = load_ledger_for_state(state).await?;
+            if !records
+                .iter()
+                .any(|record| exact_agent_install(record, &payload.next))
+            {
+                Err(AppError::StorageCorrupt {
+                    message: "Agent install recovery lost committed ledger metadata".into(),
+                })
+            } else {
+                database.commit_filesystem_operation(&operation.id).await
+            }
+        }
+        crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+    }
+}
+
+fn recovery_file_hash(path: &Path) -> Result<Option<String>, AppError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("inspect Agent recovery file: {error}"),
+            });
+        }
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+        || metadata.len() > MAX_INSTALLED_BYTES
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent recovery found an unsafe file".into(),
+        });
+    }
+    let bytes = std::fs::read(path).map_err(|error| AppError::Io {
+        message: format!("read Agent recovery file: {error}"),
+    })?;
+    Ok(Some(render::sha256_hex(&bytes)))
+}
+
+async fn apply_recovered_agent_move(
+    state: &AppState,
+    operation_id: &str,
+    payload: &AgentMoveOperation,
+) -> Result<(), AppError> {
+    let mut records = load_ledger_for_state(state).await?;
+    let index = records
+        .iter()
+        .position(|record| same_agent_install(record, &payload.next))
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "Agent move recovery lost its ledger metadata".into(),
+        })?;
+    if exact_agent_install(&records[index], &payload.previous) {
+        records[index] = payload.next.clone();
+    } else if !exact_agent_install(&records[index], &payload.next) {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent move recovery found changed ledger metadata".into(),
+        });
+    }
+    save_ledger_after_filesystem(state, &records, operation_id).await
+}
+
+async fn recover_agent_move_operation(
+    state: &AppState,
+    database: &crate::state_db::StateDatabase,
+    operation: &crate::state_db::FilesystemOperation,
+) -> Result<(), AppError> {
+    let payload =
+        serde_json::from_value::<AgentMoveOperation>(operation.payload.clone()).map_err(|_| {
+            AppError::StorageCorrupt {
+                message: "Agent move recovery payload is invalid".into(),
+            }
+        })?;
+    if !same_agent_install(&payload.previous, &payload.next)
+        || payload.previous.rendered_hash != payload.next.rendered_hash
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent move recovery identity changed".into(),
+        });
+    }
+    let active = resolved_record_paths(state, &payload.next).await?;
+    let disabled = active
+        .iter()
+        .map(|path| disabled_destination(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    if payload.active.iter().map(PathBuf::from).collect::<Vec<_>>() != active
+        || payload
+            .disabled
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+            != disabled
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent move recovery destinations changed".into(),
+        });
+    }
+    let (sources, targets) = match operation.kind.as_str() {
+        "agent_disable"
+            if payload.previous.disabled_path.is_none() && payload.next.disabled_path.is_some() =>
+        {
+            (&active, &disabled)
+        }
+        "agent_enable"
+            if payload.previous.disabled_path.is_some() && payload.next.disabled_path.is_none() =>
+        {
+            (&disabled, &active)
+        }
+        _ => {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent move recovery transition is invalid".into(),
+            });
+        }
+    };
+    let mut remaining_sources = Vec::new();
+    let mut remaining_targets = Vec::new();
+    for (source, target) in sources.iter().zip(targets) {
+        let source_hash = recovery_file_hash(source)?;
+        let target_hash = recovery_file_hash(target)?;
+        match (source_hash.as_deref(), target_hash.as_deref()) {
+            (Some(hash), None) if hash == payload.next.rendered_hash => {
+                remaining_sources.push(source.clone());
+                remaining_targets.push(target.clone());
+            }
+            (None, Some(hash)) if hash == payload.next.rendered_hash => {}
+            _ => {
+                return Err(AppError::StorageCorrupt {
+                    message: "Agent move recovery found changed or duplicate content".into(),
+                });
+            }
+        }
+    }
+    match operation.phase {
+        crate::state_db::FilesystemOperationPhase::Prepared => {
+            if !remaining_sources.is_empty() {
+                move_managed_files(
+                    &remaining_sources,
+                    &remaining_targets,
+                    &payload.next.rendered_hash,
+                )?;
+            }
+            apply_recovered_agent_move(state, &operation.id, &payload).await?;
+            database.commit_filesystem_operation(&operation.id).await
+        }
+        crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+            if !remaining_sources.is_empty() {
+                return Err(AppError::StorageCorrupt {
+                    message: "Agent move recovery found incomplete committed files".into(),
+                });
+            }
+            let records = load_ledger_for_state(state).await?;
+            if !records
+                .iter()
+                .any(|record| exact_agent_install(record, &payload.next))
+            {
+                Err(AppError::StorageCorrupt {
+                    message: "Agent move recovery lost committed ledger metadata".into(),
+                })
+            } else {
+                database.commit_filesystem_operation(&operation.id).await
+            }
+        }
+        crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+    }
+}
+
+async fn apply_recovered_agent_uninstall(
+    state: &AppState,
+    operation_id: &str,
+    previous: &InstallRecord,
+) -> Result<(), AppError> {
+    let mut records = load_ledger_for_state(state).await?;
+    if let Some(index) = records
+        .iter()
+        .position(|record| same_agent_install(record, previous))
+    {
+        if !exact_agent_install(&records[index], previous) {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent uninstall recovery found changed ledger metadata".into(),
+            });
+        }
+        records.remove(index);
+    }
+    save_ledger_after_filesystem(state, &records, operation_id).await
+}
+
+async fn recover_agent_uninstall_operation(
+    state: &AppState,
+    database: &crate::state_db::StateDatabase,
+    operation: &crate::state_db::FilesystemOperation,
+) -> Result<(), AppError> {
+    let payload = serde_json::from_value::<AgentUninstallOperation>(operation.payload.clone())
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent uninstall recovery payload is invalid".into(),
+        })?;
+    let active = resolved_record_paths(state, &payload.previous).await?;
+    let paths = if payload.previous.disabled_path.is_some() {
+        active
+            .iter()
+            .map(|path| disabled_destination(path))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        active
+    };
+    if payload.paths.iter().map(PathBuf::from).collect::<Vec<_>>() != paths
+        || paths.len() != payload.hashes.len()
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent uninstall recovery destinations changed".into(),
+        });
+    }
+    match operation.phase {
+        crate::state_db::FilesystemOperationPhase::Prepared => {
+            for (path, expected_hash) in paths.iter().zip(&payload.hashes) {
+                match (recovery_file_hash(path)?, expected_hash) {
+                    (Some(hash), Some(expected)) if hash == *expected => {
+                        remove_file_strict(path).await?
+                    }
+                    (None, _) | (_, None) if !path.exists() => {}
+                    _ => {
+                        return Err(AppError::StorageCorrupt {
+                            message: "Agent uninstall recovery found changed content".into(),
+                        });
+                    }
+                }
+            }
+            apply_recovered_agent_uninstall(state, &operation.id, &payload.previous).await?;
+            database.commit_filesystem_operation(&operation.id).await
+        }
+        crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+            let records = load_ledger_for_state(state).await?;
+            if paths
+                .iter()
+                .map(|path| recovery_file_hash(path))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(Option::is_some)
+                || records
+                    .iter()
+                    .any(|record| same_agent_install(record, &payload.previous))
+            {
+                Err(AppError::StorageCorrupt {
+                    message: "Agent uninstall recovery found changed committed state".into(),
+                })
+            } else {
+                database.commit_filesystem_operation(&operation.id).await
+            }
+        }
+        crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+    }
+}
+
+pub(crate) async fn recover_agent_operations(state: &AppState) -> Result<(), AppError> {
+    let Some(database) = state.completed_state_database().await? else {
+        return Ok(());
+    };
+    for operation in database.pending_filesystem_operations().await? {
+        if !matches!(operation.kind.as_str(), "agent_install" | "agent_update") {
+            continue;
+        }
+        if let Err(error) = recover_agent_install_operation(state, &database, &operation).await {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+            return Err(error);
+        }
+    }
+    for operation in database.pending_filesystem_operations().await? {
+        let result = match operation.kind.as_str() {
+            "agent_disable" | "agent_enable" => {
+                recover_agent_move_operation(state, &database, &operation).await
+            }
+            "agent_uninstall" => {
+                recover_agent_uninstall_operation(state, &database, &operation).await
+            }
+            _ => continue,
+        };
+        if let Err(error) = result {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn rollback_error(action: &str, original: AppError, rollback: AppError) -> AppError {
@@ -2055,6 +2673,41 @@ pub(crate) async fn mcp_move_agent_install(
             });
         }
     }
+    let stored_disabled = records[index].disabled_path.clone();
+    let previous = records[index].clone();
+    records[index].disabled_path = if enable {
+        None
+    } else {
+        Some(disabled[0].to_string_lossy().into_owned())
+    };
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    if enable {
+                        "agent_enable"
+                    } else {
+                        "agent_disable"
+                    },
+                    &AgentMoveOperation {
+                        previous,
+                        next: records[index].clone(),
+                        active: active
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                        disabled: disabled
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     if let Some(authorization) = authorization {
         let contents = sources
             .iter()
@@ -2098,13 +2751,14 @@ pub(crate) async fn mcp_move_agent_install(
         snapshot_record(state, &records[index], sources).await?;
         move_managed_files(sources, destinations, &records[index].rendered_hash)?;
     }
-    let stored_disabled = records[index].disabled_path.clone();
-    records[index].disabled_path = if enable {
-        None
-    } else {
-        Some(disabled[0].to_string_lossy().into_owned())
+    let save = match &operation {
+        Some(operation) => save_ledger_after_filesystem(state, &records, &operation.id).await,
+        None => save_ledger_for(&state.app_data_dir, &records).await,
     };
-    if let Err(error) = save_ledger_for(&state.app_data_dir, &records).await {
+    if let Err(error) = save {
+        if operation.is_some() {
+            return Err(error);
+        }
         records[index].disabled_path = stored_disabled;
         let rollback = if let Some(authorization) = authorization {
             for (source, destination) in sources.iter().zip(destinations).rev() {
@@ -2123,6 +2777,9 @@ pub(crate) async fn mcp_move_agent_install(
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("move Agent install", error, rollback)),
         };
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     Ok(records[index].clone())
 }
@@ -2581,14 +3238,49 @@ pub async fn disable_agent(
         .iter()
         .map(|path| disabled_destination(path))
         .collect::<Result<Vec<_>, _>>()?;
+    let previous = records[index].clone();
+    records[index].disabled_path = Some(disabled[0].to_string_lossy().into_owned());
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "agent_disable",
+                    &AgentMoveOperation {
+                        previous,
+                        next: records[index].clone(),
+                        active: active
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                        disabled: disabled
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     snapshot_record(&state, &records[index], &active).await?;
     move_managed_files(&active, &disabled, &records[index].rendered_hash)?;
-    records[index].disabled_path = Some(disabled[0].to_string_lossy().into_owned());
-    if let Err(error) = save_ledger(&app, &records).await {
+    let save = match &operation {
+        Some(operation) => save_ledger_after_filesystem(&state, &records, &operation.id).await,
+        None => save_ledger(&app, &records).await,
+    };
+    if let Err(error) = save {
+        if operation.is_some() {
+            return Err(error);
+        }
         return match move_managed_files(&disabled, &active, &records[index].rendered_hash) {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("disable Agent", error, rollback)),
         };
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     Ok(records[index].clone())
 }
@@ -2629,14 +3321,49 @@ pub async fn enable_agent(
             message: "stored Agent disabled path does not match its destination".into(),
         });
     }
-    move_managed_files(&disabled, &active, &records[index].rendered_hash)?;
+    let previous = records[index].clone();
     records[index].disabled_path = None;
-    if let Err(error) = save_ledger(&app, &records).await {
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "agent_enable",
+                    &AgentMoveOperation {
+                        previous,
+                        next: records[index].clone(),
+                        active: active
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                        disabled: disabled
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+    move_managed_files(&disabled, &active, &records[index].rendered_hash)?;
+    let save = match &operation {
+        Some(operation) => save_ledger_after_filesystem(&state, &records, &operation.id).await,
+        None => save_ledger(&app, &records).await,
+    };
+    if let Err(error) = save {
+        if operation.is_some() {
+            return Err(error);
+        }
         records[index].disabled_path = Some(stored_disabled);
         return match move_managed_files(&active, &disabled, &records[index].rendered_hash) {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("enable Agent", error, rollback)),
         };
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     Ok(records[index].clone())
 }
@@ -3013,6 +3740,30 @@ async fn do_uninstall_locked(
     } else {
         Some(snapshot_record(state, &record, &existing).await?)
     };
+    let hashes = paths
+        .iter()
+        .map(|path| recovery_file_hash(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "agent_uninstall",
+                    &AgentUninstallOperation {
+                        previous: record.clone(),
+                        paths: paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                        hashes,
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     for path in &existing {
         if let Err(error) = remove_file_strict(path).await {
             if let Some(snapshot) = &snapshot {
@@ -3027,11 +3778,21 @@ async fn do_uninstall_locked(
                     return Err(rollback_error("uninstall Agent", error, rollback));
                 }
             }
+            if let (Some(database), Some(operation)) = (&database, &operation) {
+                database.abort_filesystem_operation(&operation.id).await?;
+            }
             return Err(error);
         }
     }
     ledger.remove(index);
-    if let Err(error) = save_ledger(app, &ledger).await {
+    let save = match &operation {
+        Some(operation) => save_ledger_after_filesystem(state, &ledger, &operation.id).await,
+        None => save_ledger(app, &ledger).await,
+    };
+    if let Err(error) = save {
+        if operation.is_some() {
+            return Err(error);
+        }
         if let Some(snapshot) = &snapshot {
             if let Err(rollback) = history::restore_snapshot(
                 &state.app_data_dir,
@@ -3045,6 +3806,9 @@ async fn do_uninstall_locked(
             }
         }
         return Err(error);
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     if tool_is_dir_unit(&record.tool) {
         for path in existing {
@@ -3590,6 +4354,14 @@ fn lock_project_registry(app_data_dir: &Path) -> Result<std::fs::File, AppError>
 }
 
 pub(crate) async fn registered_projects(app_data_dir: &Path) -> Result<Vec<PathBuf>, AppError> {
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        return database
+            .read(projects_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "project registry is missing after SQLite migration".into(),
+            });
+    }
     let path = project_registry_path(app_data_dir);
     if !path.exists() {
         return Ok(Vec::new());
@@ -3610,6 +4382,16 @@ async fn save_registered_projects(
     app_data_dir: &Path,
     projects: &[PathBuf],
 ) -> Result<(), AppError> {
+    validate_projects(projects)?;
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        let replacement = projects.to_vec();
+        return database
+            .mutate(projects_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await;
+    }
     let bytes = serde_json::to_vec_pretty(
         &projects
             .iter()
@@ -3620,6 +4402,37 @@ async fn save_registered_projects(
         message: format!("serialize projects.json: {error}"),
     })?;
     atomic_write(&project_registry_path(app_data_dir), &bytes).await
+}
+
+fn validate_projects(projects: &[PathBuf]) -> Result<(), AppError> {
+    let mut unique = std::collections::HashSet::new();
+    if projects.len() > MAX_REGISTERED_PROJECTS
+        || projects.iter().any(|path| {
+            !path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                })
+                || !unique.insert(path)
+        })
+    {
+        return Err(AppError::InvalidArgument {
+            message: "project registry is invalid or exceeds its limit".into(),
+        });
+    }
+    Ok(())
+}
+
+fn projects_spec() -> crate::state_db::DocumentSpec<Vec<PathBuf>> {
+    crate::state_db::DocumentSpec::new("projects", 1, MAX_PROJECT_REGISTRY_BYTES, |projects| {
+        validate_projects(projects)
+    })
+}
+
+pub(crate) fn projects_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(projects_spec(), Vec::new())
 }
 
 async fn register_project(app_data_dir: &Path, path: &str) -> Result<PathBuf, AppError> {
@@ -3865,6 +4678,207 @@ mod tests {
             installed_at: String::new(),
             corpus_version: String::new(),
         }
+    }
+
+    fn recovery_record(project: &Path, rendered_hash: String) -> InstallRecord {
+        let destination = project.join(".codex/agents/frontend-developer.toml");
+        InstallRecord {
+            slug: "frontend-developer".into(),
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/frontend-developer.md".into(),
+            tool: "codex".into(),
+            scope: crate::types::Scope::Project,
+            project_path: Some(project.to_string_lossy().into_owned()),
+            dest: destination.to_string_lossy().into_owned(),
+            source_hash: "a".repeat(64),
+            body_hash: "b".repeat(64),
+            rendered_hash,
+            disabled_path: None,
+            source_snapshot_hash: "a".repeat(64),
+            capabilities: Vec::new(),
+            publisher_key: None,
+            publisher_verified: false,
+            installed_at: "2026-08-06T00:00:00Z".into(),
+            corpus_version: "1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_agent_install_recovery_rolls_forward_exact_content_once() {
+        let app = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        database
+            .mutate(installs_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let rendered = "[agent]\nname = \"Frontend Developer\"\n".to_owned();
+        let hash = render::sha256_hex(rendered.as_bytes());
+        let project_root = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project_root.join(".codex/agents/frontend-developer.toml");
+        let next = recovery_record(&project_root, hash);
+        let operation = database
+            .prepare_filesystem_operation(
+                "agent_install",
+                &AgentInstallOperation {
+                    previous: None,
+                    next: next.clone(),
+                    targets: vec![destination.to_string_lossy().into_owned()],
+                    rendered: rendered.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, rendered).unwrap();
+
+        recover_agent_operations(&state).await.unwrap();
+        recover_agent_operations(&state).await.unwrap();
+
+        let records = load_ledger_for_state(&state).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_id, next.source_id);
+        assert_eq!(records[0].relative_path, next.relative_path);
+        assert_eq!(records[0].rendered_hash, next.rendered_hash);
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            operation.phase,
+            crate::state_db::FilesystemOperationPhase::Prepared
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_agent_move_and_uninstall_recover_once() {
+        let app = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        let rendered = "[agent]\nname = \"Frontend Developer\"\n";
+        let hash = render::sha256_hex(rendered.as_bytes());
+        let previous = recovery_record(&project, hash.clone());
+        database
+            .mutate(installs_spec(), Vec::new(), {
+                let previous = previous.clone();
+                move |records| {
+                    records.push(previous);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let active = PathBuf::from(&previous.dest);
+        let disabled = disabled_destination(&active).unwrap();
+        std::fs::create_dir_all(active.parent().unwrap()).unwrap();
+        std::fs::write(&active, rendered).unwrap();
+        let mut disabled_record = previous.clone();
+        disabled_record.disabled_path = Some(disabled.to_string_lossy().into_owned());
+        database
+            .prepare_filesystem_operation(
+                "agent_disable",
+                &AgentMoveOperation {
+                    previous: previous.clone(),
+                    next: disabled_record.clone(),
+                    active: vec![active.to_string_lossy().into_owned()],
+                    disabled: vec![disabled.to_string_lossy().into_owned()],
+                },
+            )
+            .await
+            .unwrap();
+
+        recover_agent_operations(&state).await.unwrap();
+        recover_agent_operations(&state).await.unwrap();
+        assert!(!active.exists());
+        assert_eq!(std::fs::read(&disabled).unwrap(), rendered.as_bytes());
+        assert_eq!(
+            load_ledger_for_state(&state).await.unwrap()[0].disabled_path,
+            disabled_record.disabled_path
+        );
+
+        database
+            .prepare_filesystem_operation(
+                "agent_uninstall",
+                &AgentUninstallOperation {
+                    previous: disabled_record,
+                    paths: vec![disabled.to_string_lossy().into_owned()],
+                    hashes: vec![Some(hash)],
+                },
+            )
+            .await
+            .unwrap();
+        recover_agent_operations(&state).await.unwrap();
+        recover_agent_operations(&state).await.unwrap();
+        assert!(!disabled.exists());
+        assert!(load_ledger_for_state(&state).await.unwrap().is_empty());
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_agent_uninstall_retains_changed_content() {
+        let app = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        let expected = "expected";
+        let record = recovery_record(&project, render::sha256_hex(expected.as_bytes()));
+        database
+            .mutate(installs_spec(), Vec::new(), {
+                let record = record.clone();
+                move |records| {
+                    records.push(record);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let destination = PathBuf::from(&record.dest);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, "changed").unwrap();
+        let operation = database
+            .prepare_filesystem_operation(
+                "agent_uninstall",
+                &AgentUninstallOperation {
+                    previous: record,
+                    paths: vec![destination.to_string_lossy().into_owned()],
+                    hashes: vec![Some(render::sha256_hex(expected.as_bytes()))],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(recover_agent_operations(&state).await.is_err());
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "changed");
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|pending| pending.id == operation.id && pending.recovery_error.is_some()));
     }
 
     fn built_in_result(paths: &[(&str, &str)]) -> crate::types::AgentSourceResult {

@@ -74,6 +74,13 @@ async fn lock_sources_async(app_data_dir: PathBuf) -> Result<File, AppError> {
 }
 
 async fn load_registered_sources(app_data_dir: &Path) -> Result<Vec<AgentSource>, AppError> {
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        return database.read(agent_sources_spec()).await?.ok_or_else(|| {
+            AppError::StorageCorrupt {
+                message: "Agent sources are missing after SQLite migration".into(),
+            }
+        });
+    }
     let sources = match tokio::fs::read(sources_path(app_data_dir)).await {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| AppError::JsonParse {
             command: "agent_sources_list".into(),
@@ -87,6 +94,20 @@ async fn load_registered_sources(app_data_dir: &Path) -> Result<Vec<AgentSource>
     }?;
     validate_registered_sources(&sources)?;
     Ok(sources)
+}
+
+fn validate_registered_sources_document(sources: &[AgentSource]) -> Result<(), AppError> {
+    validate_registered_sources(sources)
+}
+
+fn agent_sources_spec() -> crate::state_db::DocumentSpec<Vec<AgentSource>> {
+    crate::state_db::DocumentSpec::new("agent_sources", 1, 1_048_576, |sources| {
+        validate_registered_sources_document(sources)
+    })
+}
+
+pub(crate) fn agent_sources_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(agent_sources_spec(), Vec::new())
 }
 
 fn validate_registered_sources(sources: &[AgentSource]) -> Result<(), AppError> {
@@ -150,6 +171,16 @@ async fn save_registered_sources(
         return Err(invalid(
             "Agent source registry is invalid or exceeds its limit",
         ));
+    }
+    validate_registered_sources(sources)?;
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        let replacement = sources.to_vec();
+        return database
+            .mutate(agent_sources_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await;
     }
     let directory = corpus::state_dir(app_data_dir);
     tokio::fs::create_dir_all(&directory)

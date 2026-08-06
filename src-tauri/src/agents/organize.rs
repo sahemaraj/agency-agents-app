@@ -395,6 +395,14 @@ fn validate_state(state: &AgentLibraryState) -> Result<(), AppError> {
 }
 
 async fn load(app_data_dir: &Path) -> Result<AgentLibraryState, AppError> {
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        return database
+            .read(document_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent library is missing after SQLite migration".into(),
+            });
+    }
     let path = library_path(app_data_dir);
     let state = match tokio::fs::read(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| AppError::JsonParse {
@@ -413,8 +421,29 @@ async fn load(app_data_dir: &Path) -> Result<AgentLibraryState, AppError> {
     Ok(state)
 }
 
+fn document_spec() -> crate::state_db::DocumentSpec<AgentLibraryState> {
+    crate::state_db::DocumentSpec::new("agent_library", 1, 1_048_576, validate_state)
+}
+
+pub(crate) fn import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(document_spec(), AgentLibraryState::default())
+}
+
 async fn save(app_data_dir: &Path, state: &AgentLibraryState) -> Result<(), AppError> {
     validate_state(state)?;
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        let replacement = state.clone();
+        return database
+            .mutate(
+                document_spec(),
+                AgentLibraryState::default(),
+                move |current| {
+                    *current = replacement;
+                    Ok(())
+                },
+            )
+            .await;
+    }
     let bytes = serde_json::to_vec_pretty(state).map_err(|error| AppError::Internal {
         message: format!("serialize Agent library: {error}"),
     })?;
@@ -1031,6 +1060,61 @@ async fn approve_with_execution(
     Ok(result)
 }
 
+pub(crate) async fn reconcile_draft_publish_approval(
+    state: &AppState,
+    approval_id: Option<&str>,
+    draft_id: &str,
+    plan_revision: &str,
+    completed: bool,
+    error: Option<String>,
+) -> Result<(), AppError> {
+    let Some(approval_id) = approval_id else {
+        return Ok(());
+    };
+    let _guard = lock_library_async(state.app_data_dir.clone()).await?;
+    let mut library = load(&state.app_data_dir).await?;
+    let approval = library
+        .approvals
+        .iter_mut()
+        .find(|approval| approval.id == approval_id)
+        .ok_or_else(|| invalid("recovered Agent approval no longer exists"))?;
+    if approval.request
+        != (AgentApprovalAction::DraftPublish {
+            id: draft_id.to_owned(),
+            plan_revision: plan_revision.to_owned(),
+        })
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Recovered Agent approval revision does not match its operation".into(),
+        });
+    }
+    if approval.state == AgentApprovalState::Approved && completed {
+        return Ok(());
+    }
+    if !matches!(
+        approval.state,
+        AgentApprovalState::Running | AgentApprovalState::Pending
+    ) {
+        return Err(AppError::StorageCorrupt {
+            message: "Recovered Agent approval is in an incompatible state".into(),
+        });
+    }
+    if completed {
+        approval.state = AgentApprovalState::Approved;
+        approval.result = Some("completed".into());
+    } else {
+        approval.state = AgentApprovalState::Pending;
+        approval.result = Some(error.unwrap_or_else(|| "publication recovery rolled back".into()));
+    }
+    let result = approval.clone();
+    save(&state.app_data_dir, &library).await?;
+    drop(_guard);
+    if completed {
+        append_approval_audit(state, &result, "terminal", true).await?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn agent_library_list(state: State<'_, AppState>) -> Result<AgentLibraryState, AppError> {
     list(&state).await
@@ -1111,6 +1195,34 @@ mod tests {
         let mut state = AppState::build().unwrap();
         state.app_data_dir = root.to_path_buf();
         state
+    }
+
+    #[tokio::test]
+    async fn sqlite_library_preserves_independent_state_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .mutate(document_spec(), AgentLibraryState::default(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let left = state(root.path());
+        let right = state(root.path());
+
+        let (left_result, right_result) = tokio::join!(
+            create_folder(&left, "Engineering".into()),
+            create_folder(&right, "Operations".into()),
+        );
+        left_result.unwrap();
+        right_result.unwrap();
+
+        assert_eq!(
+            list(&left).await.unwrap().folders,
+            ["Engineering", "Operations"]
+        );
     }
 
     #[tokio::test]
@@ -1394,6 +1506,52 @@ mod tests {
                 .state,
             crate::types::AgentDraftState::Published
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_reconciles_only_the_bound_running_draft_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let app = state(root.path());
+        let revision = "a".repeat(64);
+        let approval = submit_approval(
+            &app,
+            "codex".into(),
+            AgentApprovalAction::DraftPublish {
+                id: Uuid::new_v4().to_string(),
+                plan_revision: revision.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let approval_id = approval.id.clone();
+        let draft_id = match &approval.request {
+            AgentApprovalAction::DraftPublish { id, .. } => id.clone(),
+            _ => unreachable!(),
+        };
+        let mut library = load(root.path()).await.unwrap();
+        library.approvals[0].state = AgentApprovalState::Running;
+        save(root.path(), &library).await.unwrap();
+
+        reconcile_draft_publish_approval(
+            &app,
+            Some(&approval_id),
+            &draft_id,
+            &revision,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reconciled = list(&app)
+            .await
+            .unwrap()
+            .approvals
+            .into_iter()
+            .find(|item| item.id == approval_id)
+            .unwrap();
+        assert_eq!(reconciled.state, AgentApprovalState::Approved);
+        assert_eq!(reconciled.result.as_deref(), Some("completed"));
     }
 
     #[tokio::test]

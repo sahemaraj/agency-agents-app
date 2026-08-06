@@ -27,6 +27,116 @@ const MCP_AUDIT_MAX_BYTES: usize = 1024 * 1024;
 const MCP_AUDIT_PROCESS_LOCK_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_AUDIT_OS_LOCK_DEADLINE: Duration = Duration::from_secs(1);
 const MCP_AUDIT_LOCK_RETRY: Duration = Duration::from_millis(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistenceDocument {
+    pub(crate) name: &'static str,
+    pub(crate) relative_path: &'static str,
+    pub(crate) version: u32,
+    pub(crate) max_bytes: u64,
+    pub(crate) parser: &'static str,
+    pub(crate) validator: &'static str,
+}
+
+impl PersistenceDocument {
+    const fn json(
+        name: &'static str,
+        relative_path: &'static str,
+        max_bytes: u64,
+        validator: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            relative_path,
+            version: 1,
+            max_bytes,
+            parser: "json",
+            validator,
+        }
+    }
+}
+
+pub(crate) const PERSISTENCE_INVENTORY: &[PersistenceDocument] = &[
+    PersistenceDocument::json("settings", "settings.json", 1_048_576, "settings"),
+    PersistenceDocument::json("catalog", "state/catalog.json", 65_536, "catalog_source"),
+    PersistenceDocument::json(
+        "skill_sources",
+        "state/skill-sources.json",
+        1_048_576,
+        "skill_sources",
+    ),
+    PersistenceDocument::json(
+        "skill_trust",
+        "state/skill-trust.json",
+        1_048_576,
+        "skill_trust",
+    ),
+    PersistenceDocument::json(
+        "skill_drafts",
+        "state/skill-drafts.json",
+        16_777_216,
+        "skill_drafts",
+    ),
+    PersistenceDocument::json(
+        "skill_library",
+        "state/skill-folders.json",
+        4_194_304,
+        "skill_library",
+    ),
+    PersistenceDocument::json(
+        "skill_installs",
+        "state/skill-installs.json",
+        16_777_216,
+        "skill_installs",
+    ),
+    PersistenceDocument::json(
+        "agent_sources",
+        "state/agent-sources.json",
+        1_048_576,
+        "agent_sources",
+    ),
+    PersistenceDocument::json(
+        "agent_drafts",
+        "state/agent-drafts.json",
+        8_388_608,
+        "agent_drafts",
+    ),
+    PersistenceDocument::json(
+        "agent_library",
+        "state/agent-library.json",
+        1_048_576,
+        "agent_library",
+    ),
+    PersistenceDocument::json("installs", "state/installs.json", 16_777_216, "installs"),
+    PersistenceDocument::json("projects", "state/projects.json", 65_536, "projects"),
+    PersistenceDocument::json("experts", "state/experts.json", 4_194_304, "experts"),
+    PersistenceDocument::json(
+        "expert_activation_requests",
+        "state/expert-activation-requests.json",
+        524_288,
+        "expert_activation_requests",
+    ),
+    PersistenceDocument::json(
+        "expert_activations",
+        "state/expert-activations.json",
+        524_288,
+        "expert_activations",
+    ),
+    PersistenceDocument::json(
+        "expert_runs",
+        "state/expert-runs.json",
+        4_194_304,
+        "expert_runs",
+    ),
+    PersistenceDocument {
+        name: "mcp_audit",
+        relative_path: "state/mcp-audit.jsonl",
+        version: 1,
+        max_bytes: 1_048_576,
+        parser: "jsonl",
+        validator: "mcp_audit",
+    },
+];
 #[cfg(test)]
 static MCP_AUDIT_FAILURES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
@@ -62,6 +172,12 @@ pub struct AppState {
     /// derive their paths from this; the security gates that check "is
     /// this path inside our app data dir?" anchor on it too.
     pub app_data_dir: PathBuf,
+
+    #[cfg(not(test))]
+    pub(crate) storage_lease: std::sync::Mutex<Option<crate::state_db::StorageLease>>,
+
+    #[cfg(not(test))]
+    pub(crate) state_database: crate::state_db::StateDatabase,
 
     /// Phase 1 (corpus) — memoized in-memory corpus (parsed agents +
     /// index). Built lazily on the first `corpus_*` command (seed + parse
@@ -101,6 +217,51 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn release_storage_lease(&self) -> Result<(), AppError> {
+        #[cfg(not(test))]
+        {
+            self.storage_lease
+                .lock()
+                .map_err(|_| AppError::Internal {
+                    message: "storage lease lock is poisoned".into(),
+                })?
+                .take();
+        }
+        Ok(())
+    }
+
+    fn reacquire_storage_lease(&self) -> Result<(), AppError> {
+        #[cfg(not(test))]
+        {
+            let lease = crate::state_db::StorageLease::shared(&self.app_data_dir)?;
+            *self.storage_lease.lock().map_err(|_| AppError::Internal {
+                message: "storage lease lock is poisoned".into(),
+            })? = Some(lease);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn completed_state_database(
+        &self,
+    ) -> Result<Option<crate::state_db::StateDatabase>, AppError> {
+        #[cfg(not(test))]
+        let database = self.state_database.clone();
+        #[cfg(test)]
+        return crate::state_db::StateDatabase::completed(&self.app_data_dir).await;
+
+        #[cfg(not(test))]
+        match database.migration_state().await? {
+            crate::types::StorageMigrationState::Complete => Ok(Some(database)),
+            crate::types::StorageMigrationState::Legacy
+            | crate::types::StorageMigrationState::InProgress
+            | crate::types::StorageMigrationState::Corrupt => Ok(None),
+            crate::types::StorageMigrationState::Unsupported => Err(AppError::StorageUnsupported {
+                found: crate::state_db::SCHEMA_VERSION.saturating_add(1),
+                supported: crate::state_db::SCHEMA_VERSION,
+            }),
+        }
+    }
+
     /// Build the state at startup. Resolves the app-data directory and
     /// loads persisted settings; the corpus and updater caches start
     /// empty and hydrate lazily on first use.
@@ -116,6 +277,11 @@ impl AppState {
             })?;
         }
 
+        #[cfg(not(test))]
+        let storage_lease = crate::state_db::StorageLease::shared(&app_data_dir)?;
+        #[cfg(not(test))]
+        let state_database = crate::state_db::StateDatabase::open(&app_data_dir)?;
+
         // Load settings synchronously at startup. The loader handles
         // file-absent (FirstLaunch → defaults), file-corrupt (Corrupt →
         // fail closed in `require_network`), and good parse (Loaded(s)).
@@ -129,6 +295,10 @@ impl AppState {
 
         Ok(Self {
             app_data_dir,
+            #[cfg(not(test))]
+            storage_lease: std::sync::Mutex::new(Some(storage_lease)),
+            #[cfg(not(test))]
+            state_database,
             corpus_cache: Arc::new(Mutex::new(None)),
             corpus_refresh_in_flight: Arc::new(Mutex::new(())),
             skill_sources_write_lock: Arc::new(Mutex::new(())),
@@ -345,7 +515,20 @@ fn mcp_denied(action: McpAction) -> AppError {
     }
 }
 
-pub async fn append_mcp_audit(app_data_dir: &Path, entry: McpAuditEntry) -> Result<(), AppError> {
+pub async fn append_mcp_audit(
+    app_data_dir: &Path,
+    mut entry: McpAuditEntry,
+) -> Result<(), AppError> {
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        sanitize_mcp_audit(&mut entry);
+        return database
+            .mutate_quiet(mcp_audit_spec(), Vec::new(), move |entries| {
+                entries.insert(0, entry);
+                entries.truncate(MCP_AUDIT_MAX_ENTRIES);
+                Ok(())
+            })
+            .await;
+    }
     let app_data_dir = app_data_dir.to_path_buf();
     tokio::task::spawn_blocking(move || append_mcp_audit_blocking(&app_data_dir, entry))
         .await
@@ -355,12 +538,83 @@ pub async fn append_mcp_audit(app_data_dir: &Path, entry: McpAuditEntry) -> Resu
 }
 
 pub async fn load_mcp_audit(app_data_dir: &Path) -> Result<Vec<McpAuditEntry>, AppError> {
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        return database
+            .read(mcp_audit_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "MCP audit is missing after SQLite migration".into(),
+            });
+    }
     let app_data_dir = app_data_dir.to_path_buf();
     tokio::task::spawn_blocking(move || load_mcp_audit_blocking(&app_data_dir))
         .await
         .map_err(|error| AppError::Internal {
             message: format!("MCP audit task failed: {error}"),
         })?
+}
+
+fn validate_mcp_audit(entries: &[McpAuditEntry]) -> Result<(), AppError> {
+    if entries.len() > MCP_AUDIT_MAX_ENTRIES
+        || entries.iter().any(|entry| {
+            let mut sanitized = entry.clone();
+            sanitize_mcp_audit(&mut sanitized);
+            sanitized != *entry
+        })
+    {
+        return Err(AppError::InvalidArgument {
+            message: "MCP audit contains unbounded or unredacted entries".into(),
+        });
+    }
+    Ok(())
+}
+
+fn mcp_audit_spec() -> crate::state_db::DocumentSpec<Vec<McpAuditEntry>> {
+    crate::state_db::DocumentSpec::new("mcp_audit", 1, MCP_AUDIT_MAX_BYTES as u64, |entries| {
+        validate_mcp_audit(entries)
+    })
+}
+
+fn parse_mcp_audit_import(raw: &[u8]) -> Result<String, AppError> {
+    let mut entries = raw
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<McpAuditEntry>(line).map_err(|_| AppError::StorageCorrupt {
+                message: "MCP audit legacy state is malformed".into(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.reverse();
+    entries.truncate(MCP_AUDIT_MAX_ENTRIES);
+    validate_mcp_audit(&entries).map_err(|_| AppError::StorageCorrupt {
+        message: "MCP audit legacy state is invalid".into(),
+    })?;
+    serde_json::to_string(&entries).map_err(|_| AppError::Internal {
+        message: "serialize MCP audit migration state".into(),
+    })
+}
+
+fn migration_import_specs() -> Vec<crate::state_db::ImportSpec> {
+    vec![
+        crate::commands::settings::settings_import_spec(),
+        crate::corpus::catalog_source_import_spec(),
+        crate::skills::skill_sources_import_spec(),
+        crate::skills::skill_trust_import_spec(),
+        crate::skills::drafts::import_spec(),
+        crate::skills::organize::import_spec(),
+        crate::skills::install::import_spec(),
+        crate::agents::agent_sources_import_spec(),
+        crate::agents::drafts::import_spec(),
+        crate::agents::organize::import_spec(),
+        crate::install::installs_import_spec(),
+        crate::install::projects_import_spec(),
+        crate::experts::experts_import_spec(),
+        crate::experts::activation_requests_import_spec(),
+        crate::experts::activations_import_spec(),
+        crate::expert_runs::import_spec(),
+        crate::state_db::ImportSpec::new("mcp_audit", "", parse_mcp_audit_import),
+    ]
 }
 
 #[tauri::command]
@@ -783,6 +1037,204 @@ pub fn initialize<R: tauri::Runtime>(
     Ok(())
 }
 
+pub(crate) async fn recover_filesystem_operations(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<(), AppError> {
+    if state.completed_state_database().await?.is_none() {
+        return Ok(());
+    }
+    let mut failures = Vec::new();
+    for result in [
+        crate::skills::drafts::recover_publish_operations(state).await,
+        crate::agents::drafts::recover_publish_operations(state).await,
+        crate::skills::recover_install_operations(state).await,
+        crate::install::recover_agent_operations(state).await,
+        crate::experts::recover_activation_operations(app, state).await,
+    ] {
+        if let Err(error) = result {
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::StorageCorrupt {
+            message: format!(
+                "filesystem recovery requires attention: {}",
+                failures.join("; ")
+            ),
+        })
+    }
+}
+
+async fn migration_status(
+    state: &AppState,
+) -> Result<crate::types::StorageMigrationStatus, AppError> {
+    let database = crate::state_db::StateDatabase::open(&state.app_data_dir)?;
+    let migration_state = database.migration_state().await?;
+    let (stage, detail, legacy_conflicts) = match migration_state {
+        crate::types::StorageMigrationState::Legacy => (
+            Some("checkingData".into()),
+            Some("Ready for the one-time data update.".into()),
+            Vec::new(),
+        ),
+        crate::types::StorageMigrationState::InProgress => (
+            Some("movingRecords".into()),
+            Some("The previous update was interrupted and can be retried safely.".into()),
+            Vec::new(),
+        ),
+        crate::types::StorageMigrationState::Complete => {
+            let pending = database.pending_filesystem_operations().await?;
+            let recovery_errors = pending
+                .iter()
+                .filter_map(|operation| operation.recovery_error.as_deref())
+                .collect::<Vec<_>>();
+            let conflicts = database
+                .legacy_conflicts(&state.app_data_dir, PERSISTENCE_INVENTORY)
+                .await?;
+            if pending.is_empty() {
+                (
+                    Some("complete".into()),
+                    Some(
+                        "Data update complete. Reopen connected Claude and Codex sessions.".into(),
+                    ),
+                    conflicts,
+                )
+            } else {
+                (
+                    Some("recovery".into()),
+                    Some(if recovery_errors.is_empty() {
+                        "Finishing an interrupted package operation.".into()
+                    } else {
+                        recovery_errors.join("; ")
+                    }),
+                    conflicts,
+                )
+            }
+        }
+        crate::types::StorageMigrationState::Corrupt => (
+            Some("failed".into()),
+            Some("Nothing was lost. Fix the reported data issue, then retry.".into()),
+            Vec::new(),
+        ),
+        crate::types::StorageMigrationState::Unsupported => (
+            Some("unsupported".into()),
+            Some("This data was created by a newer Agency Agents version.".into()),
+            Vec::new(),
+        ),
+    };
+    Ok(crate::types::StorageMigrationStatus {
+        state: migration_state,
+        stage,
+        detail,
+        legacy_conflicts,
+    })
+}
+
+#[tauri::command]
+pub async fn storage_migration_status(
+    state: State<'_, AppState>,
+) -> Result<crate::types::StorageMigrationStatus, AppError> {
+    migration_status(&state).await
+}
+
+async fn run_storage_migration(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<crate::types::StorageMigrationStatus, AppError> {
+    let database = crate::state_db::StateDatabase::open(&state.app_data_dir)?;
+    state.release_storage_lease()?;
+    let result = database
+        .import_legacy(
+            &state.app_data_dir,
+            PERSISTENCE_INVENTORY,
+            &migration_import_specs(),
+        )
+        .await;
+    let lease = state.reacquire_storage_lease();
+    let outcome = match (result, lease) {
+        (Ok(outcome), Ok(())) => outcome,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(import_error), Err(lease_error)) => {
+            return Err(AppError::Internal {
+                message: format!(
+                    "storage migration failed ({import_error}); storage lease recovery also failed ({lease_error})"
+                ),
+            });
+        }
+    };
+    recover_filesystem_operations(app, state).await?;
+    let mut status = migration_status(state).await?;
+    status.detail = Some(format!(
+        "Data update complete. Verified backup: {}. Reopen connected Claude and Codex sessions.",
+        outcome.backup_dir.display()
+    ));
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn storage_migration_start(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::types::StorageMigrationStatus, AppError> {
+    run_storage_migration(&app, &state).await
+}
+
+#[tauri::command]
+pub async fn storage_migration_retry(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::types::StorageMigrationStatus, AppError> {
+    run_storage_migration(&app, &state).await
+}
+
+#[tauri::command]
+pub async fn storage_visible_revision(state: State<'_, AppState>) -> Result<u64, AppError> {
+    let database = crate::state_db::StateDatabase::open(&state.app_data_dir)?;
+    if database.migration_state().await? == crate::types::StorageMigrationState::Complete {
+        database.visible_revision().await
+    } else {
+        Ok(0)
+    }
+}
+
+#[tauri::command]
+pub async fn storage_backup(state: State<'_, AppState>) -> Result<String, AppError> {
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "SQLite migration must complete before creating a live backup".into(),
+            })?;
+    let destination = state.app_data_dir.join("state/backups").join(format!(
+        "agency-agents-{}.sqlite3",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ")
+    ));
+    database.backup_to(&destination).await?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub async fn storage_open_data_directory(state: State<'_, AppState>) -> Result<(), AppError> {
+    crate::install::reveal_path(state.app_data_dir.to_string_lossy().into_owned()).await
+}
+
+#[tauri::command]
+pub async fn storage_legacy_conflicts_dismiss(state: State<'_, AppState>) -> Result<(), AppError> {
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "SQLite migration must complete before dismissing legacy conflicts".into(),
+            })?;
+    database
+        .dismiss_legacy_conflicts(&state.app_data_dir, PERSISTENCE_INVENTORY)
+        .await
+}
+
 // ---------- Tests ----------
 
 #[cfg(test)]
@@ -790,6 +1242,84 @@ mod tests {
     use super::*;
     use crate::commands::settings::Settings;
     use crate::types::McpAuditEntry;
+
+    #[tokio::test]
+    async fn every_persistence_document_has_a_working_import_validator() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+
+        database
+            .import_legacy(
+                root.path(),
+                PERSISTENCE_INVENTORY,
+                &migration_import_specs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database.migration_state().await.unwrap(),
+            crate::types::StorageMigrationState::Complete
+        );
+        let connection =
+            rusqlite::Connection::open(root.path().join("state/agency-agents.sqlite3")).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM state_documents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, PERSISTENCE_INVENTORY.len() as i64);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual rehearsal against an explicitly copied app-data directory"]
+    async fn copied_real_state_migrates_with_semantic_equality() {
+        let root = PathBuf::from(
+            std::env::var("AGENCY_AGENTS_REHEARSAL_DIR")
+                .expect("set AGENCY_AGENTS_REHEARSAL_DIR to a copied app-data directory"),
+        );
+        assert!(root.join(".sqlite-rehearsal-copy").is_file());
+        let database = crate::state_db::StateDatabase::open(&root).unwrap();
+        database
+            .import_legacy(&root, PERSISTENCE_INVENTORY, &migration_import_specs())
+            .await
+            .unwrap();
+
+        let connection =
+            rusqlite::Connection::open(root.join("state/agency-agents.sqlite3")).unwrap();
+        for document in PERSISTENCE_INVENTORY {
+            let payload: String = connection
+                .query_row(
+                    "SELECT payload FROM state_documents WHERE name = ?1",
+                    [document.name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let source = root.join(document.relative_path);
+            if !source.is_file() {
+                continue;
+            }
+            let expected = if document.parser == "jsonl" {
+                serde_json::to_value(load_mcp_audit_blocking(&root).unwrap()).unwrap()
+            } else {
+                serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap()
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+                expected
+            );
+        }
+
+        let restored = root.join("rehearsal-restore/state/agency-agents.sqlite3");
+        database.backup_to(&restored).await.unwrap();
+        let restored = rusqlite::Connection::open(restored).unwrap();
+        let integrity: String = restored
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        let documents: i64 = restored
+            .query_row("SELECT count(*) FROM state_documents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(documents, PERSISTENCE_INVENTORY.len() as i64);
+    }
 
     /// Build a minimal AppState whose only meaningful field is `settings`.
     /// All other fields use whatever `AppState::build` resolves — for the
@@ -803,6 +1333,70 @@ mod tests {
             *guard = slot;
         }
         state
+    }
+
+    #[test]
+    fn persistence_inventory_covers_every_live_legacy_document() {
+        let actual = PERSISTENCE_INVENTORY
+            .iter()
+            .map(|document| {
+                format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    document.name,
+                    document.relative_path,
+                    document.version,
+                    document.max_bytes,
+                    document.parser,
+                    document.validator
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            actual,
+            "settings|settings.json|1|1048576|json|settings\n\
+catalog|state/catalog.json|1|65536|json|catalog_source\n\
+skill_sources|state/skill-sources.json|1|1048576|json|skill_sources\n\
+skill_trust|state/skill-trust.json|1|1048576|json|skill_trust\n\
+skill_drafts|state/skill-drafts.json|1|16777216|json|skill_drafts\n\
+skill_library|state/skill-folders.json|1|4194304|json|skill_library\n\
+skill_installs|state/skill-installs.json|1|16777216|json|skill_installs\n\
+agent_sources|state/agent-sources.json|1|1048576|json|agent_sources\n\
+agent_drafts|state/agent-drafts.json|1|8388608|json|agent_drafts\n\
+agent_library|state/agent-library.json|1|1048576|json|agent_library\n\
+installs|state/installs.json|1|16777216|json|installs\n\
+projects|state/projects.json|1|65536|json|projects\n\
+experts|state/experts.json|1|4194304|json|experts\n\
+expert_activation_requests|state/expert-activation-requests.json|1|524288|json|expert_activation_requests\n\
+expert_activations|state/expert-activations.json|1|524288|json|expert_activations\n\
+expert_runs|state/expert-runs.json|1|4194304|json|expert_runs\n\
+mcp_audit|state/mcp-audit.jsonl|1|1048576|jsonl|mcp_audit"
+        );
+
+        let mut names = PERSISTENCE_INVENTORY
+            .iter()
+            .map(|document| document.name)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            PERSISTENCE_INVENTORY.len(),
+            "document names must be unique"
+        );
+
+        let mut paths = PERSISTENCE_INVENTORY
+            .iter()
+            .map(|document| document.relative_path)
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(
+            paths.len(),
+            PERSISTENCE_INVENTORY.len(),
+            "legacy paths must be unique"
+        );
     }
 
     #[tokio::test]
@@ -1366,6 +1960,43 @@ mod tests {
         assert_eq!(saved.skipped_update_versions, vec!["9.9.10"]);
         assert!(saved.paranoid_mode);
         assert!(!saved.ai_features_enabled);
+    }
+
+    #[tokio::test]
+    async fn sqlite_audit_is_bounded_redacted_and_revision_neutral() {
+        let app = tempfile::tempdir().expect("app data");
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        database
+            .mutate_quiet(mcp_audit_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let revision = database.visible_revision().await.unwrap();
+
+        append_mcp_audit(
+            app.path(),
+            McpAuditEntry {
+                id: "audit".into(),
+                timestamp: "2026-08-06T00:00:00Z".into(),
+                client: None,
+                tool: "not trusted".into(),
+                action: "invalid".into(),
+                phase: "invalid".into(),
+                success: false,
+                project_path: Some("token=secret".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(database.visible_revision().await.unwrap(), revision);
+        let entries = load_mcp_audit(app.path()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tool, "[redacted]");
+        assert_eq!(entries[0].project_path.as_deref(), Some("[redacted]"));
     }
 
     #[tokio::test]

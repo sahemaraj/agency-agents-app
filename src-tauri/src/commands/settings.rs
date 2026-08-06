@@ -402,6 +402,66 @@ pub fn settings_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("settings.json")
 }
 
+fn validate_persisted_settings(settings: &Settings) -> Result<(), AppError> {
+    let mut clamped = settings.clone();
+    clamped.clamp();
+    if clamped != *settings {
+        return Err(AppError::InvalidArgument {
+            message: "persisted settings exceed supported bounds".into(),
+        });
+    }
+    Ok(())
+}
+
+fn settings_spec() -> crate::state_db::DocumentSpec<Settings> {
+    crate::state_db::DocumentSpec::new(
+        "settings",
+        1,
+        MAX_SETTINGS_BYTES,
+        validate_persisted_settings,
+    )
+}
+
+pub(crate) fn settings_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(settings_spec(), Settings::default())
+}
+
+fn settings_database(
+    app_data_dir: &Path,
+) -> Result<Option<crate::state_db::StateDatabase>, AppError> {
+    if !app_data_dir
+        .join("state")
+        .join("agency-agents.sqlite3")
+        .exists()
+    {
+        return Ok(None);
+    }
+    let database = crate::state_db::StateDatabase::open(app_data_dir)?;
+    match database.migration_state_blocking()? {
+        crate::types::StorageMigrationState::Complete => Ok(Some(database)),
+        crate::types::StorageMigrationState::Legacy
+        | crate::types::StorageMigrationState::InProgress => Ok(None),
+        crate::types::StorageMigrationState::Corrupt => Err(AppError::StorageCorrupt {
+            message: "settings database is corrupt".into(),
+        }),
+        crate::types::StorageMigrationState::Unsupported => Err(AppError::StorageUnsupported {
+            found: crate::state_db::SCHEMA_VERSION.saturating_add(1),
+            supported: crate::state_db::SCHEMA_VERSION,
+        }),
+    }
+}
+
+async fn settings_database_async(
+    app_data_dir: &Path,
+) -> Result<Option<crate::state_db::StateDatabase>, AppError> {
+    let app_data_dir = app_data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || settings_database(&app_data_dir))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("settings database task failed: {error}"),
+        })?
+}
+
 /// Synchronous startup loader. Called from `AppState::build()` (which is
 /// a non-async function) so we use the blocking `std::fs` API rather
 /// than tokio. The trade-off accepted is a single small read on startup
@@ -410,6 +470,25 @@ pub fn settings_path(app_data_dir: &Path) -> PathBuf {
 /// Returns the same three-state shape as the async loader so callers
 /// stay uniform.
 pub fn load_at_startup(app_data_dir: &Path) -> SettingsLoadState {
+    match settings_database(app_data_dir) {
+        Ok(Some(database)) => {
+            return match database.read_blocking(settings_spec()) {
+                Ok(Some(settings)) => SettingsLoadState::Loaded(settings),
+                Ok(None) => SettingsLoadState::Corrupt {
+                    message: "settings are missing after SQLite migration".into(),
+                },
+                Err(error) => SettingsLoadState::Corrupt {
+                    message: error.to_string(),
+                },
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return SettingsLoadState::Corrupt {
+                message: error.to_string(),
+            };
+        }
+    }
     let path = settings_path(app_data_dir);
 
     let meta = match std::fs::metadata(&path) {
@@ -474,6 +553,25 @@ pub fn load_at_startup(app_data_dir: &Path) -> SettingsLoadState {
 /// non-blocking. Used by tests and any future callers that need to
 /// re-read from disk without blocking the runtime.
 pub(crate) async fn load_async(app_data_dir: &Path) -> SettingsLoadState {
+    match settings_database_async(app_data_dir).await {
+        Ok(Some(database)) => {
+            return match database.read(settings_spec()).await {
+                Ok(Some(settings)) => SettingsLoadState::Loaded(settings),
+                Ok(None) => SettingsLoadState::Corrupt {
+                    message: "settings are missing after SQLite migration".into(),
+                },
+                Err(error) => SettingsLoadState::Corrupt {
+                    message: error.to_string(),
+                },
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return SettingsLoadState::Corrupt {
+                message: error.to_string(),
+            };
+        }
+    }
     let path = settings_path(app_data_dir);
 
     let meta = match tokio::fs::metadata(&path).await {
@@ -546,6 +644,17 @@ pub(crate) async fn persist(
                 MAX_SETTINGS_BYTES
             ),
         });
+    }
+
+    if let Some(database) = settings_database_async(app_data_dir).await? {
+        let replacement = settings.clone();
+        database
+            .mutate(settings_spec(), Settings::default(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await?;
+        return Ok(settings);
     }
 
     // Defense in depth — ensure the parent dir exists. `AppState::build`
@@ -810,6 +919,49 @@ mod tests {
             .effective_settings()
             .expect("first launch has defaults");
         assert!(!effective.paranoid_mode);
+    }
+
+    #[tokio::test]
+    async fn completed_sqlite_settings_are_authoritative_and_corruption_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        let stored = Settings {
+            paranoid_mode: true,
+            ..Settings::default()
+        };
+        database
+            .mutate(settings_spec(), Settings::default(), move |settings| {
+                *settings = stored;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(
+            settings_path(root.path()),
+            serde_json::to_vec(&Settings::default()).unwrap(),
+        )
+        .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            load_at_startup(root.path()),
+            SettingsLoadState::Loaded(Settings {
+                paranoid_mode: true,
+                ..
+            })
+        ));
+
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Corrupt)
+            .await
+            .unwrap();
+        assert!(matches!(
+            load_at_startup(root.path()),
+            SettingsLoadState::Corrupt { .. }
+        ));
     }
 
     /// File-corrupt (bad JSON) → fail closed.

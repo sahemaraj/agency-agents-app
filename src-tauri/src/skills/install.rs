@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::corpus::state_dir;
 use crate::error::AppError;
+use crate::state::AppState;
 use crate::types::{SkillInstallRecord, SkillInstallState, SkillPackageFile};
 use crate::util::fs::atomic_write;
 
@@ -45,6 +46,84 @@ pub async fn save_ledger(
         message: format!("serialize skill-installs.json: {error}"),
     })?;
     atomic_write(&ledger_path(app_data_dir), &bytes).await
+}
+
+fn validate_ledger(records: &[SkillInstallRecord]) -> Result<(), AppError> {
+    if records.iter().any(|record| {
+        record.source_id.is_empty()
+            || record.relative_path.is_empty()
+            || record.name.is_empty()
+            || !matches!(record.runtime.as_str(), "claudeCode" | "codex")
+            || !matches!(record.scope.as_str(), "user" | "project")
+            || record.source_hash.len() != 64
+            || record.installed_hash.len() != 64
+    }) {
+        return Err(AppError::InvalidArgument {
+            message: "persisted skill install ledger is invalid".into(),
+        });
+    }
+    Ok(())
+}
+
+fn document_spec() -> crate::state_db::DocumentSpec<Vec<SkillInstallRecord>> {
+    crate::state_db::DocumentSpec::new("skill_installs", 1, 16_777_216, |records| {
+        validate_ledger(records)
+    })
+}
+
+pub(crate) fn import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(document_spec(), Vec::new())
+}
+
+pub async fn load_ledger_for_state(state: &AppState) -> Result<Vec<SkillInstallRecord>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(document_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "skill install ledger is missing after SQLite migration".into(),
+            });
+    }
+    load_ledger(&state.app_data_dir).await
+}
+
+pub async fn save_ledger_for_state(
+    state: &AppState,
+    records: &[SkillInstallRecord],
+) -> Result<(), AppError> {
+    validate_ledger(records)?;
+    if let Some(database) = state.completed_state_database().await? {
+        let replacement = records.to_vec();
+        return database
+            .mutate(document_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await;
+    }
+    save_ledger(&state.app_data_dir, records).await
+}
+
+pub async fn save_ledger_after_filesystem(
+    state: &AppState,
+    records: &[SkillInstallRecord],
+    operation_id: &str,
+) -> Result<(), AppError> {
+    validate_ledger(records)?;
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Skill install operation lost its SQLite database".into(),
+            })?;
+    let replacement = records.to_vec();
+    database
+        .mutate_after_filesystem(document_spec(), Vec::new(), operation_id, move |current| {
+            *current = replacement;
+            Ok(())
+        })
+        .await
 }
 
 pub fn target_path(
@@ -519,6 +598,29 @@ pub fn install_validated_directory_in_project(
     backups: &Path,
     replace_managed: bool,
 ) -> Result<String, AppError> {
+    install_validated_directory_in_project_with_id(
+        root,
+        source,
+        files,
+        destination,
+        backups,
+        replace_managed,
+        &Uuid::new_v4().to_string(),
+    )
+}
+
+pub fn install_validated_directory_in_project_with_id(
+    root: &fs::File,
+    source: &Path,
+    files: &[SkillPackageFile],
+    destination: &Path,
+    backups: &Path,
+    replace_managed: bool,
+    transaction_id: &str,
+) -> Result<String, AppError> {
+    Uuid::parse_str(transaction_id).map_err(|_| AppError::InvalidArgument {
+        message: "skill install transaction id is invalid".into(),
+    })?;
     validate_project_relative(destination)?;
     let verified = verified_inventory_files(source, files)?;
     let parent = destination
@@ -543,7 +645,6 @@ pub fn install_validated_directory_in_project(
     }
     ensure_project_replacement_cleanup(had_destination, cfg!(not(windows)))?;
 
-    let transaction_id = Uuid::new_v4();
     let stage = PathBuf::from(format!(".agency-skill-{transaction_id}.stage"));
     let retired = PathBuf::from(format!(".agency-skill-{transaction_id}.previous"));
     write_project_tree(&parent_dir, &stage, &verified)?;
@@ -883,6 +984,27 @@ pub fn install_validated_directory(
     backups: &Path,
     replace_managed: bool,
 ) -> Result<String, AppError> {
+    install_validated_directory_with_id(
+        source,
+        files,
+        destination,
+        backups,
+        replace_managed,
+        &Uuid::new_v4().to_string(),
+    )
+}
+
+pub fn install_validated_directory_with_id(
+    source: &Path,
+    files: &[SkillPackageFile],
+    destination: &Path,
+    backups: &Path,
+    replace_managed: bool,
+    transaction_id: &str,
+) -> Result<String, AppError> {
+    Uuid::parse_str(transaction_id).map_err(|_| AppError::InvalidArgument {
+        message: "skill install transaction id is invalid".into(),
+    })?;
     let verified = verified_inventory_files(source, files)?;
     let parent = destination
         .parent()
@@ -904,7 +1026,6 @@ pub fn install_validated_directory(
         });
     }
 
-    let transaction_id = Uuid::new_v4();
     let stage = parent.join(format!(".agency-skill-{transaction_id}.stage"));
     let retired = parent.join(format!(".agency-skill-{transaction_id}.previous"));
     fs::create_dir_all(&stage).map_err(|error| AppError::Io {

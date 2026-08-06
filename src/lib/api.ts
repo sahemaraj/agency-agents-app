@@ -62,7 +62,20 @@ import type {
   AgentDiff,
   InstallRecord,
   Tool,
+  StorageMigrationStatus,
 } from "./types";
+
+export const storageMigrationStatus = () =>
+  invoke<StorageMigrationStatus>("storage_migration_status");
+export const storageMigrationStart = () =>
+  invoke<StorageMigrationStatus>("storage_migration_start");
+export const storageMigrationRetry = () =>
+  invoke<StorageMigrationStatus>("storage_migration_retry");
+export const storageVisibleRevision = () => invoke<number>("storage_visible_revision");
+export const storageBackup = () => invoke<string>("storage_backup");
+export const storageOpenDataDirectory = () => invoke<void>("storage_open_data_directory");
+export const storageLegacyConflictsDismiss = () =>
+  invoke<void>("storage_legacy_conflicts_dismiss");
 
 // ============================================================
 // Agent sources, drafts, and personal library
