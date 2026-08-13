@@ -15,7 +15,7 @@
    * agent, division, or team on the left; install into the project's tools on
    * the right) — so an empty project can be filled.
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import EmptyState from "./EmptyState.svelte";
   import Pill from "./Pill.svelte";
   import Button from "./Button.svelte";
@@ -37,7 +37,28 @@
   import { toast } from "$lib/stores/toast.svelte";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { InstalledAgent } from "$lib/types";
+  import { appErrorMessage, isAppError, type InstalledAgent } from "$lib/types";
+
+  const installTruthFresh = $derived(install.reconciled && !install.reconcileError);
+  const mutationTruthFresh = $derived(installTruthFresh && skillSources.reconciled && !skillSources.reconcileError);
+  const installTruthMessage = $derived(install.reconcileError ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.") : i18n.optional("reconcile.checking", "Checking installation status…"));
+  let projectsRoot: HTMLElement | undefined = $state();
+  let reconcileAnnouncement = $state("");
+  let priorReconcileError: string | null = $state(null);
+  let priorReconcileTerminal = $state(0);
+  let priorReconciling = $state(false);
+  $effect(() => {
+    const { reconcileError: error, reconciling, reconcileTerminal: terminal } = install;
+    if (reconciling && !priorReconciling) reconcileAnnouncement = i18n.optional("reconcile.refreshing", error ? "Refreshing installation status…" : "Checking installation status…");
+    else if (error && (error !== priorReconcileError || terminal !== priorReconcileTerminal)) reconcileAnnouncement = priorReconcileError ? i18n.optional("reconcile.stillOutOfDate", "Installation status is still out of date. {message}", { message: error }) : i18n.optional("reconcile.outOfDate", "Installation status may be out of date. {message}", { message: error });
+    else if (!error && priorReconcileError && !reconciling) reconcileAnnouncement = i18n.optional("reconcile.upToDate", "Installation status is up to date.");
+    priorReconcileError = error; priorReconcileTerminal = terminal; priorReconciling = reconciling;
+  });
+  async function retryReconcile(event: MouseEvent): Promise<void> {
+    const restoreFocus = event.currentTarget === document.activeElement;
+    await install.reconcile();
+    if (!install.reconcileError && restoreFocus) { await tick(); projectsRoot?.focus({ preventScroll: true }); }
+  }
 
   onMount(() => {
     corpus.ensureLoaded();
@@ -125,7 +146,7 @@
     try {
       await install.revealPath(path);
     } catch (e) {
-      toast.error(i18n.t("common.couldNotOpenFolder"), String(e));
+      toast.error(i18n.t("common.couldNotOpenFolder"), isAppError(e) ? appErrorMessage(e) : String(e));
     }
   }
 
@@ -150,7 +171,7 @@
       await projects.unregister(path);
       finishRemove(path);
     } catch (e) {
-      toast.error(i18n.t("common.actionFailed"), String(e));
+      toast.error(i18n.t("common.actionFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
     } finally {
       deleteBusy = false;
     }
@@ -159,7 +180,7 @@
   // "Remove & uninstall" — delete the agents THIS APP installed here (never the
   // user's own files; uninstall backs up modified files first), then forget.
   async function uninstallAndRemove() {
-    if (!confirm || deleteBusy) return;
+    if (!mutationTruthFresh || !confirm || deleteBusy) return;
     const { path } = confirm;
     deleteBusy = true;
     try {
@@ -176,7 +197,7 @@
       await projects.unregister(path);
       finishRemove(path);
     } catch (e) {
-      toast.error(i18n.t("common.actionFailed"), String(e));
+      toast.error(i18n.t("common.actionFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
     } finally {
       deleteBusy = false;
     }
@@ -197,7 +218,16 @@
   }
 </script>
 
-<section class="pr">
+<section class="pr" bind:this={projectsRoot} tabindex="-1">
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{reconcileAnnouncement}</div>
+  {#if install.reconcileError}
+    <aside class="install-truth-warning" aria-busy={install.reconciling}>
+      <div class="reconcile-copy"><strong>{i18n.optional("reconcile.heading", "Installation status may be out of date")}</strong><p><span>{install.reconcileError}</span> {install.reconciled ? i18n.optional("reconcile.retained", "Your last known installation data is still shown.") : installTruthMessage}</p></div>
+      <Button size="sm" loading={install.reconciling} onclick={(event) => void retryReconcile(event)}>{install.reconciling ? i18n.optional("reconcile.retrying", "Retrying…") : i18n.optional("reconcile.retry", "Retry status check")}</Button>
+    </aside>
+  {:else if !install.reconciled}
+    <p class="install-truth-checking">{installTruthMessage}</p>
+  {/if}
   {#if selected}
     <!-- ── Detail ── -->
     <header class="pr-head detail">
@@ -206,18 +236,20 @@
         <h2 class="dh-label">{selected.label}</h2>
         <button class="dh-path" title={selected.path} onclick={() => reveal(selected.path)}>{selected.path}</button>
       </div>
-      <span class="dh-count">{i18n.count(selected.installedCount, "common.agent.one", "common.agent.many")}</span>
+      <span class="dh-count">{install.reconciled ? i18n.count(rosterFor(selected.path).length, "common.agent.one", "common.agent.many") : installTruthMessage}</span>
       <button class="btn" onclick={() => reveal(selected.path)}><FolderOpen size={15} /><span>{i18n.t("common.reveal")}</span></button>
-      <button class="btn primary" onclick={() => (browseFor = selected.path)}>{i18n.t("teams.deploy")}</button>
-      <button class="btn danger-ic" title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: selected.installedCount, skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
+      <button class="btn primary" disabled={!installTruthFresh} onclick={() => (browseFor = selected.path)}>{i18n.t("teams.deploy")}</button>
+      <button class="btn danger-ic" disabled={!mutationTruthFresh} title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: rosterFor(selected.path).length, skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
     </header>
 
     <div class="scroll">
-      {#if detailGroups.length === 0}
+      {#if !install.reconciled}
+        <p class="install-truth-unavailable">{installTruthMessage}</p>
+      {:else if detailGroups.length === 0}
         <div class="d-empty">
           <LayersIcon size={40} />
           <p>{i18n.t("projects.emptyHere")}</p>
-          <Button variant="primary" onclick={() => (browseFor = selected.path)}>{i18n.t("projects.deployDivisionTeam")}</Button>
+          <Button variant="primary" disabled={!installTruthFresh} onclick={() => (browseFor = selected.path)}>{i18n.t("projects.deployDivisionTeam")}</Button>
         </div>
       {:else}
         <div class="groups">
@@ -283,7 +315,7 @@
                 <span class="proj-label">{project.label}</span>
                 <span class="proj-path" title={project.path}>{project.path}</span>
               </span>
-              <span class="proj-count">{i18n.count(project.installedCount, "common.agent.one", "common.agent.many")}</span>
+              <span class="proj-count">{install.reconciled ? i18n.count(rosterFor(project.path).length, "common.agent.one", "common.agent.many") : "—"}</span>
               <ChevronRight size={16} class="proj-go" />
             </button>
           </li>
@@ -312,7 +344,7 @@
     {#snippet actions()}
       <Button variant="secondary" modalAction="cancel" onclick={() => (confirm = null)}>{i18n.t("common.cancel")}</Button>
       {#if (confirm?.agentCount ?? 0) + (confirm?.skillCount ?? 0) > 0}
-        <Button variant="danger" disabled={deleteBusy} onclick={uninstallAndRemove}>
+        <Button variant="danger" disabled={!mutationTruthFresh || deleteBusy} onclick={uninstallAndRemove}>
           {i18n.t("projects.deleteUninstall", { count: (confirm?.agentCount ?? 0) + (confirm?.skillCount ?? 0) })}
         </Button>
       {/if}
@@ -323,6 +355,10 @@
 
 <style>
   .pr { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  .install-truth-warning { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); border-bottom: 1px solid var(--color-warning); background: var(--color-warning-subtle); color: var(--color-warning-strong); font-size: var(--text-body-sm); }
+  .install-truth-warning span { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; text-wrap: pretty; }
+  .install-truth-warning button { flex: none; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-raised); }
+  .install-truth-unavailable { height: 100%; display: grid; place-items: center; padding: var(--space-6); color: var(--color-warning-strong); font-size: var(--text-body-sm); text-wrap: pretty; }
   .pr-head {
     flex: none; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
     padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border);

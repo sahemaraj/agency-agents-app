@@ -32,6 +32,7 @@ import {
   agentVersionRollback,
 } from "$lib/api";
 import { agentInstallKey } from "$lib/agents/libraryModel";
+import { appErrorMessage, isAppError } from "$lib/types";
 import type {
   AgentDiff,
   AgentMutationPlan,
@@ -95,6 +96,11 @@ class InstallStore {
   /** True once the first reconcile has completed (so we can tell "empty"
       apart from "not scanned yet"). */
   reconciled: boolean = $state(false);
+  /** Latest reconcile failure. Retained while retrying, cleared only by success. */
+  reconcileError: string | null = $state(null);
+  /** Actual scan attempt and latest terminal attempt, for transition announcements. */
+  reconcileAttempt = $state(0);
+  reconcileTerminal = $state(0);
   /** Tools currently checked in the "Install into…" menu. Persisted so the
       choice is remembered for the next agent and the next launch. */
   selectedTools: Tool[] = $state([]);
@@ -150,15 +156,18 @@ class InstallStore {
    */
   async reconcile(): Promise<void> {
     if (reconcileInflight) return reconcileInflight;
+    const attempt = ++this.reconcileAttempt;
     this.reconciling = true;
     reconcileInflight = (async () => {
       try {
         const result = await invoke<InstalledAgent[]>("installs_reconcile", { projectRoots: [] });
         this.installed = result;
         this.reconciled = true;
-      } catch {
-        // keep prior `installed`; just stop the spinner
+        this.reconcileError = null;
+      } catch (error) {
+        this.reconcileError = isAppError(error) ? appErrorMessage(error) : String(error);
       } finally {
+        this.reconcileTerminal = attempt;
         this.reconciling = false;
         reconcileInflight = null;
       }

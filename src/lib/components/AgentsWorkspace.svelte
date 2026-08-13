@@ -10,7 +10,7 @@
    * not a separate destination — so "what an agent does" and "where it's
    * installed" are finally visible together.
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import SearchIcon from "@lucide/svelte/icons/search";
   import RefreshIcon from "@lucide/svelte/icons/refresh-cw";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
@@ -21,6 +21,7 @@
   import LayersIcon from "@lucide/svelte/icons/layers";
 
   import Input from "./Input.svelte";
+  import Button from "./Button.svelte";
   import Pill from "./Pill.svelte";
   import EmptyState from "./EmptyState.svelte";
   import LoadingState from "./LoadingState.svelte";
@@ -122,6 +123,7 @@
   function buckets(slug: string): Set<Lens> {
     const rows = installsBySlug.get(slug) ?? [];
     const s = new Set<Lens>();
+    if (!install.reconciled) return s;
     if (rows.length === 0) { s.add("none"); return s; }
     for (const r of rows) {
       if (r.state === "current") s.add("current");
@@ -301,6 +303,7 @@
   let creatorButton: HTMLButtonElement | undefined = $state();
   let organizerButton: HTMLButtonElement | undefined = $state();
   let approvalsButton: HTMLButtonElement | undefined = $state();
+  let rescanButton: HTMLButtonElement | undefined = $state();
   async function editLibraryAgent() {
     if (!panelPackage) return;
     const text = await agentTextRead(panelPackage.reference);
@@ -369,14 +372,16 @@
   });
 
   const selInstalls = $derived([...selected].flatMap((slug) => installsBySlug.get(slug) ?? []));
-  const canBulkUpdate = $derived(selInstalls.some((i) => i.state !== "current"));
-  const canBulkTrack = $derived(selInstalls.some((i) => i.state === "foreign"));
+  const installTruthFresh = $derived(install.reconciled && !install.reconcileError);
+  const canBulkUpdate = $derived(installTruthFresh && selInstalls.some((i) => i.state !== "current"));
+  const canBulkTrack = $derived(installTruthFresh && selInstalls.some((i) => i.state === "foreign"));
   // Foreign rows = files we don't manage ("not ours"). When the selection has any,
   // the destructive action is a genuine delete; otherwise it's a reversible
   // uninstall (catalog agents re-install; any edits are backed up first).
   const selHasForeign = $derived(selInstalls.some((i) => i.state === "foreign"));
 
   async function runBulk(action: "update" | "track" | "uninstall", verbKey: MessageKey) {
+    if (!installTruthFresh) return;
     let picked = selInstalls;
     if (action === "update") picked = selInstalls.filter((i) => i.state !== "current");
     else if (action === "track") picked = selInstalls.filter((i) => i.state === "foreign");
@@ -396,6 +401,47 @@
   }
 
   const scanning = $derived(install.reconciling && !install.reconciled);
+  let reconcileAnnouncement = $state("");
+  let priorReconcileError: string | null = $state(null);
+  let priorReconcileTerminal = $state(0);
+  let priorReconciling = $state(false);
+
+  $effect(() => {
+    const error = install.reconcileError;
+    const reconciling = install.reconciling;
+    const terminal = install.reconcileTerminal;
+    if (reconciling && !priorReconciling) {
+      reconcileAnnouncement = i18n.optional(
+        "reconcile.refreshing",
+        error ? "Refreshing installation status…" : "Checking installation status…",
+      );
+    } else if (error && (error !== priorReconcileError || terminal !== priorReconcileTerminal)) {
+      reconcileAnnouncement = priorReconcileError
+        ? i18n.optional("reconcile.stillOutOfDate", "Installation status is still out of date. {message}", { message: error })
+        : i18n.optional("reconcile.outOfDate", "Installation status may be out of date. {message}", { message: error });
+    } else if (!error && priorReconcileError && !reconciling) {
+      reconcileAnnouncement = i18n.optional("reconcile.upToDate", "Installation status is up to date.");
+    }
+    priorReconcileError = error;
+    priorReconcileTerminal = terminal;
+    priorReconciling = reconciling;
+  });
+
+  async function retryReconcile(event: MouseEvent): Promise<void> {
+    const restoreFocus = event.currentTarget === document.activeElement;
+    reconcileAnnouncement = i18n.optional("reconcile.refreshing", "Refreshing installation status…");
+    await install.reconcile();
+    if (install.reconcileError) {
+      reconcileAnnouncement = i18n.optional(
+        "reconcile.stillOutOfDate",
+        "Installation status is still out of date. {message}",
+        { message: install.reconcileError },
+      );
+    } else if (restoreFocus) {
+      await tick();
+      rescanButton?.focus({ preventScroll: true });
+    }
+  }
 </script>
 
 <section class="ws" class:sel={!!panelAgent}>
@@ -436,7 +482,7 @@
             <button class="ghost" onclick={enterSelect}>{i18n.t("common.select")}</button>
           {/if}
         {/if}
-        <button class="ghost icon" title={i18n.t("agents.rescanTitle")} aria-label={i18n.t("agents.rescanTitle")} onclick={() => install.reconcile()}>
+        <button class="ghost icon" data-install-rescan bind:this={rescanButton} title={i18n.t("agents.rescanTitle")} aria-label={i18n.t("agents.rescanTitle")} onclick={() => install.reconcile()}>
           <RefreshIcon size={15} />
         </button>
       </div>
@@ -487,7 +533,7 @@
                   <button class="bulk-opt" role="menuitem" disabled={!canBulkTrack} title={canBulkTrack ? "" : i18n.t("agents.nothingUntrackedSelection")} onclick={() => runBulk("track", "agents.trackedVerb")}>
                     <PlusIcon size={14} /><span>{i18n.t("agents.trackSelected")}</span>
                   </button>
-                  <button class="bulk-opt" class:danger={selHasForeign} role="menuitem" onclick={() => { menuOpen = false; confirmDelete = true; }}>
+                  <button class="bulk-opt" class:danger={selHasForeign} role="menuitem" disabled={!installTruthFresh} onclick={() => { menuOpen = false; confirmDelete = true; }}>
                     <TrashIcon size={14} /><span>{i18n.t(selHasForeign ? "agents.deleteSelected" : "agents.uninstallSelected")}</span>
                   </button>
                 </div>
@@ -497,6 +543,27 @@
         </div>
       {/if}
     </div>
+
+    <div class="reconcile-announcement" role="status" aria-live="polite" aria-atomic="true">{reconcileAnnouncement}</div>
+    {#if install.reconcileError}
+      <aside class="reconcile-warning" aria-busy={install.reconciling}>
+        <AlertTriangle size={16} aria-hidden="true" />
+        <div class="reconcile-copy">
+          <strong>{i18n.optional("reconcile.heading", "Installation status may be out of date")}</strong>
+          <p class="reconcile-message">
+            <span>{install.reconcileError}</span>
+            {install.reconciled
+              ? i18n.optional("reconcile.retained", "Your last known installation data is still shown.")
+              : i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.")}
+          </p>
+        </div>
+        <Button size="sm" loading={install.reconciling} onclick={(event) => void retryReconcile(event)}>
+          {install.reconciling
+            ? i18n.optional("reconcile.retrying", "Retrying…")
+            : i18n.optional("reconcile.retry", "Retry status check")}
+        </Button>
+      </aside>
+    {/if}
 
     <div class="lp-list">
       {#if divisionMeta}
@@ -671,7 +738,7 @@
     <p class="cd-note">{i18n.t("agents.confirmTip")}</p>
     <div class="cd-actions">
       <button class="cd-cancel" onclick={() => (confirmDelete = false)}>{i18n.t("common.cancel")}</button>
-      <button class="cd-delete" disabled={bulkBusy} onclick={() => { confirmDelete = false; runBulk("uninstall", selHasForeign ? "agents.deletedVerb" : "agents.uninstalledVerb"); }}>
+      <button class="cd-delete" disabled={bulkBusy || !installTruthFresh} onclick={() => { if (!installTruthFresh) return; confirmDelete = false; void runBulk("uninstall", selHasForeign ? "agents.deletedVerb" : "agents.uninstalledVerb"); }}>
         <TrashIcon size={14} /> {i18n.t(selHasForeign ? "common.delete" : "common.uninstall")} {selInstalls.length}
       </button>
     </div>
@@ -690,6 +757,16 @@
   }
   .lp-search-row { display: flex; align-items: center; gap: var(--space-2); }
   .lp-search-row :global(.wrap) { flex: 1; min-width: 0; }
+  .reconcile-announcement { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .reconcile-warning {
+    flex: none; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2);
+    padding: var(--space-2) var(--space-4); border-bottom: 1px solid var(--color-warning);
+    background: var(--color-warning-subtle); color: var(--color-warning-strong);
+  }
+  .reconcile-copy { flex: 1 1 auto; min-width: 0; display: grid; gap: var(--space-1); }
+  .reconcile-copy strong { font-size: var(--text-body); font-weight: var(--fw-medium); line-height: var(--lh-snug); text-wrap: balance; }
+  .reconcile-message { margin: 0; font-size: var(--text-body-sm); line-height: var(--lh-normal); overflow-wrap: anywhere; text-wrap: pretty; }
+  .reconcile-message span { margin-right: var(--space-1); }
 
   .ghost {
     display: inline-flex; align-items: center; gap: 6px; flex: none;

@@ -22,7 +22,7 @@
   import { catalog } from "$lib/stores/catalog.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { toast } from "$lib/stores/toast.svelte";
-  import type { CatalogCandidate } from "$lib/types";
+  import { appErrorMessage, isAppError, type CatalogCandidate } from "$lib/types";
 
   let expanded = $state<"clone" | null>(null);
   let manage = $state(true);
@@ -34,7 +34,7 @@
       await fn();
       toast.success(ok);
     } catch (e) {
-      toast.error(i18n.t("firstRun.error"), String(e));
+      toast.error(i18n.t("firstRun.error"), isAppError(e) ? appErrorMessage(e) : String(e));
     }
   }
 

@@ -1218,7 +1218,8 @@ pub async fn storage_backup(state: State<'_, AppState>) -> Result<String, AppErr
 
 #[tauri::command]
 pub async fn storage_open_data_directory(state: State<'_, AppState>) -> Result<(), AppError> {
-    crate::install::reveal_path(state.app_data_dir.to_string_lossy().into_owned()).await
+    crate::install::reveal_path_for_state(&state, state.app_data_dir.to_string_lossy().into_owned())
+        .await
 }
 
 #[tauri::command]

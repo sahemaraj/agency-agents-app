@@ -32,16 +32,18 @@
   import { i18n } from "$lib/stores/i18n.svelte";
   import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
   import { canApplyAgentPlan, installStateMessageKey, sameAgent } from "$lib/agents/libraryModel";
-  import type {
-    Tool,
-    Agent,
-    AgentMutationPlan,
-    AgentPackageResult,
-    AgentReference,
-    AgentUpdatePolicy,
-    AgentVersionSnapshot,
-    InstalledAgent,
-    InstallState,
+  import {
+    appErrorMessage,
+    isAppError,
+    type Tool,
+    type Agent,
+    type AgentMutationPlan,
+    type AgentPackageResult,
+    type AgentReference,
+    type AgentUpdatePolicy,
+    type AgentVersionSnapshot,
+    type InstalledAgent,
+    type InstallState,
   } from "$lib/types";
 
   interface Props {
@@ -53,6 +55,7 @@
     onClose: () => void;
   }
   let { title, agentSlugs = [], agentPackage, collectionName, onClose }: Props = $props();
+  const installTruthFresh = $derived(install.reconciled && !install.reconciling && !install.reconcileError);
 
   onMount(() => {
     projects.refresh();
@@ -146,15 +149,16 @@
     const destination = targetOf(row);
     const cov = cover(t.id, destination);
     const isBusy = busy === cellKey(t.id, destination);
+    const unavailable = i18n.optional("reconcile.unavailableLabel", "Installation status unavailable");
     return {
       state: cov.all ? "on" : cov.some ? "partial" : "off",
       busy: isBusy,
-      disabled: total === 0,
-      title: i18n.t("install.cellTitle", { tool: t.label, target: row.kind === "global" ? i18n.t("common.global") : row.label }),
-      ariaLabel: i18n.t(cov.all ? "install.removeFromAria" : "install.installIntoAria", {
+      disabled: !installTruthFresh || total === 0,
+      title: installTruthFresh ? i18n.t("install.cellTitle", { tool: t.label, target: row.kind === "global" ? i18n.t("common.global") : row.label }) : unavailable,
+      ariaLabel: installTruthFresh ? i18n.t(cov.all ? "install.removeFromAria" : "install.installIntoAria", {
         tool: t.label,
         target: row.kind === "global" ? i18n.t("install.globally") : i18n.t("install.inProject", { project: row.label }),
-      }),
+      }) : unavailable,
     };
   }
 
@@ -220,6 +224,7 @@
     tool: Tool,
     target: string | null,
   ) {
+    if (!installTruthFresh) return;
     planLoading = true;
     actionError = null;
     try {
@@ -230,7 +235,7 @@
         collectionName: null,
       };
     } catch (error) {
-      actionError = String(error);
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
       planLoading = false;
     }
@@ -241,7 +246,7 @@
     tool: Tool,
     target: string | null,
   ) {
-    if (!collectionName) return;
+    if (!installTruthFresh || !collectionName) return;
     planLoading = true;
     actionError = null;
     try {
@@ -252,14 +257,14 @@
         collectionName,
       };
     } catch (error) {
-      actionError = String(error);
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
       planLoading = false;
     }
   }
 
   async function applyPlan() {
-    if (!pending || !canApplyAgentPlan(pending.plan)) return;
+    if (!installTruthFresh || !pending || !canApplyAgentPlan(pending.plan)) return;
     const { operation, reference, collectionName: pendingCollection, plan } = pending;
     busy = cellKey(plan.tool, plan.projectPath);
     actionError = null;
@@ -280,7 +285,7 @@
       toast.success(i18n.t("agents.lifecycleApplied", { operation }));
       pending = null;
     } catch (error) {
-      actionError = String(error);
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
       busy = null;
     }
@@ -290,7 +295,7 @@
     action: "track" | "disable" | "enable",
     row: InstalledAgent,
   ) {
-    if (!exactReference) return;
+    if (!installTruthFresh || !exactReference) return;
     busy = cellKey(row.tool, row.projectPath);
     actionError = null;
     try {
@@ -299,7 +304,7 @@
       else await install.enableReference(exactReference, row.tool, row.projectPath);
       toast.success(i18n.t("agents.lifecycleApplied", { operation: action }));
     } catch (error) {
-      actionError = String(error);
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
       busy = null;
     }
@@ -314,12 +319,12 @@
     try {
       snapshots = await install.history(exactReference, row.tool, row.projectPath);
     } catch (error) {
-      actionError = String(error);
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     }
   }
 
   async function rollback(snapshotId: string) {
-    if (!exactReference || !historyRow) return;
+    if (!install.reconciled || install.reconciling || install.reconcileError || !exactReference || !historyRow) return;
     if (rollbackConfirm !== snapshotId) {
       rollbackConfirm = snapshotId;
       return;
@@ -333,7 +338,7 @@
       historyRow = null;
       rollbackConfirm = null;
     } catch (error) {
-      actionError = String(error);
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
       busy = null;
     }
@@ -348,7 +353,7 @@
   }
 
   async function toggle(tool: Tool, target: string | null) {
-    if (busy) return;
+    if (!installTruthFresh || busy) return;
     const cov = cover(tool, target);
     if (cov.all) {
       if (collectionName) {
@@ -392,6 +397,7 @@
   }
 
   async function remove(tool: Tool, target: string | null, rs: InstalledAgent[]) {
+    if (!install.reconciled || install.reconciling || install.reconcileError) return;
     busy = cellKey(tool, target);
     try {
       const { ok, fail } = await install.bulk(
@@ -406,7 +412,7 @@
   }
 
   async function confirmRemove() {
-    if (!confirm) return;
+    if (!install.reconciled || install.reconciling || install.reconcileError || !confirm) return;
     const { tool, target, rows: rs } = confirm;
     confirm = null;
     await remove(tool, target, rs);
@@ -526,18 +532,18 @@
               <button onclick={() => (diffRow = row)}>{i18n.t("agents.reviewDiff")}</button>
             {/if}
             {#if ["outdated", "modified", "missing"].includes(row.state)}
-              <button onclick={() => reviewPlan("update", exactReference, row.tool, row.projectPath)}>{i18n.t("common.update")}</button>
+              <button disabled={!installTruthFresh} onclick={() => reviewPlan("update", exactReference, row.tool, row.projectPath)}>{i18n.t("common.update")}</button>
             {/if}
             {#if row.state === "foreign"}
-              <button onclick={() => runLifecycle("track", row)}>{i18n.t("agents.track")}</button>
+              <button disabled={!installTruthFresh} onclick={() => runLifecycle("track", row)}>{i18n.t("agents.track")}</button>
             {:else}
               {#if row.state === "disabled"}
-                <button onclick={() => runLifecycle("enable", row)}>{i18n.t("agents.enable")}</button>
+                <button disabled={!installTruthFresh} onclick={() => runLifecycle("enable", row)}>{i18n.t("agents.enable")}</button>
               {:else if row.state === "current" || row.state === "outdated"}
-                <button onclick={() => runLifecycle("disable", row)}>{i18n.t("agents.disable")}</button>
+                <button disabled={!installTruthFresh} onclick={() => runLifecycle("disable", row)}>{i18n.t("agents.disable")}</button>
               {/if}
               <button onclick={() => showHistory(row)}>{i18n.t("agents.versionHistory")}</button>
-              <button class="danger" onclick={() => reviewPlan("uninstall", exactReference, row.tool, row.projectPath)}>{i18n.t("common.uninstall")}</button>
+              <button class="danger" disabled={!installTruthFresh} onclick={() => reviewPlan("uninstall", exactReference, row.tool, row.projectPath)}>{i18n.t("common.uninstall")}</button>
             {/if}
           </div>
         </article>
@@ -555,8 +561,8 @@
             <span>{[...target.states].map((state) => i18n.t(installStateMessageKey(state))).join(", ")}</span>
           </div>
           <div class="row-actions">
-            <button onclick={() => reviewCollection("update", target.tool, target.projectPath)}>{i18n.t("common.update")}</button>
-            <button class="danger" onclick={() => reviewCollection("uninstall", target.tool, target.projectPath)}>{i18n.t("common.uninstall")}</button>
+            <button disabled={!installTruthFresh} onclick={() => reviewCollection("update", target.tool, target.projectPath)}>{i18n.t("common.update")}</button>
+            <button class="danger" disabled={!installTruthFresh} onclick={() => reviewCollection("uninstall", target.tool, target.projectPath)}>{i18n.t("common.uninstall")}</button>
           </div>
         </article>
       {/each}
@@ -573,7 +579,7 @@
           <div class="snapshot">
             <span>{new Date(snapshot.createdAt).toLocaleString()}</span>
             <code>{snapshot.sourceHash.slice(0, 12)}</code>
-            <button onclick={() => rollback(snapshot.id)}>
+            <button disabled={!installTruthFresh} onclick={() => rollback(snapshot.id)}>
               {rollbackConfirm === snapshot.id ? i18n.t("agents.confirmRollback") : i18n.t("agents.rollback")}
             </button>
           </div>
@@ -633,7 +639,7 @@
   {#snippet actions()}
     {#if pending}
       <Button onclick={() => (pending = null)}>{i18n.t("common.cancel")}</Button>
-      <Button variant="primary" disabled={!canApplyAgentPlan(pending.plan) || !!busy} onclick={applyPlan}>{i18n.t("agents.applyPlan")}</Button>
+      <Button variant="primary" disabled={!installTruthFresh || !canApplyAgentPlan(pending.plan) || !!busy} onclick={applyPlan}>{i18n.t("agents.applyPlan")}</Button>
     {:else}
       <span class="legend"><span class="dot full"></span> {i18n.t("common.installed")} <span class="dot half"></span> {i18n.t("common.some")} <span class="dot"></span> {i18n.t("common.none")}</span>
       <Button variant="primary" onclick={onClose}>{i18n.t("common.done")}</Button>
@@ -660,6 +666,7 @@
     title={i18n.t("install.deleteTitle", { count: n, label })}
     confirmLabel={i18n.t("install.deleteConfirm", { count: n })}
     cancelLabel={i18n.t("common.cancel")}
+    confirmDisabled={!installTruthFresh}
     onConfirm={confirmRemove}
     onCancel={() => (confirm = null)}
   >

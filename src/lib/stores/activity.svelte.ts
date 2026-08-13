@@ -15,7 +15,7 @@
  */
 
 import { mcpAuditList } from "$lib/api";
-import type { McpAuditEntry, Tool } from "$lib/types";
+import { appErrorMessage, isAppError, type McpAuditEntry, type Tool } from "$lib/types";
 
 /** Bumped v1 -> v2: the persisted shape changed from streaming jobs to journal
  *  entries. The old v1 store was never populated (no backend emitted stream
@@ -27,7 +27,7 @@ const MAX_ENTRIES = 500;
 const PERSIST_DEBOUNCE_MS = 400;
 
 export function safeActivityDetail(value: unknown): string {
-  return String(value)
+  return (isAppError(value) ? appErrorMessage(value) : String(value))
     .replace(/-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/gi, "[redacted]")
     .replace(/:\/\/[^/\s:@]+:[^@\s/]+@/g, "://[redacted]@")
     .replace(/authorization:\s*bearer\s+\S+/gi, "Authorization: [redacted]")

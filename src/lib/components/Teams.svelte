@@ -12,7 +12,7 @@
    * "Your team" reads the live install ledger (reconciled in +layout). Saved
    * teams live in the teams store (localStorage). Presets are bundled data.
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import EmptyState from "./EmptyState.svelte";
   import Pill from "./Pill.svelte";
   import Modal from "./Modal.svelte";
@@ -41,8 +41,28 @@
   import { PRESET_TEAMS } from "$lib/data/presetTeams";
   import { TEAM_EXAMPLES } from "$lib/data/playbook";
   import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-  import type { InstalledAgent, Agent } from "$lib/types";
+  import { appErrorMessage, isAppError, type InstalledAgent, type Agent } from "$lib/types";
   import type { Component } from "svelte";
+
+  const installTruthFresh = $derived(install.reconciled && !install.reconcileError);
+  const installTruthMessage = $derived(install.reconcileError ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.") : i18n.optional("reconcile.checking", "Checking installation status…"));
+  let currentTab: HTMLButtonElement | undefined = $state();
+  let reconcileAnnouncement = $state("");
+  let priorReconcileError: string | null = $state(null);
+  let priorReconcileTerminal = $state(0);
+  let priorReconciling = $state(false);
+  $effect(() => {
+    const { reconcileError: error, reconciling, reconcileTerminal: terminal } = install;
+    if (reconciling && !priorReconciling) reconcileAnnouncement = i18n.optional("reconcile.refreshing", error ? "Refreshing installation status…" : "Checking installation status…");
+    else if (error && (error !== priorReconcileError || terminal !== priorReconcileTerminal)) reconcileAnnouncement = priorReconcileError ? i18n.optional("reconcile.stillOutOfDate", "Installation status is still out of date. {message}", { message: error }) : i18n.optional("reconcile.outOfDate", "Installation status may be out of date. {message}", { message: error });
+    else if (!error && priorReconcileError && !reconciling) reconcileAnnouncement = i18n.optional("reconcile.upToDate", "Installation status is up to date.");
+    priorReconcileError = error; priorReconcileTerminal = terminal; priorReconciling = reconciling;
+  });
+  async function retryReconcile(event: MouseEvent): Promise<void> {
+    const restoreFocus = event.currentTarget === document.activeElement;
+    await install.reconcile();
+    if (!install.reconcileError && restoreFocus) { await tick(); currentTab?.focus({ preventScroll: true }); }
+  }
 
   onMount(() => {
     corpus.ensureLoaded();
@@ -237,7 +257,7 @@
       const n = await install.exportLoadout(path);
       toast.success(i18n.t("teams.exportedToast", { count: n }), path);
     } catch (e) {
-      toast.error(i18n.t("teams.exportFailed"), String(e));
+      toast.error(i18n.t("teams.exportFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
     } finally {
       busy = false;
     }
@@ -250,7 +270,7 @@
       const recs = await install.importLoadout(picked);
       toast.success(i18n.t("teams.restoredToast", { count: recs.length }), picked);
     } catch (e) {
-      toast.error(i18n.t("teams.restoreFailed"), String(e));
+      toast.error(i18n.t("teams.restoreFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
     } finally {
       busy = false;
     }
@@ -258,9 +278,10 @@
 </script>
 
 <section class="lo">
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{reconcileAnnouncement}</div>
   <header class="lo-head">
     <div class="seg" role="tablist" aria-label={i18n.t("teams.view")}>
-      <button class="seg-btn" class:on={tab === "current"} role="tab" aria-selected={tab === "current"} onclick={() => (tab = "current")}>
+      <button bind:this={currentTab} class="seg-btn" class:on={tab === "current"} role="tab" aria-selected={tab === "current"} onclick={() => (tab = "current")}>
         <UsersIcon size={14} /> {i18n.t("teams.yourTeam")}
       </button>
       <button class="seg-btn" class:on={tab === "presets"} role="tab" aria-selected={tab === "presets"} onclick={() => (tab = "presets")}>
@@ -272,16 +293,25 @@
       <div class="lo-actions">
         {#if managed.length > 0}
           <button class="btn ghost" onclick={toggleAll}>{i18n.t(allCollapsed ? "common.expandAll" : "common.collapseAll")}</button>
-          <button class="btn" onclick={openSave}><SaveIcon size={15} /><span>{i18n.t("teams.saveAsTeam")}</span></button>
+          <button class="btn" disabled={!installTruthFresh} onclick={openSave}><SaveIcon size={15} /><span>{i18n.t("teams.saveAsTeam")}</span></button>
         {/if}
         <button class="btn" disabled={busy} onclick={importLoadout}><DownloadIcon size={15} /><span>{i18n.t("teams.restore")}</span></button>
-        <button class="btn primary" disabled={busy || managed.length === 0} onclick={exportLoadout}><UploadIcon size={15} /><span>{i18n.t("teams.export")}</span></button>
+        <button class="btn primary" disabled={!installTruthFresh || busy || managed.length === 0} onclick={exportLoadout}><UploadIcon size={15} /><span>{i18n.t("teams.export")}</span></button>
       </div>
     {/if}
   </header>
 
+  {#if install.reconcileError}
+    <aside class="install-truth-warning" aria-busy={install.reconciling}>
+      <div class="reconcile-copy"><strong>{i18n.optional("reconcile.heading", "Installation status may be out of date")}</strong><p><span>{install.reconcileError}</span> {install.reconciled ? i18n.optional("reconcile.retained", "Your last known installation data is still shown.") : installTruthMessage}</p></div>
+      <Button size="sm" loading={install.reconciling} onclick={(event) => void retryReconcile(event)}>{install.reconciling ? i18n.optional("reconcile.retrying", "Retrying…") : i18n.optional("reconcile.retry", "Retry status check")}</Button>
+    </aside>
+  {/if}
+
   {#if tab === "current"}
-    {#if managed.length === 0}
+    {#if !install.reconciled}
+      <p class="install-truth-unavailable">{installTruthMessage}</p>
+    {:else if managed.length === 0}
       <EmptyState title={i18n.t("teams.emptyTitle")}>
         {#snippet icon()}<ArchiveIcon size={48} />{/snippet}
         {i18n.t("teams.emptyBody")}
@@ -427,13 +457,17 @@
     <Input bind:value={saveName} placeholder={i18n.t("teams.namePlaceholder")} ariaLabel={i18n.t("teams.nameAria")} />
     {#snippet actions()}
       <Button variant="secondary" modalAction="cancel" onclick={() => (saveOpen = false)}>{i18n.t("common.cancel")}</Button>
-      <Button variant="primary" modalAction="confirm" disabled={managedSlugs.length === 0} onclick={confirmSave}>{i18n.t("teams.saveTeam")}</Button>
+      <Button variant="primary" modalAction="confirm" disabled={!installTruthFresh || managedSlugs.length === 0} onclick={confirmSave}>{i18n.t("teams.saveTeam")}</Button>
     {/snippet}
   </Modal>
 {/if}
 
 <style>
   .lo { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  .install-truth-warning { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); border-bottom: 1px solid var(--color-warning); background: var(--color-warning-subtle); color: var(--color-warning-strong); font-size: var(--text-body-sm); }
+  .install-truth-warning span { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; text-wrap: pretty; }
+  .install-truth-warning button { flex: none; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-raised); }
+  .install-truth-unavailable { flex: 1; display: grid; place-items: center; padding: var(--space-6); color: var(--color-warning-strong); font-size: var(--text-body-sm); text-wrap: pretty; }
   .lo-head {
     flex: none; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
     padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border);

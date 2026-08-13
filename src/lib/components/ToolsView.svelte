@@ -7,7 +7,7 @@
    * default install target, and run tool-wide actions — Sync to catalog, Track
    * all, Remove all — plus per-agent controls.
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import RefreshIcon from "@lucide/svelte/icons/refresh-cw";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import TrashIcon from "@lucide/svelte/icons/trash-2";
@@ -22,6 +22,7 @@
   import Input from "./Input.svelte";
   import DiffModal from "./DiffModal.svelte";
   import ResizeHandle from "./ResizeHandle.svelte";
+  import Button from "./Button.svelte";
   import { install } from "$lib/stores/install.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
   import { toast } from "$lib/stores/toast.svelte";
@@ -33,7 +34,29 @@
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
   import type { MessageKey } from "$lib/i18n/messages";
-  import type { InstalledAgent, InstallState, Tool, ToolInfo } from "$lib/types";
+  import { appErrorMessage, isAppError, type InstalledAgent, type InstallState, type Tool, type ToolInfo } from "$lib/types";
+
+  const installTruthFresh = $derived(install.reconciled && !install.reconciling && !install.reconcileError);
+  const installTruthMessage = $derived(install.reconcileError
+    ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.")
+    : i18n.optional("reconcile.checking", "Checking installation status…"));
+  let rescanFocus: HTMLButtonElement | undefined = $state();
+  let reconcileAnnouncement = $state("");
+  let priorReconcileError: string | null = $state(null);
+  let priorReconcileTerminal = $state(0);
+  let priorReconciling = $state(false);
+  $effect(() => {
+    const { reconcileError: error, reconciling, reconcileTerminal: terminal } = install;
+    if (reconciling && !priorReconciling) reconcileAnnouncement = i18n.optional("reconcile.refreshing", error ? "Refreshing installation status…" : "Checking installation status…");
+    else if (error && (error !== priorReconcileError || terminal !== priorReconcileTerminal)) reconcileAnnouncement = priorReconcileError ? i18n.optional("reconcile.stillOutOfDate", "Installation status is still out of date. {message}", { message: error }) : i18n.optional("reconcile.outOfDate", "Installation status may be out of date. {message}", { message: error });
+    else if (!error && priorReconcileError && !reconciling) reconcileAnnouncement = i18n.optional("reconcile.upToDate", "Installation status is up to date.");
+    priorReconcileError = error; priorReconcileTerminal = terminal; priorReconciling = reconciling;
+  });
+  async function retryReconcile(event: MouseEvent): Promise<void> {
+    const restoreFocus = event.currentTarget === document.activeElement;
+    await install.reconcile();
+    if (!install.reconcileError && restoreFocus) { await tick(); rescanFocus?.focus({ preventScroll: true }); }
+  }
 
   // ── List-pane width (resizable, persisted) ──
   const LW_KEY = "agency-agents:tools-list-width";
@@ -106,7 +129,7 @@
   /** A tool counts as "installed/discovered" if its config dir is present on
       this machine, or we already have agents deployed in it. */
   function toolPresent(t: ToolInfo): boolean {
-    return t.detected || health(t.tool).total > 0;
+    return t.detected || (install.reconciled && health(t.tool).total > 0);
   }
   const TLENS: { id: ToolLens; key: MessageKey }[] = [
     { id: "installed", key: "tools.lens.installed" },
@@ -280,10 +303,11 @@
   function toTarget(i: InstalledAgent) {
     return { slug: i.slug, tool: i.tool, projectPath: i.projectPath };
   }
-  const canSync = $derived(selRows.some((r) => r.state !== "current"));
-  const canTrack = $derived(selRows.some((r) => r.state === "foreign"));
+  const canSync = $derived(installTruthFresh && selRows.some((r) => r.state !== "current"));
+  const canTrack = $derived(installTruthFresh && selRows.some((r) => r.state === "foreign"));
 
   async function runToolBulk(action: "update" | "track" | "uninstall", verb: string) {
+    if (!install.reconciled || install.reconciling || install.reconcileError) return;
     let picked = selRows;
     if (action === "update") picked = selRows.filter((r) => r.state !== "current");
     else if (action === "track") picked = selRows.filter((r) => r.state === "foreign");
@@ -304,7 +328,7 @@
       await fn();
       toast.success(ok);
     } catch (e) {
-      toast.error(i18n.t("common.actionFailed"), String(e));
+      toast.error(i18n.t("common.actionFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
     }
   }
   async function reveal(path: string | null | undefined) {
@@ -312,7 +336,7 @@
     try {
       await install.revealPath(path);
     } catch (e) {
-      toast.error(i18n.t("common.couldNotOpenFolder"), String(e));
+      toast.error(i18n.t("common.couldNotOpenFolder"), isAppError(e) ? appErrorMessage(e) : String(e));
     }
   }
 
@@ -329,7 +353,7 @@
       await settingsSet({ toolPaths: next });
       await install.loadTools(); // re-detect against the new base
     } catch (e) {
-      toast.error("Could not save install location", String(e));
+      toast.error("Could not save install location", isAppError(e) ? appErrorMessage(e) : String(e));
     } finally {
       locationBusy = false;
     }
@@ -348,6 +372,16 @@
 </script>
 
 <section class="tw">
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{reconcileAnnouncement}</div>
+  {#if install.reconcileError}
+    <aside class="install-truth-warning" aria-busy={install.reconciling}>
+      <div class="reconcile-copy"><strong>{i18n.optional("reconcile.heading", "Installation status may be out of date")}</strong><p><span>{install.reconcileError}</span> {install.reconciled ? i18n.optional("reconcile.retained", "Your last known installation data is still shown.") : installTruthMessage}</p></div>
+      <Button size="sm" loading={install.reconciling} onclick={(event) => void retryReconcile(event)}>{install.reconciling ? i18n.optional("reconcile.retrying", "Retrying…") : i18n.optional("reconcile.retry", "Retry status check")}</Button>
+    </aside>
+  {:else if !install.reconciled}
+    <p class="install-truth-checking">{installTruthMessage}</p>
+  {/if}
+  <div class="tw-body">
   <!-- ── List pane ── -->
   <div class="list-pane" style="width:{listWidth}px">
     <header class="lp-head">
@@ -364,14 +398,16 @@
           </button>
         {/each}
       </div>
-      <button class="ghost icon" disabled={busy} onclick={rescan} title={i18n.t("tools.rescanTitle")} aria-label={i18n.t("tools.rescanTitle")}>
+      <button bind:this={rescanFocus} class="ghost icon" disabled={busy} onclick={rescan} title={i18n.t("tools.rescanTitle")} aria-label={i18n.t("tools.rescanTitle")}>
         <RefreshIcon size={15} />
       </button>
     </header>
     <ul class="tlist">
       {#if visibleTools.length === 0}
         <li class="tlist-empty">
-          {toolLens === "installed"
+          {!install.reconciled && toolLens === "installed"
+            ? installTruthMessage
+            : toolLens === "installed"
             ? i18n.t("tools.emptyInstalled")
             : i18n.t("tools.emptyUninstalled")}
         </li>
@@ -389,12 +425,12 @@
                 {#if t.wired}<span class="c-dot" class:on={t.detected} title={t.detected ? i18n.t("common.detected") : i18n.t("common.notDetected")}></span>{/if}
               </span>
               {#if t.wired}
-                <span class="hbar" title={i18n.t("tools.hbarTitle", { installed: inst, total: catalogTotal })}>
+                {#if install.reconciled}<span class="hbar" title={i18n.t("tools.hbarTitle", { installed: inst, total: catalogTotal })}>
                   <span class="hseg" style="flex:{inst};background:var(--color-success)"></span>
                   <span class="hseg" style="flex:{Math.max(catalogTotal - inst, 0)}"></span>
-                </span>
+                </span>{/if}
                 <span class="trow-sub">
-                  {h.total > 0 ? i18n.count(h.total, "common.agent.one", "common.agent.many") : i18n.t("common.noAgents")}{#if ver} · <span class="trow-ver" title={ver}>{ver}</span>{/if}
+                  {install.reconciled ? (h.total > 0 ? i18n.count(h.total, "common.agent.one", "common.agent.many") : i18n.t("common.noAgents")) : installTruthMessage}{#if ver} · <span class="trow-ver" title={ver}>{ver}</span>{/if}
                 </span>
               {:else}
                 <span class="trow-sub recognized">{i18n.t("tools.recognizedSub")}</span>
@@ -490,7 +526,7 @@
           <button class="act" disabled={busy || !canTrack} title={canTrack ? i18n.t("tools.canTrackTitle") : i18n.t("tools.cannotTrackTitle")} onclick={() => runToolBulk("track", i18n.t("tools.trackedVerb"))}>
             <PlusIcon size={14} /> {i18n.t("tools.trackAll")}
           </button>
-          <button class="act danger" disabled={busy || selRows.length === 0} onclick={() => (confirmRemove = true)}>
+          <button class="act danger" disabled={!installTruthFresh || busy || selRows.length === 0} onclick={() => (confirmRemove = true)}>
             <TrashIcon size={14} /> {i18n.t("tools.removeAll")}
           </button>
         </div>
@@ -509,7 +545,9 @@
           </div>
         {/if}
 
-        {#if selRows.length === 0}
+        {#if !install.reconciled}
+          <p class="empty">{installTruthMessage}</p>
+        {:else if selRows.length === 0}
           <p class="empty">{i18n.t("tools.noAgentsDeployed", { tool: sel.label })}</p>
         {:else}
           <div class="list-head">
@@ -549,12 +587,12 @@
                               <button class="mini" title={i18n.t("tools.diffTitle")} onclick={() => (diffTarget = r)}><DiffIcon size={13} /></button>
                             {/if}
                             {#if r.state === "foreign"}
-                              <button class="mini" title={i18n.t("tools.trackTitle")} disabled={isBusy} onclick={() => quick(() => install.track(r.slug, r.tool, r.projectPath), i18n.t("tools.quickTracking", { name: r.name }))}><PlusIcon size={13} /></button>
+                              <button class="mini" title={i18n.t("tools.trackTitle")} disabled={!installTruthFresh || isBusy} onclick={() => quick(() => install.track(r.slug, r.tool, r.projectPath), i18n.t("tools.quickTracking", { name: r.name }))}><PlusIcon size={13} /></button>
                             {/if}
                             {#if r.state !== "current"}
-                              <button class="mini" title={i18n.t("tools.updateTitle")} disabled={isBusy} onclick={() => quick(() => install.update(r.slug, r.tool, r.projectPath), i18n.t("tools.quickUpdated", { name: r.name }))}><RefreshIcon size={13} /></button>
+                              <button class="mini" title={i18n.t("tools.updateTitle")} disabled={!installTruthFresh || isBusy} onclick={() => quick(() => install.update(r.slug, r.tool, r.projectPath), i18n.t("tools.quickUpdated", { name: r.name }))}><RefreshIcon size={13} /></button>
                             {/if}
-                            <button class="mini danger" title={i18n.t("tools.removeTitle")} disabled={isBusy} onclick={() => quick(() => install.uninstall(r.slug, r.tool, r.projectPath), i18n.t("tools.quickRemoved", { name: r.name }))}><XIcon size={13} /></button>
+                            <button class="mini danger" title={i18n.t("tools.removeTitle")} disabled={!installTruthFresh || isBusy} onclick={() => quick(() => install.uninstall(r.slug, r.tool, r.projectPath), i18n.t("tools.quickRemoved", { name: r.name }))}><XIcon size={13} /></button>
                           </span>
                         </li>
                       {/each}
@@ -579,6 +617,7 @@
       </div>
     {/if}
   </div>
+  </div>
 </section>
 
 {#if diffTarget}
@@ -592,7 +631,7 @@
     <p class="cd-body">{i18n.t("tools.removeAllBody", { count: selRows.length })}</p>
     <div class="cd-actions">
       <button class="cd-cancel" onclick={() => (confirmRemove = false)}>{i18n.t("common.cancel")}</button>
-      <button class="cd-delete" disabled={busy} onclick={() => { confirmRemove = false; runToolBulk("uninstall", i18n.t("tools.removedVerb")); }}>
+      <button class="cd-delete" disabled={busy || !installTruthFresh} onclick={() => { if (!installTruthFresh) return; confirmRemove = false; void runToolBulk("uninstall", i18n.t("tools.removedVerb")); }}>
         <TrashIcon size={14} /> {i18n.t("common.remove")} {selRows.length}
       </button>
     </div>
@@ -600,7 +639,11 @@
 {/if}
 
 <style>
-  .tw { display: flex; height: 100%; min-height: 0; }
+  .tw { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  .tw-body { display: flex; flex: 1; min-height: 0; }
+  .install-truth-warning { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); border-bottom: 1px solid var(--color-warning); background: var(--color-warning-subtle); color: var(--color-warning-strong); font-size: var(--text-body-sm); }
+  .reconcile-copy { flex: 1 1 auto; min-width: 0; }
+  .reconcile-copy p { overflow-wrap: anywhere; text-wrap: pretty; }
 
   /* ── List pane ── */
   .list-pane { flex: none; display: flex; flex-direction: column; min-height: 0; min-width: 0; }

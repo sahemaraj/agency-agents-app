@@ -6,7 +6,7 @@
    * surface deep-links into the Agents workspace (with the matching filter) or
    * the Tools view. All charts are dependency-free (SVG + CSS).
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
   import RepoIcon from "@lucide/svelte/icons/git-branch";
   import { corpus } from "$lib/stores/corpus.svelte";
@@ -20,8 +20,36 @@
   import CoverageDonuts from "./CoverageDonuts.svelte";
   import CatalogByDivision from "./CatalogByDivision.svelte";
   import InstallSunburst from "./InstallSunburst.svelte";
+  import Button from "./Button.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { InstalledAgent } from "$lib/types";
+  import { appErrorMessage, isAppError, type InstalledAgent } from "$lib/types";
+
+  let dashboardRoot: HTMLElement | undefined = $state();
+  let reconcileAnnouncement = $state("");
+  let priorReconcileError: string | null = $state(null);
+  let priorReconcileTerminal = $state(0);
+  let priorReconciling = $state(false);
+  const installTruthMessage = $derived(install.reconcileError
+    ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.")
+    : i18n.optional("reconcile.checking", "Checking installation status…"));
+
+  $effect(() => {
+    const { reconcileError: error, reconciling, reconcileTerminal: terminal } = install;
+    if (reconciling && !priorReconciling) reconcileAnnouncement = i18n.optional("reconcile.refreshing", error ? "Refreshing installation status…" : "Checking installation status…");
+    else if (error && (error !== priorReconcileError || terminal !== priorReconcileTerminal)) reconcileAnnouncement = priorReconcileError
+      ? i18n.optional("reconcile.stillOutOfDate", "Installation status is still out of date. {message}", { message: error })
+      : i18n.optional("reconcile.outOfDate", "Installation status may be out of date. {message}", { message: error });
+    else if (!error && priorReconcileError && !reconciling) reconcileAnnouncement = i18n.optional("reconcile.upToDate", "Installation status is up to date.");
+    priorReconcileError = error;
+    priorReconcileTerminal = terminal;
+    priorReconciling = reconciling;
+  });
+
+  async function retryReconcile(event: MouseEvent): Promise<void> {
+    const restoreFocus = event.currentTarget === document.activeElement;
+    await install.reconcile();
+    if (!install.reconcileError && restoreFocus) { await tick(); dashboardRoot?.focus({ preventScroll: true }); }
+  }
 
   // Pure reader — install state loaded globally in +layout.
   onMount(() => {
@@ -47,7 +75,7 @@
       await catalog.pull();
       toast.success(i18n.t("dashboard.catalogUpdated"));
     } catch (e) {
-      toast.error(i18n.t("common.actionFailed"), String(e));
+      toast.error(i18n.t("common.actionFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
     }
   }
 
@@ -153,7 +181,8 @@
   });
 </script>
 
-<section class="dash">
+<section class="dash" bind:this={dashboardRoot} tabindex="-1">
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{reconcileAnnouncement}</div>
   {#if showCatalogUpdate}
     <div class="cat-bar">
       <span class="cat-info">
@@ -174,13 +203,19 @@
       </button>
     </div>
   {/if}
+  {#if install.reconcileError}
+    <aside class="install-truth-warning" aria-busy={install.reconciling}>
+      <div class="reconcile-copy"><strong>{i18n.optional("reconcile.heading", "Installation status may be out of date")}</strong><p><span>{install.reconcileError}</span> {install.reconciled ? i18n.optional("reconcile.retained", "Your last known installation data is still shown.") : installTruthMessage}</p></div>
+      <Button size="sm" loading={install.reconciling} onclick={(event) => void retryReconcile(event)}>{install.reconciling ? i18n.optional("reconcile.retrying", "Retrying…") : i18n.optional("reconcile.retry", "Retry status check")}</Button>
+    </aside>
+  {/if}
   <div class="stats">
     <button class="stat" onclick={() => ui.openAgents()}>
       <span class="s-num">{available}</span>
       <span class="s-lbl">{i18n.t("dashboard.agentsAvailable")}</span>
     </button>
     <button class="stat" onclick={() => ui.openAgents()}>
-      <span class="s-num">{managed}</span>
+      <span class="s-num">{install.reconciled ? managed : "—"}</span>
       <span class="s-lbl">{i18n.t("dashboard.totalInstalled")}</span>
       {#if fromOtherTools > 0}
         <span class="s-sub">{i18n.t("dashboard.viaThisApp", { tracked: trackedByApp, other: fromOtherTools })}</span>
@@ -204,7 +239,9 @@
     <div class="card">
       <h3 class="c-title">{i18n.t("dashboard.totalInstalled")}</h3>
       <div class="card-fill center">
-        {#if managed === 0}
+        {#if !install.reconciled}
+          <p class="muted">{installTruthMessage}</p>
+        {:else if managed === 0}
           <p class="muted">{i18n.t("dashboard.emptyInstalled")}</p>
         {:else}
           <InstallSunburst groups={sunburstGroups} />
@@ -215,7 +252,9 @@
     <div class="card">
       <h3 class="c-title">{i18n.t("dashboard.projects")}</h3>
       <div class="card-fill">
-        {#if projectBreakdown.length === 0}
+        {#if !install.reconciled}
+          <p class="muted">{installTruthMessage}</p>
+        {:else if projectBreakdown.length === 0}
         <p class="muted">
           {i18n.t("dashboard.noProjectInstalls")}
           <button class="link inline" onclick={() => ui.setSection("projects")}>{i18n.t("dashboard.openProjects")}</button>
@@ -253,7 +292,9 @@
     <div class="card">
       <h3 class="c-title">{i18n.t("dashboard.installHealth")}</h3>
       <div class="card-fill center">
-        {#if totalInstalls === 0}
+        {#if !install.reconciled}
+          <p class="muted">{installTruthMessage}</p>
+        {:else if totalInstalls === 0}
           <p class="muted">{i18n.t("dashboard.emptyHealth")}</p>
         {:else}
           <HealthDonut segments={healthSegments} />
@@ -264,7 +305,9 @@
     <div class="card">
       <h3 class="c-title">{i18n.t("dashboard.coverageByTool")}</h3>
       <div class="card-fill">
-        {#if perTool.length === 0}
+        {#if !install.reconciled}
+          <p class="muted">{installTruthMessage}</p>
+        {:else if perTool.length === 0}
         <p class="muted">{i18n.t("dashboard.emptyToolCoverage")}</p>
       {:else}
         <ul class="bars">
@@ -287,7 +330,11 @@
 
   <div class="card">
     <h3 class="c-title">{i18n.t("dashboard.crossToolCoverage")}</h3>
-    <CoverageDonuts bind:hovered={divisionHover} />
+    {#if install.reconciled}
+      <CoverageDonuts bind:hovered={divisionHover} />
+    {:else}
+      <p class="muted">{installTruthMessage}</p>
+    {/if}
     <div class="merge-sep">
       <span class="merge-cap">{i18n.t("dashboard.catalogByDivision")}</span>
     </div>
@@ -297,6 +344,9 @@
 
 <style>
   .dash { height: 100%; overflow-y: auto; padding: var(--space-5); display: flex; flex-direction: column; gap: var(--space-4); }
+  .install-truth-warning { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); border: 1px solid var(--color-warning); border-radius: var(--radius-md); background: var(--color-warning-subtle); color: var(--color-warning-strong); font-size: var(--text-body-sm); }
+  .reconcile-copy { flex: 1 1 auto; min-width: 0; }
+  .reconcile-copy p { overflow-wrap: anywhere; text-wrap: pretty; }
 
   /* ── "Update from GitHub" bar (only when the catalog is a managed git clone) ── */
   .cat-bar {

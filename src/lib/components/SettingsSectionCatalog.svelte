@@ -26,7 +26,7 @@
   import { toast } from "$lib/stores/toast.svelte";
   import { safeOpenUrl } from "$lib/util/url";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { CatalogCandidate } from "$lib/types";
+  import { appErrorMessage, isAppError, type CatalogCandidate } from "$lib/types";
 
   let manage = $state(true);
   let repoStats = $state<RepoStatsOutcome>({ kind: "loading" });
@@ -52,7 +52,7 @@
       await fn();
       toast.success(ok);
     } catch (e) {
-      toast.error(i18n.t("catalog.actionFailed"), String(e));
+      toast.error(i18n.t("catalog.actionFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
     }
   }
 

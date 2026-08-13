@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import Settings2 from "@lucide/svelte/icons/settings-2";
@@ -22,7 +22,7 @@
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { skillCollectionBatch, skillInstallPlan } from "$lib/api";
-  import type { InstalledSkill, SkillApprovalAction, SkillDraft, SkillMutationPlan, SkillPackageResult, SkillReference, SkillSmartFolderRule, SkillSource, SkillSourceResult, SkillType, SkillUpdatePolicy, SkillVersionSnapshot } from "$lib/types";
+  import { appErrorMessage, isAppError, type InstalledSkill, type SkillApprovalAction, type SkillDraft, type SkillMutationPlan, type SkillPackageResult, type SkillReference, type SkillSmartFolderRule, type SkillSource, type SkillSourceResult, type SkillType, type SkillUpdatePolicy, type SkillVersionSnapshot } from "$lib/types";
   import {
     buildPersonalFolderTree,
     filterPackages,
@@ -93,23 +93,73 @@
   let editorLoading = $state(false);
   let installPlan: SkillMutationPlan | null = $state(null);
   let plannedInstall: { pkg: SkillPackageResult; runtime: "claudeCode" | "codex"; projectPath: string | null; destination: string } | null = $state(null);
+  let workspaceHeading: HTMLHeadingElement | undefined = $state();
+  let priorReconcileError: string | null = $state(null);
+  let priorReconcileTerminal = $state(0);
+  let priorReconciling = $state(false);
+
+  $effect(() => {
+    const error = skillSources.reconcileError;
+    const reconciling = skillSources.reconciling;
+    const terminal = skillSources.reconcileTerminal;
+    if (reconciling && !priorReconciling) {
+      announcement = i18n.optional(
+        "reconcile.refreshing",
+        error ? "Refreshing installation status…" : "Checking installation status…",
+      );
+    } else if (error && (error !== priorReconcileError || terminal !== priorReconcileTerminal)) {
+      announcement = priorReconcileError
+        ? i18n.optional("reconcile.stillOutOfDate", "Installation status is still out of date. {message}", { message: error })
+        : i18n.optional("reconcile.outOfDate", "Installation status may be out of date. {message}", { message: error });
+    } else if (!error && priorReconcileError && !reconciling) {
+      announcement = i18n.optional("reconcile.upToDate", "Installation status is up to date.");
+    }
+    priorReconcileError = error;
+    priorReconcileTerminal = terminal;
+    priorReconciling = reconciling;
+  });
+
+  async function retryReconcile(event: MouseEvent): Promise<void> {
+    const restoreFocus = event.currentTarget === document.activeElement;
+    announcement = i18n.optional("reconcile.refreshing", "Refreshing installation status…");
+    await skillSources.reconcileInstalls(projects.list.map((project) => project.path));
+    if (skillSources.reconcileError) {
+      announcement = i18n.optional(
+        "reconcile.stillOutOfDate",
+        "Installation status is still out of date. {message}",
+        { message: skillSources.reconcileError },
+      );
+    } else if (restoreFocus) {
+      await tick();
+      workspaceHeading?.focus({ preventScroll: true });
+    }
+  }
 
   const packages = $derived.by<PackageView[]>(() =>
     Object.values(skillSources.results).flatMap((result) =>
       result.packages.map((pkg) => ({ pkg, source: result.source })),
     ),
   );
+  const installTruthKnown = $derived(skillSources.reconciled);
+  const installTruthFresh = $derived(installTruthKnown && !skillSources.reconcileError);
+  const installTruthMessage = $derived(skillSources.reconcileError
+    ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.")
+    : i18n.optional("reconcile.checking", "Checking installation status…"));
   const personalFolders = $derived(skillSources.folderState.folders);
-  const filtered = $derived(filterPackages({
-    packages,
-    installed: skillSources.installed,
-    folderState: skillSources.folderState,
-    query,
-    statusFilter,
-    sourceFilter,
-    libraryFilter,
-    sortOrder,
-  }));
+  const filtered = $derived(
+    !installTruthKnown && ["installed", "recommendations", "cleanup"].includes(libraryFilter)
+      ? []
+      : filterPackages({
+          packages,
+          installed: skillSources.installed,
+          folderState: skillSources.folderState,
+          query,
+          statusFilter,
+          sourceFilter,
+          libraryFilter,
+          sortOrder,
+        }),
+  );
   const grouped = $derived(groupPackages(packages));
   const selected = $derived(
     selectedKey === null
@@ -145,13 +195,16 @@
       && approval.request.planRevision === draft.treeHash,
     )
   ));
-  const metrics = $derived(libraryMetrics(packages, skillSources.installed, skillSources.folderState));
-  const installedCount = $derived(metrics.installed);
-  const trustedCount = $derived(metrics.trusted);
-  const reviewCount = $derived(metrics.review);
-  const recommendationCount = $derived(metrics.recommendations);
-  const duplicateCount = $derived(metrics.duplicates);
-  const cleanupCount = $derived(metrics.cleanup);
+  const metrics = $derived(installTruthKnown ? libraryMetrics(packages, skillSources.installed, skillSources.folderState) : null);
+  const installedCount = $derived(metrics?.installed ?? 0);
+  const installTruthUnavailable = $derived(
+    ["installed", "recommendations", "cleanup"].includes(libraryFilter) && !installTruthKnown,
+  );
+  const trustedCount = $derived(packages.filter(({ pkg }) => trustedScripts(pkg)).length);
+  const reviewCount = $derived(packages.filter(({ pkg }) => !pkg.installable || requiresTrust(pkg)).length);
+  const recommendationCount = $derived(metrics?.recommendations ?? 0);
+  const duplicateCount = $derived(packages.filter(({ pkg }) => packageConflicts(pkg).length > 0).length);
+  const cleanupCount = $derived(metrics?.cleanup ?? 0);
   const libraryTitle = $derived.by(() => {
     if (libraryFilter === "installed") return i18n.t("skills.installed");
     if (libraryFilter === "trusted") return i18n.t("skills.trustedScripts");
@@ -415,6 +468,7 @@
   }
 
   async function rollbackVersion(installed: InstalledSkill, snapshotPath: string): Promise<void> {
+    if (!installTruthFresh) return;
     const succeeded = await skillSources.rollback(
       installed,
       snapshotPath,
@@ -427,6 +481,7 @@
   }
 
   async function installCurrentCollection(): Promise<void> {
+    if (!installTruthFresh) return;
     const collectionName = libraryFilter.startsWith("collection:")
       ? libraryFilter.slice("collection:".length)
       : "";
@@ -441,7 +496,7 @@
       announcement = `${collectionOperation} completed for ${result.completed.length} skill(s).`;
       collectionInstallOpen = false;
     } catch (error) {
-      announcement = String(error);
+      announcement = isAppError(error) ? appErrorMessage(error) : String(error);
     }
   }
 
@@ -469,7 +524,7 @@
       editorText = await skillSources.readSkillText(selected.pkg);
       editorOpen = true;
     } catch (error) {
-      folderError = String(error);
+      folderError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
       editorLoading = false;
     }
@@ -563,29 +618,30 @@
     const where = row.kind === "global" ? "globally" : `in ${row.label}`;
     const state = record?.state ?? "missing";
     const canInstall = !record || state === "missing";
+    const unavailable = i18n.optional("reconcile.unavailableLabel", "Installation status unavailable");
     return {
       state: record && state !== "missing" ? (state === "current" ? "on" : "partial") : "off",
       busy: skillSources.installing[key] === true,
-      disabled: !selected.pkg.installable || !canInstall,
-      title: record ? `${column.label}: ${state}` : `Install ${column.label} ${where}`,
-      ariaLabel: canInstall ? `Install ${selected.pkg.name} for ${column.label} ${where}` : `${column.label} ${where}: ${state}`,
+      disabled: !installTruthFresh || !selected.pkg.installable || !canInstall,
+      title: installTruthFresh ? (record ? `${column.label}: ${state}` : `Install ${column.label} ${where}`) : unavailable,
+      ariaLabel: installTruthFresh ? (canInstall ? `Install ${selected.pkg.name} for ${column.label} ${where}` : `${column.label} ${where}: ${state}`) : unavailable,
     };
   }
 
   async function installSelected(column: DeploymentColumn, row: DeploymentRow): Promise<void> {
-    if (!selected) return;
+    if (!selected || !installTruthFresh) return;
     const projectPath = row.kind === "global" ? null : row.path;
     const runtime = column.id as "claudeCode" | "codex";
     try {
       installPlan = await skillInstallPlan(selected.pkg.sourceId, selected.pkg.relativePath, runtime, projectPath);
       plannedInstall = { pkg: selected.pkg, runtime, projectPath, destination: column.label };
     } catch (error) {
-      announcement = String(error);
+      announcement = isAppError(error) ? appErrorMessage(error) : String(error);
     }
   }
 
   async function confirmPlannedInstall(): Promise<void> {
-    if (!plannedInstall || !installPlan || installPlan.blockers.length > 0) return;
+    if (!installTruthFresh || !plannedInstall || !installPlan || installPlan.blockers.length > 0) return;
     const target = plannedInstall;
     const succeeded = await skillSources.installPackage(
       target.pkg,
@@ -616,6 +672,7 @@
     action: "update" | "disable" | "enable" | "uninstall",
     installed: InstalledSkill,
   ): Promise<void> {
+    if (!installTruthFresh) return;
     const succeeded = await skillSources.lifecycle(
       action,
       installed,
@@ -767,7 +824,7 @@
 <div class="workspace">
   <header>
     <div>
-      <h2>{i18n.t("skills.title")}</h2>
+      <h2 bind:this={workspaceHeading} tabindex="-1">{i18n.t("skills.title")}</h2>
       <p>{i18n.t("skills.subtitle")}</p>
     </div>
     <div class="header-actions">
@@ -894,10 +951,31 @@
     </div>
   </header>
 
-  <div class="announcement" role="status" aria-live="polite">{announcement}</div>
+  <div class="announcement" role="status" aria-live="polite" aria-atomic="true">{announcement}</div>
   <div class="announcement" role="status" aria-live="polite">
-    {i18n.t("skills.packagesShown", { count: filtered.length })}
+    {installTruthUnavailable
+      ? installTruthMessage
+      : i18n.t("skills.packagesShown", { count: filtered.length })}
   </div>
+
+  {#if skillSources.reconcileError}
+    <aside class="reconcile-warning" aria-busy={skillSources.reconciling}>
+      <div class="reconcile-copy">
+        <strong>{i18n.optional("reconcile.heading", "Installation status may be out of date")}</strong>
+        <p class="reconcile-message">
+          <span>{skillSources.reconcileError}</span>
+          {skillSources.reconciled
+            ? i18n.optional("reconcile.retained", "Your last known installation data is still shown.")
+            : i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.")}
+        </p>
+      </div>
+      <Button size="sm" loading={skillSources.reconciling} onclick={(event) => void retryReconcile(event)}>
+        {skillSources.reconciling
+          ? i18n.optional("reconcile.retrying", "Retrying…")
+          : i18n.optional("reconcile.retry", "Retry status check")}
+      </Button>
+    </aside>
+  {/if}
 
   {#if unavailableInstalls.length > 0}
     <aside class="unavailable" aria-label={i18n.t("skills.unavailableAria")}>
@@ -906,8 +984,8 @@
       {#each unavailableInstalls as installed (lifecycleKey(installed))}
         <div>
           <code>{installed.name} · {destinationLabel(installed)}</code>
-          <Button size="sm" ariaLabel={`${i18n.t("skills.disable")} ${destinationLabel(installed)}`} onclick={() => void runLifecycle("disable", installed)}>{i18n.t("skills.disable")}</Button>
-          <Button size="sm" variant="danger" ariaLabel={`${i18n.t("skills.uninstall")} ${destinationLabel(installed)}`} onclick={() => (uninstallCandidate = installed)}>{i18n.t("skills.uninstall")}</Button>
+          <Button size="sm" disabled={!installTruthFresh} ariaLabel={`${i18n.t("skills.disable")} ${destinationLabel(installed)}`} onclick={() => void runLifecycle("disable", installed)}>{i18n.t("skills.disable")}</Button>
+          <Button size="sm" variant="danger" disabled={!installTruthFresh} ariaLabel={`${i18n.t("skills.uninstall")} ${destinationLabel(installed)}`} onclick={() => (uninstallCandidate = installed)}>{i18n.t("skills.uninstall")}</Button>
         </div>
       {/each}
     </aside>
@@ -934,14 +1012,14 @@
         <div class="quick-filters">
           {#each [
             ["all", i18n.t("skills.allSkills"), packages.length],
-            ["installed", i18n.t("skills.installed"), installedCount],
+            ["installed", i18n.t("skills.installed"), installTruthKnown ? installedCount : "—"],
             ["trusted", i18n.t("skills.trustedScripts"), trustedCount],
             ["review", i18n.t("skills.needsReview"), reviewCount],
             ["favorites", i18n.t("skills.favorites"), skillSources.folderState.favorites.length],
             ["recent", i18n.t("skills.recent"), skillSources.folderState.recent.length],
-            ["recommendations", "Recommendations", recommendationCount],
+            ["recommendations", "Recommendations", installTruthKnown ? recommendationCount : "—"],
             ["duplicates", "Duplicates", duplicateCount],
-            ["cleanup", "Cleanup", cleanupCount],
+            ["cleanup", "Cleanup", installTruthKnown ? cleanupCount : "—"],
           ] as item}
             <button
               class:active={libraryFilter === item[0]}
@@ -1007,9 +1085,9 @@
         <div class="pane-heading">
           <span>{libraryTitle}</span>
           <span class="pane-tools">
-            <span>{filtered.length}</span>
+            <span>{installTruthUnavailable ? "—" : filtered.length}</span>
             {#if libraryFilter.startsWith("collection:") && filtered.length > 0}
-              <Button size="sm" onclick={() => (collectionInstallOpen = true)}>{i18n.t("skills.manageCollection")}</Button>
+              <Button size="sm" disabled={!installTruthFresh} onclick={() => (collectionInstallOpen = true)}>{i18n.t("skills.manageCollection")}</Button>
             {/if}
           </span>
         </div>
@@ -1040,15 +1118,23 @@
           </div>
         </div>
 
-        <div class="result-count" aria-hidden="true">{i18n.t("skills.results", { count: filtered.length })}</div>
-        {#if filtered.length === 0}
-          <EmptyState title={i18n.t("skills.noMatches")} body={i18n.t("skills.noMatchesBody", { query: query || statusLabel(statusFilter) })} />
+        {#if installTruthUnavailable}
+          <p class="install-truth-unavailable">
+            {installTruthMessage}
+          </p>
         {:else}
-          <ul class="results" aria-label={i18n.t("skills.resultsAria")}>
-            {#each filtered as view (skillSources.packageKey(view.pkg))}
-              {@render packageRow(view)}
-            {/each}
-          </ul>
+          <div class="result-count" aria-hidden="true">{i18n.t("skills.results", { count: filtered.length })}</div>
+        {/if}
+        {#if !installTruthUnavailable}
+          {#if filtered.length === 0}
+            <EmptyState title={i18n.t("skills.noMatches")} body={i18n.t("skills.noMatchesBody", { query: query || statusLabel(statusFilter) })} />
+          {:else}
+            <ul class="results" aria-label={i18n.t("skills.resultsAria")}>
+              {#each filtered as view (skillSources.packageKey(view.pkg))}
+                {@render packageRow(view)}
+              {/each}
+            </ul>
+          {/if}
         {/if}
       </section>
 
@@ -1254,15 +1340,15 @@
                         </div>
                         <div class="lifecycle-actions">
                           {#if installed.state === "outdated" || installed.state === "missing"}
-                            <Button size="sm" loading={busy} ariaLabel={`${i18n.t("skills.update")} ${destinationLabel(installed)}`} onclick={() => void runLifecycle("update", installed)}>{i18n.t("skills.update")}</Button>
+                            <Button size="sm" loading={busy} disabled={!installTruthFresh} ariaLabel={`${i18n.t("skills.update")} ${destinationLabel(installed)}`} onclick={() => void runLifecycle("update", installed)}>{i18n.t("skills.update")}</Button>
                           {/if}
                           {#if ["current", "outdated", "sourceUnavailable"].includes(installed.state)}
-                            <Button size="sm" loading={busy} ariaLabel={`${i18n.t("skills.disable")} ${destinationLabel(installed)}`} onclick={() => void runLifecycle("disable", installed)}>{i18n.t("skills.disable")}</Button>
+                            <Button size="sm" loading={busy} disabled={!installTruthFresh} ariaLabel={`${i18n.t("skills.disable")} ${destinationLabel(installed)}`} onclick={() => void runLifecycle("disable", installed)}>{i18n.t("skills.disable")}</Button>
                           {:else if installed.state === "disabled"}
-                            <Button size="sm" loading={busy} ariaLabel={`${i18n.t("skills.enable")} ${destinationLabel(installed)}`} onclick={() => void runLifecycle("enable", installed)}>{i18n.t("skills.enable")}</Button>
+                            <Button size="sm" loading={busy} disabled={!installTruthFresh} ariaLabel={`${i18n.t("skills.enable")} ${destinationLabel(installed)}`} onclick={() => void runLifecycle("enable", installed)}>{i18n.t("skills.enable")}</Button>
                           {/if}
                           {#if installed.tracked}
-                            <Button size="sm" variant="danger" disabled={busy} ariaLabel={`${i18n.t("skills.uninstall")} ${destinationLabel(installed)}`} onclick={() => (uninstallCandidate = installed)}>{i18n.t("skills.uninstall")}</Button>
+                            <Button size="sm" variant="danger" disabled={busy || !installTruthFresh} ariaLabel={`${i18n.t("skills.uninstall")} ${destinationLabel(installed)}`} onclick={() => (uninstallCandidate = installed)}>{i18n.t("skills.uninstall")}</Button>
                           {/if}
                         </div>
                         {#if skillSources.installErrors[lifecycleKey(installed)]}
@@ -1284,7 +1370,7 @@
                               {#each versionHistory[lifecycleKey(installed)] as snapshot (snapshot.path)}
                                 <li>
                                   <span>{new Date(snapshot.createdAt).toLocaleString()}</span>
-                                  <Button size="sm" onclick={() => void rollbackVersion(installed, snapshot.path)}>{i18n.t("skills.rollback")}</Button>
+                                  <Button size="sm" disabled={!installTruthFresh} onclick={() => void rollbackVersion(installed, snapshot.path)}>{i18n.t("skills.rollback")}</Button>
                                 </li>
                               {/each}
                             </ul>
@@ -1508,7 +1594,7 @@
     </div>
     {#snippet actions()}
       <Button variant="secondary" modalAction="cancel" onclick={() => (collectionInstallOpen = false)}>{i18n.t("common.cancel")}</Button>
-      <Button variant="primary" modalAction="confirm" onclick={() => void installCurrentCollection()}>{i18n.t("skills.applyCollectionOperation")}</Button>
+      <Button variant="primary" modalAction="confirm" disabled={!installTruthFresh} onclick={() => void installCurrentCollection()}>{i18n.t("skills.applyCollectionOperation")}</Button>
     {/snippet}
   </Modal>
 {/if}
@@ -1533,7 +1619,7 @@
     </div>
     {#snippet actions()}
       <Button variant="secondary" modalAction="cancel" onclick={() => { installPlan = null; plannedInstall = null; }}>{i18n.t("common.cancel")}</Button>
-      <Button variant="primary" modalAction="confirm" disabled={plan.blockers.length > 0} onclick={() => void confirmPlannedInstall()}>{i18n.t("common.install")}</Button>
+      <Button variant="primary" modalAction="confirm" disabled={!installTruthFresh || plan.blockers.length > 0} onclick={() => void confirmPlannedInstall()}>{i18n.t("common.install")}</Button>
     {/snippet}
   </Modal>
 {/if}
@@ -1601,7 +1687,7 @@
   open={uninstallCandidate !== null}
   title={i18n.t("skills.uninstallTitle")}
   confirmLabel={i18n.t("skills.uninstall")}
-  confirmDisabled={uninstallCandidate ? skillSources.installing[lifecycleKey(uninstallCandidate)] === true : false}
+  confirmDisabled={!installTruthFresh || (uninstallCandidate ? skillSources.installing[lifecycleKey(uninstallCandidate)] === true : false)}
   onConfirm={() => uninstallCandidate && void runLifecycle("uninstall", uninstallCandidate)}
   onCancel={() => (uninstallCandidate = null)}
 >
@@ -1615,6 +1701,15 @@
   h2 { font-size: var(--text-h2); font-weight: var(--fw-semibold); color: var(--color-text-primary); text-wrap: balance; }
   header p, .quiet, .section-help { margin-top: var(--space-1); color: var(--color-text-muted); font-size: var(--text-body-sm); }
   .announcement { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .reconcile-warning {
+    flex: none; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2);
+    padding: var(--space-2) var(--space-4); border-bottom: 1px solid var(--color-warning);
+    background: var(--color-warning-subtle); color: var(--color-warning-strong);
+  }
+  .reconcile-copy { flex: 1 1 auto; min-width: 0; display: grid; gap: var(--space-1); }
+  .reconcile-copy strong { font-size: var(--text-body); font-weight: var(--fw-medium); line-height: var(--lh-snug); text-wrap: balance; }
+  .reconcile-message { margin: 0; font-size: var(--text-body-sm); line-height: var(--lh-normal); overflow-wrap: anywhere; text-wrap: pretty; }
+  .reconcile-message span { margin-right: var(--space-1); }
   .unavailable { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-warning); color: var(--color-text-secondary); font-size: var(--text-body-sm); }
   .unavailable > div { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--space-2); }
   .unavailable code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1681,6 +1776,7 @@
   .segments button.active { background: var(--color-surface-raised); color: var(--color-text-primary); box-shadow: var(--shadow-sm); }
   select { min-width: 0; max-width: 45%; padding: var(--space-1) var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-raised); color: var(--color-text-secondary); font-size: var(--text-caption); }
   .result-count { padding: var(--space-2) var(--space-3); color: var(--color-text-muted); font-size: var(--text-caption); border-bottom: 1px solid var(--color-border); }
+  .install-truth-unavailable { padding: var(--space-3); color: var(--color-warning-strong); font-size: var(--text-body-sm); line-height: var(--lh-normal); border-bottom: 1px solid var(--color-border); text-wrap: pretty; }
   .results { flex: 1; min-height: 0; overflow-y: auto; }
   .skill-group summary { display: flex; justify-content: space-between; padding: var(--space-2) var(--space-3); padding-left: calc(var(--space-3) + var(--tree-depth) * 14px); cursor: pointer; color: var(--color-text-secondary); font-size: var(--text-body-sm); }
   .skill-group summary:hover { background: var(--color-surface-raised); color: var(--color-text-primary); }

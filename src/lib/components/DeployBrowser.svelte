@@ -35,6 +35,7 @@
     onClose: () => void;
   }
   let { projectPath, onClose }: Props = $props();
+  const installTruthFresh = $derived(install.reconciled && !install.reconciling && !install.reconcileError);
 
   onMount(() => {
     corpus.ensureLoaded();
@@ -211,7 +212,7 @@
   let confirm = $state<{ tool: Tool; rows: InstalledAgent[] } | null>(null);
 
   async function toggle(tool: Tool) {
-    if (busy || !selected) return;
+    if (!installTruthFresh || busy || !selected) return;
     const cov = cover(tool);
     if (cov.all) {
       if (cov.hasForeign) {
@@ -238,6 +239,7 @@
   }
 
   async function remove(tool: Tool, rows: InstalledAgent[]) {
+    if (!install.reconciled || install.reconciling || install.reconcileError) return;
     busy = tool;
     try {
       const { ok, fail } = await install.bulk(
@@ -252,7 +254,7 @@
   }
 
   async function confirmRemove() {
-    if (!confirm) return;
+    if (!install.reconciled || install.reconciling || install.reconcileError || !confirm) return;
     const { tool, rows } = confirm;
     confirm = null;
     await remove(tool, rows);
@@ -327,20 +329,21 @@
               {#each projectTools as t (t.id)}
                 {@const cov = cover(t.id)}
                 {@const isBusy = busy === t.id}
+                {@const unavailable = i18n.optional("reconcile.unavailableLabel", "Installation status unavailable")}
                 <button
                   class="cell toggle"
                   class:on={cov.all}
                   class:partial={cov.some}
-                  disabled={isBusy || setTotal === 0}
-                  title={i18n.t("install.cellTitle", { tool: t.label, target: cov.all ? i18n.t("deploy.cellAll", { count: setTotal }) : cov.some ? i18n.t("deploy.cellPartial", { count: cov.count, total: setTotal }) : i18n.t("deploy.cellNone") })}
-                  aria-label={i18n.t(cov.all ? "install.removeFromAria" : "install.installIntoAria", { tool: t.label, target: projectName })}
+                  disabled={!installTruthFresh || isBusy || setTotal === 0}
+                  title={installTruthFresh ? i18n.t("install.cellTitle", { tool: t.label, target: cov.all ? i18n.t("deploy.cellAll", { count: setTotal }) : cov.some ? i18n.t("deploy.cellPartial", { count: cov.count, total: setTotal }) : i18n.t("deploy.cellNone") }) : unavailable}
+                  aria-label={installTruthFresh ? i18n.t(cov.all ? "install.removeFromAria" : "install.installIntoAria", { tool: t.label, target: projectName }) : unavailable}
                   onclick={() => toggle(t.id)}
                 >
                   {#if isBusy}<span class="dot busy"></span>
                   {:else if cov.all}<span class="dot full"></span>
                   {:else if cov.some}<span class="dot half"></span>
                   {:else}<span class="dot"></span>{/if}
-                  <span class="t-count" class:cta={!cov.all && !cov.some}>{#if cov.all}{i18n.t("deploy.cellAll", { count: setTotal })}{:else if cov.some}{i18n.t("deploy.cellPartial", { count: cov.count, total: setTotal })}{:else}{i18n.t("deploy.cellInstall")}{/if}</span>
+                  <span class="t-count" class:cta={installTruthFresh && !cov.all && !cov.some}>{#if cov.all}{i18n.t("deploy.cellAll", { count: setTotal })}{:else if cov.some}{i18n.t("deploy.cellPartial", { count: cov.count, total: setTotal })}{:else if installTruthFresh}{i18n.t("deploy.cellInstall")}{:else}{unavailable}{/if}</span>
                 </button>
               {/each}
             </div>
@@ -393,6 +396,7 @@
     title={i18n.t("install.deleteTitle", { count: n, label })}
     confirmLabel={i18n.t("install.deleteConfirm", { count: n })}
     cancelLabel={i18n.t("common.cancel")}
+    confirmDisabled={!installTruthFresh}
     onConfirm={confirmRemove}
     onCancel={() => (confirm = null)}
   >

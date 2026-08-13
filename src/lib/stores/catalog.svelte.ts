@@ -13,12 +13,14 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 
-import type {
-  CatalogDetection,
-  CatalogSource,
-  CatalogStatus,
-  CatalogUpdateCheck,
-  CorpusMeta,
+import {
+  appErrorMessage,
+  isAppError,
+  type CatalogDetection,
+  type CatalogSource,
+  type CatalogStatus,
+  type CatalogUpdateCheck,
+  type CorpusMeta,
 } from "$lib/types";
 import { corpus } from "$lib/stores/corpus.svelte";
 
@@ -61,7 +63,7 @@ class CatalogStore {
     try {
       this.status = await invoke<CatalogStatus>("catalog_status");
     } catch (e) {
-      this.error = String(e);
+      this.error = isAppError(e) ? appErrorMessage(e) : String(e);
     }
   }
 
@@ -72,7 +74,7 @@ class CatalogStore {
     try {
       this.updateCheck = await invoke<CatalogUpdateCheck>("catalog_check_updates");
     } catch (e) {
-      this.error = String(e);
+      this.error = isAppError(e) ? appErrorMessage(e) : String(e);
     } finally {
       this.checking = false;
     }
@@ -85,7 +87,7 @@ class CatalogStore {
     try {
       this.detection = await invoke<CatalogDetection>("catalog_detect", { scan });
     } catch (e) {
-      this.error = String(e);
+      this.error = isAppError(e) ? appErrorMessage(e) : String(e);
     } finally {
       this.scanning = false;
     }
@@ -103,7 +105,7 @@ class CatalogStore {
       await corpus.reload();
       await this.loadStatus();
     } catch (e) {
-      this.error = String(e);
+      this.error = isAppError(e) ? appErrorMessage(e) : String(e);
       throw e;
     } finally {
       this.busy = false;
@@ -132,7 +134,7 @@ class CatalogStore {
       await corpus.reload();
       await this.loadStatus();
     } catch (e) {
-      this.error = String(e);
+      this.error = isAppError(e) ? appErrorMessage(e) : String(e);
       throw e;
     } finally {
       this.busy = false;
@@ -149,7 +151,7 @@ class CatalogStore {
       await corpus.reload();
       await this.loadStatus();
     } catch (e) {
-      this.error = String(e);
+      this.error = isAppError(e) ? appErrorMessage(e) : String(e);
       throw e;
     } finally {
       this.busy = false;

@@ -81,11 +81,22 @@ function sourceLabel(source: SkillSource | undefined, fallback: string): string 
   return source.kind.kind === "local" ? source.kind.root : source.kind.repository;
 }
 
+type ReconcileRequest = { key: string; paths: string[]; generation: number };
+let reconcileInstallsInflight: Promise<void> | null = null;
+let reconcileInstallsExecuting: ReconcileRequest | null = null;
+let reconcileInstallsPending: ReconcileRequest | null = null;
+let reconcileInstallsGeneration = 0;
+
 class SkillSourcesStore {
   sources: SkillSource[] = $state([]);
   results: Record<string, SkillSourceResult> = $state({});
   destinations: Record<string, SkillDestinationPresence[]> = $state({});
   installed: InstalledSkill[] = $state([]);
+  reconciling = $state(false);
+  reconciled = $state(false);
+  reconcileError: string | null = $state(null);
+  reconcileAttempt = $state(0);
+  reconcileTerminal = $state(0);
   drafts: SkillDraft[] = $state([]);
   backups: string[] = $state([]);
   folderState: SkillFolderState = $state({
@@ -521,12 +532,42 @@ class SkillSourcesStore {
   }
 
   async reconcileInstalls(projectPaths: string[]): Promise<void> {
-    try {
-      this.installed = await skillInstallsReconcile(projectPaths);
-      this.backups = await skillBackupsList();
-    } catch (error) {
-      this.addError = errorMessage(error);
+    const canonicalPaths = [...new Set(projectPaths)].sort();
+    const key = canonicalPaths.join("\0");
+    if (reconcileInstallsInflight) {
+      if (reconcileInstallsPending?.key === key) return reconcileInstallsInflight;
+      if (!reconcileInstallsPending && reconcileInstallsExecuting?.key === key) return reconcileInstallsInflight;
     }
+    reconcileInstallsPending = { key, paths: canonicalPaths, generation: ++reconcileInstallsGeneration };
+    if (reconcileInstallsInflight) return reconcileInstallsInflight;
+
+    this.reconciling = true;
+    reconcileInstallsInflight = (async () => {
+      while (reconcileInstallsPending) {
+        const request = reconcileInstallsPending;
+        reconcileInstallsPending = null;
+        reconcileInstallsExecuting = request;
+        const attempt = ++this.reconcileAttempt;
+        try {
+          const installed = await skillInstallsReconcile(request.paths);
+          const backups = await skillBackupsList();
+          if (request.generation === reconcileInstallsGeneration) {
+            this.installed = installed;
+            this.backups = backups;
+            this.reconciled = true;
+            this.reconcileError = null;
+          }
+        } catch (error) {
+          if (request.generation === reconcileInstallsGeneration) this.reconcileError = errorMessage(error);
+        } finally {
+          if (request.generation === reconcileInstallsGeneration) this.reconcileTerminal = attempt;
+        }
+      }
+      reconcileInstallsExecuting = null;
+      this.reconciling = false;
+      reconcileInstallsInflight = null;
+    })();
+    return reconcileInstallsInflight;
   }
 
   async lifecycle(

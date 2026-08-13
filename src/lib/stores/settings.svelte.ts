@@ -13,6 +13,7 @@
  */
 
 import {
+  appErrorMessage,
   isAppError,
   SETTINGS_DEFAULTS,
   type GeneralSettingsPatch,
@@ -55,9 +56,9 @@ class SettingsStore {
         // defaults for any reader that needs a value to render.
         this.corruptOnDisk = true;
         this.data = { ...SETTINGS_DEFAULTS };
-        this.error = e.message;
+        this.error = appErrorMessage(e);
       } else if (isAppError(e)) {
-        this.error = e.code;
+        this.error = appErrorMessage(e);
       } else {
         this.error = String(e);
       }
@@ -87,7 +88,7 @@ class SettingsStore {
       // Revert optimistic update on failure.
       this.data = base;
       if (isAppError(e)) {
-        this.error = e.code === "invalid_argument" ? e.message : e.code;
+        this.error = appErrorMessage(e);
       } else {
         this.error = String(e);
       }
@@ -107,7 +108,7 @@ class SettingsStore {
       this.corruptOnDisk = false;
     } catch (e) {
       if (isAppError(e)) {
-        this.error = e.code;
+        this.error = appErrorMessage(e);
       } else {
         this.error = String(e);
       }

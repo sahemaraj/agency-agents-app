@@ -14,7 +14,7 @@
   import { install } from "$lib/stores/install.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { diffLines, diffStat, type DiffRow } from "$lib/util/diff";
-  import type { AgentDiff, AgentReference, Tool } from "$lib/types";
+  import { appErrorMessage, isAppError, type AgentDiff, type AgentReference, type Tool } from "$lib/types";
 
   interface Props {
     slug: string;
@@ -35,7 +35,7 @@
       ? install.diffReference(reference, tool, projectPath)
       : install.diff(slug, tool, projectPath))
       .then((d) => (data = d))
-      .catch((e) => (error = String(e)))
+      .catch((e) => (error = isAppError(e) ? appErrorMessage(e) : String(e)))
       .finally(() => (loading = false));
   });
 

@@ -9,7 +9,7 @@
   import { SUPPORTED_TOOLS } from "$lib/stores/install.svelte";
   import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { Agent, AgentPackageResult, AgentSource, Tool } from "$lib/types";
+  import { appErrorMessage, isAppError, type Agent, type AgentPackageResult, type AgentSource, type Tool } from "$lib/types";
 
   interface Props {
     agent: Agent;
@@ -73,7 +73,7 @@
     void agentTextRead(reference).then((text) => {
       if (`${pkg?.reference.sourceId}\0${pkg?.reference.relativePath}` === key) sourceText = text;
     }).catch((error) => {
-      sourceError = String(error);
+      sourceError = isAppError(error) ? appErrorMessage(error) : String(error);
     });
   });
 
@@ -87,7 +87,7 @@
     void agentRenderPreview(reference, tool).then((text) => {
       if (`${pkg?.reference.sourceId}\0${pkg?.reference.relativePath}\0${selectedTool}` === key) rendered = text;
     }).catch((error) => {
-      renderError = String(error);
+      renderError = isAppError(error) ? appErrorMessage(error) : String(error);
       rendered = "";
     });
   });

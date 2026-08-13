@@ -14,14 +14,16 @@
   import { teams } from "$lib/stores/teams.svelte";
   import { activity } from "$lib/stores/activity.svelte";
   import { toast } from "$lib/stores/toast.svelte";
-  import type {
-    ExpertActivationPlan,
-    ExpertClient,
-    ExpertCreationRequest,
-    ExpertDefinition,
-    ExpertProposalInput,
-    ExpertResolved,
-    ExpertRun,
+  import {
+    appErrorMessage,
+    isAppError,
+    type ExpertActivationPlan,
+    type ExpertClient,
+    type ExpertCreationRequest,
+    type ExpertDefinition,
+    type ExpertProposalInput,
+    type ExpertResolved,
+    type ExpertRun,
   } from "$lib/types";
 
   onMount(() => {
@@ -92,7 +94,7 @@
     try {
       plan = await experts.plan(expert.id, projectPath, client || null);
     } catch (error) {
-      toast.error("Could not plan activation", String(error));
+      toast.error("Could not plan activation", isAppError(error) ? appErrorMessage(error) : String(error));
     } finally {
       planning = false;
     }
@@ -127,9 +129,9 @@
         subjectName: plan?.expert.name,
         projectPath: plan?.projectPath,
         outcome: "error",
-        detail: String(error),
+        detail: isAppError(error) ? appErrorMessage(error) : String(error),
       });
-      toast.error("Activation failed", String(error));
+      toast.error("Activation failed", isAppError(error) ? appErrorMessage(error) : String(error));
     } finally {
       activating = false;
     }
@@ -164,7 +166,7 @@
       builder = null;
       toast.success("Expert saved");
     } catch (error) {
-      toast.error("Could not save Expert", String(error));
+      toast.error("Could not save Expert", isAppError(error) ? appErrorMessage(error) : String(error));
     }
   }
 
@@ -195,7 +197,7 @@
         detail: "Rejected Expert proposal",
       });
     } catch (error) {
-      toast.error("Could not reject Expert proposal", String(error));
+      toast.error("Could not reject Expert proposal", isAppError(error) ? appErrorMessage(error) : String(error));
     }
   }
 
@@ -217,7 +219,7 @@
       waiverReason = "";
       toast.success(`Run marked ${verdict}`);
     } catch (error) {
-      toast.error("Could not review run", String(error));
+      toast.error("Could not review run", isAppError(error) ? appErrorMessage(error) : String(error));
     }
   }
 
@@ -243,14 +245,14 @@
     const path = await open({ multiple: false, filters: [{ name: "Expert JSON", extensions: ["json"] }] });
     if (typeof path !== "string") return;
     try { toast.success(`Imported ${await experts.importFile(path)} Expert(s)`); }
-    catch (error) { toast.error("Import failed", String(error)); }
+    catch (error) { toast.error("Import failed", isAppError(error) ? appErrorMessage(error) : String(error)); }
   }
 
   async function exportExperts() {
     const path = await save({ defaultPath: "experts.json", filters: [{ name: "Expert JSON", extensions: ["json"] }] });
     if (!path) return;
     try { toast.success(`Exported ${await experts.exportFile(path)} Expert(s)`); }
-    catch (error) { toast.error("Export failed", String(error)); }
+    catch (error) { toast.error("Export failed", isAppError(error) ? appErrorMessage(error) : String(error)); }
   }
 
   function saveRoster(expert: ExpertResolved) {

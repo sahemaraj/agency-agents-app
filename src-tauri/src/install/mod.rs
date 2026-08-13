@@ -11,8 +11,9 @@
 //! slug for its tool (the deterministic `render/` layer makes that reproducible).
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
 use tauri::{AppHandle, State};
@@ -4252,30 +4253,200 @@ pub(crate) async fn tool_detected(state: &AppState, tool: &str) -> Result<bool, 
     Ok(detect(tool, &base).0)
 }
 
-/// Open a path in the OS file manager (Finder / Explorer / xdg-open).
-/// Best-effort: returns an error the UI can toast if the path is missing or no
-/// opener is available. Used by the Tools panel's "Reveal" affordance.
-#[tauri::command]
-pub async fn reveal_path(path: String) -> Result<(), AppError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum RevealPlatform {
+    MacOs,
+    Windows,
+    Linux,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RevealOpenerSpec {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+fn current_reveal_platform() -> RevealPlatform {
+    #[cfg(target_os = "macos")]
+    return RevealPlatform::MacOs;
+    #[cfg(target_os = "windows")]
+    return RevealPlatform::Windows;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return RevealPlatform::Linux;
+}
+
+fn reveal_opener_spec(
+    target: &Path,
+    target_is_dir: bool,
+    platform: RevealPlatform,
+) -> RevealOpenerSpec {
+    match platform {
+        RevealPlatform::MacOs => RevealOpenerSpec {
+            program: OsString::from("/usr/bin/open"),
+            args: vec![OsString::from("-R"), target.as_os_str().to_owned()],
+        },
+        RevealPlatform::Windows => {
+            let args = if target_is_dir {
+                vec![target.as_os_str().to_owned()]
+            } else {
+                vec![OsString::from("/select,"), target.as_os_str().to_owned()]
+            };
+            RevealOpenerSpec {
+                program: OsString::from("explorer"),
+                args,
+            }
+        }
+        RevealPlatform::Linux => RevealOpenerSpec {
+            program: OsString::from("xdg-open"),
+            args: vec![if target_is_dir {
+                target.as_os_str().to_owned()
+            } else {
+                target.parent().unwrap_or(target).as_os_str().to_owned()
+            }],
+        },
+    }
+}
+
+fn validate_reveal_target(path: &str, roots: &[PathBuf]) -> Result<PathBuf, AppError> {
+    let supplied = Path::new(path);
+    let normalized = supplied.components().collect::<PathBuf>();
+    if path.is_empty()
+        || path.contains("://")
+        || path.to_ascii_lowercase().starts_with("file:")
+        || !supplied.is_absolute()
+        || supplied
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || normalized.as_os_str() != supplied.as_os_str()
+    {
+        return Err(AppError::InvalidArgument {
+            message: "reveal path must be an absolute normalized filesystem path".into(),
+        });
+    }
+    std::fs::symlink_metadata(supplied).map_err(|error| AppError::InvalidArgument {
+        message: format!("reveal path must exist: {error}"),
+    })?;
+    let canonical = std::fs::canonicalize(supplied).map_err(|error| AppError::InvalidArgument {
+        message: format!("could not canonicalize reveal path: {error}"),
+    })?;
+    if roots.iter().any(|root| canonical.starts_with(root)) {
+        Ok(canonical)
+    } else {
+        Err(AppError::InvalidArgument {
+            message: "reveal path is outside supported Agency Agents locations".into(),
+        })
+    }
+}
+
+async fn reveal_allowed_roots(state: &AppState) -> Result<Vec<PathBuf>, AppError> {
+    reveal_allowed_roots_for_home(state, &home()?).await
+}
+
+async fn reveal_allowed_roots_for_home(
+    state: &AppState,
+    home: &Path,
+) -> Result<Vec<PathBuf>, AppError> {
+    let mut candidates = vec![state.app_data_dir.clone()];
+    let settings = state.settings.read().await.effective_settings();
+    for tool in registry::wired().filter(|tool| tool.supports_user()) {
+        let base = settings
+            .as_ref()
+            .map(|settings| resolve_tool_base(&settings.tool_paths, &tool.id, home))
+            .unwrap_or_else(|| home.to_path_buf());
+        if let Some(destinations) = tool.dest.as_ref() {
+            candidates.extend(destinations.user.iter().filter_map(|template| {
+                template
+                    .split_once("{slug}")
+                    .map(|(prefix, _)| base.join(prefix))
+            }));
+        }
+    }
+    for runtime in ["claudeCode", "codex"] {
+        candidates.push(
+            crate::skills::install::target_path(home, None, runtime, "probe")?
+                .parent()
+                .expect("skill target always has a parent")
+                .to_path_buf(),
+        );
+    }
+
+    let mut projects = registered_projects(&state.app_data_dir).await?;
+    projects.extend(
+        load_ledger_for_state(state)
+            .await?
+            .into_iter()
+            .filter_map(|record| record.project_path.map(PathBuf::from)),
+    );
+    projects.extend(
+        crate::skills::install::load_ledger_for_state(state)
+            .await?
+            .into_iter()
+            .filter_map(|record| record.project_path.map(PathBuf::from)),
+    );
+    for project in projects {
+        candidates.push(project.clone());
+        for runtime in ["claudeCode", "codex"] {
+            candidates.push(
+                crate::skills::install::target_path(home, Some(&project), runtime, "probe")?
+                    .parent()
+                    .expect("skill target always has a parent")
+                    .to_path_buf(),
+            );
+        }
+    }
+
+    Ok(candidates
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+fn reveal_path_from_roots_with_executor<F>(
+    path: String,
+    roots: Vec<PathBuf>,
+    platform: RevealPlatform,
+    executor: F,
+) -> Result<(), AppError>
+where
+    F: FnOnce(RevealOpenerSpec) -> std::io::Result<bool>,
+{
+    let target = validate_reveal_target(&path, &roots)?;
+    let spec = reveal_opener_spec(&target, target.is_dir(), platform);
+    let success = executor(spec).map_err(|error| AppError::Io {
+        message: format!("could not reveal {path}: {error}"),
+    })?;
+    if success {
+        Ok(())
+    } else {
+        Err(AppError::Io {
+            message: format!("file manager could not reveal {path}"),
+        })
+    }
+}
+
+pub(crate) async fn reveal_path_for_state(state: &AppState, path: String) -> Result<(), AppError> {
+    let roots = reveal_allowed_roots(state).await?;
     tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
-        let program = "open";
-        #[cfg(target_os = "windows")]
-        let program = "explorer";
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let program = "xdg-open";
-        std::process::Command::new(program)
-            .arg(&path)
-            .status()
-            .map(|_| ())
-            .map_err(|e| AppError::Io {
-                message: format!("could not open {path}: {e}"),
-            })
+        reveal_path_from_roots_with_executor(path, roots, current_reveal_platform(), |spec| {
+            std::process::Command::new(&spec.program)
+                .args(&spec.args)
+                .status()
+                .map(|status| status.success())
+        })
     })
     .await
-    .map_err(|e| AppError::Io {
-        message: e.to_string(),
+    .map_err(|error| AppError::Io {
+        message: format!("file manager task failed: {error}"),
     })?
+}
+
+/// Reveal an app-owned or supported installation path in the OS file manager.
+#[tauri::command]
+pub async fn reveal_path(state: State<'_, AppState>, path: String) -> Result<(), AppError> {
+    reveal_path_for_state(&state, path).await
 }
 
 /// The `<bin> --version`-style probe command for a tool, or `None` when we don't
@@ -4631,6 +4802,287 @@ pub async fn loadout_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reveal_app_data_target_reaches_opener_spec_without_launching_gui() {
+        let app = tempfile::tempdir().unwrap();
+        let target = app.path().join("state/installs.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"[]").unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let roots = reveal_allowed_roots(&state).await.unwrap();
+        let mut recorded = None;
+
+        reveal_path_from_roots_with_executor(
+            target.to_string_lossy().into_owned(),
+            roots,
+            RevealPlatform::MacOs,
+            |spec| {
+                recorded = Some(spec);
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        let spec = recorded.expect("validated target must reach the recording executor");
+        assert_eq!(spec.program, std::ffi::OsString::from("/usr/bin/open"));
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("-R"),
+                std::fs::canonicalize(target).unwrap().into_os_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reveal_unrelated_target_is_rejected_before_executor() {
+        let app = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let roots = reveal_allowed_roots(&state).await.unwrap();
+        let mut calls = 0;
+
+        let result = reveal_path_from_roots_with_executor(
+            unrelated.path().to_string_lossy().into_owned(),
+            roots,
+            RevealPlatform::MacOs,
+            |_| {
+                calls += 1;
+                Ok(true)
+            },
+        );
+
+        assert!(matches!(result, Err(AppError::InvalidArgument { .. })));
+        assert_eq!(calls, 0, "rejected input must not reach the executor");
+    }
+
+    #[tokio::test]
+    async fn reveal_roots_come_from_backend_install_state() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+
+        let app = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let custom_tool_home = tempfile::tempdir().unwrap();
+        let registered_project = tempfile::tempdir().unwrap();
+        let agent_project = tempfile::tempdir().unwrap();
+        let skill_project = tempfile::tempdir().unwrap();
+        for path in [
+            custom_tool_home.path().join(".claude/agents"),
+            home.path().join(".claude/skills"),
+            home.path().join(".agents/skills"),
+            registered_project.path().join(".claude/skills"),
+            registered_project.path().join(".agents/skills"),
+            agent_project.path().join(".claude/skills"),
+            skill_project.path().join(".agents/skills"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir_all(app.path().join("state")).unwrap();
+        std::fs::write(
+            app.path().join("state/projects.json"),
+            serde_json::to_vec(&vec![registered_project.path()]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            app.path().join("state/installs.json"),
+            serde_json::to_vec(&vec![row(
+                "agent",
+                "claudeCode",
+                Some(agent_project.path().to_str().unwrap()),
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            app.path().join("state/skill-installs.json"),
+            serde_json::to_vec(&vec![crate::types::SkillInstallRecord {
+                source_id: "builtin:skills".into(),
+                relative_path: "reviewer/SKILL.md".into(),
+                name: "reviewer".into(),
+                runtime: "codex".into(),
+                scope: "project".into(),
+                project_path: Some(skill_project.path().to_string_lossy().into_owned()),
+                dest: skill_project
+                    .path()
+                    .join(".agents/skills/reviewer")
+                    .to_string_lossy()
+                    .into_owned(),
+                source_hash: "a".repeat(64),
+                installed_hash: "b".repeat(64),
+                installed_at: "2026-08-12T00:00:00Z".into(),
+                disabled_path: None,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "claudeCode".into(),
+            custom_tool_home.path().to_string_lossy().into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+
+        let roots = reveal_allowed_roots_for_home(&state, home.path())
+            .await
+            .unwrap();
+        for expected in [
+            app.path().to_path_buf(),
+            custom_tool_home.path().join(".claude/agents"),
+            home.path().join(".claude/skills"),
+            home.path().join(".agents/skills"),
+            registered_project.path().to_path_buf(),
+            registered_project.path().join(".claude/skills"),
+            registered_project.path().join(".agents/skills"),
+            agent_project.path().to_path_buf(),
+            skill_project.path().to_path_buf(),
+        ] {
+            let expected = std::fs::canonicalize(expected).unwrap();
+            assert!(
+                roots.contains(&expected),
+                "missing root {}",
+                expected.display()
+            );
+        }
+    }
+
+    #[test]
+    fn reveal_rejects_forbidden_paths_before_executor() {
+        let allowed = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let target = allowed.path().join("target.txt");
+        std::fs::write(&target, b"target").unwrap();
+        let sibling = allowed.path().parent().unwrap().join(format!(
+            "{}-other",
+            allowed.path().file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&sibling).unwrap();
+        let roots = vec![std::fs::canonicalize(allowed.path()).unwrap()];
+        let missing = allowed.path().join("missing");
+        let dot = allowed.path().join("./target.txt");
+        let parent = allowed.path().join("child/../target.txt");
+        let cases = vec![
+            String::new(),
+            "https://example.com".into(),
+            "file:///tmp/example".into(),
+            "relative/path".into(),
+            missing.to_string_lossy().into_owned(),
+            unrelated.path().to_string_lossy().into_owned(),
+            sibling.to_string_lossy().into_owned(),
+            dot.to_string_lossy().into_owned(),
+            parent.to_string_lossy().into_owned(),
+        ];
+        for path in cases {
+            let mut calls = 0;
+            let result = reveal_path_from_roots_with_executor(
+                path.clone(),
+                roots.clone(),
+                RevealPlatform::MacOs,
+                |_| {
+                    calls += 1;
+                    Ok(true)
+                },
+            );
+            assert!(
+                matches!(result, Err(AppError::InvalidArgument { .. })),
+                "unexpected authorization for {path:?}"
+            );
+            assert_eq!(calls, 0, "rejected {path:?} reached executor");
+        }
+        let _ = std::fs::remove_dir(sibling);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reveal_allows_contained_symlink_and_rejects_escape() {
+        use std::os::unix::fs::symlink;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_target = allowed.path().join("inside.txt");
+        let outside_target = outside.path().join("outside.txt");
+        std::fs::write(&inside_target, b"inside").unwrap();
+        std::fs::write(&outside_target, b"outside").unwrap();
+        let inside_link = allowed.path().join("inside-link");
+        let escape_link = allowed.path().join("escape-link");
+        symlink(&inside_target, &inside_link).unwrap();
+        symlink(&outside_target, &escape_link).unwrap();
+        let roots = vec![std::fs::canonicalize(allowed.path()).unwrap()];
+        let mut calls = 0;
+
+        reveal_path_from_roots_with_executor(
+            inside_link.to_string_lossy().into_owned(),
+            roots.clone(),
+            RevealPlatform::MacOs,
+            |_| {
+                calls += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+
+        let result = reveal_path_from_roots_with_executor(
+            escape_link.to_string_lossy().into_owned(),
+            roots,
+            RevealPlatform::MacOs,
+            |_| {
+                calls += 1;
+                Ok(true)
+            },
+        );
+        assert!(matches!(result, Err(AppError::InvalidArgument { .. })));
+        assert_eq!(calls, 1, "symlink escape reached executor");
+    }
+
+    #[test]
+    fn reveal_opener_specs_are_pure_and_platform_specific() {
+        let directory = Path::new("/allowed/directory");
+        let file = directory.join("file.txt");
+        assert_eq!(
+            reveal_opener_spec(&file, false, RevealPlatform::MacOs),
+            RevealOpenerSpec {
+                program: OsString::from("/usr/bin/open"),
+                args: vec![OsString::from("-R"), file.as_os_str().to_owned()],
+            }
+        );
+        assert_eq!(
+            reveal_opener_spec(&file, false, RevealPlatform::Windows),
+            RevealOpenerSpec {
+                program: OsString::from("explorer"),
+                args: vec![OsString::from("/select,"), file.as_os_str().to_owned()],
+            }
+        );
+        assert_eq!(
+            reveal_opener_spec(&file, false, RevealPlatform::Linux),
+            RevealOpenerSpec {
+                program: OsString::from("xdg-open"),
+                args: vec![directory.as_os_str().to_owned()],
+            }
+        );
+        assert_eq!(
+            reveal_opener_spec(directory, true, RevealPlatform::Linux).args,
+            vec![directory.as_os_str().to_owned()]
+        );
+    }
+
+    #[test]
+    fn reveal_nonzero_status_is_io_error() {
+        let allowed = tempfile::tempdir().unwrap();
+        let roots = vec![std::fs::canonicalize(allowed.path()).unwrap()];
+        let result = reveal_path_from_roots_with_executor(
+            allowed.path().to_string_lossy().into_owned(),
+            roots,
+            RevealPlatform::MacOs,
+            |_| Ok(false),
+        );
+        assert!(matches!(result, Err(AppError::Io { .. })));
+    }
 
     #[test]
     fn agentfile_roundtrips() {

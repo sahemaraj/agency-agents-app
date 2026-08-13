@@ -1,14 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import type {
-  ExpertActivationPlan,
-  ExpertActivationRecord,
-  ExpertActivationRequest,
-  ExpertClient,
-  ExpertCreationRequest,
-  ExpertDefinition,
-  ExpertProposalInput,
-  ExpertResolved,
-  ExpertRun,
+import {
+  appErrorMessage,
+  isAppError,
+  type ExpertActivationPlan,
+  type ExpertActivationRecord,
+  type ExpertActivationRequest,
+  type ExpertClient,
+  type ExpertCreationRequest,
+  type ExpertDefinition,
+  type ExpertProposalInput,
+  type ExpertResolved,
+  type ExpertRun,
 } from "$lib/types";
 
 class ExpertsStore {
@@ -39,7 +41,7 @@ class ExpertsStore {
         this.selectedId = this.list[0]?.id ?? null;
       }
     } catch (error) {
-      this.error = String(error);
+      this.error = isAppError(error) ? appErrorMessage(error) : String(error);
       this.list = [];
     } finally {
       this.loading = false;
