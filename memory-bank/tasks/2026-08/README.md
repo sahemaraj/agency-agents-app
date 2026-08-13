@@ -52,3 +52,7 @@ Moved the desktop and MCP mutable control plane to a shared transactional SQLite
 verified one-time migration, private backups, crash-recoverable filesystem journals, exact approval
 reconciliation, and foreground revision refresh. Package artifacts and Keychain secrets remain
 outside the database. See [260806_sqlite-control-plane.md](./260806_sqlite-control-plane.md).
+
+### 2026-08-13: Phase 6 Reliability Gate
+
+Added semantic application errors, retained and retryable Agent/Skill reconciliation truth, stale-mutation guards, and backend-authorized canonical filesystem reveal. Verification passed with zero implementation blockers; the user explicitly waived unavailable 375px geometry and native Linux/Windows evidence without treating them as green. See [260813_phase6-reliability-gate.md](./260813_phase6-reliability-gate.md).

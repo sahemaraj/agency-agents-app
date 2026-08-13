@@ -1,5 +1,9 @@
 # Active Context — Agency Agents
 
+## ✅ v2.0 Phase 6 — Reliability Gate [COMPLETE] (2026-08-13)
+
+The approved `feat/v2-activation-truthful-state` branch now renders affected application failures semantically, preserves last-known Agent and Skill installation truth through reconciliation failures, exposes safe coalesced Retry, blocks stale mutations, and authorizes filesystem reveal only for existing canonical targets inside backend-derived supported roots. Verification: 65 frontend tests and 528 Rust tests passed, Svelte check reported 0 errors and 0 warnings, production build/format/diff gates passed, Nyquist is compliant, and security has zero blocking threats. The user explicitly waived real 375px geometry and native Linux/Windows evidence; those remain UNAVAILABLE, not green. Implementation commit: `73e7c5d`. Record: `tasks/2026-08/260813_phase6-reliability-gate.md`.
+
 ## ✅ SQLite Control Plane [COMPLETE] (2026-08-06)
 
 The approved `feat/sqlite-control-plane` branch now uses a shared transactional SQLite authority
