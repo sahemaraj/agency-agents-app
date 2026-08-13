@@ -1,5 +1,9 @@
 # Active Context — Agency Agents
 
+## ✅ v2.0 Phase 9 — Safe Bulk Repair [COMPLETE] (2026-08-13)
+
+The approved `feat/phase-9-safe-bulk-repair` branch now combines exact tracked outdated and missing Agent and Skill installations into one reviewed repair workflow. Unsafe states remain visible but cannot be selected. Approval is bound to fresh dual-ledger reconciliation plus normalized plan and Skill source-byte signatures; drift causes zero writes. Execution reuses the existing sequential, backed-up exact lifecycle operations, continues after individual failure, records bounded Activity, and reconciles final truth. Verification: OpenSpec 16/16 and strict validation passed, canonical specs validate 3/3, 84 frontend tests and 529 executed Rust tests passed, Svelte check reported 0 errors and 0 warnings, and production build and diff gates passed. Implementation commit: `e36ec10`. Record: `tasks/2026-08/260813_phase9-safe-bulk-repair.md`.
+
 ## ✅ v2.0 Phase 8 — Foreground Reconciliation [COMPLETE] (2026-08-13)
 
 The approved `feat/phase-8-foreground-reconciliation` branch now refreshes Agent and Skill installation truth after a root-owned 250 ms focus debounce, reuses each store's in-flight guard, includes registered project paths, performs only local read commands, and preserves stale rows plus existing Retry behavior after failure. Verification: OpenSpec 10/10 and strict validation passed, 74 frontend tests and 529 executed Rust tests passed, Svelte check reported 0 errors and 0 warnings, and the production build and diff gates passed. The existing manual-platform waiver remains explicit. Implementation commit: `af9aa2b`. Record: `tasks/2026-08/260813_phase8-foreground-reconciliation.md`.
