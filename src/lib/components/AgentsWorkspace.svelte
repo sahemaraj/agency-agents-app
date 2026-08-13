@@ -57,9 +57,9 @@
   import type { MessageKey } from "$lib/i18n/messages";
   import type { Agent, AgentPackageResult, InstalledAgent, InstallState, Tool } from "$lib/types";
 
+  let agentCatalogLoaded = $state(false);
   onMount(() => {
-    void corpus.ensureLoaded();
-    void agentLibrary.load();
+    void Promise.all([corpus.ensureLoaded(), agentLibrary.load()]).then(() => (agentCatalogLoaded = true));
   });
 
   // ── OS-style dropdown dismissal: click anywhere outside (or Escape) closes the
@@ -234,8 +234,11 @@
   let detailLoading = $state(false);
   const selectedLibraryPackage = $derived(findAgentPackage(
     agentLibrary.packages,
-    agentLibrary.selectedReference,
+    ui.agentsReference,
   ));
+  $effect(() => {
+    if (agentCatalogLoaded && ui.agentsReference && !selectedLibraryPackage) ui.selectAgent(null);
+  });
   const panelAgent = $derived(selectedLibraryPackage?.agent ?? libraryDetail ?? detail ?? detailStub);
   const panelPackage = $derived(selectedLibraryPackage ?? libraryPackage ?? (panelAgent
     ? agentLibrary.packages.find((pkg) =>
@@ -280,7 +283,7 @@
   }
   function openLibraryAgent(pkg: AgentPackageResult) {
     if (!pkg.agent) return;
-    ui.selectAgent(null);
+    ui.openAgentReference(pkg.reference);
     libraryPackage = pkg;
     libraryDetail = pkg.agent;
     agentLibrary.selectedReference = pkg.reference;

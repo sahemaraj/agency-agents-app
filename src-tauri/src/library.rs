@@ -5,6 +5,16 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
+use crate::state::AppState;
+use crate::types::{
+    AgentPackageResult, AgentPreferredSource, AgentRecommendation, AgentSourceResult,
+    SkillRecommendation, SkillSourceResult, TaskRecommendation,
+};
+use tauri::State;
+
+pub(crate) const MAX_RECOMMEND_TASK_BYTES: usize = 2_048;
+pub(crate) const MAX_RECOMMEND_LANGUAGES: usize = 32;
+pub(crate) const MAX_RECOMMEND_LANGUAGE_BYTES: usize = 64;
 
 pub(crate) const MAX_LIBRARY_FOLDERS: usize = 256;
 pub(crate) const MAX_LIBRARY_FOLDER_DEPTH: usize = 8;
@@ -15,6 +25,254 @@ fn invalid(message: impl Into<String>) -> AppError {
     AppError::InvalidArgument {
         message: message.into(),
     }
+}
+
+fn metadata_tokens(value: &str) -> std::collections::BTreeSet<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+pub(crate) fn validate_recommend_request(task: &str, languages: &[String]) -> Result<(), AppError> {
+    if task.len() > MAX_RECOMMEND_TASK_BYTES {
+        return Err(invalid(format!(
+            "task exceeds the {MAX_RECOMMEND_TASK_BYTES}-byte limit"
+        )));
+    }
+    if languages.len() > MAX_RECOMMEND_LANGUAGES {
+        return Err(invalid(format!(
+            "languages exceeds the {MAX_RECOMMEND_LANGUAGES}-item limit"
+        )));
+    }
+    if languages
+        .iter()
+        .any(|language| language.len() > MAX_RECOMMEND_LANGUAGE_BYTES)
+    {
+        return Err(invalid(format!(
+            "language exceeds the {MAX_RECOMMEND_LANGUAGE_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn sanitized_agent_package(mut package: AgentPackageResult) -> AgentPackageResult {
+    if let Some(agent) = &mut package.agent {
+        agent.body.clear();
+    }
+    package
+}
+
+pub(crate) fn recommend_agents(
+    results: &[AgentSourceResult],
+    preferred: &[AgentPreferredSource],
+    task: &str,
+    limit: usize,
+) -> Result<Vec<AgentRecommendation>, AppError> {
+    validate_recommend_request(task, &[])?;
+    let task_tokens = metadata_tokens(task);
+    let mut recommendations = results
+        .iter()
+        .flat_map(|source| &source.agents)
+        .filter(|package| package.installable)
+        .filter_map(|package| {
+            let agent = package.agent.as_ref()?;
+            let name = metadata_tokens(&agent.name);
+            let description = metadata_tokens(&agent.description);
+            let taxonomy = std::iter::once(agent.category.as_str())
+                .chain(package.groups.iter().map(String::as_str))
+                .chain(package.tags.iter().map(String::as_str))
+                .chain(package.capabilities.iter().map(String::as_str))
+                .flat_map(metadata_tokens)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut score = 0;
+            let mut reasons = Vec::new();
+            for token in &task_tokens {
+                if name.contains(token) {
+                    score += 4;
+                    reasons.push(format!("task:name:{token}"));
+                } else if description.contains(token) {
+                    score += 2;
+                    reasons.push(format!("task:description:{token}"));
+                } else if taxonomy.contains(token) {
+                    score += 2;
+                    reasons.push(format!("task:taxonomy:{token}"));
+                }
+            }
+            if preferred.iter().any(|item| {
+                item.agent_name.eq_ignore_ascii_case(&agent.name)
+                    && item.source_id == package.reference.source_id
+            }) {
+                score += 1;
+                reasons.push("preferred-source".into());
+            }
+            (score > 0).then(|| AgentRecommendation {
+                package: sanitized_agent_package(package.clone()),
+                score,
+                reasons,
+            })
+        })
+        .collect::<Vec<_>>();
+    recommendations.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.package.reference.cmp(&right.package.reference))
+    });
+    recommendations.truncate(limit.clamp(1, 50));
+    Ok(recommendations)
+}
+
+pub(crate) fn recommend_skills(
+    results: &[SkillSourceResult],
+    task: &str,
+    languages: &[String],
+    limit: usize,
+) -> Result<Vec<SkillRecommendation>, AppError> {
+    validate_recommend_request(task, languages)?;
+    let task_tokens = metadata_tokens(task);
+    let language_tokens = languages
+        .iter()
+        .flat_map(|language| metadata_tokens(language))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut recommendations = results
+        .iter()
+        .flat_map(|result| &result.packages)
+        .filter(|package| package.installable)
+        .filter_map(|package| {
+            let name = metadata_tokens(package.name.as_deref().unwrap_or_default());
+            let description = metadata_tokens(package.description.as_deref().unwrap_or_default());
+            let taxonomy = std::iter::once(package.skill_type.as_str())
+                .chain(package.group.iter().map(String::as_str))
+                .chain(package.tags.iter().map(String::as_str))
+                .flat_map(metadata_tokens)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut score = 0;
+            let mut reasons = Vec::new();
+            for token in &task_tokens {
+                if name.contains(token) {
+                    score += 4;
+                    reasons.push(format!("task:name:{token}"));
+                } else if description.contains(token) {
+                    score += 2;
+                    reasons.push(format!("task:description:{token}"));
+                } else if taxonomy.contains(token) {
+                    score += 2;
+                    reasons.push(format!("task:taxonomy:{token}"));
+                }
+            }
+            for token in &language_tokens {
+                if name.contains(token) || description.contains(token) || taxonomy.contains(token) {
+                    score += 3;
+                    reasons.push(format!("language:{token}"));
+                }
+            }
+            (score > 0).then(|| SkillRecommendation {
+                package: package.clone(),
+                score,
+                reasons,
+            })
+        })
+        .collect::<Vec<_>>();
+    recommendations.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                left.package
+                    .name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .cmp(
+                        &right
+                            .package
+                            .name
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase(),
+                    )
+            })
+            .then_with(|| left.package.name.cmp(&right.package.name))
+            .then_with(|| left.package.source_id.cmp(&right.package.source_id))
+            .then_with(|| left.package.relative_path.cmp(&right.package.relative_path))
+    });
+    recommendations.truncate(limit.clamp(1, 50));
+    Ok(recommendations)
+}
+
+pub(crate) fn recommend_catalog(
+    agents: &[AgentSourceResult],
+    preferred: &[AgentPreferredSource],
+    skills: &[SkillSourceResult],
+    task: &str,
+    languages: &[String],
+    limit: usize,
+) -> Result<Vec<TaskRecommendation>, AppError> {
+    let mut combined = recommend_agents(agents, preferred, task, limit)?
+        .into_iter()
+        .map(|item| TaskRecommendation::Agent {
+            package: item.package,
+            score: item.score,
+            reasons: item.reasons,
+        })
+        .chain(
+            recommend_skills(skills, task, languages, limit)?
+                .into_iter()
+                .map(|item| TaskRecommendation::Skill {
+                    package: item.package,
+                    score: item.score,
+                    reasons: item.reasons,
+                }),
+        )
+        .collect::<Vec<_>>();
+    combined.sort_by(|left, right| {
+        right
+            .score()
+            .cmp(&left.score())
+            .then_with(|| match (left, right) {
+                (
+                    TaskRecommendation::Agent { package: left, .. },
+                    TaskRecommendation::Agent { package: right, .. },
+                ) => left.reference.cmp(&right.reference),
+                (
+                    TaskRecommendation::Skill { package: left, .. },
+                    TaskRecommendation::Skill { package: right, .. },
+                ) => (&left.source_id, &left.relative_path)
+                    .cmp(&(&right.source_id, &right.relative_path)),
+                (TaskRecommendation::Agent { .. }, TaskRecommendation::Skill { .. }) => {
+                    std::cmp::Ordering::Less
+                }
+                (TaskRecommendation::Skill { .. }, TaskRecommendation::Agent { .. }) => {
+                    std::cmp::Ordering::Greater
+                }
+            })
+    });
+    combined.truncate(limit.clamp(1, 50));
+    Ok(combined)
+}
+
+#[tauri::command]
+pub async fn task_recommendations(
+    state: State<'_, AppState>,
+    task: String,
+    limit: Option<usize>,
+) -> Result<Vec<TaskRecommendation>, AppError> {
+    validate_recommend_request(&task, &[])?;
+    let agents = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
+    let preferred = crate::agents::organize::list(&state)
+        .await?
+        .preferred_sources;
+    let skills = crate::skills::inspect_skill_sources(&state).await?;
+    recommend_catalog(
+        &agents,
+        &preferred,
+        &skills,
+        &task,
+        &[],
+        limit.unwrap_or(10),
+    )
 }
 
 pub(crate) fn verify_publisher_signature(
@@ -278,6 +536,146 @@ pub(crate) fn deleted_folder_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{
+        Agent, AgentPackageResult, AgentReference, AgentSource, AgentSourceKind, AgentSourceResult,
+        SkillPackageResult, SkillSource, SkillSourceKind, SkillSourceResult, SkillType,
+        TaskRecommendation,
+    };
+
+    fn agent_package(source_id: &str, path: &str, installable: bool) -> AgentPackageResult {
+        AgentPackageResult {
+            reference: AgentReference {
+                source_id: source_id.into(),
+                relative_path: path.into(),
+            },
+            agent: Some(Agent {
+                slug: "rust-reviewer".into(),
+                name: "Rust Reviewer".into(),
+                description: "Reviews backend changes".into(),
+                category: "engineering".into(),
+                emoji: None,
+                color: None,
+                vibe: None,
+                body: "private prompt".into(),
+            }),
+            source_hash: "source-hash".into(),
+            frontmatter_hash: "frontmatter-hash".into(),
+            body_hash: "body-hash".into(),
+            version: None,
+            channel: None,
+            changelog: None,
+            publisher: None,
+            publisher_key: None,
+            publisher_verified: false,
+            required_agents: Vec::new(),
+            required_skills: Vec::new(),
+            recommended_agents: Vec::new(),
+            groups: Vec::new(),
+            tags: vec!["rust".into()],
+            capabilities: Vec::new(),
+            permissions: Vec::new(),
+            quality_score: 80,
+            quality_checks: Vec::new(),
+            diagnostics: Vec::new(),
+            installable,
+        }
+    }
+
+    fn skill_package(source_id: &str, path: &str, installable: bool) -> SkillPackageResult {
+        SkillPackageResult {
+            source_id: source_id.into(),
+            relative_path: path.into(),
+            name: Some("Rust Reviewer".into()),
+            description: Some("Reviews backend changes".into()),
+            skill_type: SkillType::Testing,
+            group: Vec::new(),
+            tags: vec!["rust".into()],
+            dependencies: Vec::new(),
+            recommended_skills: Vec::new(),
+            version: None,
+            channel: "stable".into(),
+            changelog: None,
+            publisher: None,
+            publisher_key: None,
+            publisher_verified: false,
+            validation_results: Vec::new(),
+            permissions: Vec::new(),
+            quality_score: 80,
+            quality_checks: Vec::new(),
+            files: Vec::new(),
+            trust_fingerprint: None,
+            errors: Vec::new(),
+            installable,
+        }
+    }
+
+    #[test]
+    fn task_recommendations_are_bounded_stable_exact_and_installable_only() {
+        let agents = vec![AgentSourceResult {
+            source: AgentSource {
+                id: "agents".into(),
+                label: "Agent source".into(),
+                enabled: true,
+                kind: AgentSourceKind::Local {
+                    root: "/agents".into(),
+                },
+            },
+            agents: vec![
+                agent_package("source-b", "z/reviewer.md", true),
+                agent_package("source-a", "a/reviewer.md", true),
+                agent_package("source-c", "broken.md", false),
+            ],
+            errors: Vec::new(),
+            revision: "revision".into(),
+        }];
+        let skills = vec![SkillSourceResult {
+            source: SkillSource {
+                id: "skills".into(),
+                kind: SkillSourceKind::Local {
+                    root: "/skills".into(),
+                },
+            },
+            packages: vec![
+                skill_package("skill-b", "z-review", true),
+                skill_package("skill-a", "a-review", true),
+                skill_package("skill-c", "broken", false),
+            ],
+            errors: Vec::new(),
+        }];
+
+        let matches = recommend_catalog(&agents, &[], &skills, "rust review", &[], 10)
+            .expect("bounded recommendation");
+        let identities = matches
+            .iter()
+            .map(|item| match item {
+                TaskRecommendation::Agent { package, .. } => format!(
+                    "agent:{}:{}",
+                    package.reference.source_id, package.reference.relative_path
+                ),
+                TaskRecommendation::Skill { package, .. } => {
+                    format!("skill:{}:{}", package.source_id, package.relative_path)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            identities,
+            [
+                "agent:source-a:a/reviewer.md",
+                "agent:source-b:z/reviewer.md",
+                "skill:skill-a:a-review",
+                "skill:skill-b:z-review",
+            ]
+        );
+        assert_eq!(
+            matches
+                .iter()
+                .map(TaskRecommendation::score)
+                .collect::<Vec<_>>(),
+            [4, 4, 4, 4]
+        );
+        assert!(recommend_catalog(&agents, &[], &skills, &"x".repeat(2049), &[], 10).is_err());
+    }
 
     #[test]
     fn relative_paths_must_already_be_portable_and_normalized() {

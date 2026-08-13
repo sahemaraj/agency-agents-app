@@ -19,6 +19,7 @@
   import LoadingState from "$lib/components/LoadingState.svelte";
   import Modal from "$lib/components/Modal.svelte";
   import { projects } from "$lib/stores/projects.svelte";
+  import { ui } from "$lib/stores/ui.svelte";
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { skillCollectionBatch, skillInstallPlan } from "$lib/api";
@@ -63,6 +64,7 @@
   let sortOrder: SortOrder = $state("name");
   let detailTab: DetailTab = $state("overview");
   let selectedKey: string | null = $state(null);
+  let catalogLoaded = $state(false);
   let uninstallCandidate: InstalledSkill | null = $state(null);
   let rejectDraftCandidate: SkillDraft | null = $state(null);
   let trustCandidate: PackageView | null = $state(null);
@@ -228,8 +230,14 @@
   });
 
   $effect(() => {
-    if (selectedKey !== null && !filtered.some(({ pkg }) => skillSources.packageKey(pkg) === selectedKey)) {
+    const reference = ui.skillsSelected;
+    if (reference) selectedKey = `${reference.sourceId}\0${reference.relativePath}`;
+  });
+
+  $effect(() => {
+    if (catalogLoaded && selectedKey !== null && !filtered.some(({ pkg }) => skillSources.packageKey(pkg) === selectedKey)) {
       selectedKey = null;
+      ui.selectSkill(null);
     }
   });
 
@@ -251,6 +259,7 @@
     void (async () => {
       await projects.refresh();
       await skillSources.load();
+      catalogLoaded = true;
       await migratePersonalFolders();
       await skillSources.reconcileInstalls(projects.list.map((project) => project.path));
     })();
@@ -594,6 +603,7 @@
 
   function selectPackage(view: PackageView): void {
     selectedKey = skillSources.packageKey(view.pkg);
+    ui.selectSkill({ sourceId: view.pkg.sourceId, relativePath: view.pkg.relativePath });
     detailTab = "overview";
     void skillSources.touchRecent(view.pkg);
   }

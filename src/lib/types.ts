@@ -706,6 +706,10 @@ export interface AgentPackageResult {
   installable: boolean;
 }
 
+export type TaskRecommendation =
+  | { kind: "agent"; package: AgentPackageResult; score: number; reasons: string[] }
+  | { kind: "skill"; package: SkillPackageResult; score: number; reasons: string[] };
+
 export interface AgentSourceResult {
   source: AgentSource;
   agents: AgentPackageResult[];
@@ -1307,4 +1311,5 @@ export type SettingsSection =
 
 /** Command-palette item — a verb (action). */
 export type PaletteItem =
-  | { kind: "command"; id: string; label: string; shortcut?: string; section?: string; run: () => void | Promise<void> };
+  | { kind: "command"; id: string; label: string; shortcut?: string; section?: string; run: () => void | Promise<void> }
+  | { kind: "agent" | "skill"; id: string; label: string; description: string; reason: string; source: string; run: () => void };

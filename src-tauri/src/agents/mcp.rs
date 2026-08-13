@@ -131,14 +131,6 @@ struct AgentFileEntry {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentRecommendation {
-    package: AgentPackageResult,
-    score: u32,
-    reasons: Vec<String>,
-}
-
-#[derive(Serialize)]
 struct DraftMetadata<'a> {
     name: &'a str,
     description: &'a str,
@@ -840,76 +832,6 @@ fn search_agents(
         .collect())
 }
 
-fn metadata_tokens(value: &str) -> std::collections::BTreeSet<String> {
-    value
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
-fn recommend_agents(
-    results: &[AgentSourceResult],
-    preferred: &[crate::types::AgentPreferredSource],
-    task: &str,
-    limit: usize,
-) -> Result<Vec<AgentRecommendation>, String> {
-    if task.len() > 2_048 {
-        return Err("task exceeds the 2048-byte limit".into());
-    }
-    let task_tokens = metadata_tokens(task);
-    let mut recommendations = results
-        .iter()
-        .flat_map(|source| &source.agents)
-        .filter(|package| package.installable)
-        .filter_map(|package| {
-            let agent = package.agent.as_ref()?;
-            let name = metadata_tokens(&agent.name);
-            let description = metadata_tokens(&agent.description);
-            let taxonomy = std::iter::once(agent.category.as_str())
-                .chain(package.groups.iter().map(String::as_str))
-                .chain(package.tags.iter().map(String::as_str))
-                .chain(package.capabilities.iter().map(String::as_str))
-                .flat_map(metadata_tokens)
-                .collect::<std::collections::BTreeSet<_>>();
-            let mut score = 0;
-            let mut reasons = Vec::new();
-            for token in &task_tokens {
-                if name.contains(token) {
-                    score += 4;
-                    reasons.push(format!("task:name:{token}"));
-                } else if description.contains(token) {
-                    score += 2;
-                    reasons.push(format!("task:description:{token}"));
-                } else if taxonomy.contains(token) {
-                    score += 2;
-                    reasons.push(format!("task:taxonomy:{token}"));
-                }
-            }
-            if preferred.iter().any(|item| {
-                item.agent_name.eq_ignore_ascii_case(&agent.name)
-                    && item.source_id == package.reference.source_id
-            }) {
-                score += 1;
-                reasons.push("preferred-source".into());
-            }
-            (score > 0).then(|| AgentRecommendation {
-                package: sanitized_package(package.clone()),
-                score,
-                reasons,
-            })
-        })
-        .collect::<Vec<_>>();
-    recommendations.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.package.reference.cmp(&right.package.reference))
-    });
-    recommendations.truncate(limit.clamp(1, 50));
-    Ok(recommendations)
-}
-
 async fn refresh_agent_source(
     state: &AppState,
     source_id: &str,
@@ -1354,12 +1276,15 @@ impl SkillMcpServer {
             let library = super::organize::list(self.state())
                 .await
                 .map_err(|error| error.to_string())?;
-            serde_json::to_string_pretty(&recommend_agents(
-                &sources,
-                &library.preferred_sources,
-                &task,
-                limit.unwrap_or(10),
-            )?)
+            serde_json::to_string_pretty(
+                &crate::library::recommend_agents(
+                    &sources,
+                    &library.preferred_sources,
+                    &task,
+                    limit.unwrap_or(10),
+                )
+                .map_err(|error| error.to_string())?,
+            )
             .map_err(|error| error.to_string())
         })
         .await

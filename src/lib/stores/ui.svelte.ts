@@ -3,7 +3,7 @@
  * Uses Svelte 5 runes inside a module-scope class instance.
  */
 
-import type { SettingsSection, SidebarSection, ThemePreference, Tool } from "$lib/types";
+import type { AgentReference, SettingsSection, SidebarSection, SkillReference, ThemePreference, Tool } from "$lib/types";
 
 /** A navigable app location — the unit of back/forward history. Captures the
     section plus the full Agents workspace view-state so a back/forward jump
@@ -13,6 +13,8 @@ interface NavLocation {
   agentsCategory: string | null;
   agentsLens: string;
   agentsSelected: string | null;
+  agentsReference: AgentReference | null;
+  skillsSelected: SkillReference | null;
   projectsSelected: string | null;
   teamsSelected: string | null;
 }
@@ -126,6 +128,10 @@ class UiStore {
   /** Slug of the agent open in the workspace detail pane; null = none. In ui so
       back/forward can restore the open agent. */
   agentsSelected: string | null = $state(null);
+  /** Exact source-qualified Agent selected from the library. */
+  agentsReference: AgentReference | null = $state(null);
+  /** Exact source-qualified Skill selected in the Skills workspace. */
+  skillsSelected: SkillReference | null = $state(null);
   /** Tool selected in the Tools console; null = let it auto-pick. Set by the
       Dashboard "Coverage by tool" rows so a click lands on that tool's console. */
   toolsSelected: Tool | null = $state(null);
@@ -188,6 +194,8 @@ class UiStore {
     this.selectedPackage = null;
     this.projectsSelected = null;
     this.teamsSelected = null;
+    this.agentsReference = null;
+    this.skillsSelected = null;
     this.commitNav();
   }
 
@@ -213,8 +221,11 @@ class UiStore {
   openAgents(category: string | null = null, lens: string = "all") {
     this.applyingNav = true;
     this.agentsCategory = category;
+    this.skillsSelected = null;
     this.agentsLens = lens;
     this.agentsSelected = null;
+    this.agentsReference = null;
+    this.skillsSelected = null;
     this.section = "personas";
     this.selectedPackage = null;
     this.projectsSelected = null;
@@ -240,7 +251,32 @@ class UiStore {
 
   setAgentsCategory(c: string | null) { this.agentsCategory = c; this.commitNav(); }
   setAgentsLens(l: string) { this.agentsLens = l; this.commitNav(); }
-  selectAgent(slug: string | null) { this.agentsSelected = slug; this.commitNav(); }
+  selectAgent(slug: string | null) { this.agentsSelected = slug; this.agentsReference = null; this.commitNav(); }
+
+  openAgentReference(reference: AgentReference) {
+    this.section = "personas";
+    this.agentsSelected = null;
+    this.agentsReference = { ...reference };
+    this.skillsSelected = null;
+    this.projectsSelected = null;
+    this.teamsSelected = null;
+    this.commitNav();
+  }
+
+  selectSkill(reference: SkillReference | null) {
+    this.skillsSelected = reference ? { ...reference } : null;
+    this.commitNav();
+  }
+
+  openSkill(reference: SkillReference) {
+    this.section = "skills";
+    this.skillsSelected = { ...reference };
+    this.agentsSelected = null;
+    this.agentsReference = null;
+    this.projectsSelected = null;
+    this.teamsSelected = null;
+    this.commitNav();
+  }
 
   /** Seed history with the current location — call once at startup, after the
       default landing section has been applied. */
@@ -265,6 +301,8 @@ class UiStore {
       agentsCategory: this.agentsCategory,
       agentsLens: this.agentsLens,
       agentsSelected: this.agentsSelected,
+      agentsReference: this.agentsReference ? { ...this.agentsReference } : null,
+      skillsSelected: this.skillsSelected ? { ...this.skillsSelected } : null,
       projectsSelected: this.projectsSelected,
       teamsSelected: this.teamsSelected,
     };
@@ -281,6 +319,10 @@ class UiStore {
       cur.agentsCategory === loc.agentsCategory &&
       cur.agentsLens === loc.agentsLens &&
       cur.agentsSelected === loc.agentsSelected &&
+      cur.agentsReference?.sourceId === loc.agentsReference?.sourceId &&
+      cur.agentsReference?.relativePath === loc.agentsReference?.relativePath &&
+      cur.skillsSelected?.sourceId === loc.skillsSelected?.sourceId &&
+      cur.skillsSelected?.relativePath === loc.skillsSelected?.relativePath &&
       cur.projectsSelected === loc.projectsSelected &&
       cur.teamsSelected === loc.teamsSelected
     ) {
@@ -297,6 +339,8 @@ class UiStore {
     this.agentsCategory = loc.agentsCategory;
     this.agentsLens = loc.agentsLens;
     this.agentsSelected = loc.agentsSelected;
+    this.agentsReference = loc.agentsReference ? { ...loc.agentsReference } : null;
+    this.skillsSelected = loc.skillsSelected ? { ...loc.skillsSelected } : null;
     this.projectsSelected = loc.projectsSelected;
     this.teamsSelected = loc.teamsSelected;
     this.selectedPackage = null;

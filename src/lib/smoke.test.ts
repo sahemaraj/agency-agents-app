@@ -6,6 +6,7 @@ import StorageMigrationGate from "$lib/components/StorageMigrationGate.svelte";
 import UpdatesModal from "$lib/components/UpdatesModal.svelte";
 import DivisionsLanding from "$lib/components/DivisionsLanding.svelte";
 import Sidebar from "$lib/components/Sidebar.svelte";
+import CommandPalette from "$lib/components/CommandPalette.svelte";
 import agentsWorkspaceSource from "$lib/components/AgentsWorkspace.svelte?raw";
 import skillsWorkspaceSource from "$lib/components/SkillsWorkspace.svelte?raw";
 import installModalSource from "$lib/components/InstallModal.svelte?raw";
@@ -27,6 +28,19 @@ import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
 import type { Agent, AgentPackageResult, AgentSource, ExpertResolved, InstalledAgent, InstalledSkill, McpAuditEntry } from "$lib/types";
+
+const skillRecommendation = (sourceId = "skills-b") => ({
+  kind: "skill" as const,
+  package: {
+    sourceId, relativePath: "nested/reviewer", name: "Reviewer", description: "Reviews Rust",
+    skillType: "testing" as const, group: [], tags: ["rust"], dependencies: [], recommendedSkills: [],
+    version: null, channel: "stable", changelog: null, publisher: null, publisherKey: null,
+    publisherVerified: false, validationResults: [], permissions: [], qualityScore: 80,
+    qualityChecks: [], files: [], trustFingerprint: null, errors: [], installable: true,
+  },
+  score: 4,
+  reasons: ["task:name:reviewer"],
+});
 
 const rel01Sources = import.meta.glob([
   "./components/Teams.svelte", "./components/SettingsSectionCatalog.svelte", "./components/ToolsView.svelte",
@@ -132,6 +146,9 @@ beforeEach(async () => {
   ui.projectsSelected = null;
   ui.teamsSelected = null;
   ui.toolsSelected = null;
+  ui.agentsReference = null;
+  ui.skillsSelected = null;
+  ui.paletteOpen = false;
   await tick();
 });
 
@@ -146,6 +163,164 @@ afterEach(async () => {
 describe("frontend test harness", () => {
   it("runs unit tests", () => {
     expect(true).toBe(true);
+  });
+
+  it("restores exact Agent and Skill recommendation navigation", () => {
+    const agent = { sourceId: "source-b", relativePath: "nested/reviewer.md" };
+    const skill = { sourceId: "skills-b", relativePath: "nested/reviewer" };
+    const nav = ui as unknown as {
+      openAgentReference(reference: typeof agent): void;
+      openSkill(reference: typeof skill): void;
+      agentsReference: typeof agent | null;
+      skillsSelected: typeof skill | null;
+    };
+
+    ui.navStack = [];
+    ui.navIndex = -1;
+    nav.openAgentReference(agent);
+    nav.openSkill(skill);
+    ui.back();
+    expect(ui.section).toBe("personas");
+    expect(nav.agentsReference).toEqual(agent);
+    ui.forward();
+    expect(ui.section).toBe("skills");
+    expect(nav.skillsSelected).toEqual(skill);
+  });
+
+  it("opens an exact recommendation without invoking mutation commands", async () => {
+    const recommendation = skillRecommendation();
+    vi.mocked(invoke).mockImplementation(async (command: string) =>
+      command === "task_recommendations" ? [recommendation] as never : [] as never);
+    ui.openPalette();
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(CommandPalette, { target });
+    try {
+      await tick();
+      const input = target.querySelector<HTMLInputElement>("input")!;
+      input.value = "review rust";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(target.querySelectorAll('[role="option"]')).toHaveLength(1));
+      target.querySelector<HTMLButtonElement>('[role="option"]')!.click();
+      expect(ui.section).toBe("skills");
+      expect((ui as unknown as { skillsSelected: unknown }).skillsSelected)
+        .toEqual({ sourceId: "skills-b", relativePath: "nested/reviewer" });
+      expect(vi.mocked(invoke).mock.calls.map(([command]) => command))
+        .toEqual(["task_recommendations"]);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("distinguishes duplicate Agent names and opens the keyboard-selected exact source", async () => {
+    const recommendations = ["source-a", "source-b"].map((sourceId) => ({
+      kind: "agent" as const,
+      package: { ...staleControlPackage, reference: { sourceId, relativePath: "reviewer.md" } },
+      score: 4,
+      reasons: ["task:name:reviewer"],
+    }));
+    vi.mocked(invoke).mockImplementation(async (command: string) =>
+      command === "task_recommendations" ? recommendations as never : [] as never);
+    ui.openPalette();
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(CommandPalette, { target });
+    try {
+      await tick();
+      const input = target.querySelector<HTMLInputElement>("input")!;
+      input.value = "review agent";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(target.querySelectorAll('[role="option"]')).toHaveLength(2));
+      expect(target.textContent).toContain("source-a · reviewer.md");
+      expect(target.textContent).toContain("source-b · reviewer.md");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      expect(ui.section).toBe("personas");
+      expect(ui.agentsReference).toEqual({ sourceId: "source-b", relativePath: "reviewer.md" });
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("keeps command, Agent, and Skill groups together and restores focus on Escape", async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => command === "task_recommendations"
+      ? [
+          { kind: "agent", package: staleControlPackage, score: 4, reasons: ["task:name:reviewer"] },
+          skillRecommendation(),
+        ] as never
+      : [] as never);
+    const trigger = document.createElement("button");
+    document.body.append(trigger);
+    trigger.focus();
+    ui.openPalette();
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(CommandPalette, { target });
+    try {
+      await tick();
+      const input = target.querySelector<HTMLInputElement>("input")!;
+      input.value = "open agents";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(target.querySelectorAll('[role="option"]')).toHaveLength(3));
+      expect(target.textContent).toContain("Commands");
+      expect(target.textContent).toContain("Agents");
+      expect(target.textContent).toContain("Skills");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await vi.waitFor(() => expect(document.activeElement).toBe(trigger));
+      expect(ui.paletteOpen).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+      trigger.remove();
+    }
+  });
+
+  it("debounces task search, ignores stale results, and preserves commands on failure", async () => {
+    let resolveOld: ((value: unknown) => void) | undefined;
+    let resolveNew: ((value: unknown) => void) | undefined;
+    vi.mocked(invoke).mockImplementation((command: string, args?: unknown) => {
+      if (command !== "task_recommendations") return Promise.resolve([] as never);
+      const task = (args as { task: string }).task;
+      if (task === "old query") return new Promise((resolve) => { resolveOld = resolve; });
+      if (task === "new query") return new Promise((resolve) => { resolveNew = resolve; });
+      return Promise.reject({ code: "internal", message: "offline index" });
+    });
+    ui.openPalette();
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(CommandPalette, { target });
+    try {
+      await tick();
+      const input = target.querySelector<HTMLInputElement>("input")!;
+      input.value = "ab";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      expect(vi.mocked(invoke)).not.toHaveBeenCalled();
+
+      input.value = "old query";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(resolveOld).toBeTypeOf("function"));
+      input.value = "new query";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(resolveNew).toBeTypeOf("function"));
+      resolveNew?.([skillRecommendation("new-source")]);
+      await vi.waitFor(() => expect(target.textContent).toContain("new-source"));
+      resolveOld?.([skillRecommendation("old-source")]);
+      await tick();
+      expect(target.textContent).not.toContain("old-source");
+
+      input.value = "open agents";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(target.textContent).toContain("Recommendations unavailable"));
+      expect(target.textContent).toContain("Open Agents");
+      expect(target.querySelector("[role=status]")?.textContent).toContain("offline index");
+      expect(input.maxLength).toBe(2048);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
   });
 
   it("bounds and redacts Activity failure details", () => {

@@ -63,6 +63,7 @@ import type {
   InstallRecord,
   Tool,
   StorageMigrationStatus,
+  TaskRecommendation,
 } from "./types";
 
 export const storageMigrationStatus = () =>
@@ -76,6 +77,9 @@ export const storageBackup = () => invoke<string>("storage_backup");
 export const storageOpenDataDirectory = () => invoke<void>("storage_open_data_directory");
 export const storageLegacyConflictsDismiss = () =>
   invoke<void>("storage_legacy_conflicts_dismiss");
+
+export const taskRecommendations = (task: string, limit = 10) =>
+  invoke<TaskRecommendation[]>("task_recommendations", { task, limit });
 
 // ============================================================
 // Agent sources, drafts, and personal library

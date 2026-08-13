@@ -1,23 +1,33 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import Search from "@lucide/svelte/icons/search";
 
+  import { taskRecommendations } from "$lib/api";
   import { ui } from "$lib/stores/ui.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { shortcut } from "$lib/util/platform";
-  import type { PaletteItem } from "$lib/types";
+  import { appErrorMessage, isAppError, type PaletteItem, type TaskRecommendation } from "$lib/types";
 
   let query = $state("");
   let selectedIdx = $state(0);
   let inputEl: HTMLInputElement | undefined = $state();
+  let recommendations: TaskRecommendation[] = $state([]);
+  let recommendationLoading = $state(false);
+  let recommendationError: string | null = $state(null);
+  let retry = $state(0);
+  let focusReturn: HTMLElement | null = null;
+  let wasOpen = false;
 
   $effect(() => {
     if (ui.paletteOpen) {
+      if (!wasOpen) focusReturn = document.activeElement as HTMLElement | null;
       query = "";
       selectedIdx = 0;
       // focus after mount/render
       setTimeout(() => inputEl?.focus(), 0);
+    } else if (wasOpen) {
+      setTimeout(() => focusReturn?.focus(), 0);
     }
+    wasOpen = ui.paletteOpen;
   });
 
   const commands = $derived<PaletteItem[]>([
@@ -39,6 +49,74 @@
     return commands.filter((c) => c.kind === "command" && c.label.toLowerCase().includes(q));
   });
 
+  function explain(reasons: string[]): string {
+    return reasons.map((reason) => {
+      const [scope, field, token] = reason.split(":");
+      if (scope === "task" && field === "name") return i18n.optional("palette.reasonName", "Name matches “{token}”", { token });
+      if (scope === "task" && field === "description") return i18n.optional("palette.reasonDescription", "Description matches “{token}”", { token });
+      if (scope === "task" && field === "taxonomy") return i18n.optional("palette.reasonTaxonomy", "Category matches “{token}”", { token });
+      if (scope === "language") return i18n.optional("palette.reasonLanguage", "Language matches “{token}”", { token: field });
+      if (scope === "preferred-source") return i18n.optional("palette.reasonPreferredSource", "Preferred source");
+      return reason;
+    }).join(" · ");
+  }
+
+  let recommendationItems = $derived<PaletteItem[]>(recommendations.map((recommendation) => {
+    if (recommendation.kind === "agent") {
+      const pkg = recommendation.package;
+      return {
+        kind: "agent",
+        id: `agent:${pkg.reference.sourceId}:${pkg.reference.relativePath}`,
+        label: pkg.agent?.name ?? pkg.reference.relativePath,
+        description: pkg.agent?.description ?? "Agent",
+        reason: explain(recommendation.reasons),
+        source: `${pkg.reference.sourceId} · ${pkg.reference.relativePath}`,
+        run: () => ui.openAgentReference(pkg.reference),
+      };
+    }
+    const pkg = recommendation.package;
+    return {
+      kind: "skill",
+      id: `skill:${pkg.sourceId}:${pkg.relativePath}`,
+      label: pkg.name ?? pkg.relativePath,
+      description: pkg.description ?? "Skill",
+      reason: explain(recommendation.reasons),
+      source: `${pkg.sourceId} · ${pkg.relativePath}`,
+      run: () => ui.openSkill({ sourceId: pkg.sourceId, relativePath: pkg.relativePath }),
+    };
+  }));
+
+  $effect(() => {
+    retry;
+    const task = query.trim();
+    if (!ui.paletteOpen || task.length < 3) {
+      recommendations = [];
+      recommendationLoading = false;
+      recommendationError = null;
+      return;
+    }
+    let current = true;
+    recommendations = [];
+    recommendationLoading = true;
+    recommendationError = null;
+    const timer = setTimeout(() => {
+      void taskRecommendations(task).then((results) => {
+        if (current && query.trim() === task && ui.paletteOpen) recommendations = results;
+      }).catch((error: unknown) => {
+        if (current && query.trim() === task && ui.paletteOpen) {
+          recommendations = [];
+          recommendationError = isAppError(error) ? appErrorMessage(error) : "Unexpected local search error";
+        }
+      }).finally(() => {
+        if (current && query.trim() === task && ui.paletteOpen) recommendationLoading = false;
+      });
+    }, 200);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
+  });
+
   type Group = { label: string; items: Array<{ item: PaletteItem; idx: number }> };
   let groups = $derived.by<Group[]>(() => {
     const out: Group[] = [];
@@ -48,6 +126,14 @@
         label: i18n.t("palette.commands"),
         items: commandHits.map((c) => ({ item: c, idx: idx++ })),
       });
+    }
+    const agents = recommendationItems.filter((item) => item.kind === "agent");
+    if (agents.length > 0) {
+      out.push({ label: i18n.optional("palette.agents", "Agents"), items: agents.map((item) => ({ item, idx: idx++ })) });
+    }
+    const skills = recommendationItems.filter((item) => item.kind === "skill");
+    if (skills.length > 0) {
+      out.push({ label: i18n.optional("palette.skills", "Skills"), items: skills.map((item) => ({ item, idx: idx++ })) });
     }
     return out;
   });
@@ -59,15 +145,13 @@
   });
 
   function activate(item: PaletteItem) {
-    if (item.kind === "command") {
-      item.run();
-      ui.closePalette();
-    }
+    void item.run();
+    ui.closePalette();
   }
 
   function onKey(e: KeyboardEvent) {
     if (e.key === "Escape") { e.preventDefault(); ui.closePalette(); return; }
-    if (e.key === "ArrowDown") { e.preventDefault(); selectedIdx = Math.min(totalItems - 1, selectedIdx + 1); }
+    if (e.key === "ArrowDown") { e.preventDefault(); selectedIdx = Math.max(0, Math.min(totalItems - 1, selectedIdx + 1)); }
     if (e.key === "ArrowUp") { e.preventDefault(); selectedIdx = Math.max(0, selectedIdx - 1); }
     if (e.key === "Enter") {
       e.preventDefault();
@@ -98,12 +182,26 @@
         aria-expanded={totalItems > 0}
         aria-activedescendant={totalItems > 0 ? `palette-opt-${selectedIdx}` : undefined}
         aria-autocomplete="list"
+        aria-describedby="palette-limit"
+        maxlength="2048"
       />
       <span class="kbd">Esc</span>
     </div>
 
     <div class="results">
-      {#if totalItems === 0}
+      <div class="status" role="status" aria-live="polite">
+        {#if recommendationLoading}{i18n.optional("palette.loadingRecommendations", "Finding local Agents and Skills…")}{/if}
+        {#if recommendationError}
+          {i18n.optional("palette.recommendationsUnavailable", "Recommendations unavailable")}: {recommendationError}
+          <button class="retry" onclick={() => (retry += 1)}>{i18n.optional("common.retry", "Retry")}</button>
+        {/if}
+        {#if !recommendationLoading && !recommendationError && query.trim().length >= 3}
+          {recommendations.length} {recommendations.length === 1
+            ? i18n.optional("palette.recommendation", "recommendation")
+            : i18n.optional("palette.recommendations", "recommendations")}
+        {/if}
+      </div>
+      {#if totalItems === 0 && !recommendationLoading}
         <p class="empty">{i18n.t("palette.empty")}</p>
       {:else}
         <div id="palette-listbox" role="listbox" aria-label={i18n.t("palette.resultsLabel")}>
@@ -122,7 +220,13 @@
                   onclick={() => activate(item)}
                 >
                   <span class="name">{item.label}</span>
-                  {#if item.shortcut}<span class="meta kbd">{item.shortcut}</span>{/if}
+                  {#if item.kind === "command" && item.shortcut}<span class="meta kbd">{item.shortcut}</span>{/if}
+                  {#if item.kind !== "command"}
+                    <span class="detail">{item.description}</span>
+                    <span class="meta">{item.kind === "agent" ? i18n.optional("palette.agent", "Agent") : i18n.optional("palette.skill", "Skill")}</span>
+                    <span class="detail reason">{item.reason}</span>
+                    <span class="meta source">{item.source}</span>
+                  {/if}
                 </button>
               {/each}
             </div>
@@ -132,6 +236,7 @@
     </div>
 
     <footer class="foot">
+      <span id="palette-limit" class="sr-only">{i18n.optional("palette.taskLimit", "Task description limit: 2048 characters.")}</span>
       <span class="kbd">↑↓</span> {i18n.t("palette.navigate")}
       <span class="kbd">⏎</span> {i18n.t("palette.open")}
       <span class="kbd">Esc</span> {i18n.t("palette.close")}
@@ -211,9 +316,16 @@
     gap: var(--space-3);
     text-align: left;
   }
+  .name { min-width: 0; }
+  .detail { color: var(--color-text-muted); font-size: var(--text-body-sm); min-width: 0; }
+  .reason, .source { font-size: var(--text-caption); }
   .result.on { background: var(--color-selection-strong); color: var(--color-text-inverse); }
   .meta { color: var(--color-text-muted); font-size: var(--text-body-sm); }
-  .result.on .meta { color: var(--color-text-inverse); opacity: 0.85; }
+  .result.on .meta, .result.on .detail { color: var(--color-text-inverse); opacity: 0.85; }
+
+  .status { color: var(--color-text-muted); font-size: var(--text-body-sm); padding: 0 var(--space-3); }
+  .status:empty { display: none; }
+  .retry { margin-left: var(--space-2); text-decoration: underline; }
 
   .kbd {
     font-family: var(--font-mono);
@@ -232,4 +344,5 @@
     font-size: var(--text-caption);
   }
   .empty { padding: var(--space-4); color: var(--color-text-muted); }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 </style>

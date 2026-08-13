@@ -43,9 +43,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-const MAX_RECOMMEND_TASK_BYTES: usize = 2_048;
-const MAX_RECOMMEND_LANGUAGES: usize = 32;
-const MAX_RECOMMEND_LANGUAGE_BYTES: usize = 64;
 const MIN_HTTP_TOKEN_BYTES: usize = 43;
 const MAX_RESOURCE_SUBSCRIPTIONS: usize = 128;
 
@@ -621,14 +618,6 @@ struct ExpertBlockerRequest {
     project_path: String,
     kind: String,
     summary: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SkillRecommendation {
-    package: SkillPackageResult,
-    score: u32,
-    reasons: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1540,16 +1529,18 @@ impl SkillMcpServer {
                     languages.sort();
                     languages.dedup();
                 }
-                validate_recommend_request(&task, &languages)?;
                 let sources = super::inspect_skill_sources(&self.state)
                     .await
                     .map_err(|error| error.to_string())?;
-                serde_json::to_string_pretty(&recommend_skills(
-                    &sources,
-                    &task,
-                    &languages,
-                    limit.unwrap_or(10).clamp(1, 50),
-                ))
+                serde_json::to_string_pretty(
+                    &crate::library::recommend_skills(
+                        &sources,
+                        &task,
+                        &languages,
+                        limit.unwrap_or(10).clamp(1, 50),
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
                 .map_err(|error| error.to_string())
             },
         )
@@ -2287,11 +2278,12 @@ impl SkillMcpServer {
                         .await
                         .map_err(|error| error.to_string())?;
                 let languages = detect_project_languages(&project_path)?;
-                validate_recommend_request(&outcome, &languages)?;
                 let sources = super::inspect_skill_sources(&self.state)
                     .await
                     .map_err(|error| error.to_string())?;
-                let recommendations = recommend_skills(&sources, &outcome, &languages, 10);
+                let recommendations =
+                    crate::library::recommend_skills(&sources, &outcome, &languages, 10)
+                        .map_err(|error| error.to_string())?;
                 let mut value = serde_json::to_value(context).map_err(|error| error.to_string())?;
                 value["skillRecommendations"] =
                     serde_json::to_value(recommendations).map_err(|error| error.to_string())?;
@@ -3185,117 +3177,6 @@ fn search_packages(results: &[SkillSourceResult], query: &str) -> Vec<SkillPacka
         .collect()
 }
 
-fn validate_recommend_request(task: &str, languages: &[String]) -> Result<(), String> {
-    if task.len() > MAX_RECOMMEND_TASK_BYTES {
-        return Err(format!(
-            "task exceeds the {MAX_RECOMMEND_TASK_BYTES}-byte limit"
-        ));
-    }
-    if languages.len() > MAX_RECOMMEND_LANGUAGES {
-        return Err(format!(
-            "languages exceeds the {MAX_RECOMMEND_LANGUAGES}-item limit"
-        ));
-    }
-    if languages
-        .iter()
-        .any(|language| language.len() > MAX_RECOMMEND_LANGUAGE_BYTES)
-    {
-        return Err(format!(
-            "language exceeds the {MAX_RECOMMEND_LANGUAGE_BYTES}-byte limit"
-        ));
-    }
-    Ok(())
-}
-
-fn metadata_tokens(value: &str) -> std::collections::BTreeSet<String> {
-    value
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
-fn recommend_skills(
-    results: &[SkillSourceResult],
-    task: &str,
-    languages: &[String],
-    limit: usize,
-) -> Vec<SkillRecommendation> {
-    let task_tokens = metadata_tokens(task);
-    let language_tokens = languages
-        .iter()
-        .flat_map(|language| metadata_tokens(language))
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut recommendations = results
-        .iter()
-        .flat_map(|result| &result.packages)
-        .filter(|package| package.installable)
-        .filter_map(|package| {
-            let name_tokens = metadata_tokens(package.name.as_deref().unwrap_or_default());
-            let description_tokens =
-                metadata_tokens(package.description.as_deref().unwrap_or_default());
-            let taxonomy_tokens = std::iter::once(package.skill_type.as_str())
-                .chain(package.group.iter().map(String::as_str))
-                .chain(package.tags.iter().map(String::as_str))
-                .flat_map(metadata_tokens)
-                .collect::<std::collections::BTreeSet<_>>();
-            let mut score = 0;
-            let mut reasons = Vec::new();
-            for token in &task_tokens {
-                if name_tokens.contains(token) {
-                    score += 4;
-                    reasons.push(format!("task:name:{token}"));
-                } else if description_tokens.contains(token) {
-                    score += 2;
-                    reasons.push(format!("task:description:{token}"));
-                } else if taxonomy_tokens.contains(token) {
-                    score += 2;
-                    reasons.push(format!("task:taxonomy:{token}"));
-                }
-            }
-            for token in &language_tokens {
-                if name_tokens.contains(token)
-                    || description_tokens.contains(token)
-                    || taxonomy_tokens.contains(token)
-                {
-                    score += 3;
-                    reasons.push(format!("language:{token}"));
-                }
-            }
-            (score > 0).then(|| SkillRecommendation {
-                package: package.clone(),
-                score,
-                reasons,
-            })
-        })
-        .collect::<Vec<_>>();
-    recommendations.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| {
-                left.package
-                    .name
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase()
-                    .cmp(
-                        &right
-                            .package
-                            .name
-                            .as_deref()
-                            .unwrap_or_default()
-                            .to_ascii_lowercase(),
-                    )
-            })
-            .then_with(|| left.package.name.cmp(&right.package.name))
-            .then_with(|| left.package.source_id.cmp(&right.package.source_id))
-            .then_with(|| left.package.relative_path.cmp(&right.package.relative_path))
-    });
-    recommendations.truncate(limit);
-    recommendations
-}
-
 fn catalog_revision(results: &[SkillSourceResult]) -> String {
     let mut canonical = results.to_vec();
     canonical.sort_by(|left, right| left.source.id.cmp(&right.source.id));
@@ -3595,10 +3476,9 @@ mod tests {
 
     use super::{
         action_for_tool, catalog_revision, detect_project_languages, package_resource_uri,
-        parse_package_resource_uri, parse_skill_type, parse_update_policy, recommend_skills,
-        resource_list_changed, search_packages, validate_recommend_request, FindAndInstallRequest,
-        HttpAuth, NamedApprovalRequest, RecommendRequest, SkillMcpServer, SkillRuntime,
-        SourceRequest,
+        parse_package_resource_uri, parse_skill_type, parse_update_policy, resource_list_changed,
+        search_packages, FindAndInstallRequest, HttpAuth, NamedApprovalRequest, RecommendRequest,
+        SkillMcpServer, SkillRuntime, SourceRequest,
     };
 
     fn package(name: &str, description: &str, installable: bool) -> SkillPackageResult {
@@ -3980,7 +3860,9 @@ mod tests {
             errors: Vec::new(),
         }];
 
-        let recommendations = recommend_skills(&results, "review backend", &["rust".into()], 10);
+        let recommendations =
+            crate::library::recommend_skills(&results, "review backend", &["rust".into()], 10)
+                .expect("recommendations");
 
         let expected = [
             (
@@ -4055,10 +3937,16 @@ mod tests {
 
     #[test]
     fn recommendation_inputs_are_bounded_before_tokenization() {
-        assert!(validate_recommend_request(&"x".repeat(2048), &vec!["rust".into(); 32]).is_ok());
-        assert!(validate_recommend_request(&"x".repeat(2049), &[]).is_err());
-        assert!(validate_recommend_request("review", &vec!["rust".into(); 33]).is_err());
-        assert!(validate_recommend_request("review", &["x".repeat(65)]).is_err());
+        assert!(crate::library::validate_recommend_request(
+            &"x".repeat(2048),
+            &vec!["rust".into(); 32]
+        )
+        .is_ok());
+        assert!(crate::library::validate_recommend_request(&"x".repeat(2049), &[]).is_err());
+        assert!(
+            crate::library::validate_recommend_request("review", &vec!["rust".into(); 33]).is_err()
+        );
+        assert!(crate::library::validate_recommend_request("review", &["x".repeat(65)]).is_err());
     }
 
     #[test]

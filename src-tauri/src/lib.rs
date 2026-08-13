@@ -249,6 +249,7 @@ pub fn run() {
             agents::drafts::agent_draft_reject,
             agents::drafts::agent_draft_duplicate,
             agents::organize::agent_library_list,
+            library::task_recommendations,
             agents::organize::agent_folder_create,
             agents::organize::agent_folder_rename,
             agents::organize::agent_folder_move,

@@ -791,6 +791,49 @@ pub struct AgentPackageResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentRecommendation {
+    pub package: AgentPackageResult,
+    pub score: u32,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRecommendation {
+    pub package: SkillPackageResult,
+    pub score: u32,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum TaskRecommendation {
+    Agent {
+        package: AgentPackageResult,
+        score: u32,
+        reasons: Vec<String>,
+    },
+    Skill {
+        package: SkillPackageResult,
+        score: u32,
+        reasons: Vec<String>,
+    },
+}
+
+impl TaskRecommendation {
+    pub fn score(&self) -> u32 {
+        match self {
+            Self::Agent { score, .. } | Self::Skill { score, .. } => *score,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSourceResult {
     pub source: AgentSource,
     pub agents: Vec<AgentPackageResult>,
