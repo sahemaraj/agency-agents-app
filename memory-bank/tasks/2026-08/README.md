@@ -60,3 +60,7 @@ Added semantic application errors, retained and retryable Agent/Skill reconcilia
 ### 2026-08-13: Phase 7 Guided First Deployment
 
 Continued catalog setup into a deterministic, approval-gated Claude Code/Codex team deployment with exact-reference transactional rollback and reconciliation-backed success. OpenSpec, frontend, backend, build, formatting, and security-sensitive transaction gates passed; manual platform evidence remains explicitly unavailable under the approved waiver. See [260813_phase7-guided-first-deployment.md](./260813_phase7-guided-first-deployment.md).
+
+### 2026-08-13: Phase 8 Foreground Reconciliation
+
+Added debounced root-owned Agent and Skill foreground reconciliation, reused existing in-flight guards, retained stale data and Retry after failures, and restricted focus work to local reads. OpenSpec, frontend, backend, Svelte, build, and diff gates passed. See [260813_phase8-foreground-reconciliation.md](./260813_phase8-foreground-reconciliation.md).

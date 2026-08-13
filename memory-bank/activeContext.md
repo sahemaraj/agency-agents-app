@@ -1,5 +1,9 @@
 # Active Context — Agency Agents
 
+## ✅ v2.0 Phase 8 — Foreground Reconciliation [COMPLETE] (2026-08-13)
+
+The approved `feat/phase-8-foreground-reconciliation` branch now refreshes Agent and Skill installation truth after a root-owned 250 ms focus debounce, reuses each store's in-flight guard, includes registered project paths, performs only local read commands, and preserves stale rows plus existing Retry behavior after failure. Verification: OpenSpec 10/10 and strict validation passed, 74 frontend tests and 529 executed Rust tests passed, Svelte check reported 0 errors and 0 warnings, and the production build and diff gates passed. The existing manual-platform waiver remains explicit. Implementation commit: `af9aa2b`. Record: `tasks/2026-08/260813_phase8-foreground-reconciliation.md`.
+
 ## ✅ v2.0 Phase 7 — Guided First Deployment [COMPLETE] (2026-08-13)
 
 The approved `feat/phase-7-guided-first-deployment` branch now continues catalog setup into a deterministic Claude Code/Codex first deployment, recommends only a complete preset, reuses the existing scope and mutation-plan UI, and applies exact references through a bounded revision-bound transaction. Success is shown only after fresh reconciliation confirms every planned Agent; defer and completion use a versioned local marker. Verification: OpenSpec strict validation passed, 69 frontend tests and 529 executed Rust tests passed, Svelte check reported 0 errors and 0 warnings, production build/format/diff gates passed, and the transaction tests prove no-write planning plus file/ledger rollback. The approved manual-platform waiver records 375px timing and native Linux/Windows evidence as UNAVAILABLE. Implementation commit: `7b1c19b`. Record: `tasks/2026-08/260813_phase7-guided-first-deployment.md`.
