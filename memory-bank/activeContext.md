@@ -1,5 +1,9 @@
 # Active Context — Agency Agents
 
+## ✅ v2.0 Phase 10 — Unified Task Search [COMPLETE] (2026-08-13)
+
+The approved `feat/phase-10-unified-task-search` branch now reuses the deterministic Agent and Skill rankers behind one bounded local read-only desktop command and exposes results through the existing Cmd+K palette. Results retain exact source identity, provenance, and human-readable reasons; activation opens the existing workspaces without installing, executing, or bypassing approvals. The palette preserves commands and adds debouncing, stale-response rejection, retryable errors, input bounds, keyboard navigation, announcements, and focus restoration. Verification: OpenSpec 13/13 and strict validation passed, canonical specs validate 4/4, 89 frontend and 530 Rust tests passed with 3 existing environment-gated ignores, strict Clippy/format and Svelte checks passed, and the production build and diff gates passed. Implementation commit: `42256d5`. Record: `tasks/2026-08/260813_phase10-unified-task-search.md`.
+
 ## ✅ v2.0 Phase 9 — Safe Bulk Repair [COMPLETE] (2026-08-13)
 
 The approved `feat/phase-9-safe-bulk-repair` branch now combines exact tracked outdated and missing Agent and Skill installations into one reviewed repair workflow. Unsafe states remain visible but cannot be selected. Approval is bound to fresh dual-ledger reconciliation plus normalized plan and Skill source-byte signatures; drift causes zero writes. Execution reuses the existing sequential, backed-up exact lifecycle operations, continues after individual failure, records bounded Activity, and reconciles final truth. Verification: OpenSpec 16/16 and strict validation passed, canonical specs validate 3/3, 84 frontend tests and 529 executed Rust tests passed, Svelte check reported 0 errors and 0 warnings, and production build and diff gates passed. Implementation commit: `e36ec10`. Record: `tasks/2026-08/260813_phase9-safe-bulk-repair.md`.

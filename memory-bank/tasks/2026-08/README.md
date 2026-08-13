@@ -68,3 +68,7 @@ Added debounced root-owned Agent and Skill foreground reconciliation, reused exi
 ### 2026-08-13: Phase 9 Safe Bulk Repair
 
 Added one approval-bound repair workflow for exact tracked outdated and missing Agent and Skill installations, kept unsafe states in manual review, reused the existing recoverable lifecycle paths, and reported every terminal outcome. OpenSpec, frontend, backend, Svelte, build, and diff gates passed. See [260813_phase9-safe-bulk-repair.md](./260813_phase9-safe-bulk-repair.md).
+
+### 2026-08-13: Phase 10 Unified Task Search
+
+Added bounded, deterministic, local Agent and Skill recommendations to the existing Cmd+K palette with explanations, provenance, exact workspace handoff, async lifecycle safety, and no mutation or network path. OpenSpec, frontend, backend, Rust quality, Svelte, build, and diff gates passed. See [260813_phase10-unified-task-search.md](./260813_phase10-unified-task-search.md).

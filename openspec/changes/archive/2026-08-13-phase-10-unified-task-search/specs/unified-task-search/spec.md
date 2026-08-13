@@ -66,4 +66,3 @@ The task search SHALL enforce its input bound, avoid stale asynchronous results,
 #### Scenario: Input exceeds the bound
 - **WHEN** the task description reaches the supported maximum length
 - **THEN** additional input is prevented or rejected before unbounded processing and the supported limit is communicated accessibly
-
