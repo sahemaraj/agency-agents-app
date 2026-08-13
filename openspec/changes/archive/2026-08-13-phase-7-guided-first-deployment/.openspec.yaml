@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-08-13
+goal: Satisfy GUIDE-01 through GUIDE-05 by reusing existing target detection,
+  mutation planning, transactional installation, reconciliation, projects,
+  presets, and starter prompts.

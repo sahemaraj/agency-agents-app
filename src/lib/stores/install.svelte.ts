@@ -16,6 +16,8 @@ import { i18n } from "$lib/stores/i18n.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
 import { wiredTools } from "$lib/data/toolRegistry";
 import {
+  agentBatchApply,
+  agentBatchInstallPlan,
   agentDisable,
   agentCollectionApply,
   agentCollectionPlan,
@@ -373,6 +375,53 @@ class InstallStore {
     projectPath: string | null,
   ): Promise<AgentMutationPlan> {
     return agentCollectionPlan(name, operation, tool, projectPath);
+  }
+
+  planBatch(
+    references: AgentReference[],
+    tool: Tool,
+    projectPath: string | null,
+  ): Promise<AgentMutationPlan> {
+    return agentBatchInstallPlan(references, tool, projectPath);
+  }
+
+  async applyBatch(plan: AgentMutationPlan): Promise<InstallRecord[]> {
+    this.busy = JSON.stringify(["batch", plan.revision]);
+    try {
+      const records = await agentBatchApply(
+        plan.agents.filter((item) => !item.dependency).map((item) => item.reference),
+        plan.tool,
+        plan.projectPath,
+        plan.revision,
+      );
+      await this.reconcile();
+      void this.loadTools();
+      activity.log({
+        action: "bulk",
+        subject: "agentLibrary",
+        subjectName: i18n.t("firstRun.deployTitle"),
+        tool: plan.tool,
+        scope: this.scopeOf(plan.projectPath),
+        projectPath: plan.projectPath ?? undefined,
+        outcome: "ok",
+        detail: `${i18n.t("common.install")} · ${records.length}`,
+      });
+      return records;
+    } catch (error) {
+      activity.log({
+        action: "bulk",
+        subject: "agentLibrary",
+        subjectName: i18n.t("firstRun.deployTitle"),
+        tool: plan.tool,
+        scope: this.scopeOf(plan.projectPath),
+        projectPath: plan.projectPath ?? undefined,
+        outcome: "error",
+        detail: safeActivityDetail(error instanceof Error ? error.message : error),
+      });
+      throw error;
+    } finally {
+      this.busy = null;
+    }
   }
 
   async applyCollection(

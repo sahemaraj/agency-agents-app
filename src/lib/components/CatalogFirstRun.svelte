@@ -11,27 +11,99 @@
    * Posture: nothing is written until the user picks. Choosing any option
    * persists the choice (configured → true), which dismisses this modal.
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import FolderGit2 from "@lucide/svelte/icons/folder-git-2";
   import Sparkles from "@lucide/svelte/icons/sparkles";
   import Package from "@lucide/svelte/icons/package";
   import Search from "@lucide/svelte/icons/search";
   import Check from "@lucide/svelte/icons/check";
+  import Bot from "@lucide/svelte/icons/bot";
 
   import { catalog } from "$lib/stores/catalog.svelte";
+  import { corpus } from "$lib/stores/corpus.svelte";
+  import { install, SUPPORTED_TOOLS } from "$lib/stores/install.svelte";
+  import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { toast } from "$lib/stores/toast.svelte";
-  import { appErrorMessage, isAppError, type CatalogCandidate } from "$lib/types";
+  import InstallModal from "./InstallModal.svelte";
+  import StarterPrompt from "./StarterPrompt.svelte";
+  import { PRESET_TEAMS } from "$lib/data/presetTeams";
+  import { TEAM_EXAMPLES } from "$lib/data/playbook";
+  import {
+    FIRST_DEPLOYMENT_COMPLETION,
+    FIRST_DEPLOYMENT_STORAGE_KEY,
+    defaultFirstDeploymentTool,
+    recommendFirstDeploymentPreset,
+  } from "$lib/firstDeployment";
+  import {
+    appErrorMessage,
+    isAppError,
+    type AgentMutationPlan,
+    type AgentReference,
+    type CatalogCandidate,
+  } from "$lib/types";
+
+  interface Props { onFinish?: () => void }
+  let { onFinish = () => {} }: Props = $props();
 
   let expanded = $state<"clone" | null>(null);
   let manage = $state(true);
+  let stage = $state<"catalog" | "prepare" | "success">(catalog.configured ? "prepare" : "catalog");
+  let installOpen = $state(false);
+  let guideError = $state<string | null>(null);
+  let destinations = $state<string[]>([]);
+  let dialog: HTMLDivElement;
 
-  onMount(() => void catalog.detect(false));
+  const recommendation = $derived(
+    recommendFirstDeploymentPreset(new Set(corpus.agents.map((agent) => agent.slug)), PRESET_TEAMS),
+  );
+  const references = $derived<AgentReference[]>(recommendation
+    ? recommendation.agents.flatMap((slug) => {
+        const pkg = agentLibrary.packages.find((candidate) =>
+          candidate.reference.sourceId === "builtin:agency-agents"
+          && candidate.installable
+          && candidate.agent?.slug === slug
+        );
+        return pkg ? [pkg.reference] : [];
+      })
+    : []);
+  const target = $derived(defaultFirstDeploymentTool(install.tools));
+  const targetInfo = $derived(install.tools.find((tool) => tool.tool === target) ?? null);
+  const supportedTargets = $derived(SUPPORTED_TOOLS
+    .filter((tool) => tool.id === "claudeCode" || tool.id === "codex")
+    .map((tool) => ({
+      ...tool,
+      detected: install.tools.some((info) => info.tool === tool.id && info.detected),
+    })));
+  const ready = $derived(
+    !!recommendation
+    && references.length === recommendation.agents.length
+    && !!target
+    && install.reconciled
+    && !install.reconciling
+    && !install.reconcileError,
+  );
+
+  $effect(() => {
+    stage;
+    void tick().then(() => dialog?.focus());
+  });
+
+  onMount(() => {
+    if (stage === "catalog") void catalog.detect(false);
+    else {
+      void corpus.ensureLoaded();
+      void agentLibrary.load();
+    }
+    void install.loadTools();
+  });
 
   async function choose(fn: () => Promise<unknown>, ok: string) {
     try {
       await fn();
+      await agentLibrary.load(true);
+      stage = "prepare";
       toast.success(ok);
     } catch (e) {
       toast.error(i18n.t("firstRun.error"), isAppError(e) ? appErrorMessage(e) : String(e));
@@ -48,10 +120,36 @@
   function useCandidate(c: CatalogCandidate) {
     void choose(() => catalog.useClone(c.path, manage), i18n.t("firstRun.usingPath", { path: c.path }));
   }
+
+  function complete() {
+    localStorage.setItem(FIRST_DEPLOYMENT_STORAGE_KEY, FIRST_DEPLOYMENT_COMPLETION);
+    onFinish();
+  }
+
+  function deployed(plan: AgentMutationPlan) {
+    const present = plan.agents.every((item) => install.installed.some((row) =>
+      row.tracked
+      && row.state === "current"
+      && row.sourceId === item.reference.sourceId
+      && row.relativePath === item.reference.relativePath
+      && row.tool === plan.tool
+      && row.projectPath === plan.projectPath
+    ));
+    if (!present || install.reconcileError) {
+      guideError = install.reconcileError ?? i18n.t("firstRun.verifyFailed");
+      installOpen = false;
+      return;
+    }
+    destinations = plan.agents.map((item) => item.destination);
+    installOpen = false;
+    stage = "success";
+  }
 </script>
 
 <div class="scrim">
-  <div class="box" role="dialog" aria-modal="true" aria-label={i18n.t("firstRun.dialogAria")}>
+  <div class="box" bind:this={dialog} tabindex="-1" role="dialog" aria-modal="true" aria-label={i18n.t("firstRun.dialogAria")}>
+    <p class="sr-only" aria-live="polite">{i18n.t(`firstRun.stage.${stage}`)}</p>
+    {#if stage === "catalog"}
     <header>
       <h1>{i18n.t("firstRun.title")}</h1>
       <p class="lede">{i18n.t("firstRun.lede")}</p>
@@ -125,12 +223,85 @@
     </div>
 
     {#if catalog.error}<p class="err">{catalog.error}</p>{/if}
+    {:else if stage === "prepare"}
+      <header>
+        <h1>{i18n.t("firstRun.deployTitle")}</h1>
+        <p class="lede">{i18n.t("firstRun.deployLede")}</p>
+      </header>
+
+      <div class="guide-facts">
+        <div class="fact">
+          <Bot size={20} />
+          <div class="ct">
+            <span class="t">{targetInfo?.label ?? i18n.t("firstRun.noTarget")}</span>
+            <span class="d">{targetInfo ? i18n.t("firstRun.detectedTarget") : i18n.t("firstRun.noTargetHelp")}</span>
+            <span class="target-states">
+              {#each supportedTargets as candidate}
+                <span class:available={candidate.detected}>
+                  {candidate.label}: {i18n.t(candidate.detected ? "common.detected" : "firstRun.unavailable")}
+                </span>
+              {/each}
+            </span>
+          </div>
+        </div>
+        <div class="fact">
+          {#if recommendation}
+            {@const RecommendedIcon = recommendation.icon}
+            <RecommendedIcon size={20} color={recommendation.color} />
+          {:else}
+            <Package size={20} />
+          {/if}
+          <div class="ct">
+            <span class="t">{recommendation?.label ?? i18n.t("firstRun.noPreset")}</span>
+            <span class="d">{recommendation?.description ?? i18n.t("firstRun.noPresetHelp")}</span>
+          </div>
+        </div>
+      </div>
+
+      {#if recommendation && references.length !== recommendation.agents.length}
+        <p class="err" role="alert">{i18n.t("firstRun.presetUnavailable")}</p>
+      {/if}
+      {#if install.reconcileError}<p class="err" role="alert">{install.reconcileError}</p>{/if}
+      {#if guideError}<p class="err" role="alert">{guideError}</p>{/if}
+
+      <div class="guide-actions">
+        <button class="ghost" onclick={complete}>{i18n.t("firstRun.later")}</button>
+        <button class="primary" disabled={!ready} onclick={() => (installOpen = true)}>
+          {i18n.t("firstRun.reviewDeployment")}
+        </button>
+      </div>
+    {:else}
+      <header>
+        <h1>{i18n.t("firstRun.successTitle")}</h1>
+        <p class="lede">{i18n.t("firstRun.successLede")}</p>
+      </header>
+      <ul class="destinations">
+        {#each destinations as destination}<li><code>{destination}</code></li>{/each}
+      </ul>
+      {#if recommendation}
+        <StarterPrompt
+          label={i18n.t("firstRun.starterPrompt")}
+          template={TEAM_EXAMPLES[recommendation.slug]?.[0] ?? ""}
+        />
+      {/if}
+      <div class="guide-actions"><button class="primary" onclick={complete}>{i18n.t("common.done")}</button></div>
+    {/if}
   </div>
 </div>
 
+{#if installOpen && recommendation}
+  <InstallModal
+    title={i18n.t("firstRun.reviewTitle", { team: recommendation.label })}
+    agentReferences={references}
+    allowedTools={["claudeCode", "codex"]}
+    onClose={() => (installOpen = false)}
+    onApplied={deployed}
+  />
+{/if}
+
 <style>
   .scrim {
-    position: fixed; inset: 36px 0 0 0; z-index: 90;
+    position: fixed; inset: 36px 0 0 0; z-index: 40;
     display: flex; align-items: center; justify-content: center;
     background: color-mix(in srgb, var(--color-bg) 70%, transparent);
     backdrop-filter: blur(6px);
@@ -186,4 +357,21 @@
   .ghost:hover:not(:disabled) { color: var(--color-text-primary); background: var(--color-surface-sunken); }
   .ghost:disabled { opacity: 0.5; cursor: default; }
   .err { font-size: var(--text-body-sm); color: var(--color-danger); }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .guide-facts { display: grid; gap: var(--space-3); }
+  .fact {
+    display: flex; align-items: flex-start; gap: var(--space-3); padding: var(--space-4);
+    border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface);
+  }
+  .guide-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
+  .target-states { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-1); }
+  .target-states span { font-size: var(--text-caption); color: var(--color-text-muted); }
+  .target-states .available { color: var(--color-success); }
+  .primary {
+    height: 32px; padding: 0 var(--space-4); border: 0; border-radius: var(--radius-md);
+    background: var(--color-brand); color: var(--color-text-inverse); cursor: pointer;
+  }
+  .primary:disabled { opacity: 0.5; cursor: default; }
+  .destinations { display: flex; flex-direction: column; gap: var(--space-2); }
+  .destinations code { font-size: var(--text-mono); overflow-wrap: anywhere; }
 </style>

@@ -9,11 +9,38 @@
   import { catalog } from "$lib/stores/catalog.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import CatalogFirstRun from "$lib/components/CatalogFirstRun.svelte";
+  import {
+    FIRST_DEPLOYMENT_COMPLETION,
+    FIRST_DEPLOYMENT_STORAGE_KEY,
+    shouldShowFirstDeployment,
+  } from "$lib/firstDeployment";
 
   let { children } = $props();
+  let firstDeploymentCompletion = $state<string | null>(null);
+  let firstDeploymentActive = $state(false);
+  const managedInstallCount = $derived(
+    install.installed.filter((row) => row.tracked && row.state !== "missing").length,
+  );
+  const showFirstDeployment = $derived(shouldShowFirstDeployment({
+    catalogLoaded: catalog.loaded,
+    catalogConfigured: catalog.configured,
+    completion: firstDeploymentCompletion,
+    reconciled: install.reconciled,
+    reconcileError: install.reconcileError,
+    managedInstallCount,
+  }));
+  $effect(() => {
+    if (showFirstDeployment) firstDeploymentActive = true;
+  });
+
+  function finishFirstDeployment() {
+    firstDeploymentCompletion = FIRST_DEPLOYMENT_COMPLETION;
+    firstDeploymentActive = false;
+  }
 
   onMount(() => {
     i18n.init();
+    firstDeploymentCompletion = localStorage.getItem(FIRST_DEPLOYMENT_STORAGE_KEY);
     ui.loadThemeFromStorage();
     // Settings (Phase 12b) — all read with enum/numeric validation so a
     // corrupt or hostile localStorage entry can't poison runtime state.
@@ -83,6 +110,6 @@
 
 {@render children()}
 
-{#if !catalog.configured}
-  <CatalogFirstRun />
+{#if firstDeploymentActive}
+  <CatalogFirstRun onFinish={finishFirstDeployment} />
 {/if}

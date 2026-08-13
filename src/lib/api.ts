@@ -293,6 +293,21 @@ export const agentCollectionApply = (
   name, operation, tool, projectPath, confirmed,
 });
 
+export const agentBatchInstallPlan = (
+  references: AgentReference[],
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentMutationPlan>("agent_batch_install_plan", { references, tool, projectPath });
+
+export const agentBatchApply = (
+  references: AgentReference[],
+  tool: Tool,
+  projectPath: string | null,
+  planRevision: string,
+) => invoke<InstallRecord[]>("agent_batch_apply", {
+  references, tool, projectPath, planRevision, confirmed: true,
+});
+
 export function skillInstallPlan(
   sourceId: string,
   relativePath: string,

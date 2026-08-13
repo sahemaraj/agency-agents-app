@@ -25,6 +25,8 @@ import {
 import { corpus } from "$lib/stores/corpus.svelte";
 
 class CatalogStore {
+  /** True after the persisted configured flag has been read or failed closed. */
+  loaded: boolean = $state(false);
   /** The active catalog source (default bundled until loaded). */
   source: CatalogSource = $state({ kind: "bundled" });
   /** Whether the user has made an explicit choice yet (drives first-run). */
@@ -55,6 +57,8 @@ class CatalogStore {
       this.configured = configured;
     } catch {
       // leave defaults (bundled / configured) so the app still runs
+    } finally {
+      this.loaded = true;
     }
   }
 

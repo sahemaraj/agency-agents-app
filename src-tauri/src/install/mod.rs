@@ -38,6 +38,7 @@ const MAX_INSTALLED_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_REGISTERED_PROJECTS: usize = 200;
 const MAX_PROJECT_REGISTRY_BYTES: u64 = 64 * 1024;
 const MAX_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_AGENT_BATCH_ROOTS: usize = 64;
 pub(crate) const MAX_AGENT_HISTORY_ENTRIES: usize = 10;
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -3104,6 +3105,74 @@ async fn collection_plan(
     .await
 }
 
+fn validate_batch_references(
+    mut references: Vec<AgentReference>,
+) -> Result<Vec<AgentReference>, AppError> {
+    if references.is_empty() || references.len() > MAX_AGENT_BATCH_ROOTS {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "Agent batch must contain between 1 and {MAX_AGENT_BATCH_ROOTS} exact references"
+            ),
+        });
+    }
+    for reference in &references {
+        crate::library::validate_reference(&reference.source_id, &reference.relative_path)?;
+    }
+    references.sort();
+    references.dedup();
+    Ok(references)
+}
+
+#[tauri::command]
+pub async fn agent_batch_install_plan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    references: Vec<AgentReference>,
+    tool: Tool,
+    project_path: Option<String>,
+) -> Result<AgentMutationPlan, AppError> {
+    corpus::ensure_corpus(&app, &state).await?;
+    build_mutation_plan(
+        &state,
+        validate_batch_references(references)?,
+        tool,
+        project_path,
+        "install",
+        true,
+    )
+    .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // ponytail: flat Tauri args preserve the command ABI.
+pub async fn agent_batch_apply(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    references: Vec<AgentReference>,
+    tool: Tool,
+    project_path: Option<String>,
+    plan_revision: String,
+    confirmed: Option<bool>,
+) -> Result<Vec<InstallRecord>, AppError> {
+    corpus::ensure_corpus(&app, &state).await?;
+    if confirmed != Some(true) {
+        return Err(AppError::InvalidArgument {
+            message: "Agent batch requires explicit confirmation".into(),
+        });
+    }
+    let plan = build_mutation_plan(
+        &state,
+        validate_batch_references(references)?,
+        tool,
+        project_path,
+        "install",
+        true,
+    )
+    .await?;
+    require_plan_revision(&plan, &plan_revision)?;
+    execute_install_plan(&app, &state, &plan, true).await
+}
+
 #[tauri::command]
 pub async fn agent_collection_install_plan(
     app: AppHandle,
@@ -5931,7 +6000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_failure_restores_preexisting_files_and_removes_created_files() {
+    async fn transient_batch_failure_recovery_restores_files_and_prior_ledger() {
         let root = tempfile::tempdir().unwrap();
         let existing = root.path().join("existing.md");
         let created = root.path().join("created.md");
@@ -5939,13 +6008,112 @@ mod tests {
         let snapshot = capture_batch_files(&[existing.clone(), created.clone()])
             .await
             .unwrap();
+        let mut original = row("existing", "claudeCode", None);
+        original.source_hash = "a".repeat(64);
+        original.source_snapshot_hash = original.source_hash.clone();
+        original.body_hash = "b".repeat(64);
+        original.rendered_hash = "c".repeat(64);
+        let original_ledger = vec![original];
+        save_ledger_for(root.path(), &original_ledger)
+            .await
+            .unwrap();
         std::fs::write(&existing, b"after").unwrap();
         std::fs::write(&created, b"new").unwrap();
+        save_ledger_for(root.path(), &[]).await.unwrap();
 
         restore_batch_files(&snapshot).await.unwrap();
+        save_ledger_for(root.path(), &original_ledger)
+            .await
+            .unwrap();
 
         assert_eq!(std::fs::read(&existing).unwrap(), b"before");
         assert!(!created.exists());
+        let restored: Vec<InstallRecord> =
+            serde_json::from_slice(&std::fs::read(ledger_path_for(root.path())).unwrap()).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].slug, original_ledger[0].slug);
+        assert_eq!(restored[0].dest, original_ledger[0].dest);
+    }
+
+    #[tokio::test]
+    async fn transient_batch_plan_expands_dependencies_without_writing() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let tool_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source_root.path().join("base.md"),
+            "---\nname: Base\ndescription: Foundation.\n---\nBase instructions.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_root.path().join("lead.md"),
+            "---\nname: Lead\ndescription: Leads.\nrequired-agents: [base.md]\nrecommended-agents: [optional.md]\n---\nLead instructions.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_root.path().join("optional.md"),
+            "---\nname: Optional\ndescription: Optional support.\n---\nOptional instructions.\n",
+        )
+        .unwrap();
+        let source = crate::agents::add_local_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "claudeCode".into(),
+            tool_home.path().to_string_lossy().into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+
+        let plan = build_mutation_plan(
+            &state,
+            vec![AgentReference {
+                source_id: source.id,
+                relative_path: "lead.md".into(),
+            }],
+            "claudeCode".into(),
+            None,
+            "install",
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Optional")));
+        assert_eq!(plan.agents.len(), 2);
+        assert!(plan.agents[0].dependency);
+        assert_eq!(plan.agents[0].reference.relative_path, "base.md");
+        assert!(!plan.agents[1].dependency);
+        assert_eq!(plan.agents[1].reference.relative_path, "lead.md");
+        assert!(plan
+            .agents
+            .iter()
+            .all(|item| !Path::new(&item.destination).exists()));
+        assert!(!ledger_path_for(app_data.path()).exists());
+
+        let blocked = build_mutation_plan(
+            &state,
+            vec![AgentReference {
+                source_id: "local:missing".into(),
+                relative_path: "missing.md".into(),
+            }],
+            "claudeCode".into(),
+            None,
+            "install",
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(!blocked.blockers.is_empty());
+        assert!(!ledger_path_for(app_data.path()).exists());
     }
 
     #[test]

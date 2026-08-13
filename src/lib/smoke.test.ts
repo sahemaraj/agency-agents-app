@@ -35,7 +35,7 @@ const rel01Sources = import.meta.glob([
 ], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async (command: string) => command === "skill_folders_list"
+  invoke: vi.fn(async (command: string) => ["skill_folders_list", "agent_library_list"].includes(command)
     ? {
         folders: [], assignments: [], favorites: [], recent: [], collections: [], smartFolders: [],
         profiles: [], updatePolicies: [], publisherTrust: [], preferredSources: [], usage: [], approvals: [],
@@ -79,7 +79,7 @@ beforeEach(async () => {
     clear: () => storage.clear(),
   });
   vi.mocked(invoke).mockReset().mockImplementation(async (command: string) =>
-    command === "skill_folders_list" ? emptyFolderState() as never : [] as never);
+    ["skill_folders_list", "agent_library_list"].includes(command) ? emptyFolderState() as never : [] as never);
   catalog.busy = false;
   catalog.error = null;
   corpus.agents = [];
@@ -344,6 +344,7 @@ describe("frontend test harness", () => {
       if (command === "catalog_provision_managed") throw { code: "storage_corrupt", message: "catalog state is invalid" };
       return [] as never;
     });
+    catalog.configured = false;
     catalog.busy = false;
     toast.items = [];
     const { default: CatalogFirstRun } = await import("$lib/components/CatalogFirstRun.svelte");
@@ -360,6 +361,29 @@ describe("frontend test harness", () => {
       unmount(component);
       target.remove();
       toast.items = [];
+    }
+  });
+
+  it("blocks deployment without a detected target and defers without an Agent write", async () => {
+    const invokeMock = vi.mocked(invoke);
+    catalog.configured = true;
+    install.reconciled = true;
+    const onFinish = vi.fn();
+    const { default: CatalogFirstRun } = await import("$lib/components/CatalogFirstRun.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(CatalogFirstRun, { target, props: { onFinish } });
+    try {
+      await tick();
+      expect(target.textContent).toContain("No supported target detected");
+      expect(target.querySelector<HTMLButtonElement>("button.primary")?.disabled).toBe(true);
+      target.querySelector<HTMLButtonElement>("button.ghost")!.click();
+      expect(onFinish).toHaveBeenCalledOnce();
+      expect(localStorage.getItem("agency-agents:first-deployment")).toBe("v1");
+      expect(invokeMock.mock.calls.some(([command]) => String(command).includes("install"))).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
     }
   });
 
@@ -1790,7 +1814,7 @@ describe("frontend test harness", () => {
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(43);
+      .toHaveLength(44);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -1805,7 +1829,7 @@ describe("frontend test harness", () => {
     for (const [name, marker] of propagationEdges) {
       expect(installSource.match(marker) ?? [], name).toHaveLength(1);
     }
-    expect(installSource.match(/safeActivityDetail\(/g) ?? []).toHaveLength(7); // six live edges + retained legacy install()
+    expect(installSource.match(/safeActivityDetail\(/g) ?? []).toHaveLength(8); // seven live edges + retained legacy install()
 
     const rawFallbacks = Object.entries(rel01Sources).flatMap(([path, source]) =>
       [...source.matchAll(/^\s*toast\.error\([^\n]*,\s*String\((?:e|error)\)\);?$/gm)]
@@ -1897,7 +1921,7 @@ describe("frontend test harness", () => {
         /modalAction="confirm" disabled=\{!installTruthFresh \|\| plan\.blockers\.length > 0\}/,
         /confirmDisabled=\{!installTruthFresh \|\| \(uninstallCandidate/,
       ] }],
-      ["InstallModal", { source: installModalSource, freshnessUses: 16, markers: [
+      ["InstallModal", { source: installModalSource, freshnessUses: 17, markers: [
         /disabled: !installTruthFresh \|\| total === 0,/,
         /disabled=\{!installTruthFresh\}[^\n]*reviewPlan\("update"/,
         /disabled=\{!installTruthFresh\}[^\n]*runLifecycle\("track"/,

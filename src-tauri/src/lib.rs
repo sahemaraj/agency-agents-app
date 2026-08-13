@@ -329,6 +329,8 @@ pub fn run() {
             install::agent_update_plan,
             install::agent_uninstall_plan,
             install::agent_install_with_dependencies,
+            install::agent_batch_install_plan,
+            install::agent_batch_apply,
             install::agent_collection_install_plan,
             install::agent_collection_update_plan,
             install::agent_collection_uninstall_plan,

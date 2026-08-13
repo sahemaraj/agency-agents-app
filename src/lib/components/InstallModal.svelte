@@ -51,10 +51,14 @@
     agentSlugs?: string[];
     /** Exact source-aware single-Agent mode. Collections use `collectionName`. */
     agentPackage?: AgentPackageResult;
+    /** Exact source-aware multi-Agent mode used by guided deployment. */
+    agentReferences?: AgentReference[];
+    allowedTools?: Tool[];
     collectionName?: string;
     onClose: () => void;
+    onApplied?: (plan: AgentMutationPlan) => void;
   }
-  let { title, agentSlugs = [], agentPackage, collectionName, onClose }: Props = $props();
+  let { title, agentSlugs = [], agentPackage, agentReferences = [], allowedTools, collectionName, onClose, onApplied }: Props = $props();
   const installTruthFresh = $derived(install.reconciled && !install.reconciling && !install.reconcileError);
 
   onMount(() => {
@@ -70,11 +74,11 @@
       : null,
   );
   const exactReferences = $derived(
-    agentPackage ? [agentPackage.reference] : collection?.agents ?? [],
+    agentPackage ? [agentPackage.reference] : agentReferences.length ? agentReferences : collection?.agents ?? [],
   );
   const collectionPackages = $derived(
-    collection
-      ? collection.agents.flatMap((reference) => {
+    exactReferences.length
+      ? exactReferences.flatMap((reference) => {
           const pkg = agentLibrary.packages.find((item) => sameAgent(item.reference, reference));
           return pkg ? [pkg] : [];
         })
@@ -118,7 +122,11 @@
       ))
     );
   }
-  const cols = $derived(SUPPORTED_TOOLS.filter((t) => (t.supportsUser || t.supportsProject) && detected(t)));
+  const cols = $derived(SUPPORTED_TOOLS.filter((t) =>
+    (t.supportsUser || t.supportsProject)
+    && (!allowedTools || allowedTools.includes(t.id))
+    && detected(t)
+  ));
 
   // Rows = Global + each registered/used project.
   type Row = { kind: "global" } | { kind: "project"; path: string; label: string };
@@ -189,6 +197,7 @@
     operation: "install" | "update" | "uninstall";
     reference: AgentReference | null;
     collectionName: string | null;
+    batchReferences: AgentReference[];
   } | null>(null);
   let planLoading = $state(false);
   let actionError = $state<string | null>(null);
@@ -233,6 +242,7 @@
         operation,
         reference,
         collectionName: null,
+        batchReferences: [],
       };
     } catch (error) {
       actionError = isAppError(error) ? appErrorMessage(error) : String(error);
@@ -255,6 +265,26 @@
         operation,
         reference: null,
         collectionName,
+        batchReferences: [],
+      };
+    } catch (error) {
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      planLoading = false;
+    }
+  }
+
+  async function reviewBatch(tool: Tool, target: string | null) {
+    if (!installTruthFresh || agentReferences.length === 0) return;
+    planLoading = true;
+    actionError = null;
+    try {
+      pending = {
+        plan: await install.planBatch(agentReferences, tool, target),
+        operation: "install",
+        reference: null,
+        collectionName: null,
+        batchReferences: agentReferences,
       };
     } catch (error) {
       actionError = isAppError(error) ? appErrorMessage(error) : String(error);
@@ -265,7 +295,7 @@
 
   async function applyPlan() {
     if (!installTruthFresh || !pending || !canApplyAgentPlan(pending.plan)) return;
-    const { operation, reference, collectionName: pendingCollection, plan } = pending;
+    const { operation, reference, collectionName: pendingCollection, batchReferences, plan } = pending;
     busy = cellKey(plan.tool, plan.projectPath);
     actionError = null;
     try {
@@ -273,6 +303,8 @@
         await install.applyCollection(
           pendingCollection, operation, plan.tool, plan.projectPath,
         );
+      } else if (batchReferences.length) {
+        await install.applyBatch(plan);
       } else if (operation === "install" && reference) {
         await install.installReference(reference, plan.tool, plan.projectPath, true);
       } else if (operation === "update" && reference) {
@@ -284,6 +316,7 @@
       }
       toast.success(i18n.t("agents.lifecycleApplied", { operation }));
       pending = null;
+      onApplied?.(plan);
     } catch (error) {
       actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
@@ -373,6 +406,10 @@
     }
     if (collectionName) {
       await reviewCollection("install", tool, target);
+      return;
+    }
+    if (agentReferences.length) {
+      await reviewBatch(tool, target);
       return;
     }
     if (exactReference) {
