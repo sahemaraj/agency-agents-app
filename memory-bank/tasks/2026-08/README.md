@@ -56,3 +56,7 @@ outside the database. See [260806_sqlite-control-plane.md](./260806_sqlite-contr
 ### 2026-08-13: Phase 6 Reliability Gate
 
 Added semantic application errors, retained and retryable Agent/Skill reconciliation truth, stale-mutation guards, and backend-authorized canonical filesystem reveal. Verification passed with zero implementation blockers; the user explicitly waived unavailable 375px geometry and native Linux/Windows evidence without treating them as green. See [260813_phase6-reliability-gate.md](./260813_phase6-reliability-gate.md).
+
+### 2026-08-13: Phase 7 Guided First Deployment
+
+Continued catalog setup into a deterministic, approval-gated Claude Code/Codex team deployment with exact-reference transactional rollback and reconciliation-backed success. OpenSpec, frontend, backend, build, formatting, and security-sensitive transaction gates passed; manual platform evidence remains explicitly unavailable under the approved waiver. See [260813_phase7-guided-first-deployment.md](./260813_phase7-guided-first-deployment.md).

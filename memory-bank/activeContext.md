@@ -1,5 +1,9 @@
 # Active Context — Agency Agents
 
+## ✅ v2.0 Phase 7 — Guided First Deployment [COMPLETE] (2026-08-13)
+
+The approved `feat/phase-7-guided-first-deployment` branch now continues catalog setup into a deterministic Claude Code/Codex first deployment, recommends only a complete preset, reuses the existing scope and mutation-plan UI, and applies exact references through a bounded revision-bound transaction. Success is shown only after fresh reconciliation confirms every planned Agent; defer and completion use a versioned local marker. Verification: OpenSpec strict validation passed, 69 frontend tests and 529 executed Rust tests passed, Svelte check reported 0 errors and 0 warnings, production build/format/diff gates passed, and the transaction tests prove no-write planning plus file/ledger rollback. The approved manual-platform waiver records 375px timing and native Linux/Windows evidence as UNAVAILABLE. Implementation commit: `7b1c19b`. Record: `tasks/2026-08/260813_phase7-guided-first-deployment.md`.
+
 ## ✅ v2.0 Phase 6 — Reliability Gate [COMPLETE] (2026-08-13)
 
 The approved `feat/v2-activation-truthful-state` branch now renders affected application failures semantically, preserves last-known Agent and Skill installation truth through reconciliation failures, exposes safe coalesced Retry, blocks stale mutations, and authorizes filesystem reveal only for existing canonical targets inside backend-derived supported roots. Verification: 65 frontend tests and 528 Rust tests passed, Svelte check reported 0 errors and 0 warnings, production build/format/diff gates passed, Nyquist is compliant, and security has zero blocking threats. The user explicitly waived real 375px geometry and native Linux/Windows evidence; those remain UNAVAILABLE, not green. Implementation commit: `73e7c5d`. Record: `tasks/2026-08/260813_phase6-reliability-gate.md`.
