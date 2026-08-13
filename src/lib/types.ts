@@ -1281,6 +1281,35 @@ export interface StorageMigrationStatus {
   legacyConflicts: string[];
 }
 
+export type DoctorClassification = "healthy" | "needsAttention" | "unavailable";
+export type DoctorCategory = "core" | "library" | "installations" | "tools" | "integrations" | "updates";
+export type DoctorAction =
+  | "retryDoctor"
+  | "openCatalog"
+  | "openAgents"
+  | "openSkills"
+  | "openTools"
+  | "openMcp"
+  | "openNetwork";
+
+export interface DoctorCheck {
+  id: string;
+  category: DoctorCategory;
+  title: string;
+  classification: DoctorClassification;
+  evidence: string;
+  guidance: string | null;
+  action: DoctorAction | null;
+}
+
+export interface DoctorReport {
+  generatedAt: string;
+  overall: DoctorClassification;
+  counts: { healthy: number; needsAttention: number; unavailable: number };
+  checks: DoctorCheck[];
+  copyText: string;
+}
+
 // =========================================================
 // UI-only types (frontend stores, command palette, etc.)
 // =========================================================
@@ -1302,6 +1331,7 @@ export type ThemePreference = "light" | "dark" | "system";
     `ui.openSettings(section)`. */
 export type SettingsSection =
   | "appearance"
+  | "doctor"
   | "catalog"
   | "mcp"
   | "network"

@@ -27,7 +27,7 @@ import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import type { Agent, AgentPackageResult, AgentSource, ExpertResolved, InstalledAgent, InstalledSkill, McpAuditEntry } from "$lib/types";
+import type { Agent, AgentPackageResult, AgentSource, DoctorReport, ExpertResolved, InstalledAgent, InstalledSkill, McpAuditEntry } from "$lib/types";
 
 const skillRecommendation = (sourceId = "skills-b") => ({
   kind: "skill" as const,
@@ -149,6 +149,8 @@ beforeEach(async () => {
   ui.agentsReference = null;
   ui.skillsSelected = null;
   ui.paletteOpen = false;
+  ui.settingsOpen = false;
+  ui.settingsInitialSection = null;
   await tick();
 });
 
@@ -163,6 +165,122 @@ afterEach(async () => {
 describe("frontend test harness", () => {
   it("runs unit tests", () => {
     expect(true).toBe(true);
+  });
+
+  it("renders the canonical Doctor report, copies it, and routes every safe action without mutation", async () => {
+    const report: DoctorReport = {
+      generatedAt: "2026-08-13T12:00:00Z",
+      overall: "needsAttention",
+      counts: { healthy: 1, needsAttention: 1, unavailable: 6 },
+      copyText: "canonical redacted report",
+      checks: [
+        { id: "storage", category: "core", title: "Storage", classification: "healthy", evidence: "SQLite complete", guidance: null, action: null },
+        { id: "retry", category: "core", title: "Retry", classification: "unavailable", evidence: "Retry needed", guidance: "Retry Doctor.", action: "retryDoctor" },
+        { id: "catalog", category: "library", title: "Catalog", classification: "needsAttention", evidence: "Missing", guidance: "Open Catalog.", action: "openCatalog" },
+        { id: "agents", category: "library", title: "Agent sources", classification: "unavailable", evidence: "Unknown", guidance: "Open Agents.", action: "openAgents" },
+        { id: "skills", category: "library", title: "Skill sources", classification: "unavailable", evidence: "Unknown", guidance: "Open Skills.", action: "openSkills" },
+        { id: "tools", category: "tools", title: "Tools", classification: "unavailable", evidence: "None", guidance: "Open Tools.", action: "openTools" },
+        { id: "mcp", category: "integrations", title: "MCP", classification: "unavailable", evidence: "None", guidance: "Open MCP.", action: "openMcp" },
+        { id: "updates", category: "updates", title: "Updates", classification: "unavailable", evidence: "No cache", guidance: "Open Network.", action: "openNetwork" },
+      ],
+    };
+    vi.mocked(invoke).mockResolvedValue(report as never);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    const { default: SettingsSectionDoctor } = await import("$lib/components/SettingsSectionDoctor.svelte");
+    const target = document.createElement("div");
+    const main = document.createElement("main");
+    const workspaceHeading = document.createElement("h2");
+    main.append(workspaceHeading);
+    document.body.append(main);
+    document.body.append(target);
+    const component = mount(SettingsSectionDoctor, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain("SQLite complete"));
+      expect(target.textContent).toContain("Healthy 1");
+      expect(target.textContent).toContain("Needs attention 1");
+      expect(target.textContent).toContain("Unavailable 6");
+      expect(target.querySelectorAll("[data-doctor-category]").length).toBeGreaterThanOrEqual(5);
+      for (const category of ["Core", "Library", "Tools", "Integrations", "Updates"])
+        expect(target.textContent).toContain(category);
+
+      target.querySelector<HTMLButtonElement>('[data-doctor-copy]')!.click();
+      await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith(report.copyText));
+      await vi.waitFor(() => expect(target.querySelector('[role="status"]')?.textContent).toContain("copied"));
+
+      const action = (name: string) => target.querySelector<HTMLButtonElement>(`[data-doctor-action="${name}"]`)!;
+      ui.settingsOpen = true;
+      action("openCatalog").click();
+      expect(ui.settingsInitialSection).toBe("catalog");
+      action("openMcp").click();
+      expect(ui.settingsInitialSection).toBe("mcp");
+      action("openNetwork").click();
+      expect(ui.settingsInitialSection).toBe("network");
+      action("openAgents").click();
+      expect(ui.section).toBe("personas");
+      expect(ui.agentsLens).toBe("attention");
+      await vi.waitFor(() => expect(document.activeElement).toBe(workspaceHeading));
+      ui.settingsOpen = true;
+      action("openSkills").click();
+      expect(ui.section).toBe("skills");
+      ui.settingsOpen = true;
+      action("openTools").click();
+      expect(ui.section).toBe("tools");
+
+      const callsBeforeRetry = vi.mocked(invoke).mock.calls.length;
+      action("retryDoctor").click();
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.length).toBe(callsBeforeRetry + 1));
+      expect(vi.mocked(invoke).mock.calls.map(([command]) => command))
+        .toEqual(Array(callsBeforeRetry + 1).fill("doctor_report"));
+    } finally {
+      unmount(component);
+      target.remove();
+      main.remove();
+    }
+  });
+
+  it("keeps stale Doctor evidence during one refresh and reports retryable global and copy failures", async () => {
+    const report: DoctorReport = {
+      generatedAt: "2026-08-13T12:00:00Z", overall: "unavailable",
+      counts: { healthy: 0, needsAttention: 0, unavailable: 1 }, copyText: "safe",
+      checks: [{ id: "catalog", category: "library", title: "Catalog", classification: "unavailable", evidence: "Cached local evidence", guidance: "Retry.", action: "retryDoctor" }],
+    };
+    let resolveRefresh: ((value: DoctorReport) => void) | undefined;
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(report as never)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve as (value: DoctorReport) => void; }))
+      .mockRejectedValueOnce({ code: "internal", message: "doctor unavailable" });
+    const writeText = vi.fn().mockRejectedValue(new Error("clipboard denied"));
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    const { default: SettingsSectionDoctor } = await import("$lib/components/SettingsSectionDoctor.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionDoctor, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain("Cached local evidence"));
+      const refresh = target.querySelector<HTMLButtonElement>('[data-doctor-refresh]')!;
+      refresh.click();
+      await vi.waitFor(() => expect(resolveRefresh).toBeTypeOf("function"));
+      expect(refresh.disabled).toBe(true);
+      expect(target.textContent).toContain("prior evidence");
+      expect(target.textContent).toContain("Cached local evidence");
+      refresh.click();
+      expect(vi.mocked(invoke)).toHaveBeenCalledTimes(2);
+      resolveRefresh?.(report);
+      await vi.waitFor(() => expect(refresh.disabled).toBe(false));
+      refresh.click();
+      await vi.waitFor(() => expect(target.querySelector('[role="alert"]')?.textContent).toContain("doctor unavailable"));
+      expect(target.textContent).toContain("Cached local evidence");
+      expect(target.textContent).not.toContain("All checks are healthy");
+
+      target.querySelector<HTMLButtonElement>('[data-doctor-copy]')!.click();
+      await vi.waitFor(() => expect(target.querySelector('[role="alert"]')?.textContent).toContain("Could not copy"));
+      expect(target.querySelector('[aria-live="polite"]')).not.toBeNull();
+      expect(refresh.getAttribute("aria-keyshortcuts")).toBe("Enter Space");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
   });
 
   it("restores exact Agent and Skill recommendation navigation", () => {

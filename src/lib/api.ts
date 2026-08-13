@@ -64,7 +64,10 @@ import type {
   Tool,
   StorageMigrationStatus,
   TaskRecommendation,
+  DoctorReport,
 } from "./types";
+
+export const doctorReport = () => invoke<DoctorReport>("doctor_report");
 
 export const storageMigrationStatus = () =>
   invoke<StorageMigrationStatus>("storage_migration_status");

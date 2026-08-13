@@ -217,6 +217,14 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn state_database_if_present(&self) -> Option<crate::state_db::StateDatabase> {
+        #[cfg(not(test))]
+        return Some(self.state_database.clone());
+
+        #[cfg(test)]
+        crate::state_db::StateDatabase::existing(&self.app_data_dir)
+    }
+
     fn release_storage_lease(&self) -> Result<(), AppError> {
         #[cfg(not(test))]
         {
@@ -244,12 +252,9 @@ impl AppState {
     pub(crate) async fn completed_state_database(
         &self,
     ) -> Result<Option<crate::state_db::StateDatabase>, AppError> {
-        #[cfg(not(test))]
-        let database = self.state_database.clone();
-        #[cfg(test)]
-        return crate::state_db::StateDatabase::completed(&self.app_data_dir).await;
-
-        #[cfg(not(test))]
+        let Some(database) = self.state_database_if_present() else {
+            return Ok(None);
+        };
         match database.migration_state().await? {
             crate::types::StorageMigrationState::Complete => Ok(Some(database)),
             crate::types::StorageMigrationState::Legacy
@@ -1068,10 +1073,17 @@ pub(crate) async fn recover_filesystem_operations(
     }
 }
 
-async fn migration_status(
+pub(crate) async fn migration_status(
     state: &AppState,
 ) -> Result<crate::types::StorageMigrationStatus, AppError> {
-    let database = crate::state_db::StateDatabase::open(&state.app_data_dir)?;
+    let Some(database) = state.state_database_if_present() else {
+        return Ok(crate::types::StorageMigrationStatus {
+            state: crate::types::StorageMigrationState::Legacy,
+            stage: Some("checkingData".into()),
+            detail: Some("Ready for the one-time data update.".into()),
+            legacy_conflicts: Vec::new(),
+        });
+    };
     let migration_state = database.migration_state().await?;
     let (stage, detail, legacy_conflicts) = match migration_state {
         crate::types::StorageMigrationState::Legacy => (

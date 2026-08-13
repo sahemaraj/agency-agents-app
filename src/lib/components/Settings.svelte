@@ -26,9 +26,11 @@
   import Activity from "@lucide/svelte/icons/activity";
   import Plug from "@lucide/svelte/icons/plug";
   import Info from "@lucide/svelte/icons/info";
+  import HeartPulse from "@lucide/svelte/icons/heart-pulse";
 
   import { ui } from "$lib/stores/ui.svelte";
   import SettingsSectionAppearance from "./SettingsSectionAppearance.svelte";
+  import SettingsSectionDoctor from "./SettingsSectionDoctor.svelte";
   import SettingsSectionCatalog from "./SettingsSectionCatalog.svelte";
   import SettingsSectionMcp from "./SettingsSectionMcp.svelte";
   import SettingsSectionNetwork from "./SettingsSectionNetwork.svelte";
@@ -45,6 +47,7 @@
 
   const NAV: NavEntry[] = [
     { id: "appearance", icon: Paintbrush },
+    { id: "doctor",     icon: HeartPulse },
     { id: "catalog",    icon: Library },
     { id: "mcp",        icon: Plug },
     { id: "network",    icon: Globe },
@@ -58,6 +61,7 @@
 
   function sectionLabel(id: SettingsSection): string {
     if (id === "appearance") return i18n.t("settings.appearance.title");
+    if (id === "doctor") return i18n.t("settings.doctor");
     if (id === "catalog") return i18n.t("settings.catalog");
     if (id === "mcp") return i18n.t("settings.mcp");
     if (id === "network") return i18n.t("settings.network");
@@ -168,6 +172,8 @@
         </button>
         {#if activeSection === "appearance"}
           <SettingsSectionAppearance />
+        {:else if activeSection === "doctor"}
+          <SettingsSectionDoctor />
         {:else if activeSection === "catalog"}
           <SettingsSectionCatalog />
         {:else if activeSection === "mcp"}

@@ -163,22 +163,21 @@ impl<T> DocumentSpec<T> {
 }
 
 impl StateDatabase {
+    pub(crate) fn existing(app_data_dir: &Path) -> Option<Self> {
+        let path = app_data_dir.join("state").join("agency-agents.sqlite3");
+        path.exists().then_some(Self { path })
+    }
+
     pub(crate) async fn completed(app_data_dir: &Path) -> Result<Option<Self>, AppError> {
         let app_data_dir = app_data_dir.to_path_buf();
         run_blocking(move || Self::completed_blocking(&app_data_dir)).await
     }
 
     pub(crate) fn completed_blocking(app_data_dir: &Path) -> Result<Option<Self>, AppError> {
-        if !app_data_dir
-            .join("state")
-            .join("agency-agents.sqlite3")
-            .exists()
-        {
+        let Some(database) = Self::existing(app_data_dir) else {
             return Ok(None);
-        }
-        let database = Self::open(app_data_dir)?;
-        let connection = database.connection()?;
-        match migration_state(&connection)? {
+        };
+        match database.migration_state_blocking()? {
             StorageMigrationState::Complete => Ok(Some(database)),
             StorageMigrationState::Legacy
             | StorageMigrationState::InProgress
