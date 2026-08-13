@@ -4,6 +4,8 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { ui, watchSystemTheme } from "$lib/stores/ui.svelte";
   import { install } from "$lib/stores/install.svelte";
+  import { skillSources } from "$lib/stores/skillSources.svelte";
+  import { projects } from "$lib/stores/projects.svelte";
   import { activity } from "$lib/stores/activity.svelte";
   import { settings } from "$lib/stores/settings.svelte";
   import { catalog } from "$lib/stores/catalog.svelte";
@@ -38,6 +40,15 @@
     firstDeploymentActive = false;
   }
 
+  function projectPaths(): string[] {
+    return projects.list.map((project) => project.path);
+  }
+
+  function reconcileInstallationTruth(): void {
+    void install.reconcile();
+    void skillSources.reconcileInstalls(projectPaths());
+  }
+
   onMount(() => {
     i18n.init();
     firstDeploymentCompletion = localStorage.getItem(FIRST_DEPLOYMENT_STORAGE_KEY);
@@ -59,7 +70,16 @@
     // components. A view that both reads install.* state AND triggers a mutation
     // (reconcile) during its own setup froze its reactivity (Library bug). Views
     // are now pure readers; Rescan buttons re-trigger on user action.
-    void install.reconcile();
+    reconcileInstallationTruth();
+    const initialProjectPaths = projectPaths();
+    void projects.refresh().then(() => {
+      const refreshedProjectPaths = projectPaths();
+      if (refreshedProjectPaths.join("\0") !== initialProjectPaths.join("\0")) {
+        void skillSources.reconcileInstalls(refreshedProjectPaths);
+      }
+    }).catch(() => {
+      // Existing install state remains usable; a later view or focus retries.
+    });
     void install.loadTools();
     install.loadSelection();
     // Phase 12d — hydrate the persisted settings.json into the renderer
@@ -87,12 +107,20 @@
     // with the in-app shortcut already handled in `+page.svelte`.
     let unlistenAbout: UnlistenFn | undefined;
     let unlistenSettings: UnlistenFn | undefined;
+    let foregroundTimer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleForegroundReconcile = () => {
+      if (foregroundTimer) clearTimeout(foregroundTimer);
+      foregroundTimer = setTimeout(reconcileInstallationTruth, 250);
+    };
+    window.addEventListener("focus", scheduleForegroundReconcile);
     void listen("menu:about", () => { ui.openAbout(); }).then((u) => { unlistenAbout = u; });
     void listen("menu:settings", () => { ui.openSettings(); }).then((u) => { unlistenSettings = u; });
 
     const unwatch = watchSystemTheme(() => ui.theme);
     return () => {
       unwatch();
+      window.removeEventListener("focus", scheduleForegroundReconcile);
+      if (foregroundTimer) clearTimeout(foregroundTimer);
       unlistenAbout?.();
       unlistenSettings?.();
     };

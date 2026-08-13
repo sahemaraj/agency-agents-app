@@ -43,6 +43,10 @@ vi.mock("@tauri-apps/api/core", () => ({
     : []),
 }));
 
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => () => undefined),
+}));
+
 const emptyFolderState = () => ({
   folders: [], assignments: [], favorites: [], recent: [], collections: [], smartFolders: [],
   profiles: [], updatePolicies: [], publisherTrust: [], preferredSources: [], usage: [], approvals: [],
@@ -480,6 +484,237 @@ describe("frontend test harness", () => {
     expect(onClose).toHaveBeenCalledOnce();
     unmount(component);
     target.remove();
+  });
+
+  it("debounces rapid foreground reconciliation for both install ledgers", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    const agentReconcile = vi.spyOn(install, "reconcile").mockResolvedValue();
+    const projectRefresh = vi.spyOn(projects, "refresh").mockResolvedValue();
+    const skillReconcile = vi.spyOn(skillSources, "reconcileInstalls").mockResolvedValue();
+    projects.list = [{ path: "/tmp/project", label: "project", installedCount: 0 }];
+    const { default: Layout } = await import("../routes/+layout.svelte");
+    const target = document.createElement("div");
+    const children = createRawSnippet(() => ({ render: () => "<main>App</main>" }));
+    document.body.append(target);
+    const component = mount(Layout, { target, props: { children } });
+    try {
+      await tick();
+      await Promise.resolve();
+      agentReconcile.mockClear();
+      projectRefresh.mockClear();
+      skillReconcile.mockClear();
+
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+      await vi.advanceTimersByTimeAsync(249);
+      expect(agentReconcile).not.toHaveBeenCalled();
+      expect(skillReconcile).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      expect(agentReconcile).toHaveBeenCalledOnce();
+      expect(projectRefresh).not.toHaveBeenCalled();
+      expect(skillReconcile).toHaveBeenCalledOnce();
+      expect(skillReconcile).toHaveBeenCalledWith(["/tmp/project"]);
+    } finally {
+      unmount(component);
+      target.remove();
+      agentReconcile.mockRestore();
+      projectRefresh.mockRestore();
+      skillReconcile.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("shares mount reconciliation when focus overlaps the in-flight scan", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    let resolveAgent!: (rows: InstalledAgent[]) => void;
+    let resolveSkills!: (rows: InstalledSkill[]) => void;
+    const agentScan = new Promise<InstalledAgent[]>((resolve) => (resolveAgent = resolve));
+    const skillScan = new Promise<InstalledSkill[]>((resolve) => (resolveSkills = resolve));
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "installs_reconcile") return agentScan as never;
+      if (command === "skill_installs_reconcile") return skillScan as never;
+      if (command === "skill_backups_list") return [] as never;
+      return [] as never;
+    });
+    const projectRefresh = vi.spyOn(projects, "refresh").mockResolvedValue();
+    const { default: Layout } = await import("../routes/+layout.svelte");
+    const target = document.createElement("div");
+    const children = createRawSnippet(() => ({ render: () => "<main>App</main>" }));
+    document.body.append(target);
+    const component = mount(Layout, { target, props: { children } });
+    try {
+      await tick();
+      await Promise.resolve();
+      expect(install.reconcileAttempt).toBe(1);
+      expect(skillSources.reconcileAttempt).toBe(1);
+
+      window.dispatchEvent(new Event("focus"));
+      await vi.advanceTimersByTimeAsync(250);
+      expect(invokeMock.mock.calls.filter(([command]) => command === "installs_reconcile")).toHaveLength(1);
+      expect(invokeMock.mock.calls.filter(([command]) => command === "skill_installs_reconcile")).toHaveLength(1);
+      expect(install.reconcileAttempt).toBe(1);
+      expect(skillSources.reconcileAttempt).toBe(1);
+
+      resolveAgent([]);
+      resolveSkills([]);
+      await Promise.all([agentScan, skillScan]);
+      await Promise.resolve();
+    } finally {
+      unmount(component);
+      target.remove();
+      projectRefresh.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels pending foreground work when the root layout unmounts", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    const agentReconcile = vi.spyOn(install, "reconcile").mockResolvedValue();
+    const projectRefresh = vi.spyOn(projects, "refresh").mockResolvedValue();
+    const skillReconcile = vi.spyOn(skillSources, "reconcileInstalls").mockResolvedValue();
+    const { default: Layout } = await import("../routes/+layout.svelte");
+    const target = document.createElement("div");
+    const children = createRawSnippet(() => ({ render: () => "<main>App</main>" }));
+    document.body.append(target);
+    const component = mount(Layout, { target, props: { children } });
+    await tick();
+    await Promise.resolve();
+    agentReconcile.mockClear();
+    projectRefresh.mockClear();
+    skillReconcile.mockClear();
+
+    window.dispatchEvent(new Event("focus"));
+    unmount(component);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(agentReconcile).not.toHaveBeenCalled();
+    expect(projectRefresh).not.toHaveBeenCalled();
+    expect(skillReconcile).not.toHaveBeenCalled();
+
+    target.remove();
+    agentReconcile.mockRestore();
+    projectRefresh.mockRestore();
+    skillReconcile.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("uses only local read commands for foreground reconciliation", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "project", installedCount: 0 }] as never;
+      return [] as never;
+    });
+    const { default: Layout } = await import("../routes/+layout.svelte");
+    const target = document.createElement("div");
+    const children = createRawSnippet(() => ({ render: () => "<main>App</main>" }));
+    document.body.append(target);
+    const component = mount(Layout, { target, props: { children } });
+    try {
+      await tick();
+      await vi.waitFor(() => expect(projects.list).toHaveLength(1));
+      await vi.waitFor(() => expect(skillSources.reconciling).toBe(false));
+      invokeMock.mockClear();
+
+      window.dispatchEvent(new Event("focus"));
+      await vi.advanceTimersByTimeAsync(250);
+      await vi.waitFor(() => expect(skillSources.reconciling).toBe(false));
+      expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
+        "installs_reconcile",
+        "skill_installs_reconcile",
+        "skill_backups_list",
+      ]);
+    } finally {
+      unmount(component);
+      target.remove();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains both ledgers when foreground reconciliation fails and recovers on retry", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    const agentRow = staleControlRow;
+    const skillRow: InstalledSkill = {
+      sourceId: "built-in", relativePath: "reviewer", name: "reviewer", runtime: "codex",
+      scope: "user", projectPath: null, path: "/tmp/reviewer/SKILL.md", state: "current", tracked: true,
+    };
+    install.installed = [agentRow];
+    install.reconciled = true;
+    skillSources.installed = [skillRow];
+    skillSources.reconciled = true;
+    const invokeMock = vi.mocked(invoke);
+    let failScans = false;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "installs_reconcile") {
+        if (failScans) throw { code: "io", message: "agent focus scan failed" };
+        return [agentRow] as never;
+      }
+      if (command === "skill_installs_reconcile") {
+        if (failScans) throw { code: "io", message: "skill focus scan failed" };
+        return [skillRow] as never;
+      }
+      if (command === "skill_backups_list") return [] as never;
+      return [] as never;
+    });
+    const projectRefresh = vi.spyOn(projects, "refresh").mockResolvedValue();
+    const { default: Layout } = await import("../routes/+layout.svelte");
+    const target = document.createElement("div");
+    const children = createRawSnippet(() => ({ render: () => "<main>App</main>" }));
+    document.body.append(target);
+    const component = mount(Layout, { target, props: { children } });
+    try {
+      await tick();
+      await vi.waitFor(() => expect(skillSources.reconciling).toBe(false));
+      failScans = true;
+      window.dispatchEvent(new Event("focus"));
+      await vi.advanceTimersByTimeAsync(250);
+      await vi.waitFor(() => expect(skillSources.reconciling).toBe(false));
+
+      expect(install.installed).toEqual([agentRow]);
+      expect(install.reconcileError).toBe("I/O error: agent focus scan failed");
+      expect(skillSources.installed).toEqual([skillRow]);
+      expect(skillSources.reconcileError).toBe("I/O error: skill focus scan failed");
+
+      failScans = false;
+      await Promise.all([install.reconcile(), skillSources.reconcileInstalls([])]);
+      expect(install.reconcileError).toBeNull();
+      expect(skillSources.reconcileError).toBeNull();
+      expect(install.installed).toEqual([agentRow]);
+      expect(skillSources.installed).toEqual([skillRow]);
+    } finally {
+      unmount(component);
+      target.remove();
+      projectRefresh.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("keeps Skills popovers open for inside clicks and closes them for outside clicks", async () => {
