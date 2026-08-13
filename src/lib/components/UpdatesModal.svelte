@@ -1,195 +1,445 @@
 <script lang="ts">
-  /**
-   * UpdatesModal — installed agents with a newer version in the catalog
-   * (reconcile state "outdated"), as an agents × tools grid (the app's standard
-   * install surface): one row per agent, a column per tool that has any outdated
-   * install, and a checkable cell only where that (agent, tool) install is stale.
-   *
-   * Select whole rows/cells, then bulk-update via install.bulk("update", …),
-   * which re-reconciles so updated cells drop out of the grid live.
-   */
+  import { tick } from "svelte";
   import Modal from "./Modal.svelte";
   import Button from "./Button.svelte";
-  import { install, SUPPORTED_TOOLS } from "$lib/stores/install.svelte";
-  import { corpus } from "$lib/stores/corpus.svelte";
-  import { toast } from "$lib/stores/toast.svelte";
+  import DiffModal from "./DiffModal.svelte";
+  import { skillInstallPlan, skillSourcesInspect } from "$lib/api";
+  import { install } from "$lib/stores/install.svelte";
+  import { skillSources } from "$lib/stores/skillSources.svelte";
+  import { projects } from "$lib/stores/projects.svelte";
+  import { activity, safeActivityDetail } from "$lib/stores/activity.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { Tool } from "$lib/types";
+  import { appErrorMessage, isAppError } from "$lib/types";
+  import type { AgentMutationPlan, InstalledAgent, InstalledSkill, InstallState, SkillInstallState, SkillMutationPlan } from "$lib/types";
 
   interface Props {
     onClose: () => void;
   }
   let { onClose }: Props = $props();
 
-  const outdated = $derived(install.installed.filter((r) => r.state === "outdated"));
-  const bySlug = $derived(new Map(corpus.agents.map((a) => [a.slug, a])));
-
-  // Rows: distinct outdated agents, by name.
-  const rows = $derived.by(() => {
-    const seen = new Map<string, string>(); // slug -> name
-    for (const r of outdated) if (!seen.has(r.slug)) seen.set(r.slug, r.name);
-    return [...seen.entries()]
-      .map(([slug, name]) => ({ slug, name }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  });
-  // Columns: only the tools that actually have an outdated install, in menu order.
-  const cols = $derived.by(() => {
-    const present = new Set(outdated.map((r) => r.tool));
-    return SUPPORTED_TOOLS.filter((t) => present.has(t.id));
-  });
-
-  // The install rows behind one (agent, tool) cell — usually one, but an agent
-  // installed to the same tool in multiple projects collapses into a cell that
-  // updates them all.
-  function cellRows(slug: string, tool: Tool) {
-    return outdated.filter((r) => r.slug === slug && r.tool === tool);
+  type RepairCandidate =
+    | { kind: "agent"; key: string; row: InstalledAgent }
+    | { kind: "skill"; key: string; row: InstalledSkill };
+  type ReviewPlan =
+    | { kind: "agent"; candidate: Extract<RepairCandidate, { kind: "agent" }>; plan: AgentMutationPlan | null; error: string | null }
+    | { kind: "skill"; candidate: Extract<RepairCandidate, { kind: "skill" }>; plan: SkillMutationPlan | null; sourceFiles: { relativePath: string; sizeBytes: number; sha256: string }[]; error: string | null };
+  interface RepairResult {
+    candidate: RepairCandidate;
+    ok: boolean;
+    error: string | null;
   }
-  const cellKey = (slug: string, tool: Tool) => `${slug}:${tool}`;
 
-  // Track deselected cells, so the default (empty) means "all checked".
+  const repairable = (state: InstallState | SkillInstallState) => state === "outdated" || state === "missing";
+  const agentKey = (row: InstalledAgent) => ["agent", row.sourceId, row.relativePath, row.tool, row.projectPath ?? ""].join("\0");
+  const skillKey = (row: InstalledSkill) => ["skill", row.sourceId, row.relativePath, row.runtime, row.projectPath ?? ""].join("\0");
+
+  const collectCandidates = (): RepairCandidate[] => [
+    ...install.installed
+      .filter((row) => row.tracked && repairable(row.state))
+      .map((row) => ({ kind: "agent" as const, key: agentKey(row), row })),
+    ...skillSources.installed
+      .filter((row) => row.tracked && repairable(row.state))
+      .map((row) => ({ kind: "skill" as const, key: skillKey(row), row })),
+  ];
+  const candidates = $derived.by(collectCandidates);
+  const unsafe = $derived.by<RepairCandidate[]>(() => [
+    ...install.installed
+      .filter((row) => ["modified", "foreign", "disabled", "sourceUnavailable"].includes(row.state))
+      .map((row) => ({ kind: "agent" as const, key: row.tracked ? agentKey(row) : ["agent", "unsafe", row.tool, row.dest].join("\0"), row })),
+    ...skillSources.installed
+      .filter((row) => ["modified", "foreign", "disabled", "sourceUnavailable"].includes(row.state))
+      .map((row) => ({ kind: "skill" as const, key: row.tracked ? skillKey(row) : ["skill", "unsafe", row.runtime, row.path].join("\0"), row })),
+  ]);
+
   let deselected = $state<Set<string>>(new Set());
-  const allCellKeys = $derived.by(() => {
-    const out: string[] = [];
-    for (const row of rows) for (const t of cols) if (cellRows(row.slug, t.id).length) out.push(cellKey(row.slug, t.id));
-    return out;
-  });
-  const isSel = (slug: string, tool: Tool) =>
-    cellRows(slug, tool).length > 0 && !deselected.has(cellKey(slug, tool));
+  let stage = $state<"select" | "review" | "results">("select");
+  let planning = $state(false);
+  let applying = $state(false);
+  let progress = $state(0);
+  let results = $state<RepairResult[]>([]);
+  let reviewPlans = $state<ReviewPlan[]>([]);
+  let reviewedSignature = $state("");
+  let staleMessage = $state<string | null>(null);
+  let diffCandidate = $state<Extract<RepairCandidate, { kind: "agent" }> | null>(null);
+  const selected = $derived(candidates.filter((candidate) => !deselected.has(candidate.key)));
+  const allSelected = $derived(candidates.length > 0 && selected.length === candidates.length);
+  const someSelected = $derived(selected.length > 0 && !allSelected);
+  const truthReady = $derived(
+    install.reconciled && !install.reconciling && !install.reconcileError
+    && skillSources.reconciled && !skillSources.reconciling && !skillSources.reconcileError,
+  );
 
-  // Every selected cell's underlying install(s) → the update targets.
-  const targets = $derived.by(() => {
-    const t: { slug: string; tool: Tool; projectPath: string | null }[] = [];
-    for (const key of allCellKeys) {
-      if (deselected.has(key)) continue;
-      const [slug, tool] = key.split(":") as [string, Tool];
-      for (const r of cellRows(slug, tool)) t.push({ slug: r.slug, tool: r.tool, projectPath: r.projectPath });
-    }
-    return t;
-  });
-
-  const allSel = $derived(deselected.size === 0);
-  const noneSel = $derived(allCellKeys.length > 0 && allCellKeys.every((k) => deselected.has(k)));
-
-  function toggleCell(slug: string, tool: Tool) {
-    if (!cellRows(slug, tool).length) return;
-    const k = cellKey(slug, tool);
+  function toggle(key: string) {
     const next = new Set(deselected);
-    if (next.has(k)) next.delete(k);
-    else next.add(k);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
     deselected = next;
   }
+
   function toggleAll() {
-    deselected = allSel ? new Set(allCellKeys) : new Set();
+    deselected = allSelected ? new Set(candidates.map((candidate) => candidate.key)) : new Set();
   }
 
-  let busy = $state(false);
-  async function updateChosen() {
-    if (targets.length === 0 || busy) return;
-    busy = true;
+  function target(candidate: RepairCandidate): string {
+    return candidate.kind === "agent" ? candidate.row.tool : candidate.row.runtime;
+  }
+
+  function destination(candidate: RepairCandidate): string {
+    return candidate.kind === "agent" ? candidate.row.dest : candidate.row.path;
+  }
+
+  function unsafeReason(state: InstallState | SkillInstallState): string {
+    if (state === "modified") return i18n.optional("agentUpdates.reasonModified", "Local changes require manual review");
+    if (state === "foreign") return i18n.optional("agentUpdates.reasonForeign", "Untracked content requires manual review");
+    if (state === "disabled") return i18n.optional("agentUpdates.reasonDisabled", "Enable this installation before repair");
+    return i18n.optional("agentUpdates.reasonSourceUnavailable", "Restore its source before repair");
+  }
+
+  function finalState(candidate: RepairCandidate): string {
+    const row = candidate.kind === "agent"
+      ? install.installed.find((entry) => agentKey(entry) === candidate.key)
+      : skillSources.installed.find((entry) => skillKey(entry) === candidate.key);
+    return row ? i18n.t(`state.${row.state}`) : i18n.optional("agentUpdates.notDetected", "Not detected");
+  }
+
+  function ledgerError(): string | null {
+    if (!install.reconciled || install.reconciling || install.reconcileError) {
+      return i18n.optional("agentUpdates.agentTruthUnavailable", "Agent installation status is unavailable. Retry reconciliation before repair.");
+    }
+    if (!skillSources.reconciled || skillSources.reconciling || skillSources.reconcileError) {
+      return i18n.optional("agentUpdates.skillTruthUnavailable", "Skill installation status is unavailable. Retry reconciliation before repair.");
+    }
+    return null;
+  }
+
+  function errorMessage(error: unknown): string {
+    return isAppError(error) ? appErrorMessage(error) : error instanceof Error ? error.message : String(error);
+  }
+
+  async function buildPlans(items: RepairCandidate[]): Promise<ReviewPlan[]> {
+    const needsSkills = items.some((candidate) => candidate.kind === "skill");
+    let inspectedSkills: Awaited<ReturnType<typeof skillSourcesInspect>> | null = null;
+    let inspectError: string | null = null;
+    if (needsSkills) {
+      try {
+        inspectedSkills = await skillSourcesInspect();
+      } catch (error) {
+        inspectError = errorMessage(error);
+      }
+    }
+    return Promise.all(items.map(async (candidate): Promise<ReviewPlan> => {
+      try {
+        if (candidate.kind === "agent") {
+          const plan = await install.plan(
+            "update",
+            { sourceId: candidate.row.sourceId, relativePath: candidate.row.relativePath },
+            candidate.row.tool,
+            candidate.row.projectPath,
+          );
+          return { kind: "agent", candidate, plan, error: null };
+        }
+        const plan = await skillInstallPlan(
+          candidate.row.sourceId,
+          candidate.row.relativePath,
+          candidate.row.runtime,
+          candidate.row.projectPath,
+        );
+        if (inspectError) return { kind: "skill", candidate, plan, sourceFiles: [], error: inspectError };
+        const pkg = inspectedSkills
+          ?.flatMap((source) => source.packages)
+          .find((entry) => entry.sourceId === candidate.row.sourceId && entry.relativePath === candidate.row.relativePath);
+        if (!pkg) return { kind: "skill", candidate, plan, sourceFiles: [], error: i18n.optional("agentUpdates.sourceInspectionMissing", "Skill source could not be inspected") };
+        return { kind: "skill", candidate, plan, sourceFiles: pkg.files, error: null };
+      } catch (error) {
+        return candidate.kind === "agent"
+          ? { kind: "agent", candidate, plan: null, error: errorMessage(error) }
+          : { kind: "skill", candidate, plan: null, sourceFiles: [], error: errorMessage(error) };
+      }
+    }));
+  }
+
+  function planSignature(plans: ReviewPlan[]): string {
+    return JSON.stringify(plans.map((item) => ({
+      key: item.candidate.key,
+      state: item.candidate.row.state,
+      plan: item.plan,
+      sourceFiles: item.kind === "skill" ? item.sourceFiles : undefined,
+      error: item.error,
+    })));
+  }
+
+  const reviewBlocked = $derived(
+    reviewPlans.length === 0
+    || reviewPlans.some(({ plan, error }) => Boolean(error) || !plan || plan.blockers.length > 0),
+  );
+
+  async function reviewSelected() {
+    if (!truthReady || selected.length === 0 || planning) return;
+    planning = true;
+    staleMessage = null;
     try {
-      const { ok, fail } = await install.bulk("update", targets);
-      if (fail === 0) toast.success(i18n.t("agentUpdates.done", { count: ok }));
-      else toast.error(i18n.t("agentUpdates.someFailed", { ok, fail }));
+      reviewPlans = await buildPlans(selected);
+      reviewedSignature = planSignature(reviewPlans);
+      stage = "review";
+      await tick();
     } finally {
-      busy = false;
-      if (install.installed.filter((r) => r.state === "outdated").length === 0) onClose();
+      planning = false;
+    }
+  }
+
+  async function approveReviewed() {
+    if (reviewBlocked || planning) return;
+    planning = true;
+    staleMessage = null;
+    try {
+      await Promise.all([
+        install.reconcile(),
+        skillSources.reconcileInstalls(projects.list.map((project) => project.path)),
+      ]);
+      await tick();
+      if (install.reconcileError || skillSources.reconcileError) {
+        staleMessage = i18n.optional("agentUpdates.freshReconcileFailed", "Fresh reconciliation failed. Retry before approving repairs.");
+        return;
+      }
+      const selectedKeys = new Set(reviewPlans.map(({ candidate }) => candidate.key));
+      const freshCandidates = collectCandidates().filter((candidate) => selectedKeys.has(candidate.key));
+      const freshPlans = await buildPlans(freshCandidates);
+      const freshSignature = planSignature(freshPlans);
+      if (freshCandidates.length !== selectedKeys.size || freshSignature !== reviewedSignature) {
+        reviewPlans = freshPlans;
+        reviewedSignature = freshSignature;
+        staleMessage = i18n.optional("agentUpdates.planChanged", "Repair plan changed. Review the updated plan before approving again.");
+        return;
+      }
+      applying = true;
+      progress = 0;
+      results = [];
+      for (const item of freshPlans) {
+        let result: RepairResult;
+        try {
+          if (item.candidate.kind === "agent") {
+            await install.updateReference(
+              { sourceId: item.candidate.row.sourceId, relativePath: item.candidate.row.relativePath },
+              item.candidate.row.tool,
+              item.candidate.row.projectPath,
+              true,
+            );
+            result = { candidate: item.candidate, ok: true, error: null };
+          } else {
+            const ok = await skillSources.lifecycle(
+              "update",
+              item.candidate.row,
+              projects.list.map((project) => project.path),
+            );
+            result = {
+              candidate: item.candidate,
+              ok,
+              error: ok ? null : skillSources.installErrors[item.candidate.key.slice("skill\0".length)] ?? i18n.optional("agentUpdates.unknownFailure", "Repair failed"),
+            };
+          }
+        } catch (error) {
+          result = { candidate: item.candidate, ok: false, error: safeActivityDetail(errorMessage(error)) };
+        }
+        results = [...results, result];
+        progress += 1;
+      }
+      await Promise.all([
+        install.reconcile(),
+        skillSources.reconcileInstalls(projects.list.map((project) => project.path)),
+      ]);
+      const repaired = results.filter((result) => result.ok).length;
+      const failed = results.length - repaired;
+      activity.log({
+        action: "bulk",
+        subject: "agentLibrary",
+        subjectName: i18n.optional("agentUpdates.repairActivity", "Safe repair"),
+        outcome: failed === 0 ? "ok" : "error",
+        detail: `${repaired} repaired · ${failed} failed`,
+      });
+      stage = "results";
+    } finally {
+      applying = false;
+      planning = false;
     }
   }
 </script>
 
-<Modal open size="wide" title={i18n.t("agentUpdates.title", { count: outdated.length })} onClose={onClose}>
-  <p class="sub">{i18n.t("agentUpdates.sub")}</p>
+<Modal open size="wide" dismissible={!planning} title={stage === "results" ? i18n.optional("agentUpdates.resultsTitle", "Repair results") : i18n.optional("agentUpdates.repairTitle", "Safe repair", { count: candidates.length })} onClose={onClose}>
+  <p class="sub">{i18n.optional("agentUpdates.repairSub", "Review recoverable Agent and Skill installations before changing files.")}</p>
 
-  {#if outdated.length === 0}
+  {#if ledgerError() && stage === "select"}
+    <p class="error" role="alert">{ledgerError()}</p>
+  {:else if candidates.length === 0 && unsafe.length === 0 && stage === "select"}
     <p class="empty">{i18n.t("agentUpdates.empty")}</p>
-  {:else}
-    <div class="head">
-      <label class="all">
-        <input
-          type="checkbox"
-          checked={allSel}
-          indeterminate={!allSel && !noneSel}
-          onchange={toggleAll}
-        />
-        {i18n.t("agentUpdates.selectAll")}
-      </label>
-      <span class="n">{i18n.t("common.selected", { count: targets.length })}</span>
-    </div>
-
-    <div class="grid-wrap">
-      <div class="grid" style="--cols: {cols.length}">
-        <div class="cell head corner"></div>
-        {#each cols as t (t.id)}
-          <div class="cell head tool" title={t.label}>{t.label}</div>
-        {/each}
-
-        {#each rows as row (row.slug)}
-          <div class="cell agent">
-            <span class="emoji">{bySlug.get(row.slug)?.emoji ?? "○"}</span>
-            <span class="aname">{row.name}</span>
-          </div>
-          {#each cols as t (t.id)}
-            {#if cellRows(row.slug, t.id).length}
-              <button
-                class="cell toggle"
-                onclick={() => toggleCell(row.slug, t.id)}
-                aria-label={i18n.t("agentUpdates.cellAria", { agent: row.name, tool: t.label })}
-                aria-pressed={isSel(row.slug, t.id)}
-              >
-                <span class="dot" class:full={isSel(row.slug, t.id)}></span>
-              </button>
-            {:else}
-              <div class="cell na">—</div>
-            {/if}
-          {/each}
-        {/each}
+  {:else if stage === "select"}
+    {#if candidates.length > 0}
+      <div class="head">
+        <label class="all">
+          <input type="checkbox" checked={allSelected} indeterminate={someSelected} onchange={toggleAll} />
+          {i18n.t("agentUpdates.selectAll")}
+        </label>
+        <span class="n">{i18n.t("common.selected", { count: selected.length })}</span>
       </div>
-    </div>
+      <ul class="items">
+        {#each candidates as candidate (candidate.key)}
+          <li>
+            <label class="candidate">
+              <input
+                type="checkbox"
+                name="repair-item"
+                data-candidate-key={candidate.key}
+                checked={!deselected.has(candidate.key)}
+                onchange={() => toggle(candidate.key)}
+              />
+              <span class="details">
+                <span class="name">{candidate.row.name}</span>
+                <span class="meta">{candidate.kind === "agent" ? "Agent" : "Skill"} · {target(candidate)} · {candidate.row.state === "missing" ? i18n.optional("agentUpdates.reinstall", "Reinstall") : i18n.optional("agentUpdates.update", "Update")}</span>
+                <span class="path" title={destination(candidate)}>{destination(candidate)}</span>
+              </span>
+            </label>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if unsafe.length > 0}
+      <section class="manual">
+        <h2>{i18n.optional("agentUpdates.manualTitle", "Manual review required")}</h2>
+        <ul class="items unsafe">
+          {#each unsafe as candidate (candidate.key)}
+            <li class="candidate">
+              <span class="details">
+                <span class="name">{candidate.row.name}</span>
+                <span class="meta">{candidate.kind === "agent" ? "Agent" : "Skill"} · {target(candidate)} · {unsafeReason(candidate.row.state)}</span>
+                <span class="path" title={destination(candidate)}>{destination(candidate)}</span>
+              </span>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
+  {:else if stage === "review"}
+    {#if staleMessage}<p class="error" role="alert">{staleMessage}</p>{/if}
+    <p class="sub">{i18n.optional("agentUpdates.reviewSub", "Confirm every destination, warning, blocker, and recovery option before repair.")}</p>
+    <ul class="plans">
+      {#each reviewPlans as item (item.candidate.key)}
+        <li>
+          <div class="plan-head">
+            <span class="name">{item.candidate.row.name}</span>
+            <span class="operation">{item.candidate.row.state === "missing" ? i18n.optional("agentUpdates.reinstall", "Reinstall") : i18n.optional("agentUpdates.update", "Update")}</span>
+          </div>
+          <p class="meta">{item.candidate.kind === "agent" ? "Agent" : "Skill"} · {item.candidate.row.sourceId} · {item.candidate.row.relativePath}</p>
+          {#if item.error}
+            <p class="error">{item.error}</p>
+          {:else if item.plan}
+            <ul class="packages">
+              {#if item.kind === "agent"}
+                {#each item.plan.agents as pkg}
+                  <li>
+                    <span class="path" title={pkg.destination}>{pkg.destination}</span>
+                    <span class="meta">{pkg.dependency ? i18n.optional("agentUpdates.dependency", "Dependency") : i18n.optional("agentUpdates.primary", "Primary")} · {pkg.renderedFileCount} {pkg.renderedFileCount === 1 ? "file" : "files"}</span>
+                  </li>
+                {/each}
+              {:else}
+                {#each item.plan.packages as pkg}
+                  <li>
+                    <span class="path" title={pkg.destination}>{pkg.destination}</span>
+                    <span class="meta">{pkg.dependency ? i18n.optional("agentUpdates.dependency", "Dependency") : i18n.optional("agentUpdates.primary", "Primary")} · {pkg.fileCount} {pkg.fileCount === 1 ? "file" : "files"}{#if pkg.permissions.length} · {pkg.permissions.join(", ")}{/if}</span>
+                  </li>
+                {/each}
+              {/if}
+            </ul>
+            {#each item.plan.warnings as warning}<p class="warning">{warning}</p>{/each}
+            {#each item.plan.blockers as blocker}<p class="error">{blocker}</p>{/each}
+            <p class="meta">{item.plan.rollbackAvailable ? i18n.optional("agentUpdates.rollbackAvailable", "Rollback available") : i18n.optional("agentUpdates.rollbackUnavailable", "No existing content requires backup")}</p>
+            {#if item.kind === "agent"}
+              <button class="diff-link" onclick={() => (diffCandidate = item.candidate)}>{i18n.optional("agentUpdates.viewDiff", "View diff")}</button>
+            {/if}
+          {/if}
+        </li>
+      {/each}
+    </ul>
+    {#if applying}
+      <p class="progress" role="status" aria-live="polite">{i18n.optional("agentUpdates.progress", "Repairing {done} of {total}", { done: progress, total: reviewPlans.length })}</p>
+    {/if}
+  {:else}
+    <p class="sub">{i18n.optional("agentUpdates.resultsSub", "Every selected installation reached a terminal result.")}</p>
+    <ul class="results">
+      {#each results as result (result.candidate.key)}
+        <li>
+          <span class="result-mark" class:ok={result.ok}>{result.ok ? "✓" : "!"}</span>
+          <span class="details">
+            <span class="name">{result.candidate.row.name}</span>
+            <span class="meta">{result.ok ? `${i18n.optional("agentUpdates.repaired", "Repaired")} · ${finalState(result.candidate)}` : result.error}</span>
+          </span>
+        </li>
+      {/each}
+    </ul>
   {/if}
 
   {#snippet actions()}
-    <span class="legend"><span class="dot full"></span> {i18n.t("agentUpdates.willUpdate")} <span class="dot"></span> {i18n.t("agentUpdates.skip")}</span>
-    <Button variant="secondary" modalAction="cancel" onclick={onClose}>{i18n.t("common.close")}</Button>
-    <Button variant="primary" modalAction="confirm" disabled={busy || targets.length === 0} onclick={updateChosen}>
-      {busy ? i18n.t("common.working") : i18n.t("agentUpdates.updateN", { count: targets.length })}
-    </Button>
+    {#if stage === "review"}
+      <Button variant="secondary" modalAction="cancel" disabled={planning} onclick={() => (stage = "select")}>{i18n.optional("agentUpdates.back", "Back")}</Button>
+    {:else}
+      <Button variant="secondary" modalAction="cancel" onclick={onClose}>{i18n.t("common.close")}</Button>
+    {/if}
+    {#if stage !== "results"}
+      <Button
+        variant="primary"
+        modalAction="confirm"
+        loading={planning}
+        disabled={stage === "select" ? !truthReady || selected.length === 0 : reviewBlocked}
+        onclick={stage === "select" ? reviewSelected : approveReviewed}
+      >
+        {stage === "select" ? i18n.optional("agentUpdates.reviewN", "Review {count}", { count: selected.length }) : i18n.optional("agentUpdates.approve", "Approve repairs")}
+      </Button>
+    {/if}
   {/snippet}
 </Modal>
 
+{#if diffCandidate}
+  <DiffModal
+    slug={diffCandidate.row.slug}
+    name={diffCandidate.row.name}
+    tool={diffCandidate.row.tool}
+    projectPath={diffCandidate.row.projectPath}
+    reference={{ sourceId: diffCandidate.row.sourceId, relativePath: diffCandidate.row.relativePath }}
+    onClose={() => (diffCandidate = null)}
+  />
+{/if}
+
 <style>
-  .sub { font-size: var(--text-body-sm); color: var(--color-text-muted); margin-bottom: var(--space-3); }
-  .empty { font-size: var(--text-body-sm); color: var(--color-text-muted); }
-
+  .sub, .empty { font-size: var(--text-body-sm); color: var(--color-text-muted); }
+  .error { padding: var(--space-3); border: 1px solid var(--color-danger); border-radius: var(--radius-md); color: var(--color-danger); font-size: var(--text-body-sm); }
   .head { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
-  .all { display: inline-flex; align-items: center; gap: 7px; font-size: var(--text-body-sm); color: var(--color-text-secondary); cursor: pointer; }
-  .all input { width: 15px; height: 15px; accent-color: var(--color-brand); cursor: pointer; }
-  .n { margin-left: auto; font-size: var(--text-caption); color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
-
-  /* Same grid language as InstallModal: agent rows × tool columns. */
-  .grid-wrap { max-height: 52vh; overflow: auto; border: 1px solid var(--color-border); border-radius: var(--radius-md); }
-  .grid {
-    display: grid;
-    grid-template-columns: minmax(190px, 1fr) repeat(var(--cols), 96px);
-    width: max-content; min-width: 100%; align-items: stretch;
-  }
-  .cell { display: flex; align-items: center; justify-content: center; padding: var(--space-2); border-bottom: 1px solid var(--color-border); }
-  .head { position: sticky; top: 0; z-index: 1; background: var(--color-surface-sunken); font-size: var(--text-caption); color: var(--color-text-muted); font-weight: var(--fw-semibold); min-height: 34px; padding: var(--space-2) 8px; line-height: 1.15; text-align: center; }
-  .corner { background: var(--color-surface-sunken); }
-
-  .agent { justify-content: flex-start; gap: 8px; min-width: 0; }
-  .emoji { flex: none; }
-  .aname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-body-sm); color: var(--color-text-primary); }
-
-  .toggle { background: transparent; cursor: pointer; }
-  .toggle:hover:not(:disabled) { background: var(--color-surface-sunken); }
-  /* Same dot affordance as InstallModal: filled = selected to update. */
-  .dot {
-    width: 16px; height: 16px; border-radius: 999px; box-sizing: border-box;
-    border: 1.5px solid var(--color-border-strong, var(--color-text-muted));
-  }
-  .dot.full { background: var(--color-brand); border-color: var(--color-brand); }
-  .na { color: var(--color-text-muted); opacity: 0.4; }
-
-  .legend { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; font-size: var(--text-caption); color: var(--color-text-muted); }
-  .legend .dot { width: 12px; height: 12px; }
+  .all, .candidate { display: flex; align-items: flex-start; gap: var(--space-2); }
+  .all { font-size: var(--text-body-sm); color: var(--color-text-secondary); cursor: pointer; }
+  input { width: 16px; height: 16px; accent-color: var(--color-brand); }
+  .n { margin-left: auto; font-size: var(--text-caption); color: var(--color-text-muted); }
+  .items { list-style: none; padding: 0; margin: 0; max-height: 32vh; overflow: auto; border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+  .items li { padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--color-border); }
+  .items li:last-child { border-bottom: 0; }
+  .candidate { cursor: pointer; }
+  .unsafe .candidate { cursor: default; }
+  .details { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 2px; }
+  .name { color: var(--color-text-primary); font-size: var(--text-body-sm); font-weight: var(--fw-medium); }
+  .meta { color: var(--color-text-secondary); font-size: var(--text-caption); }
+  .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-text-muted); font-family: var(--font-mono); font-size: var(--text-mono); }
+  .manual { margin-top: var(--space-4); }
+  .manual h2 { margin-bottom: var(--space-2); color: var(--color-text-secondary); font-size: var(--text-body-sm); font-weight: var(--fw-semibold); }
+  .plans { list-style: none; padding: 0; margin: 0; max-height: 52vh; overflow: auto; display: flex; flex-direction: column; gap: var(--space-3); }
+  .plans > li { padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+  .plan-head { display: flex; align-items: center; gap: var(--space-2); }
+  .operation { margin-left: auto; color: var(--color-brand); font-size: var(--text-caption); font-weight: var(--fw-semibold); }
+  .packages { list-style: none; margin: var(--space-2) 0; padding: 0; }
+  .packages li { display: flex; flex-direction: column; gap: 2px; padding: var(--space-1) 0; }
+  .warning { margin: var(--space-1) 0; color: var(--color-warning); font-size: var(--text-caption); }
+  .diff-link { margin-top: var(--space-2); padding: 0; background: transparent; color: var(--color-text-link); font-size: var(--text-body-sm); cursor: pointer; }
+  .diff-link:hover { text-decoration: underline; }
+  .progress { color: var(--color-text-secondary); font-size: var(--text-body-sm); }
+  .results { list-style: none; margin: 0; padding: 0; border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+  .results li { display: flex; align-items: flex-start; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--color-border); }
+  .results li:last-child { border-bottom: 0; }
+  .result-mark { color: var(--color-danger); font-weight: var(--fw-bold); }
+  .result-mark.ok { color: var(--color-success); }
 </style>

@@ -3,6 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Modal from "$lib/components/Modal.svelte";
 import StorageMigrationGate from "$lib/components/StorageMigrationGate.svelte";
+import UpdatesModal from "$lib/components/UpdatesModal.svelte";
+import DivisionsLanding from "$lib/components/DivisionsLanding.svelte";
+import Sidebar from "$lib/components/Sidebar.svelte";
 import agentsWorkspaceSource from "$lib/components/AgentsWorkspace.svelte?raw";
 import skillsWorkspaceSource from "$lib/components/SkillsWorkspace.svelte?raw";
 import installModalSource from "$lib/components/InstallModal.svelte?raw";
@@ -11,7 +14,7 @@ import dashboardSource from "$lib/components/AgencyDashboard.svelte?raw";
 import toolsViewSource from "$lib/components/ToolsView.svelte?raw";
 import teamsSource from "$lib/components/Teams.svelte?raw";
 import projectsSource from "$lib/components/Projects.svelte?raw";
-import { mergeActivityEntries, safeActivityDetail, selectMcpAuditEntries } from "$lib/stores/activity.svelte";
+import { activity, mergeActivityEntries, safeActivityDetail, selectMcpAuditEntries } from "$lib/stores/activity.svelte";
 import type { JournalEntry } from "$lib/stores/activity.svelte";
 import { catalog } from "$lib/stores/catalog.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
@@ -72,6 +75,18 @@ const staleControlPackage: AgentPackageResult = {
   requiredAgents: [], requiredSkills: [], recommendedAgents: [], groups: [], tags: [], capabilities: [],
   permissions: [], qualityScore: 100, qualityChecks: [], diagnostics: [], installable: true,
 };
+const repairSkillInspection = (sha256: string) => [{
+  source: { id: "skills", kind: { kind: "local", root: "/tmp/skills" } },
+  packages: [{
+    sourceId: "skills", relativePath: "audit", name: "Audit", description: "Audit package",
+    skillType: "testing", group: [], tags: [], dependencies: [], recommendedSkills: [], version: null,
+    channel: "stable", changelog: null, publisher: null, publisherKey: null, publisherVerified: false,
+    validationResults: [], permissions: [], qualityScore: 100, qualityChecks: [],
+    files: [{ relativePath: "SKILL.md", sizeBytes: 12, sha256 }], trustFingerprint: null,
+    errors: [], installable: true,
+  }],
+  errors: [],
+}];
 
 beforeEach(async () => {
   vi.unstubAllGlobals();
@@ -2010,6 +2025,372 @@ describe("frontend test harness", () => {
       confirm.click();
       await vi.waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "uninstall_agent")).toHaveLength(1));
     } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("offers only exact tracked outdated and missing Agent and Skill repairs", async () => {
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [
+      { ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated", tracked: true },
+      { ...staleControlRow, slug: "writer", name: "Writer", sourceId: "local", relativePath: "nested/writer.md", projectPath: "/tmp/project", dest: "/tmp/project/writer.md", state: "missing", tracked: true },
+      { ...staleControlRow, slug: "edited", name: "Edited", sourceId: "local", relativePath: "edited.md", state: "modified", tracked: true },
+      { ...staleControlRow, slug: "foreign", name: "Foreign", sourceId: "", relativePath: "", state: "foreign", tracked: false },
+      { ...staleControlRow, slug: "other-foreign", name: "Other Foreign", sourceId: "", relativePath: "", dest: "/tmp/other-foreign.md", state: "foreign", tracked: false },
+    ];
+    skillSources.installed = [
+      { sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/audit", state: "outdated", tracked: true },
+      { sourceId: "skills", relativePath: "build", name: "Build", runtime: "claudeCode", scope: "project", projectPath: "/tmp/project", path: "/tmp/project/build", state: "missing", tracked: true },
+      { sourceId: "skills", relativePath: "off", name: "Off", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/off", state: "disabled", tracked: true },
+      { sourceId: "gone", relativePath: "source", name: "Gone", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/gone", state: "sourceUnavailable", tracked: true },
+    ];
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      const choices = [...target.querySelectorAll<HTMLInputElement>('input[name="repair-item"]')];
+      expect(choices).toHaveLength(4);
+      expect(choices.every((choice) => choice.checked)).toBe(true);
+      expect(choices.map((choice) => choice.dataset.candidateKey)).toEqual([
+        "agent\0built-in\0reviewer.md\0claudeCode\0",
+        "agent\0local\0nested/writer.md\0claudeCode\0/tmp/project",
+        "skill\0skills\0audit\0codex\0",
+        "skill\0skills\0build\0claudeCode\0/tmp/project",
+      ]);
+      expect(target.textContent).toContain("Update");
+      expect(target.textContent).toContain("Reinstall");
+      expect(target.textContent).toContain("Local changes require manual review");
+      expect(target.textContent).toContain("Untracked content requires manual review");
+      expect(target.textContent).toContain("Other Foreign");
+      expect(target.textContent).toContain("Enable this installation before repair");
+      expect(target.textContent).toContain("Restore its source before repair");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("blocks repair review until both ledgers have fresh successful truth", async () => {
+    install.reconciled = true;
+    install.installed = [{ ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated", tracked: true }];
+    skillSources.reconciled = false;
+    skillSources.reconcileError = "I/O error: scan failed";
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      expect(target.textContent).toContain("Skill installation status is unavailable");
+      expect(target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')?.disabled).toBe(true);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("shows complete Agent and Skill plans and disables blocked approval", async () => {
+    const agent = { ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated" as const, tracked: true };
+    const skill: InstalledSkill = { sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/audit", state: "missing", tracked: true };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [agent];
+    skillSources.installed = [skill];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_update_plan") return {
+        revision: "rev-1", operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "hash", dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: ["review"] }],
+        warnings: ["Agent warning"], blockers: [], rollbackAvailable: true,
+      } as never;
+      if (command === "skill_install_plan") return {
+        operation: "install", runtime: "codex", projectPath: null,
+        packages: [{ sourceId: "skills", relativePath: "audit", name: "Audit", dependency: false, destination: "/tmp/audit", fileCount: 3, permissions: ["filesystem"] }],
+        warnings: ["Skill warning"], blockers: ["Trust required"], rollbackAvailable: false,
+      } as never;
+      if (command === "skill_sources_inspect") return repairSkillInspection("skill-hash-1") as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Trust required"));
+      expect(target.textContent).toContain("/tmp/reviewer.md");
+      expect(target.textContent).toContain("Agent warning");
+      expect(target.textContent).toContain("Rollback available");
+      expect(target.textContent).toContain("/tmp/audit");
+      expect(target.textContent).toContain("3 files");
+      expect(target.textContent).toContain("filesystem");
+      expect(target.textContent).toContain("Skill warning");
+      expect([...target.querySelectorAll<HTMLButtonElement>("button")].some((button) => button.textContent?.includes("View diff"))).toBe(true);
+      expect(target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.disabled).toBe(true);
+      expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["skill_sources_inspect", "agent_update_plan", "skill_install_plan"]);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("invalidates changed repair plans before the first mutation", async () => {
+    const agent = { ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated" as const, tracked: true };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [agent];
+    let planRevision = "rev-1";
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_update_plan") return {
+        revision: planRevision, operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "hash", dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+      } as never;
+      if (command === "installs_reconcile") return [agent] as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Approve repairs"));
+      planRevision = "rev-2";
+      vi.mocked(invoke).mockClear();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Repair plan changed"));
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "update_agent")).toBe(false);
+      expect(target.textContent).toContain("Review the updated plan");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("performs no repair when the approval-time reconciliation fails", async () => {
+    const agent = { ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated" as const, tracked: true };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [agent];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_update_plan") return {
+        revision: "rev-1", operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "hash", dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+      } as never;
+      if (command === "installs_reconcile") throw new Error("fresh scan failed");
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Approve repairs"));
+      vi.mocked(invoke).mockClear();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Fresh reconciliation failed"));
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "update_agent")).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("invalidates approval when Skill source bytes change behind an identical displayed plan", async () => {
+    const skill: InstalledSkill = { sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/audit", state: "outdated", tracked: true };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    skillSources.installed = [skill];
+    let sourceHash = "skill-hash-1";
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "skill_sources_inspect") return repairSkillInspection(sourceHash) as never;
+      if (command === "skill_install_plan") return {
+        operation: "install", runtime: "codex", projectPath: null,
+        packages: [{ sourceId: "skills", relativePath: "audit", name: "Audit", dependency: false, destination: "/tmp/audit", fileCount: 1, permissions: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+      } as never;
+      if (command === "installs_reconcile") return [] as never;
+      if (command === "skill_installs_reconcile") return [skill] as never;
+      if (command === "skill_backups_list") return [] as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Approve repairs"));
+      sourceHash = "skill-hash-2";
+      vi.mocked(invoke).mockClear();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Repair plan changed"));
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "skill_update")).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("continues exact repairs after failure and records every result plus one summary", async () => {
+    const agent = { ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated" as const, tracked: true };
+    const skill: InstalledSkill = { sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/audit", state: "missing", tracked: true };
+    const currentSkill = { ...skill, state: "current" as const };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [agent];
+    skillSources.installed = [skill];
+    const startingEntries = activity.entries.length;
+    let skillRepaired = false;
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_update_plan") return {
+        revision: "rev-1", operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "hash", dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+      } as never;
+      if (command === "skill_install_plan") return {
+        operation: "install", runtime: "codex", projectPath: null,
+        packages: [{ sourceId: "skills", relativePath: "audit", name: "Audit", dependency: false, destination: "/tmp/audit", fileCount: 3, permissions: [] }],
+        warnings: [], blockers: [], rollbackAvailable: false,
+      } as never;
+      if (command === "skill_sources_inspect") return repairSkillInspection("skill-hash-1") as never;
+      if (command === "installs_reconcile") return [agent] as never;
+      if (command === "skill_installs_reconcile") return [skillRepaired ? currentSkill : skill] as never;
+      if (command === "skill_backups_list") return [] as never;
+      if (command === "update_agent") throw new Error("agent write failed");
+      if (command === "skill_update") { skillRepaired = true; return currentSkill as never; }
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Approve repairs"));
+      vi.mocked(invoke).mockClear();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Repair results"));
+      expect(target.textContent).toContain("Reviewer");
+      expect(target.textContent).toContain("agent write failed");
+      expect(target.textContent).toContain("Audit");
+      expect(target.textContent).toContain("Repaired");
+      expect(target.textContent).toContain("In sync");
+      const mutations = vi.mocked(invoke).mock.calls
+        .map(([command]) => command)
+        .filter((command) => command === "update_agent" || command === "skill_update");
+      expect(mutations).toEqual(["update_agent", "skill_update"]);
+      const entries = activity.entries.slice(0, activity.entries.length - startingEntries);
+      expect(entries.filter((entry) => entry.action === "update" && entry.subject === "agent" && entry.outcome === "error")).toHaveLength(1);
+      expect(entries.filter((entry) => entry.action === "update" && entry.subject === "skill" && entry.outcome === "ok")).toHaveLength(1);
+      expect(entries.filter((entry) => entry.action === "bulk" && entry.subject === "agentLibrary" && entry.detail === "1 repaired · 1 failed")).toHaveLength(1);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("keeps existing repair entry points visible for a Skill-only repair", async () => {
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    skillSources.installed = [{ sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/audit", state: "outdated", tracked: true }];
+    const target = document.createElement("div");
+    document.body.append(target);
+    const divisions = mount(DivisionsLanding, { target });
+    const sidebar = mount(Sidebar, { target });
+    try {
+      await tick();
+      expect([...target.querySelectorAll<HTMLButtonElement>("button")].some((button) => button.textContent?.includes("1 repair"))).toBe(true);
+      expect(target.querySelector<HTMLElement>(".sidebar .badge")?.textContent).toBe("1");
+      expect(target.querySelector<HTMLElement>(".sidebar .badge")?.title).toContain("1 repairable installation");
+    } finally {
+      unmount(sidebar);
+      unmount(divisions);
+      target.remove();
+    }
+  });
+
+  it("moves safe focus to review and announces active repair progress", async () => {
+    const agent = { ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated" as const, tracked: true };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [agent];
+    let releaseUpdate!: () => void;
+    const updatePending = new Promise<void>((resolve) => (releaseUpdate = resolve));
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_update_plan") return {
+        revision: "rev-1", operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "hash", dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+      } as never;
+      if (command === "installs_reconcile") return [agent] as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "update_agent") { await updatePending; return {} as never; }
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Approve repairs"));
+      expect(document.activeElement?.textContent).toContain("Back");
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.querySelector('[role="status"]')?.textContent).toContain("Repairing 0 of 1"));
+      expect(target.querySelector('[role="dialog"]')?.getAttribute("aria-modal")).toBe("true");
+      releaseUpdate();
+      await vi.waitFor(() => expect(target.textContent).toContain("Repair results"));
+    } finally {
+      releaseUpdate();
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("cannot dismiss or leave the approved review while fresh preflight is running", async () => {
+    const agent = { ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated" as const, tracked: true };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [agent];
+    let releaseReconcile!: () => void;
+    const reconcilePending = new Promise<void>((resolve) => (releaseReconcile = resolve));
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_update_plan") return {
+        revision: "rev-1", operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "hash", dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+      } as never;
+      if (command === "installs_reconcile") { await reconcilePending; return [agent] as never; }
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "update_agent") return {} as never;
+      return [] as never;
+    });
+    const onClose = vi.fn();
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Approve repairs"));
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "installs_reconcile")).toBe(true));
+      expect(target.querySelector<HTMLButtonElement>('[data-modal-action="cancel"]')?.disabled).toBe(true);
+      expect(target.querySelector<HTMLButtonElement>("button.close")).toBeNull();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+      await tick();
+      expect(onClose).not.toHaveBeenCalled();
+      releaseReconcile();
+      await vi.waitFor(() => expect(target.textContent).toContain("Repair results"));
+    } finally {
+      releaseReconcile();
       unmount(component);
       target.remove();
     }

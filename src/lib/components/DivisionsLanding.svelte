@@ -20,6 +20,7 @@
   import UpdatesModal from "./UpdatesModal.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
   import { install } from "$lib/stores/install.svelte";
+  import { skillSources } from "$lib/stores/skillSources.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
@@ -67,8 +68,11 @@
     return m;
   });
 
-  // Installed agents with a newer catalog version (reconcile state "outdated").
-  const outdatedCount = $derived(install.installed.filter((r) => r.state === "outdated").length);
+  // Tracked Agent and Skill destinations that the safe-repair flow can recover.
+  const repairCount = $derived(
+    install.installed.filter((row) => row.tracked && ["outdated", "missing"].includes(row.state)).length
+    + skillSources.installed.filter((row) => row.tracked && ["outdated", "missing"].includes(row.state)).length,
+  );
   let updatesOpen = $state(false);
 
   function openDivision(slug: string) {
@@ -99,9 +103,9 @@
     {:else}
       <span class="lead"><LayersIcon size={14} /> {i18n.t("divisions.title")}</span>
       <span class="spacer"></span>
-      {#if outdatedCount > 0}
-        <button class="ghost updates" onclick={() => (updatesOpen = true)} title={i18n.t("agentUpdates.badgeTitle", { count: outdatedCount })}>
-          <ArrowUpCircle size={14} /> {i18n.t("agentUpdates.badge", { count: outdatedCount })}
+      {#if repairCount > 0}
+        <button class="ghost updates" onclick={() => (updatesOpen = true)} title={i18n.optional("agentUpdates.repairBadgeTitle", "{count} repairable installations", { count: repairCount })}>
+          <ArrowUpCircle size={14} /> {i18n.optional("agentUpdates.repairBadge", "{count} repairs", { count: repairCount })}
         </button>
       {/if}
       {#if tiles.length > 0}
