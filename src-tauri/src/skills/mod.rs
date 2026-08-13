@@ -546,7 +546,9 @@ pub(crate) fn skill_sources_import_spec() -> crate::state_db::ImportSpec {
     crate::state_db::ImportSpec::document(skill_sources_spec(), Vec::new())
 }
 
-async fn load_skill_sources_for_state(state: &AppState) -> Result<Vec<SkillSource>, AppError> {
+pub(crate) async fn load_skill_sources_for_state(
+    state: &AppState,
+) -> Result<Vec<SkillSource>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
         return database.read(skill_sources_spec()).await?.ok_or_else(|| {
             AppError::StorageCorrupt {

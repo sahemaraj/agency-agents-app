@@ -172,6 +172,7 @@ pub fn run() {
             mcp_client_disconnect,
             mcp_client_repair,
             settings_reset,
+            doctor_report,
             state::mcp_audit_list,
             state::storage_migration_status,
             state::storage_migration_start,

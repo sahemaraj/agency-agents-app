@@ -72,3 +72,7 @@ Added one approval-bound repair workflow for exact tracked outdated and missing 
 ### 2026-08-13: Phase 10 Unified Task Search
 
 Added bounded, deterministic, local Agent and Skill recommendations to the existing Cmd+K palette with explanations, provenance, exact workspace handoff, async lifecycle safety, and no mutation or network path. OpenSpec, frontend, backend, Rust quality, Svelte, build, and diff gates passed. See [260813_phase10-unified-task-search.md](./260813_phase10-unified-task-search.md).
+
+### 2026-08-13: Phase 11 Doctor Health Check
+
+Added one bounded, read-only local health report with independent classifications, privacy-safe deterministic copying, and handoff to existing recovery surfaces. OpenSpec, frontend, backend, Rust quality, Svelte, build, mutation-spy, dependency, route, and diff gates passed. See [260813_phase11-doctor-health-check.md](./260813_phase11-doctor-health-check.md).

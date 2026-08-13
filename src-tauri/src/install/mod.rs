@@ -144,6 +144,39 @@ async fn load_ledger_for_state(state: &AppState) -> Result<Vec<InstallRecord>, A
     .await
 }
 
+/// Passive ledger read for diagnostics. Unlike `load_ledger_for_state`, this
+/// never migrates a legacy document or writes a backup.
+pub(crate) async fn load_ledger_read_only(
+    state: &AppState,
+) -> Result<Vec<InstallRecord>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(installs_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent install ledger is missing after SQLite migration".into(),
+            });
+    }
+    load_ledger_read_only_at(&ledger_path_for(&state.app_data_dir)).await
+}
+
+async fn load_ledger_read_only_at(path: &Path) -> Result<Vec<InstallRecord>, AppError> {
+    match crate::util::fs::read_capped(path, MAX_LEDGER_BYTES).await {
+        Ok(bytes) => {
+            let records: Vec<InstallRecord> =
+                serde_json::from_slice(&bytes).map_err(|error| AppError::JsonParse {
+                    command: "doctor_report".into(),
+                    message: error.to_string(),
+                    raw_excerpt: String::new(),
+                })?;
+            validate_install_ledger(&records)?;
+            Ok(records)
+        }
+        Err(AppError::Io { .. }) if !path.exists() => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
 async fn save_ledger(app: &AppHandle, records: &[InstallRecord]) -> Result<(), AppError> {
     save_ledger_for(&corpus::app_data_dir(app)?, records).await
 }
@@ -4871,6 +4904,16 @@ pub async fn loadout_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn passive_ledger_read_rejects_rows_that_require_migration_without_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("installs.json");
+        std::fs::write(&path, br#"[{"slug":"legacy","sourceId":"","relativePath":"","tool":"claudeCode","scope":"user","projectPath":null,"dest":"/tmp/legacy.md","sourceHash":"a","bodyHash":"","renderedHash":"b","disabledPath":null,"sourceSnapshotHash":"","capabilities":[],"publisherKey":null,"publisherVerified":false,"installedAt":"now","corpusVersion":"old"}]"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(load_ledger_read_only_at(&path).await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
 
     #[tokio::test]
     async fn reveal_app_data_target_reaches_opener_spec_without_launching_gui() {

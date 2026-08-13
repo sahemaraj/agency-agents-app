@@ -454,6 +454,33 @@ pub(crate) async fn load_catalog_source(app_data_dir: &Path) -> CatalogSource {
     }
 }
 
+/// Strict passive variant for diagnostics. Unlike the normal app loader, a
+/// corrupt persisted value is evidence of an unavailable authority, not a
+/// reason to silently substitute the bundled default.
+pub(crate) async fn load_catalog_source_checked(
+    app_data_dir: &Path,
+) -> Result<CatalogSource, AppError> {
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        return database.read(catalog_source_spec()).await?.ok_or_else(|| {
+            AppError::StorageCorrupt {
+                message: "catalog source is missing after SQLite migration".into(),
+            }
+        });
+    }
+    let path = catalog_source_path(app_data_dir);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| AppError::JsonParse {
+            command: "doctor_report".into(),
+            message: error.to_string(),
+            raw_excerpt: String::new(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CatalogSource::default()),
+        Err(error) => Err(AppError::Io {
+            message: format!("read catalog source: {error}"),
+        }),
+    }
+}
+
 /// Persist the chosen [`CatalogSource`] to `state/catalog.json`.
 pub(crate) async fn save_catalog_source(
     app_data_dir: &Path,
@@ -2192,6 +2219,14 @@ echo done
             text.contains("\"kind\": \"managed\""),
             "tagged on kind: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn checked_catalog_source_rejects_corrupt_local_state() {
+        let app_data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(state_dir(app_data.path())).unwrap();
+        std::fs::write(catalog_source_path(app_data.path()), b"{not json").unwrap();
+        assert!(load_catalog_source_checked(app_data.path()).await.is_err());
     }
 
     #[test]

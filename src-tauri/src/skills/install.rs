@@ -32,6 +32,12 @@ pub async fn load_ledger(app_data_dir: &Path) -> Result<Vec<SkillInstallRecord>,
     }
 }
 
+pub async fn load_ledger_checked(app_data_dir: &Path) -> Result<Vec<SkillInstallRecord>, AppError> {
+    let records = load_ledger(app_data_dir).await?;
+    validate_ledger(&records)?;
+    Ok(records)
+}
+
 pub async fn save_ledger(
     app_data_dir: &Path,
     records: &[SkillInstallRecord],
@@ -1247,10 +1253,22 @@ mod tests {
 
     use super::{
         classify, disable_directory, enable_directory, ensure_project_replacement_cleanup,
-        install_directory, install_validated_directory, load_ledger, publish_failure, save_ledger,
-        target_path, tree_hash, uninstall_directory,
+        install_directory, install_validated_directory, ledger_path, load_ledger,
+        load_ledger_checked, publish_failure, save_ledger, target_path, tree_hash,
+        uninstall_directory,
     };
     use crate::types::{SkillInstallRecord, SkillInstallState, SkillPackageFile};
+
+    #[tokio::test]
+    async fn passive_skill_ledger_read_rejects_invalid_rows_without_rewrite() {
+        let root = tempdir().unwrap();
+        let path = ledger_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"[{"sourceId":"","relativePath":"","name":"","runtime":"bad","scope":"bad","projectPath":null,"dest":"/tmp/x","sourceHash":"x","installedHash":"y","installedAt":"now","disabledPath":null}]"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(load_ledger_checked(root.path()).await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
 
     fn write_package(root: &Path, body: &str) {
         std::fs::create_dir_all(root.join("references")).expect("create package");
