@@ -15,7 +15,7 @@
    * agent, division, or team on the left; install into the project's tools on
    * the right) — so an empty project can be filled.
    */
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import EmptyState from "./EmptyState.svelte";
   import Pill from "./Pill.svelte";
   import Button from "./Button.svelte";
@@ -38,6 +38,8 @@
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { appErrorMessage, isAppError, type InstalledAgent } from "$lib/types";
+  import type { ProjectInstructionApplyResult, ProjectInstructionOperation, ProjectInstructionPlan, ProjectInstructionSnippet, ProjectInstructionTarget } from "$lib/types";
+  import { diffLines, diffStat, type DiffRow } from "$lib/util/diff";
 
   const installTruthFresh = $derived(install.reconciled && !install.reconcileError);
   const mutationTruthFresh = $derived(installTruthFresh && skillSources.reconciled && !skillSources.reconcileError);
@@ -142,6 +144,151 @@
   // ── Deploy into a project: the two-pane DeployBrowser. ──
   let browseFor = $state<string | null>(null); // project path, or null = closed
 
+  // ── Project instructions: inspect → compose/remove → review → approve. ──
+  type InstructionDraft = {
+    target: ProjectInstructionTarget;
+    operation: ProjectInstructionOperation;
+    snippetId: string;
+    content: string;
+  };
+  let instructionTargets = $state<ProjectInstructionTarget[]>([]);
+  let instructionLoading = $state(false);
+  let instructionBusy = $state(false);
+  let instructionError = $state<string | null>(null);
+  let instructionAnnouncement = $state("");
+  let instructionDraft = $state<InstructionDraft | null>(null);
+  let instructionPlan = $state<ProjectInstructionPlan | null>(null);
+  let instructionResult = $state<ProjectInstructionApplyResult | null>(null);
+  let instructionRestoreFocus: HTMLElement | null = null;
+  let instructionLoadGeneration = 0;
+
+  const instructionDiffRows = $derived<DiffRow[]>(
+    instructionPlan ? diffLines(instructionPlan.current, instructionPlan.proposed) : [],
+  );
+  const instructionDiffSummary = $derived(diffStat(instructionDiffRows));
+  const instructionDraftReady = $derived(
+    !!instructionDraft?.snippetId
+      && (instructionDraft.operation === "remove" || !!instructionDraft.content),
+  );
+
+  async function refreshProjectInstructions(): Promise<void> {
+    if (!selected) return;
+    const generation = ++instructionLoadGeneration;
+    instructionLoading = true;
+    instructionError = null;
+    try {
+      const inspected = await projects.inspectInstructions(selected.path);
+      if (generation === instructionLoadGeneration) instructionTargets = inspected;
+    } catch (error) {
+      if (generation === instructionLoadGeneration) {
+        instructionError = isAppError(error) ? appErrorMessage(error) : String(error);
+      }
+    } finally {
+      if (generation === instructionLoadGeneration) instructionLoading = false;
+    }
+  }
+
+  $effect(() => {
+    const path = selected?.path;
+    untrack(() => {
+      if (!path) {
+        instructionLoadGeneration += 1;
+        instructionTargets = [];
+        return;
+      }
+      void refreshProjectInstructions();
+    });
+  });
+
+  function openInstructionEditor(
+    event: MouseEvent,
+    target: ProjectInstructionTarget,
+    snippet?: ProjectInstructionSnippet,
+  ): void {
+    instructionRestoreFocus = event.currentTarget as HTMLElement;
+    instructionDraft = {
+      target,
+      operation: "upsert",
+      snippetId: snippet?.id ?? "",
+      content: snippet?.content ?? "",
+    };
+    instructionPlan = null;
+    instructionResult = null;
+    instructionError = null;
+  }
+
+  async function removeInstruction(
+    event: MouseEvent,
+    target: ProjectInstructionTarget,
+    snippet: ProjectInstructionSnippet,
+  ): Promise<void> {
+    openInstructionEditor(event, target, snippet);
+    if (!instructionDraft || !selected) return;
+    instructionDraft.operation = "remove";
+    instructionDraft.content = "";
+    await reviewInstruction();
+  }
+
+  async function reviewInstruction(): Promise<void> {
+    if (!selected || !instructionDraft || instructionBusy) return;
+    instructionBusy = true;
+    instructionError = null;
+    instructionAnnouncement = "Preparing exact instruction diff…";
+    try {
+      instructionPlan = await projects.planInstruction(
+        selected.path,
+        instructionDraft.target.id,
+        instructionDraft.operation,
+        instructionDraft.snippetId,
+        instructionDraft.content,
+      );
+      instructionAnnouncement = instructionPlan.blockers.length > 0
+        ? `Instruction change is blocked. ${instructionPlan.blockers.join(" ")}`
+        : "Instruction diff is ready for review.";
+    } catch (error) {
+      instructionError = isAppError(error) ? appErrorMessage(error) : String(error);
+      instructionAnnouncement = `Could not prepare instruction diff. ${instructionError}`;
+    } finally {
+      instructionBusy = false;
+    }
+  }
+
+  async function applyInstruction(): Promise<void> {
+    if (!instructionPlan || !instructionDraft || instructionBusy) return;
+    instructionBusy = true;
+    instructionError = null;
+    instructionAnnouncement = "Applying reviewed instruction change…";
+    try {
+      const response = await projects.applyInstruction(instructionPlan, instructionDraft.content);
+      instructionPlan = response.plan;
+      instructionResult = response.result;
+      if (!response.result) {
+        instructionAnnouncement = "Instruction content changed. Review the refreshed diff before applying.";
+      } else {
+        instructionAnnouncement = response.result.outcome === "succeeded"
+          ? "Instruction change applied."
+          : `Instruction change ${response.result.outcome}.`;
+        await refreshProjectInstructions();
+      }
+    } catch (error) {
+      instructionError = isAppError(error) ? appErrorMessage(error) : String(error);
+      instructionAnnouncement = `Instruction change failed. ${instructionError}`;
+    } finally {
+      instructionBusy = false;
+    }
+  }
+
+  async function closeInstructionModal(): Promise<void> {
+    instructionDraft = null;
+    instructionPlan = null;
+    instructionResult = null;
+    instructionError = null;
+    const restoreInstructionFocus = instructionRestoreFocus;
+    instructionRestoreFocus = null;
+    await tick();
+    restoreInstructionFocus?.focus({ preventScroll: true });
+  }
+
   async function reveal(path: string) {
     try {
       await install.revealPath(path);
@@ -241,6 +388,40 @@
       <button class="btn primary" disabled={!installTruthFresh} onclick={() => (browseFor = selected.path)}>{i18n.t("teams.deploy")}</button>
       <button class="btn danger-ic" disabled={!mutationTruthFresh} title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: rosterFor(selected.path).length, skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
     </header>
+
+    <section class="instruction-manager" aria-labelledby="project-instructions-heading" aria-busy={instructionLoading}>
+      <div class="instruction-heading">
+        <div>
+          <h3 id="project-instructions-heading">Project instructions</h3>
+          <p>Compose reviewed snippets without replacing existing project rules.</p>
+        </div>
+        <button class="btn" disabled={instructionLoading} onclick={() => void refreshProjectInstructions()}>Refresh</button>
+      </div>
+      <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{instructionAnnouncement}</div>
+      {#if instructionError}<p class="instruction-error">{instructionError}</p>{/if}
+      {#if instructionLoading}
+        <p class="instruction-muted">Inspecting known instruction files…</p>
+      {:else}
+        <ul class="instruction-targets">
+          {#each instructionTargets as target (target.id)}
+            <li class="instruction-target">
+              <div class="instruction-target-copy">
+                <strong>{target.label}</strong>
+                <span title={target.destination}>{target.relativePath} · {target.state === "existingUnmanaged" ? "Existing · adoption required" : target.state}</span>
+                {#each target.blockers as blocker}<span class="instruction-blocker">{blocker}</span>{/each}
+              </div>
+              <div class="instruction-snippets">
+                {#each target.snippets as snippet (snippet.id)}
+                  <button class="instruction-chip" onclick={(event) => openInstructionEditor(event, target, snippet)}>{snippet.id}</button>
+                  <button class="instruction-remove" aria-label={`Remove ${snippet.id} from ${target.label}`} onclick={(event) => void removeInstruction(event, target, snippet)}>Remove</button>
+                {/each}
+              </div>
+              <button class="btn" disabled={target.blockers.length > 0} onclick={(event) => openInstructionEditor(event, target)}>Add snippet</button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
 
     <div class="scroll">
       {#if !install.reconciled}
@@ -353,6 +534,54 @@
   </Modal>
 {/if}
 
+{#if instructionDraft}
+  <Modal open title={`${instructionDraft.operation === "remove" ? "Remove" : "Manage"} ${instructionDraft.target.label} snippet`} defaultFocus="cancel" onClose={closeInstructionModal}>
+    {#if instructionResult}
+      <div class="instruction-result" data-outcome={instructionResult.outcome}>
+        <strong>{instructionResult.outcome === "succeeded" ? "Instruction change applied" : "Instruction change did not complete"}</strong>
+        <code title={instructionResult.destination}>{instructionResult.destination}</code>
+        {#if instructionResult.backupPath}<p>Backup: <code title={instructionResult.backupPath}>{instructionResult.backupPath}</code></p>{/if}
+        {#if instructionResult.message}<p class="instruction-error">{instructionResult.message}</p>{/if}
+      </div>
+    {:else if instructionPlan}
+      <div class="instruction-review">
+        <p class="instruction-destination" title={instructionPlan.destination}>{instructionPlan.destination}</p>
+        <p class="instruction-stat"><span>+{instructionDiffSummary.added}</span> <span>−{instructionDiffSummary.removed}</span></p>
+        {#if instructionPlan.adoption}<p class="instruction-warning">Existing user content remains unowned and byte-preserved.</p>{/if}
+        {#if instructionPlan.backupRequired}<p class="instruction-warning">The exact current file will be backed up before apply.</p>{/if}
+        {#each instructionPlan.warnings as warning}<p class="instruction-warning">{warning}</p>{/each}
+        {#each instructionPlan.blockers as blocker}<p class="instruction-blocker">{blocker}</p>{/each}
+        <pre class="instruction-diff" aria-label="Complete instruction file diff">{#each instructionDiffRows as row (`${row.oldNo ?? "x"}:${row.newNo ?? "x"}:${row.tag}`)}<span class:instruction-added={row.tag === "+"} class:instruction-removed={row.tag === "-"}><span class="instruction-line-number">{row.oldNo ?? ""}</span><span class="instruction-line-number">{row.newNo ?? ""}</span><span>{row.tag} {row.text}</span></span>{/each}</pre>
+      </div>
+    {:else if instructionBusy}
+      <p class="instruction-muted">Preparing exact instruction diff…</p>
+    {:else}
+      <form class="instruction-form" onsubmit={(event) => { event.preventDefault(); void reviewInstruction(); }}>
+        <label for="instruction-snippet-id">Snippet id</label>
+        <input id="instruction-snippet-id" bind:value={instructionDraft.snippetId} disabled={instructionDraft.operation === "remove"} maxlength="64" pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" required />
+        {#if instructionDraft.operation === "upsert"}
+          <label for="instruction-snippet-content">Instruction text</label>
+          <textarea id="instruction-snippet-content" bind:value={instructionDraft.content} maxlength="65536" rows="12" required></textarea>
+        {:else}
+          <p>Only the app-owned <strong>{instructionDraft.snippetId}</strong> block will be removed.</p>
+        {/if}
+      </form>
+    {/if}
+    {#if instructionError}<p class="instruction-error">{instructionError}</p>{/if}
+    {#snippet actions()}
+      {#if instructionResult}
+        <Button variant="primary" modalAction="cancel" onclick={closeInstructionModal}>Close</Button>
+      {:else if instructionPlan}
+        <Button variant="secondary" modalAction="cancel" disabled={instructionBusy} onclick={() => (instructionPlan = null)}>Back</Button>
+        <Button variant="primary" modalAction="confirm" loading={instructionBusy} disabled={instructionBusy || instructionPlan.blockers.length > 0 || instructionPlan.noOp} onclick={applyInstruction}>Apply reviewed change</Button>
+      {:else}
+        <Button variant="secondary" modalAction="cancel" disabled={instructionBusy} onclick={closeInstructionModal}>Cancel</Button>
+        <Button variant="primary" modalAction="confirm" loading={instructionBusy} disabled={instructionBusy || !instructionDraftReady} onclick={reviewInstruction}>Review exact diff</Button>
+      {/if}
+    {/snippet}
+  </Modal>
+{/if}
+
 <style>
   .pr { display: flex; flex-direction: column; height: 100%; min-height: 0; }
   .install-truth-warning { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); border-bottom: 1px solid var(--color-warning); background: var(--color-warning-subtle); color: var(--color-warning-strong); font-size: var(--text-body-sm); }
@@ -440,6 +669,34 @@
 
   .d-empty { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--space-3); color: var(--color-text-muted); padding: var(--space-6); }
   .d-empty p { font-size: var(--text-body-sm); }
+
+  /* ── Bounded project instruction manager ── */
+  .instruction-manager { flex: none; max-height: 240px; overflow-y: auto; padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); background: var(--color-surface-sunken); }
+  .instruction-heading { display: flex; align-items: start; justify-content: space-between; gap: var(--space-3); }
+  .instruction-heading h3 { color: var(--color-text-primary); font-size: var(--text-body); font-weight: var(--fw-semibold); }
+  .instruction-heading p, .instruction-muted { color: var(--color-text-muted); font-size: var(--text-caption); }
+  .instruction-targets { display: grid; gap: var(--space-2); margin: var(--space-3) 0 0; padding: 0; list-style: none; }
+  .instruction-target { display: flex; align-items: center; gap: var(--space-2); min-width: 0; padding: var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-raised); }
+  .instruction-target-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; }
+  .instruction-target-copy span { overflow: hidden; color: var(--color-text-muted); font-size: var(--text-caption); text-overflow: ellipsis; white-space: nowrap; }
+  .instruction-snippets { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .instruction-chip, .instruction-remove { border: 1px solid var(--color-border); border-radius: var(--radius-full); background: transparent; padding: 3px 7px; color: var(--color-text-secondary); font-size: var(--text-caption); cursor: pointer; }
+  .instruction-remove { color: var(--color-danger); }
+  .instruction-form { display: grid; gap: var(--space-2); }
+  .instruction-form label { color: var(--color-text-secondary); font-size: var(--text-body-sm); font-weight: var(--fw-semibold); }
+  .instruction-form input, .instruction-form textarea { width: 100%; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); padding: var(--space-2); color: var(--color-text-primary); font: inherit; }
+  .instruction-form textarea { resize: vertical; font-family: var(--font-mono); font-size: var(--text-mono); }
+  .instruction-review { display: grid; gap: var(--space-2); min-width: 0; }
+  .instruction-destination, .instruction-result code { overflow: hidden; color: var(--color-text-muted); font-family: var(--font-mono); font-size: var(--text-mono); text-overflow: ellipsis; white-space: nowrap; }
+  .instruction-stat { display: flex; gap: var(--space-2); color: var(--color-text-secondary); font-family: var(--font-mono); font-size: var(--text-caption); }
+  .instruction-warning { color: var(--color-warning-strong); font-size: var(--text-body-sm); }
+  .instruction-blocker, .instruction-error { color: var(--color-danger); font-size: var(--text-body-sm); overflow-wrap: anywhere; }
+  .instruction-diff { max-height: 45vh; overflow: auto; margin: 0; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); padding: var(--space-2); font-family: var(--font-mono); font-size: var(--text-mono); white-space: pre-wrap; }
+  .instruction-diff > span { display: block; }
+  .instruction-added { color: var(--color-success); background: color-mix(in srgb, var(--color-success) 12%, transparent); }
+  .instruction-removed { color: var(--color-danger); background: color-mix(in srgb, var(--color-danger) 12%, transparent); }
+  .instruction-line-number { display: inline-block; width: 3em; padding-right: 6px; color: var(--color-text-muted); text-align: right; user-select: none; }
+  .instruction-result { display: grid; gap: var(--space-2); }
 
   /* ── Remove-project confirm dialog ── */
   .del-body { color: var(--color-text-primary); font-size: var(--text-body); }
