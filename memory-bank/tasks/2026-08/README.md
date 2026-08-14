@@ -107,3 +107,7 @@ Added bounded privacy-safe Claude Code/Codex MCP inventory, passive validation, 
 ### 2026-08-14: Phase 16 Drift Notifications
 
 Added explicit permission-backed native drift alerts that reuse bounded local Agent and Skill reconciliation only while the running app is backgrounded, establish a silent complete baseline, deduplicate exact managed identities, retain truth after partial failures, omit private paths, and route activation to existing review surfaces without repair. OpenSpec, frontend, backend, Rust quality, Svelte, build, dependency, safety, and diff gates passed. See [260814_phase16-drift-notifications.md](./260814_phase16-drift-notifications.md).
+
+### 2026-08-14: Phase 17 Expert Improvement Coach
+
+Added five-run-gated local Expert performance summaries for exact versioned quality-contract cohorts, including acceptance, rework/rejection, waiver, and latest-evidence signals plus deterministic non-causal suggestions. No model, network, telemetry, persistence, or mutation authority was added. OpenSpec, frontend, backend regression, Rust quality, Svelte, build, dependency, safety, and diff gates passed. See [260814_phase17-expert-improvement-coach.md](./260814_phase17-expert-improvement-coach.md).

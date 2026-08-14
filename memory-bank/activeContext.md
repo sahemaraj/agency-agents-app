@@ -1,5 +1,9 @@
 # Active Context — Agency Agents
 
+## ✅ v2.0 Phase 17 — Expert Improvement Coach [COMPLETE] (2026-08-14)
+
+The approved `feat/phase-17-improvement-coach` branch now derives local performance summaries from existing Expert run verdicts, evidence, and waivers. Cohorts require the exact Expert version and ordered quality contract, exclude cancelled and non-terminal runs, and expose no rate or suggestion before five comparable quality verdicts. Eligible summaries report deterministic acceptance, rework/rejection, waiver, and latest-evidence signals without model inference, network activity, telemetry, persistence, or mutation. Verification: OpenSpec 7/7 and strict validation passed, canonical specs validate 11/11, 113 frontend tests and 567 executed Rust library tests passed with 3 existing environment-gated ignores, 2 binary tests passed, and strict Clippy/format/Svelte/build/dependency/diff and safety gates passed. Implementation commit: `64fe1f8`. Record: `tasks/2026-08/260814_phase17-expert-improvement-coach.md`.
+
 ## ✅ v2.0 Phase 16 — Drift Notifications [COMPLETE] (2026-08-14)
 
 The approved `feat/phase-16-drift-notifications` branch now adds explicit permission-backed native alerts for newly actionable tracked Agent and Skill drift while the running app is backgrounded. It reuses the existing bounded local reconciliation every 15 minutes, creates a silent complete baseline, deduplicates exact logical identities, retains the prior baseline after partial failure, omits private paths and content, and routes activation to existing review surfaces without repair. Verification: OpenSpec 11/11 and strict validation passed, canonical specs validate 10/10, 111 frontend tests and 567 executed Rust library tests passed with 3 existing environment-gated ignores, 2 binary tests passed, strict Clippy/format/Svelte/build/dependency/diff and safety gates passed. Implementation commit: `0f6a269`. Record: `tasks/2026-08/260814_phase16-drift-notifications.md`.

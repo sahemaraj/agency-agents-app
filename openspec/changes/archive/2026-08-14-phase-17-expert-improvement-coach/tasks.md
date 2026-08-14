@@ -12,4 +12,4 @@
 
 - [x] 3.1 Run focused/full frontend tests, Svelte diagnostics, production build, Rust regression tests, strict Clippy/formatting, and strict OpenSpec validation.
 - [x] 3.2 Audit for exact cohort identity, cancelled/non-terminal exclusion, five-run gating, latest-evidence semantics, local-only derivation, no mutation, no telemetry, no model/network call, and no unrelated user-file changes.
-- [ ] 3.3 Sync and archive the canonical spec, update approved Memory Bank/roadmap evidence, merge the verified branch, and repeat post-merge smoke checks.
+- [x] 3.3 Sync and archive the canonical spec, update approved Memory Bank/roadmap evidence, merge the verified branch, and repeat post-merge smoke checks.
