@@ -14,15 +14,18 @@
     mcpAgentPolicySet,
     mcpClientPolicySet,
     mcpClientsStatus,
+    mcpInventory,
     mcpPolicySet,
   } from "$lib/api";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { settings } from "$lib/stores/settings.svelte";
-  import { appErrorMessage, isAppError, type McpClient, type McpClientStatus } from "$lib/types";
+  import { appErrorMessage, isAppError, type McpClient, type McpClientStatus, type McpInventoryReport, type McpInventoryServer } from "$lib/types";
 
   let statuses: McpClientStatus[] = $state([]);
+  let inventory: McpInventoryReport = $state({ servers: [], trustedTemplates: [], issues: [] });
   let loading = $state(false);
   let error = $state("");
+  let announcement = $state("");
   let copied: McpClient | null = $state(null);
   let policySaving = $state(false);
 
@@ -38,16 +41,34 @@
     return i18n.t(`settings.mcp.status.${state}`);
   }
 
+  function scopeLabel(scope: McpInventoryServer["scope"]): string {
+    return i18n.t(`settings.mcp.inventory.source.${scope}`);
+  }
+
+  function validationLabel(validation: McpInventoryServer["validation"]): string {
+    return i18n.t(`settings.mcp.inventory.validation.${validation}`);
+  }
+
   async function refresh() {
     loading = true;
     error = "";
-    try {
-      statuses = await mcpClientsStatus();
-    } catch {
-      error = i18n.t("settings.mcp.loadFailed");
-    } finally {
-      loading = false;
+    announcement = "";
+    const [statusResult, inventoryResult] = await Promise.allSettled([
+      mcpClientsStatus(),
+      mcpInventory(),
+    ]);
+    if (statusResult.status === "fulfilled") statuses = statusResult.value;
+    else error = i18n.t("settings.mcp.loadFailed");
+    if (inventoryResult.status === "fulfilled") {
+      inventory = inventoryResult.value;
+      announcement = i18n.t(inventory.issues.length
+        ? "settings.mcp.inventory.completeWithIssues"
+        : "settings.mcp.inventory.complete");
+    } else {
+      error = error || i18n.t("settings.mcp.inventory.loadFailed");
+      announcement = i18n.t("settings.mcp.inventory.loadFailed");
     }
+    loading = false;
   }
 
   async function mutate(status: McpClientStatus, action: "connect" | "disconnect" | "repair") {
@@ -196,7 +217,7 @@
       <h2 id="mcp-title">{i18n.t("settings.mcp.title")}</h2>
       <p>{i18n.t("settings.mcp.help")}</p>
     </div>
-    <button type="button" class="icon-button" onclick={refresh} disabled={loading} aria-label={i18n.t("settings.mcp.refresh")}>
+    <button type="button" class="icon-button" onclick={refresh} disabled={loading} aria-label={i18n.t("settings.mcp.inventory.refresh")}>
       <span class:spin={loading}><RefreshCw size={15} /></span>
     </button>
   </div>
@@ -257,6 +278,58 @@
     {/each}
   </div>
 
+  <section class="inventory" aria-labelledby="mcp-inventory-title" aria-busy={loading}>
+    <div>
+      <h3 id="mcp-inventory-title">{i18n.t("settings.mcp.inventory.title")}</h3>
+      <p>{i18n.t("settings.mcp.inventory.help")}</p>
+    </div>
+    {#if inventory.issues.length}
+      <ul class="issues" aria-label={i18n.t("settings.mcp.inventory.issues")}>
+        {#each inventory.issues as issue (issue)}<li>{issue}</li>{/each}
+      </ul>
+    {/if}
+    {#if inventory.servers.length === 0}
+      <p>{i18n.t("settings.mcp.inventory.empty")}</p>
+    {:else}
+      <div class="inventory-cards">
+        {#each inventory.servers as server (`${server.client}:${server.scope}:${server.projectPath ?? ""}:${server.name}`)}
+          <article class="inventory-card" data-server={server.name}>
+            <div class="card-head">
+              <strong>{server.name}</strong>
+              <span class:ok={server.validation === "valid"} class:warn={server.validation !== "valid"}>
+                {validationLabel(server.validation)}
+              </span>
+            </div>
+            <p>{clientLabel(server.client)} · {scopeLabel(server.scope)} · {server.transport}</p>
+            {#if server.projectPath}<code>{server.projectPath}</code>{/if}
+            <dl>
+              <div><dt>{i18n.t("settings.mcp.inventory.endpoint")}</dt><dd>{server.endpoint}</dd></div>
+              {#if server.environmentKeys.length}
+                <div><dt>{i18n.t("settings.mcp.inventory.environment")}</dt><dd>{server.environmentKeys.join(", ")}</dd></div>
+              {/if}
+              <div>
+                <dt>{i18n.t("settings.mcp.inventory.tools")}</dt>
+                <dd>{server.toolDiscovery === "unavailable" ? i18n.t("settings.mcp.inventory.toolsUnavailable") : server.toolNames.join(", ")}</dd>
+              </div>
+            </dl>
+            {#if server.warnings.length || server.blockers.length}
+              <ul class="findings">
+                {#each [...server.blockers, ...server.warnings] as finding (finding)}<li>{finding}</li>{/each}
+              </ul>
+            {/if}
+          </article>
+        {/each}
+      </div>
+    {/if}
+    {#each inventory.trustedTemplates as template (template.id)}
+      <article class="template">
+        <div class="card-head"><strong>{template.name}</strong><span>{i18n.t("settings.mcp.inventory.template")}</span></div>
+        {#if template.automaticConfiguration}<p>{i18n.t("settings.mcp.inventory.automatic")}</p>{/if}
+        <p>{template.toolNames.join(", ")}</p>
+      </article>
+    {/each}
+  </section>
+
   <div class="policy" aria-busy={policySaving || settings.loading}>
     <div>
       <h3>{i18n.t("settings.mcp.policy.title")}</h3>
@@ -303,6 +376,7 @@
   <span class="sr-only" aria-live="polite">
     {copied ? `${clientLabel(copied)} ${i18n.t("settings.mcp.copied")}` : ""}
   </span>
+  <span class="sr-only" aria-live="polite" data-inventory-announcement>{announcement}</span>
 </section>
 
 <style>
@@ -313,8 +387,14 @@
   p { margin: 0; color: var(--color-text-muted); font-size: var(--text-body-sm); }
   .cards { display: grid; gap: var(--space-3); }
   .card { padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); display: grid; gap: var(--space-3); }
-  .policy { padding-top: var(--space-4); border-top: 1px solid var(--color-border); display: grid; gap: var(--space-3); }
-  .policy h3 { margin: 0 0 var(--space-1); font-size: var(--text-body); }
+  .policy, .inventory { padding-top: var(--space-4); border-top: 1px solid var(--color-border); display: grid; gap: var(--space-3); }
+  .policy h3, .inventory h3 { margin: 0 0 var(--space-1); font-size: var(--text-body); }
+  .inventory-cards { display: grid; gap: var(--space-2); }
+  .inventory-card, .template { padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); display: grid; gap: var(--space-2); }
+  dl, dl div { margin: 0; display: grid; gap: var(--space-1); }
+  dt { color: var(--color-text-muted); font-size: var(--text-caption); }
+  dd { margin: 0; overflow-wrap: anywhere; font-size: var(--text-body-sm); }
+  .issues, .findings { margin: 0; padding-left: var(--space-5); color: var(--color-danger); font-size: var(--text-body-sm); }
   .allowlist { display: grid; gap: var(--space-2); }
   .allowlist-head { justify-content: space-between; gap: var(--space-3); }
   .allowlist ul { list-style: none; display: grid; gap: var(--space-2); margin: 0; padding: 0; }

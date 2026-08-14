@@ -7,6 +7,7 @@ import UpdatesModal from "$lib/components/UpdatesModal.svelte";
 import DivisionsLanding from "$lib/components/DivisionsLanding.svelte";
 import Sidebar from "$lib/components/Sidebar.svelte";
 import CommandPalette from "$lib/components/CommandPalette.svelte";
+import SettingsSectionMcp from "$lib/components/SettingsSectionMcp.svelte";
 import agentsWorkspaceSource from "$lib/components/AgentsWorkspace.svelte?raw";
 import skillsWorkspaceSource from "$lib/components/SkillsWorkspace.svelte?raw";
 import installModalSource from "$lib/components/InstallModal.svelte?raw";
@@ -35,7 +36,7 @@ import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import type { Agent, AgentMutationPlan, AgentPackageResult, AgentSource, DoctorReport, ExpertResolved, InstalledAgent, InstalledSkill, InstallRecord, McpAuditEntry, ProjectInstructionPlan, ProjectInstructionTarget, WorkspacePackPlan } from "$lib/types";
+import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type DoctorReport, type ExpertResolved, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type WorkspacePackPlan } from "$lib/types";
 
 const skillRecommendation = (sourceId = "skills-b") => ({
   kind: "skill" as const,
@@ -3229,5 +3230,75 @@ describe("frontend test harness", () => {
     ]) expect(projectsSource.match(marker) ?? [], String(marker)).toHaveLength(1);
     expect(projectsSource).not.toContain("window.fetch");
     expect(projectsSource).not.toContain("execute(");
+  });
+});
+
+describe("MCP inventory settings", () => {
+  it("renders bounded source, validation, tool, issue, and trusted-template evidence without foreign actions", async () => {
+    settings.data = { ...SETTINGS_DEFAULTS, mcpClientPolicies: {} };
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "mcp_clients_status") {
+        return [
+          { client: "claude", installed: true, state: "exact", command: "", detail: "Connected" },
+          { client: "codex", installed: true, state: "exact", command: "", detail: "Connected" },
+        ] as never;
+      }
+      if (command === "mcp_inventory") {
+        return {
+          servers: [
+            {
+              client: "claude", name: "project-memory", scope: "project", projectPath: "/project",
+              transport: "stdio", endpoint: "memory-server", enabled: true,
+              environmentKeys: ["MCP_TOKEN"], toolNames: [], toolDiscovery: "unavailable",
+              validation: "blocked", warnings: [], blockers: ["Unsupported transport"], trustedTemplate: false,
+              rawConfig: "secret-value",
+            },
+            {
+              client: "codex", name: "agency-agents", scope: "user", projectPath: null,
+              transport: "stdio", endpoint: "agency-agents-app", enabled: true,
+              environmentKeys: [], toolNames: ["agents_search", "skills_search"], toolDiscovery: "known",
+              validation: "valid", warnings: [], blockers: [], trustedTemplate: true,
+            },
+            {
+              client: "codex", name: "declared-tools", scope: "user", projectPath: null,
+              transport: "stdio", endpoint: "local-server", enabled: true,
+              environmentKeys: [], toolNames: ["declared_read"], toolDiscovery: "declared",
+              validation: "valid", warnings: [], blockers: [], trustedTemplate: false,
+            },
+          ],
+          trustedTemplates: [{
+            id: "agency-agents", name: "Agency Agents", clients: ["claude", "codex"],
+            toolNames: ["agents_search", "skills_search"], automaticConfiguration: true,
+          }],
+          issues: ["Codex inventory partially unavailable"],
+        } as never;
+      }
+      return [] as never;
+    });
+
+    const component = mount(SettingsSectionMcp, { target: document.body });
+    await Promise.resolve();
+    await tick();
+    await Promise.resolve();
+    await tick();
+
+    const text = document.body.textContent ?? "";
+    for (const evidence of [
+      "MCP inventory", "project-memory", "Project", "/project", "Blocked",
+      "Tools unavailable", "Agency Agents", "agents_search", "skills_search",
+      "declared-tools", "declared_read", "Codex inventory partially unavailable",
+    ]) expect(text).toContain(evidence);
+    expect(text).not.toContain("secret-value");
+    expect(document.querySelector('[data-server="project-memory"] button')).toBeNull();
+    expect(document.querySelector('[data-inventory-announcement]')?.textContent).toContain("issues");
+
+    const refresh = document.querySelector<HTMLButtonElement>('[aria-label="Refresh MCP inventory"]');
+    expect(refresh).not.toBeNull();
+    refresh?.click();
+    await Promise.resolve();
+    await tick();
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "mcp_inventory")).toHaveLength(2);
+    unmount(component);
+    settings.data = null;
   });
 });

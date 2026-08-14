@@ -24,7 +24,7 @@ pub(crate) struct StorageMigrationStatus {
     pub legacy_conflicts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum McpClient {
     Claude,
@@ -48,6 +48,67 @@ pub struct McpClientStatus {
     pub state: McpClientState,
     pub command: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpServerScope {
+    User,
+    Project,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpInventoryValidation {
+    Valid,
+    Warning,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpToolDiscovery {
+    Known,
+    Declared,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpInventoryServer {
+    pub client: McpClient,
+    pub name: String,
+    pub scope: McpServerScope,
+    pub project_path: Option<String>,
+    pub transport: String,
+    pub endpoint: String,
+    pub enabled: bool,
+    pub environment_keys: Vec<String>,
+    pub tool_names: Vec<String>,
+    pub tool_discovery: McpToolDiscovery,
+    pub validation: McpInventoryValidation,
+    pub warnings: Vec<String>,
+    pub blockers: Vec<String>,
+    pub trusted_template: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpTrustedTemplate {
+    pub id: String,
+    pub name: String,
+    pub clients: Vec<McpClient>,
+    pub tool_names: Vec<String>,
+    pub automatic_configuration: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpInventoryReport {
+    pub servers: Vec<McpInventoryServer>,
+    pub trusted_templates: Vec<McpTrustedTemplate>,
+    pub issues: Vec<String>,
 }
 
 // =========================================================

@@ -643,6 +643,19 @@ pub struct SkillMcpServer {
         Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>>,
 }
 
+pub(crate) fn agency_agents_tool_names() -> Vec<String> {
+    let mut router = SkillMcpServer::skills_tool_router();
+    router.merge(SkillMcpServer::agents_tool_router());
+    let mut names = router
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 impl Clone for SkillMcpServer {
     fn clone(&self) -> Self {
         Self::new_with_client(Arc::clone(&self.state), self.client_identity.clone())
@@ -3475,10 +3488,10 @@ mod tests {
     use tokio::sync::{oneshot, Mutex, RwLock};
 
     use super::{
-        action_for_tool, catalog_revision, detect_project_languages, package_resource_uri,
-        parse_package_resource_uri, parse_skill_type, parse_update_policy, resource_list_changed,
-        search_packages, FindAndInstallRequest, HttpAuth, NamedApprovalRequest, RecommendRequest,
-        SkillMcpServer, SkillRuntime, SourceRequest,
+        action_for_tool, agency_agents_tool_names, catalog_revision, detect_project_languages,
+        package_resource_uri, parse_package_resource_uri, parse_skill_type, parse_update_policy,
+        resource_list_changed, search_packages, FindAndInstallRequest, HttpAuth,
+        NamedApprovalRequest, RecommendRequest, SkillMcpServer, SkillRuntime, SourceRequest,
     };
 
     fn package(name: &str, description: &str, installable: bool) -> SkillPackageResult {
@@ -4602,6 +4615,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
         names.sort();
+        assert_eq!(agency_agents_tool_names(), names);
         assert!(
             names.iter().all(|name| action_for_tool(name).is_some()),
             "every routed tool must have an explicit audit/policy class"
