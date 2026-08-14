@@ -38,6 +38,14 @@ import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
 import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type DoctorReport, type ExpertResolved, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type WorkspacePackPlan } from "$lib/types";
 
+const notificationMocks = vi.hoisted(() => ({
+  isPermissionGranted: vi.fn(async () => true),
+  requestPermission: vi.fn(async () => "granted" as NotificationPermission),
+  sendNotification: vi.fn(),
+  action: null as ((notification: { extra?: Record<string, unknown> }) => void) | null,
+  unlisten: vi.fn(),
+}));
+
 const skillRecommendation = (sourceId = "skills-b") => ({
   kind: "skill" as const,
   package: {
@@ -71,6 +79,16 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => undefined),
+}));
+
+vi.mock("@tauri-apps/plugin-notification", () => ({
+  isPermissionGranted: notificationMocks.isPermissionGranted,
+  requestPermission: notificationMocks.requestPermission,
+  sendNotification: notificationMocks.sendNotification,
+  onAction: vi.fn(async (callback: (notification: { extra?: Record<string, unknown> }) => void) => {
+    notificationMocks.action = callback;
+    return { unregister: async () => { notificationMocks.unlisten(); } };
+  }),
 }));
 
 const emptyFolderState = () => ({
@@ -143,7 +161,14 @@ beforeEach(async () => {
   install.reconcileAttempt = 0;
   install.reconcileTerminal = 0;
   projects.list = [];
+  settings.data = null;
   settings.error = null;
+  settings.corruptOnDisk = false;
+  notificationMocks.isPermissionGranted.mockReset().mockResolvedValue(true);
+  notificationMocks.requestPermission.mockReset().mockResolvedValue("granted");
+  notificationMocks.sendNotification.mockReset();
+  notificationMocks.action = null;
+  notificationMocks.unlisten.mockReset();
   skillSources.sources = [];
   skillSources.results = {};
   skillSources.installed = [];
@@ -1310,6 +1335,176 @@ describe("frontend test harness", () => {
       unmount(component);
       target.remove();
       projectRefresh.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps native drift notifications opt-in and persists only granted permission", async () => {
+    settings.data = { ...SETTINGS_DEFAULTS, driftNotifications: false };
+    notificationMocks.isPermissionGranted.mockResolvedValue(false);
+    notificationMocks.requestPermission.mockResolvedValue("denied");
+    const save = vi.spyOn(settings, "save").mockResolvedValue();
+    const { default: SettingsSectionNetwork } = await import("$lib/components/SettingsSectionNetwork.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionNetwork, { target });
+    try {
+      const toggle = target.querySelector<HTMLInputElement>('[data-drift-notifications]')!;
+      expect(toggle.checked).toBe(false);
+      toggle.click();
+      await vi.waitFor(() => expect(notificationMocks.requestPermission).toHaveBeenCalledOnce());
+      expect(save).not.toHaveBeenCalledWith({ driftNotifications: true });
+      expect(target.querySelector('[data-drift-notification-error]')?.textContent).toContain("permission");
+
+      notificationMocks.requestPermission.mockResolvedValue("granted");
+      toggle.click();
+      await vi.waitFor(() => expect(save).toHaveBeenCalledWith({ driftNotifications: true }));
+    } finally {
+      unmount(component);
+      target.remove();
+      save.mockRestore();
+    }
+  });
+
+  it("notifies once for newly actionable background drift and routes activation without mutation", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    settings.data = { ...SETTINGS_DEFAULTS, driftNotifications: true };
+    const loadSettings = vi.spyOn(settings, "load").mockResolvedValue();
+    const projectRefresh = vi.spyOn(projects, "refresh").mockResolvedValue();
+    const currentAgent: InstalledAgent = {
+      ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md",
+      state: "current", tracked: true,
+    };
+    const driftedAgent = { ...currentAgent, state: "modified" as const };
+    const currentSkill: InstalledSkill = {
+      sourceId: "built-in", relativePath: "audit", name: "Audit", runtime: "codex",
+      scope: "user", projectPath: null, path: "/private/project/.codex/skills/audit/SKILL.md",
+      state: "current", tracked: true,
+    };
+    let agentRows = [currentAgent];
+    let skillRows = [currentSkill];
+    let failAgentScan = false;
+    const agentReconcile = vi.spyOn(install, "reconcile").mockImplementation(async () => {
+      if (failAgentScan) {
+        install.reconcileError = "agent background scan failed";
+        return;
+      }
+      install.installed = agentRows;
+      install.reconciled = true;
+      install.reconcileError = null;
+    });
+    const skillReconcile = vi.spyOn(skillSources, "reconcileInstalls").mockImplementation(async () => {
+      skillSources.installed = skillRows;
+      skillSources.reconciled = true;
+      skillSources.reconcileError = null;
+    });
+    const openAgents = vi.spyOn(ui, "openAgents");
+    const setSection = vi.spyOn(ui, "setSection");
+    const { default: Layout } = await import("../routes/+layout.svelte");
+    const target = document.createElement("div");
+    const children = createRawSnippet(() => ({ render: () => "<main>App</main>" }));
+    document.body.append(target);
+    const component = mount(Layout, { target, props: { children } });
+    try {
+      await tick();
+      await Promise.resolve();
+      expect(notificationMocks.sendNotification).not.toHaveBeenCalled();
+
+      agentRows = [driftedAgent];
+      failAgentScan = true;
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+      expect(notificationMocks.sendNotification).not.toHaveBeenCalled();
+
+      failAgentScan = false;
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+      await Promise.resolve();
+      expect(notificationMocks.sendNotification).toHaveBeenCalledOnce();
+      expect(notificationMocks.sendNotification.mock.calls[0]?.[0]).toMatchObject({
+        title: "Agent drift needs review",
+        extra: { review: "agents" },
+      });
+      expect(JSON.stringify(notificationMocks.sendNotification.mock.calls[0]?.[0])).not.toContain("/private/project");
+
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+      expect(notificationMocks.sendNotification).toHaveBeenCalledOnce();
+
+      agentRows = [currentAgent];
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+      agentRows = [driftedAgent];
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+      expect(notificationMocks.sendNotification).toHaveBeenCalledTimes(2);
+
+      agentRows = [currentAgent];
+      skillRows = [{ ...currentSkill, state: "missing" }];
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+      expect(notificationMocks.sendNotification).toHaveBeenCalledTimes(3);
+      expect(notificationMocks.sendNotification.mock.calls[2]?.[0]).toMatchObject({
+        title: "Skill drift needs review",
+        extra: { review: "skills" },
+      });
+
+      notificationMocks.action?.({ extra: { review: "agents" } });
+      expect(openAgents).toHaveBeenCalledWith(null, "attention");
+
+      notificationMocks.action?.({ extra: { review: "skills" } });
+      expect(setSection).toHaveBeenCalledWith("skills");
+    } finally {
+      unmount(component);
+      expect(notificationMocks.unlisten).toHaveBeenCalledOnce();
+      target.remove();
+      visibility.mockRestore();
+      loadSettings.mockRestore();
+      projectRefresh.mockRestore();
+      agentReconcile.mockRestore();
+      skillReconcile.mockRestore();
+      openAgents.mockRestore();
+      setSection.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips background drift scans while the app is visible", async () => {
+    expect(SETTINGS_DEFAULTS.driftNotifications).toBe(false);
+    vi.useFakeTimers();
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    settings.data = { ...SETTINGS_DEFAULTS, driftNotifications: true };
+    const loadSettings = vi.spyOn(settings, "load").mockResolvedValue();
+    const projectRefresh = vi.spyOn(projects, "refresh").mockResolvedValue();
+    const agentReconcile = vi.spyOn(install, "reconcile").mockResolvedValue();
+    const skillReconcile = vi.spyOn(skillSources, "reconcileInstalls").mockResolvedValue();
+    const { default: Layout } = await import("../routes/+layout.svelte");
+    const target = document.createElement("div");
+    const children = createRawSnippet(() => ({ render: () => "<main>App</main>" }));
+    document.body.append(target);
+    const component = mount(Layout, { target, props: { children } });
+    try {
+      await tick();
+      await Promise.resolve();
+      agentReconcile.mockClear();
+      skillReconcile.mockClear();
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+      expect(agentReconcile).not.toHaveBeenCalled();
+      expect(skillReconcile).not.toHaveBeenCalled();
+      expect(notificationMocks.sendNotification).not.toHaveBeenCalled();
+    } finally {
+      unmount(component);
+      target.remove();
+      visibility.mockRestore();
+      loadSettings.mockRestore();
+      projectRefresh.mockRestore();
+      agentReconcile.mockRestore();
+      skillReconcile.mockRestore();
       vi.useRealTimers();
     }
   });

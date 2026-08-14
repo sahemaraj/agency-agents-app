@@ -92,6 +92,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         // Phase 15 — register the updater plugin. The endpoint URL and
         // public key are configured in `tauri.conf.json`; the plugin
         // pulls them from the parsed Config at startup. Our IPC

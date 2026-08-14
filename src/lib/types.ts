@@ -37,6 +37,9 @@ export interface Settings {
       opts in via Settings → Network → Updates. Suppressed (no fetch)
       while Offline Mode is on, regardless of this flag. */
   updateAutoCheck: boolean;
+  /** Native alerts for newly actionable local drift while the running app is
+      backgrounded. Off by default and permission-gated. */
+  driftNotifications: boolean;
   /** Per-tool custom install base path (tool id → absolute base dir). When set,
       user-scope installs + detection resolve against it instead of the OS home
       (e.g. pointing Claude Code at a WSL home). Absent/empty = OS home. */
@@ -70,6 +73,7 @@ export type GeneralSettingsPatch = Partial<
     | "githubEnabled"
     | "aiFeaturesEnabled"
     | "updateAutoCheck"
+    | "driftNotifications"
     | "toolPaths"
   >
 >;
@@ -89,6 +93,7 @@ export const SETTINGS_DEFAULTS: Settings = {
   // Auto-check for new Agency Agents releases. Off by
   // default per the "zero outbound unless user consented" posture.
   updateAutoCheck: false,
+  driftNotifications: false,
   // Per-tool custom install base paths. Empty by default (all tools use ~).
   toolPaths: {},
   mcpSourceAccess: false,

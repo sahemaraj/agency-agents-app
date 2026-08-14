@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["wry", "compression", "common-controls-v6", "dynamic-acl", "x11", "dbus"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
 # Issue #17 — persist window size + position across launches. Registered in
 # `lib.rs`; auto-saves geometry on move/resize and on exit, then restores it
 # on the next launch. No frontend wiring — the plugin hooks window events
