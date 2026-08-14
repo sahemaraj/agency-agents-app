@@ -1187,6 +1187,72 @@ export interface AgentMutationPlan {
   rollbackAvailable: boolean;
 }
 
+export type WorkspacePackScope = "user" | "project";
+
+export interface WorkspacePack {
+  workspacePack: 1;
+  name: string;
+  scope: WorkspacePackScope;
+  agents: Array<{ reference: AgentReference; tool: Tool }>;
+  skills: Array<{ reference: SkillReference; runtime: string }>;
+  runbook: string | null;
+  instructions: string[];
+  mcpServers: string[];
+}
+
+export interface WorkspacePackAgentPlan {
+  reference: AgentReference;
+  name: string;
+  tool: Tool;
+  destinations: string[];
+  dependency: boolean;
+  state: "current" | "missing" | "missingTracked" | "outdated" | "modified" | "foreign" | "disabled" | "sourceUnavailable" | "blocked";
+}
+
+export interface WorkspacePackSkillPlan {
+  reference: SkillReference;
+  name: string;
+  runtime: string;
+  destinations: string[];
+  dependency: boolean;
+  state: WorkspacePackAgentPlan["state"];
+  permissions: string[];
+}
+
+export interface WorkspacePackPlan {
+  pack: WorkspacePack;
+  projectPath: string | null;
+  agents: WorkspacePackAgentPlan[];
+  skills: WorkspacePackSkillPlan[];
+  warnings: string[];
+  blockers: string[];
+  rollbackScope: string[];
+  revision: string;
+}
+
+export interface WorkspacePackApplyItem {
+  kind: "agent" | "skill";
+  sourceId: string;
+  relativePath: string;
+  target: string;
+  destination: string;
+  outcome: "pending" | "current" | "installed" | "failed" | "skipped" | "rolledBack" | "rollbackFailed";
+  message: string | null;
+}
+
+export interface WorkspacePackApplyResult {
+  revision: string;
+  outcome: "succeeded" | "rolledBack" | "rollbackFailed";
+  items: WorkspacePackApplyItem[];
+  rolledBack: boolean;
+  rollbackErrors: string[];
+}
+
+export interface WorkspacePackApplyResponse {
+  plan: WorkspacePackPlan;
+  result: WorkspacePackApplyResult | null;
+}
+
 export interface AgentVersionSnapshot {
   id: string;
   createdAt: string;

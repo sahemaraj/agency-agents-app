@@ -27,7 +27,7 @@ use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
     AgentApprovalAction, AgentDiff, AgentInstallIdentity, AgentMutationPlan, AgentPlanItem,
     AgentReference, AgentSourceResult, AgentVersionSnapshot, InstallRecord, InstallState,
-    InstalledAgent, ProjectInfo, Tool, ToolInfo, ToolVersion, UpdateKind,
+    InstalledAgent, ProjectInfo, SkillReference, Tool, ToolInfo, ToolVersion, UpdateKind,
 };
 use crate::util::fs::{atomic_write, read_capped};
 
@@ -4826,18 +4826,901 @@ pub async fn projects_list(
 
 // ---------- Loadouts (Agentfile) ----------
 
+const WORKSPACE_PACK_VERSION: u32 = 1;
+const MAX_WORKSPACE_PACK_ITEMS: usize = 256;
+const MAX_WORKSPACE_PACK_NAME_BYTES: usize = 160;
+const MAX_WORKSPACE_PACK_REQUIREMENT_BYTES: usize = 512;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspacePack {
+    workspace_pack: u32,
+    name: String,
+    scope: WorkspacePackScope,
+    #[serde(default)]
+    agents: Vec<WorkspacePackAgent>,
+    #[serde(default)]
+    skills: Vec<WorkspacePackSkill>,
+    #[serde(default)]
+    runbook: Option<String>,
+    #[serde(default)]
+    instructions: Vec<String>,
+    #[serde(default)]
+    mcp_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspacePackScope {
+    User,
+    Project,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePackAgent {
+    reference: AgentReference,
+    tool: Tool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePackSkill {
+    reference: SkillReference,
+    runtime: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePackAgentPlan {
+    reference: AgentReference,
+    name: String,
+    tool: Tool,
+    destinations: Vec<String>,
+    dependency: bool,
+    state: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePackSkillPlan {
+    reference: SkillReference,
+    name: String,
+    runtime: String,
+    destinations: Vec<String>,
+    dependency: bool,
+    state: String,
+    permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePackPlan {
+    pack: WorkspacePack,
+    project_path: Option<String>,
+    agents: Vec<WorkspacePackAgentPlan>,
+    skills: Vec<WorkspacePackSkillPlan>,
+    warnings: Vec<String>,
+    blockers: Vec<String>,
+    rollback_scope: Vec<String>,
+    revision: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePackApplyItem {
+    kind: String,
+    source_id: String,
+    relative_path: String,
+    target: String,
+    destination: String,
+    outcome: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePackApplyResult {
+    revision: String,
+    outcome: String,
+    items: Vec<WorkspacePackApplyItem>,
+    rolled_back: bool,
+    rollback_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePackApplyResponse {
+    plan: WorkspacePackPlan,
+    result: Option<WorkspacePackApplyResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum WorkspacePackCreated {
+    Agent {
+        reference: AgentReference,
+        tool: Tool,
+        project_path: Option<String>,
+    },
+    Skill {
+        reference: SkillReference,
+        runtime: String,
+        project_path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct WorkspacePackApplyOperation {
+    revision: String,
+    expected_created: Vec<WorkspacePackCreated>,
+}
+
+#[derive(Debug)]
+enum WorkspacePackInput {
+    Pack(WorkspacePack),
+    Legacy(Agentfile),
+}
+
+fn invalid_workspace_pack(message: impl Into<String>) -> AppError {
+    AppError::InvalidArgument {
+        message: message.into(),
+    }
+}
+
+fn validate_workspace_pack_text(value: &str, label: &str, max: usize) -> Result<(), AppError> {
+    if value.trim() != value
+        || value.is_empty()
+        || value.len() > max
+        || value.chars().any(char::is_control)
+    {
+        return Err(invalid_workspace_pack(format!(
+            "Workspace Pack {label} is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn contains_workspace_pack_credential(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "token=",
+        "api_key=",
+        "api-key=",
+        "apikey=",
+        "authorization:",
+        "password=",
+        "-----begin private key",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+}
+
+fn validate_workspace_pack_runtime(value: &str, label: &str) -> Result<(), AppError> {
+    validate_workspace_pack_text(value, label, 128)
+}
+
+fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, AppError> {
+    if pack.workspace_pack != WORKSPACE_PACK_VERSION {
+        return Err(invalid_workspace_pack("Unsupported Workspace Pack version"));
+    }
+    validate_workspace_pack_text(&pack.name, "name", MAX_WORKSPACE_PACK_NAME_BYTES)?;
+    if contains_workspace_pack_credential(&pack.name) {
+        return Err(invalid_workspace_pack(
+            "Workspace Pack must not contain credentials",
+        ));
+    }
+    for (label, count) in [
+        ("agents", pack.agents.len()),
+        ("skills", pack.skills.len()),
+        ("instructions", pack.instructions.len()),
+        ("MCP requirements", pack.mcp_servers.len()),
+    ] {
+        if count > MAX_WORKSPACE_PACK_ITEMS {
+            return Err(invalid_workspace_pack(format!(
+                "Workspace Pack has too many {label}"
+            )));
+        }
+    }
+    for agent in &pack.agents {
+        crate::library::validate_reference(
+            &agent.reference.source_id,
+            &agent.reference.relative_path,
+        )?;
+        validate_workspace_pack_runtime(&agent.tool, "agent tool")?;
+    }
+    for skill in &pack.skills {
+        crate::library::validate_reference(
+            &skill.reference.source_id,
+            &skill.reference.relative_path,
+        )?;
+        validate_workspace_pack_runtime(&skill.runtime, "skill runtime")?;
+    }
+    if let Some(runbook) = &pack.runbook {
+        validate_workspace_pack_text(runbook, "runbook", MAX_WORKSPACE_PACK_NAME_BYTES)?;
+        if contains_workspace_pack_credential(runbook) {
+            return Err(invalid_workspace_pack(
+                "Workspace Pack must not contain credentials",
+            ));
+        }
+    }
+    for value in pack.instructions.iter().chain(&pack.mcp_servers) {
+        validate_workspace_pack_text(value, "requirement", MAX_WORKSPACE_PACK_REQUIREMENT_BYTES)?;
+        if contains_workspace_pack_credential(value) {
+            return Err(invalid_workspace_pack(
+                "Workspace Pack requirements must not contain credentials",
+            ));
+        }
+    }
+
+    pack.agents
+        .sort_by(|left, right| (&left.reference, &left.tool).cmp(&(&right.reference, &right.tool)));
+    pack.agents.dedup();
+    pack.skills.sort_by(|left, right| {
+        (
+            &left.reference.source_id,
+            &left.reference.relative_path,
+            &left.runtime,
+        )
+            .cmp(&(
+                &right.reference.source_id,
+                &right.reference.relative_path,
+                &right.runtime,
+            ))
+    });
+    pack.skills.dedup();
+    pack.instructions.sort();
+    pack.instructions.dedup();
+    pack.mcp_servers.sort();
+    pack.mcp_servers.dedup();
+    Ok(pack)
+}
+
+fn serialize_workspace_pack(pack: &WorkspacePack) -> Result<Vec<u8>, AppError> {
+    let mut bytes =
+        serde_json::to_vec_pretty(&normalize_workspace_pack(pack.clone())?).map_err(|error| {
+            AppError::Io {
+                message: format!("serialize Workspace Pack: {error}"),
+            }
+        })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn parse_workspace_pack_input(bytes: &[u8]) -> Result<WorkspacePackInput, AppError> {
+    if bytes.len() as u64 > MAX_INSTALLED_BYTES {
+        return Err(invalid_workspace_pack("Workspace Pack is too large"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| invalid_workspace_pack(format!("parse Workspace Pack: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid_workspace_pack("Workspace Pack must be a JSON object"))?;
+    match (
+        object
+            .get("workspacePack")
+            .and_then(serde_json::Value::as_u64),
+        object.get("agentfile").and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(version), None) if version == u64::from(WORKSPACE_PACK_VERSION) => {
+            validate_workspace_pack_json_shape(object)?;
+            let pack = serde_json::from_value(value).map_err(|error| {
+                invalid_workspace_pack(format!("parse Workspace Pack: {error}"))
+            })?;
+            Ok(WorkspacePackInput::Pack(normalize_workspace_pack(pack)?))
+        }
+        (None, Some(1)) => {
+            let legacy: Agentfile = serde_json::from_value(value)
+                .map_err(|error| invalid_workspace_pack(format!("parse Agentfile: {error}")))?;
+            if legacy.installs.len() > MAX_WORKSPACE_PACK_ITEMS {
+                return Err(invalid_workspace_pack("Agentfile has too many installs"));
+            }
+            Ok(WorkspacePackInput::Legacy(legacy))
+        }
+        _ => Err(invalid_workspace_pack(
+            "Unsupported or ambiguous Workspace Pack format",
+        )),
+    }
+}
+
+fn validate_workspace_pack_json_shape(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), AppError> {
+    let allowed = [
+        "workspacePack",
+        "name",
+        "scope",
+        "agents",
+        "skills",
+        "runbook",
+        "instructions",
+        "mcpServers",
+    ];
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(invalid_workspace_pack(
+            "Workspace Pack contains an unknown field",
+        ));
+    }
+    for (label, entries, target) in [
+        ("agent", object.get("agents"), "tool"),
+        ("skill", object.get("skills"), "runtime"),
+    ] {
+        let Some(entries) = entries.and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry.as_object().ok_or_else(|| {
+                invalid_workspace_pack(format!("Workspace Pack {label} entry is invalid"))
+            })?;
+            if entry
+                .keys()
+                .any(|key| !matches!(key.as_str(), "reference") && key != target)
+            {
+                return Err(invalid_workspace_pack(format!(
+                    "Workspace Pack {label} contains an unknown field"
+                )));
+            }
+            let reference = entry
+                .get("reference")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    invalid_workspace_pack(format!("Workspace Pack {label} reference is invalid"))
+                })?;
+            if reference
+                .keys()
+                .any(|key| !matches!(key.as_str(), "sourceId" | "relativePath"))
+            {
+                return Err(invalid_workspace_pack(format!(
+                    "Workspace Pack {label} reference contains an unknown field"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn workspace_pack_from_ledgers(
+    name: String,
+    scope: WorkspacePackScope,
+    project_path: Option<&str>,
+    agent_records: &[InstallRecord],
+    skill_records: &[crate::types::SkillInstallRecord],
+) -> Result<WorkspacePack, AppError> {
+    let selected = |candidate: Option<&str>| match scope {
+        WorkspacePackScope::User => candidate.is_none(),
+        WorkspacePackScope::Project => candidate == project_path,
+    };
+    normalize_workspace_pack(WorkspacePack {
+        workspace_pack: WORKSPACE_PACK_VERSION,
+        name,
+        scope,
+        agents: agent_records
+            .iter()
+            .filter(|record| selected(record.project_path.as_deref()))
+            .map(|record| WorkspacePackAgent {
+                reference: AgentReference {
+                    source_id: record.source_id.clone(),
+                    relative_path: record.relative_path.clone(),
+                },
+                tool: record.tool.clone(),
+            })
+            .collect(),
+        skills: skill_records
+            .iter()
+            .filter(|record| selected(record.project_path.as_deref()))
+            .map(|record| WorkspacePackSkill {
+                reference: SkillReference {
+                    source_id: record.source_id.clone(),
+                    relative_path: record.relative_path.clone(),
+                },
+                runtime: record.runtime.clone(),
+            })
+            .collect(),
+        runbook: None,
+        instructions: Vec::new(),
+        mcp_servers: Vec::new(),
+    })
+}
+
+fn convert_legacy_agentfile(
+    legacy: Agentfile,
+    sources: &[AgentSourceResult],
+) -> Result<WorkspacePack, AppError> {
+    for entry in &legacy.installs {
+        if let Some(path) = &entry.project_path {
+            if path.trim() != path
+                || path.is_empty()
+                || path.len() > 4096
+                || path.chars().any(char::is_control)
+            {
+                return Err(invalid_workspace_pack(
+                    "Legacy Agentfile project path is invalid",
+                ));
+            }
+        }
+    }
+    let project_paths = legacy
+        .installs
+        .iter()
+        .filter_map(|entry| entry.project_path.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let scope = if project_paths.is_empty() {
+        WorkspacePackScope::User
+    } else if project_paths.len() == 1
+        && legacy
+            .installs
+            .iter()
+            .all(|entry| entry.project_path.is_some())
+    {
+        WorkspacePackScope::Project
+    } else {
+        return Err(invalid_workspace_pack(
+            "Legacy Agentfile must contain exactly one logical scope",
+        ));
+    };
+    let agents = legacy
+        .installs
+        .into_iter()
+        .map(|entry| {
+            validate_workspace_pack_text(&entry.slug, "legacy slug", 160)?;
+            validate_workspace_pack_runtime(&entry.tool, "legacy tool")?;
+            Ok(WorkspacePackAgent {
+                reference: resolve_legacy_workspace_pack_reference(sources, &entry.slug)?,
+                tool: entry.tool,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    normalize_workspace_pack(WorkspacePack {
+        workspace_pack: WORKSPACE_PACK_VERSION,
+        name: "Imported Agentfile".into(),
+        scope,
+        agents,
+        skills: Vec::new(),
+        runbook: None,
+        instructions: Vec::new(),
+        mcp_servers: Vec::new(),
+    })
+}
+
+fn resolve_legacy_workspace_pack_reference(
+    sources: &[AgentSourceResult],
+    slug: &str,
+) -> Result<AgentReference, AppError> {
+    let matches = sources
+        .iter()
+        .flat_map(|source| &source.agents)
+        .filter(|package| {
+            package.installable
+                && package
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.slug == slug)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        Ok(matches[0].reference.clone())
+    } else {
+        Err(invalid_workspace_pack(format!(
+            "Legacy Agent slug must resolve to one exact installable package: {slug}"
+        )))
+    }
+}
+
+fn finalize_workspace_pack_plan(plan: &mut WorkspacePackPlan) -> Result<(), AppError> {
+    plan.agents.sort_by(|left, right| {
+        (
+            &left.reference,
+            &left.tool,
+            left.dependency,
+            &left.destinations,
+        )
+            .cmp(&(
+                &right.reference,
+                &right.tool,
+                right.dependency,
+                &right.destinations,
+            ))
+    });
+    plan.agents.dedup_by(|right, left| {
+        right.reference == left.reference
+            && right.tool == left.tool
+            && right.destinations == left.destinations
+    });
+    plan.skills.sort_by(|left, right| {
+        (
+            &left.reference.source_id,
+            &left.reference.relative_path,
+            &left.runtime,
+            left.dependency,
+            &left.destinations,
+        )
+            .cmp(&(
+                &right.reference.source_id,
+                &right.reference.relative_path,
+                &right.runtime,
+                right.dependency,
+                &right.destinations,
+            ))
+    });
+    plan.skills.dedup_by(|right, left| {
+        right.reference == left.reference
+            && right.runtime == left.runtime
+            && right.destinations == left.destinations
+    });
+    for values in [
+        &mut plan.warnings,
+        &mut plan.blockers,
+        &mut plan.rollback_scope,
+    ] {
+        values.sort();
+        values.dedup();
+    }
+    plan.revision.clear();
+    plan.revision =
+        render::sha256_hex(
+            &serde_json::to_vec(plan).map_err(|error| AppError::Internal {
+                message: format!("serialize Workspace Pack plan: {error}"),
+            })?,
+        );
+    Ok(())
+}
+
+fn require_workspace_pack_revision(
+    plan: &WorkspacePackPlan,
+    expected: &str,
+) -> Result<(), AppError> {
+    if plan.revision == expected {
+        Ok(())
+    } else {
+        Err(invalid_workspace_pack(
+            "Workspace Pack plan changed; review the refreshed plan",
+        ))
+    }
+}
+
+fn initial_workspace_pack_results(plan: &WorkspacePackPlan) -> Vec<WorkspacePackApplyItem> {
+    let mut items = Vec::new();
+    for agent in &plan.agents {
+        for destination in &agent.destinations {
+            items.push(WorkspacePackApplyItem {
+                kind: "agent".into(),
+                source_id: agent.reference.source_id.clone(),
+                relative_path: agent.reference.relative_path.clone(),
+                target: agent.tool.clone(),
+                destination: destination.clone(),
+                outcome: if agent.state == "current" {
+                    "current"
+                } else {
+                    "pending"
+                }
+                .into(),
+                message: None,
+            });
+        }
+    }
+    for skill in &plan.skills {
+        for destination in &skill.destinations {
+            items.push(WorkspacePackApplyItem {
+                kind: "skill".into(),
+                source_id: skill.reference.source_id.clone(),
+                relative_path: skill.reference.relative_path.clone(),
+                target: skill.runtime.clone(),
+                destination: destination.clone(),
+                outcome: if skill.state == "current" {
+                    "current"
+                } else {
+                    "pending"
+                }
+                .into(),
+                message: None,
+            });
+        }
+    }
+    items
+}
+
+async fn bind_workspace_pack_project(
+    state: &AppState,
+    scope: WorkspacePackScope,
+    project_path: Option<String>,
+) -> Result<Option<String>, AppError> {
+    match (scope, project_path) {
+        (WorkspacePackScope::User, None) => Ok(None),
+        (WorkspacePackScope::User, Some(_)) => Err(invalid_workspace_pack(
+            "User Workspace Pack must not include a project binding",
+        )),
+        (WorkspacePackScope::Project, None) => Ok(None),
+        (WorkspacePackScope::Project, Some(path)) => {
+            let canonical = std::fs::canonicalize(&path).map_err(|error| AppError::Io {
+                message: format!("canonicalize Workspace Pack project: {error}"),
+            })?;
+            if !registered_projects(&state.app_data_dir)
+                .await?
+                .contains(&canonical)
+            {
+                return Err(invalid_workspace_pack(
+                    "Workspace Pack project binding must be registered",
+                ));
+            }
+            Ok(Some(canonical.to_string_lossy().into_owned()))
+        }
+    }
+}
+
+fn agent_install_state_name(state: InstallState) -> &'static str {
+    match state {
+        InstallState::Current => "current",
+        InstallState::Outdated => "outdated",
+        InstallState::Modified => "modified",
+        InstallState::Missing => "missingTracked",
+        InstallState::Foreign => "foreign",
+        InstallState::Disabled => "disabled",
+        InstallState::SourceUnavailable => "sourceUnavailable",
+    }
+}
+
+fn skill_install_state_name(state: crate::types::SkillInstallState) -> &'static str {
+    match state {
+        crate::types::SkillInstallState::Current => "current",
+        crate::types::SkillInstallState::Outdated => "outdated",
+        crate::types::SkillInstallState::Modified => "modified",
+        crate::types::SkillInstallState::Missing => "missingTracked",
+        crate::types::SkillInstallState::Foreign => "foreign",
+        crate::types::SkillInstallState::Disabled => "disabled",
+        crate::types::SkillInstallState::SourceUnavailable => "sourceUnavailable",
+    }
+}
+
+async fn build_workspace_pack_plan(
+    state: &AppState,
+    pack: WorkspacePack,
+    project_path: Option<String>,
+) -> Result<WorkspacePackPlan, AppError> {
+    let project_path = bind_workspace_pack_project(state, pack.scope, project_path).await?;
+    if pack.scope == WorkspacePackScope::Project && project_path.is_none() {
+        let mut plan = WorkspacePackPlan {
+            agents: pack
+                .agents
+                .iter()
+                .map(|item| WorkspacePackAgentPlan {
+                    reference: item.reference.clone(),
+                    name: item.reference.relative_path.clone(),
+                    tool: item.tool.clone(),
+                    destinations: Vec::new(),
+                    dependency: false,
+                    state: "blocked".into(),
+                })
+                .collect(),
+            skills: pack
+                .skills
+                .iter()
+                .map(|item| WorkspacePackSkillPlan {
+                    reference: item.reference.clone(),
+                    name: item.reference.relative_path.clone(),
+                    runtime: item.runtime.clone(),
+                    destinations: Vec::new(),
+                    dependency: false,
+                    state: "blocked".into(),
+                    permissions: Vec::new(),
+                })
+                .collect(),
+            pack,
+            project_path: None,
+            warnings: Vec::new(),
+            blockers: vec!["Project Workspace Pack requires an explicit project binding".into()],
+            rollback_scope: Vec::new(),
+            revision: String::new(),
+        };
+        finalize_workspace_pack_plan(&mut plan)?;
+        return Ok(plan);
+    }
+    let agent_sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
+    let installed_agents = mcp_reconcile_agent_installs(state).await?;
+    let registered = registered_projects(&state.app_data_dir)
+        .await?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let installed_skills = crate::skills::reconcile_skill_installs(state, &registered).await?;
+    let mut plan = WorkspacePackPlan {
+        pack,
+        project_path,
+        agents: Vec::new(),
+        skills: Vec::new(),
+        warnings: Vec::new(),
+        blockers: Vec::new(),
+        rollback_scope: Vec::new(),
+        revision: String::new(),
+    };
+
+    for requested in &plan.pack.agents {
+        let mutation = match build_mutation_plan(
+            state,
+            vec![requested.reference.clone()],
+            requested.tool.clone(),
+            plan.project_path.clone(),
+            "install",
+            true,
+        )
+        .await
+        {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                plan.blockers.push(error.to_string());
+                plan.agents.push(WorkspacePackAgentPlan {
+                    reference: requested.reference.clone(),
+                    name: requested.reference.relative_path.clone(),
+                    tool: requested.tool.clone(),
+                    destinations: Vec::new(),
+                    dependency: false,
+                    state: "blocked".into(),
+                });
+                continue;
+            }
+        };
+        plan.warnings.extend(mutation.warnings);
+        plan.blockers.extend(mutation.blockers);
+        let has_requested = mutation
+            .agents
+            .iter()
+            .any(|item| !item.dependency && item.reference == requested.reference);
+        let home = tool_home(state, &requested.tool).await?;
+        for item in mutation.agents {
+            let existing = installed_agents.iter().find(|installed| {
+                installed.source_id == item.reference.source_id
+                    && installed.relative_path == item.reference.relative_path
+                    && installed.tool == requested.tool
+                    && installed.project_path == plan.project_path
+            });
+            let state_name = existing
+                .map(|installed| agent_install_state_name(installed.state))
+                .unwrap_or("missing");
+            if existing.is_some_and(|installed| installed.state != InstallState::Current) {
+                plan.blockers.push(format!(
+                    "Agent is not safe to apply in state {state_name}: {}:{}",
+                    item.reference.source_id, item.reference.relative_path
+                ));
+            }
+            let destinations = package_by_reference(&agent_sources, &item.reference)
+                .and_then(|package| package.agent.as_ref())
+                .map(|agent| {
+                    install_target_paths(
+                        agent,
+                        &requested.tool,
+                        &home,
+                        plan.project_path.as_deref().map(Path::new),
+                        existing.map(|installed| Path::new(&installed.dest)),
+                    )
+                    .map(|paths| {
+                        paths
+                            .into_iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .transpose()?
+                .unwrap_or_else(|| vec![item.destination.clone()]);
+            if state_name == "missing" {
+                plan.rollback_scope.extend(destinations.clone());
+            }
+            plan.agents.push(WorkspacePackAgentPlan {
+                reference: item.reference,
+                name: item.name,
+                tool: requested.tool.clone(),
+                destinations,
+                dependency: item.dependency,
+                state: state_name.into(),
+            });
+        }
+        if !has_requested {
+            plan.agents.push(WorkspacePackAgentPlan {
+                reference: requested.reference.clone(),
+                name: requested.reference.relative_path.clone(),
+                tool: requested.tool.clone(),
+                destinations: Vec::new(),
+                dependency: false,
+                state: "blocked".into(),
+            });
+        }
+    }
+
+    for requested in &plan.pack.skills {
+        let mutation = match crate::skills::plan_skill_install(
+            state,
+            &requested.reference.source_id,
+            &requested.reference.relative_path,
+            &requested.runtime,
+            plan.project_path.as_deref(),
+        )
+        .await
+        {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                plan.blockers.push(error.to_string());
+                plan.skills.push(WorkspacePackSkillPlan {
+                    reference: requested.reference.clone(),
+                    name: requested.reference.relative_path.clone(),
+                    runtime: requested.runtime.clone(),
+                    destinations: Vec::new(),
+                    dependency: false,
+                    state: "blocked".into(),
+                    permissions: Vec::new(),
+                });
+                continue;
+            }
+        };
+        plan.warnings.extend(mutation.warnings);
+        plan.blockers.extend(mutation.blockers);
+        for item in mutation.packages {
+            let existing = installed_skills.iter().find(|installed| {
+                installed.source_id == item.source_id
+                    && installed.relative_path == item.relative_path
+                    && installed.runtime == requested.runtime
+                    && installed.project_path == plan.project_path
+            });
+            let state_name = existing
+                .map(|installed| skill_install_state_name(installed.state))
+                .unwrap_or("missing");
+            if existing.is_some_and(|installed| {
+                installed.state != crate::types::SkillInstallState::Current
+            }) {
+                plan.blockers.push(format!(
+                    "Skill is not safe to apply in state {state_name}: {}:{}",
+                    item.source_id, item.relative_path
+                ));
+            }
+            if state_name == "missing" {
+                plan.rollback_scope.push(item.destination.clone());
+            }
+            plan.skills.push(WorkspacePackSkillPlan {
+                reference: SkillReference {
+                    source_id: item.source_id,
+                    relative_path: item.relative_path,
+                },
+                name: item.name,
+                runtime: requested.runtime.clone(),
+                destinations: vec![item.destination],
+                dependency: item.dependency,
+                state: state_name.into(),
+                permissions: item.permissions,
+            });
+        }
+    }
+    if plan.pack.runbook.is_some() {
+        plan.warnings
+            .push("Runbook context is declarative and will not be executed automatically".into());
+    }
+    if !plan.pack.instructions.is_empty() {
+        plan.warnings.push(
+            "Instruction requirements are declarative and will not be applied automatically".into(),
+        );
+    }
+    if !plan.pack.mcp_servers.is_empty() {
+        plan.warnings.push(
+            "MCP requirements are declarative and will not be configured automatically".into(),
+        );
+    }
+    finalize_workspace_pack_plan(&mut plan)?;
+    Ok(plan)
+}
+
 /// Portable manifest of an install set — "set up a new Mac in one click".
 /// JSON so it's diffable + shareable; `tool` uses the camelCase wire value.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Agentfile {
     /// Format version.
     agentfile: u32,
     installs: Vec<LoadoutEntry>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LoadoutEntry {
     slug: String,
     tool: Tool,
@@ -4851,54 +5734,508 @@ pub async fn loadout_export(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
+    name: String,
+    scope: WorkspacePackScope,
+    project_path: Option<String>,
 ) -> Result<u32, AppError> {
-    let ledger = load_ledger(&app, &state).await?;
-    let installs: Vec<LoadoutEntry> = ledger
-        .iter()
-        .map(|r| LoadoutEntry {
-            slug: r.slug.clone(),
-            tool: r.tool.clone(),
-            project_path: r.project_path.clone(),
-        })
-        .collect();
-    let n = installs.len() as u32;
-    let af = Agentfile {
-        agentfile: 1,
-        installs,
+    let project_path = match scope {
+        WorkspacePackScope::User if project_path.is_none() => None,
+        WorkspacePackScope::Project => {
+            let requested = project_path.ok_or_else(|| {
+                invalid_workspace_pack("Project Workspace Pack requires a project")
+            })?;
+            let canonical = std::fs::canonicalize(&requested).map_err(|error| AppError::Io {
+                message: format!("canonicalize Workspace Pack project: {error}"),
+            })?;
+            if !registered_projects(&state.app_data_dir)
+                .await?
+                .contains(&canonical)
+            {
+                return Err(invalid_workspace_pack(
+                    "Workspace Pack project must be registered",
+                ));
+            }
+            Some(canonical.to_string_lossy().into_owned())
+        }
+        WorkspacePackScope::User => {
+            return Err(invalid_workspace_pack(
+                "User Workspace Pack must not include a project",
+            ))
+        }
     };
-    let bytes = serde_json::to_vec_pretty(&af).map_err(|e| AppError::Io {
-        message: format!("serialize Agentfile: {e}"),
-    })?;
+    corpus::ensure_corpus(&app, &state).await?;
+    let installed_agents = mcp_reconcile_agent_installs(&state).await?;
+    let registered = registered_projects(&state.app_data_dir)
+        .await?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let installed_skills = crate::skills::reconcile_skill_installs(&state, &registered).await?;
+    let selected = |candidate: Option<&str>| match scope {
+        WorkspacePackScope::User => candidate.is_none(),
+        WorkspacePackScope::Project => candidate == project_path.as_deref(),
+    };
+    if installed_agents
+        .iter()
+        .any(|item| selected(item.project_path.as_deref()) && item.state != InstallState::Current)
+        || installed_skills.iter().any(|item| {
+            item.tracked
+                && selected(item.project_path.as_deref())
+                && item.state != crate::types::SkillInstallState::Current
+        })
+    {
+        return Err(invalid_workspace_pack(
+            "Workspace Pack export requires current managed Agent and Skill state",
+        ));
+    }
+    let agent_records = load_ledger(&app, &state).await?;
+    let skill_records = crate::skills::install::load_ledger_for_state(&state).await?;
+    if agent_records
+        .iter()
+        .filter(|record| selected(record.project_path.as_deref()))
+        .any(|record| !registry::get(&record.tool).is_some_and(registry::ToolMeta::installable))
+        || skill_records
+            .iter()
+            .filter(|record| selected(record.project_path.as_deref()))
+            .any(|record| {
+                !registry::get(&record.runtime).is_some_and(registry::ToolMeta::installable)
+            })
+    {
+        return Err(invalid_workspace_pack(
+            "Workspace Pack export contains an unsupported target",
+        ));
+    }
+    let pack = workspace_pack_from_ledgers(
+        name,
+        scope,
+        project_path.as_deref(),
+        &agent_records,
+        &skill_records,
+    )?;
+    let n = (pack.agents.len() + pack.skills.len()) as u32;
+    let bytes = serialize_workspace_pack(&pack)?;
     atomic_write(Path::new(&path), &bytes).await?;
     Ok(n)
 }
 
-/// Import an Agentfile from `path`, installing every entry. Returns the records
-/// that installed successfully (entries that fail — e.g. a project tool whose
-/// path no longer exists — are skipped, not fatal).
+/// Inspect a Workspace Pack or legacy Agentfile without mutating destinations.
 #[tauri::command]
 pub async fn loadout_import(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
-) -> Result<Vec<InstallRecord>, AppError> {
+    project_path: Option<String>,
+) -> Result<WorkspacePackPlan, AppError> {
     let bytes = read_capped(Path::new(&path), MAX_INSTALLED_BYTES).await?;
-    let af: Agentfile = serde_json::from_slice(&bytes).map_err(|e| AppError::Io {
-        message: format!("parse Agentfile: {e}"),
-    })?;
-    let mut out = Vec::with_capacity(af.installs.len());
     corpus::ensure_corpus(&app, &state).await?;
-    let sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
-    for e in af.installs {
-        if let Ok(reference) = resolve_reference_request(&sources, None, None, Some(&e.slug)) {
-            if let Ok(record) =
-                do_install(&app, &state, reference, e.tool, e.project_path, false).await
-            {
-                out.push(record);
+    let pack = match parse_workspace_pack_input(&bytes)? {
+        WorkspacePackInput::Pack(pack) => pack,
+        WorkspacePackInput::Legacy(legacy) => convert_legacy_agentfile(
+            legacy,
+            &crate::agents::inspect_agent_sources(&state.app_data_dir).await?,
+        )?,
+    };
+    build_workspace_pack_plan(&state, pack, project_path).await
+}
+
+async fn read_workspace_pack_file(
+    app: &AppHandle,
+    state: &AppState,
+    path: &Path,
+) -> Result<WorkspacePack, AppError> {
+    let bytes = read_capped(path, MAX_INSTALLED_BYTES).await?;
+    corpus::ensure_corpus(app, state).await?;
+    match parse_workspace_pack_input(&bytes)? {
+        WorkspacePackInput::Pack(pack) => Ok(pack),
+        WorkspacePackInput::Legacy(legacy) => convert_legacy_agentfile(
+            legacy,
+            &crate::agents::inspect_agent_sources(&state.app_data_dir).await?,
+        ),
+    }
+}
+
+fn expected_workspace_pack_creations(plan: &WorkspacePackPlan) -> Vec<WorkspacePackCreated> {
+    let mut created = plan
+        .agents
+        .iter()
+        .filter(|item| item.state == "missing")
+        .map(|item| WorkspacePackCreated::Agent {
+            reference: item.reference.clone(),
+            tool: item.tool.clone(),
+            project_path: plan.project_path.clone(),
+        })
+        .chain(
+            plan.skills
+                .iter()
+                .filter(|item| item.state == "missing")
+                .map(|item| WorkspacePackCreated::Skill {
+                    reference: item.reference.clone(),
+                    runtime: item.runtime.clone(),
+                    project_path: plan.project_path.clone(),
+                }),
+        )
+        .collect::<Vec<_>>();
+    created.dedup();
+    created
+}
+
+async fn rollback_workspace_pack_created(
+    app: &AppHandle,
+    state: &AppState,
+    created: &[WorkspacePackCreated],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for item in created.iter().rev() {
+        let result = match item {
+            WorkspacePackCreated::Agent {
+                reference,
+                tool,
+                project_path,
+            } => {
+                do_uninstall(
+                    app,
+                    state,
+                    reference.clone(),
+                    tool.clone(),
+                    project_path.clone(),
+                )
+                .await
+            }
+            WorkspacePackCreated::Skill {
+                reference,
+                runtime,
+                project_path,
+            } => crate::skills::uninstall_skill(
+                state,
+                &reference.source_id,
+                &reference.relative_path,
+                runtime,
+                project_path.as_deref(),
+            )
+            .await
+            .map(|_| ()),
+        };
+        if let Err(error) = result {
+            errors.push(error.to_string());
+        }
+    }
+    errors
+}
+
+pub(crate) async fn recover_workspace_pack_operations(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<(), AppError> {
+    let Some(database) = state.completed_state_database().await? else {
+        return Ok(());
+    };
+    for operation in database
+        .pending_filesystem_operations()
+        .await?
+        .into_iter()
+        .filter(|operation| operation.kind == "workspace_pack_apply")
+    {
+        let recovery = async {
+            let payload: WorkspacePackApplyOperation =
+                serde_json::from_value(operation.payload.clone()).map_err(|error| {
+                    AppError::StorageCorrupt {
+                        message: format!("parse Workspace Pack recovery operation: {error}"),
+                    }
+                })?;
+            let agent_records = load_ledger_for_state(state).await?;
+            let skill_records = crate::skills::install::load_ledger_for_state(state).await?;
+            let present = payload
+                .expected_created
+                .into_iter()
+                .filter(|item| match item {
+                    WorkspacePackCreated::Agent {
+                        reference,
+                        tool,
+                        project_path,
+                    } => agent_records.iter().any(|record| {
+                        record.source_id == reference.source_id
+                            && record.relative_path == reference.relative_path
+                            && record.tool == *tool
+                            && record.project_path == *project_path
+                    }),
+                    WorkspacePackCreated::Skill {
+                        reference,
+                        runtime,
+                        project_path,
+                    } => skill_records.iter().any(|record| {
+                        record.source_id == reference.source_id
+                            && record.relative_path == reference.relative_path
+                            && record.runtime == *runtime
+                            && record.project_path == *project_path
+                    }),
+                })
+                .collect::<Vec<_>>();
+            let errors = rollback_workspace_pack_created(app, state, &present).await;
+            if errors.is_empty() {
+                database.abort_filesystem_operation(&operation.id).await
+            } else {
+                Err(AppError::StorageCorrupt {
+                    message: format!(
+                        "Workspace Pack recovery rollback failed: {}",
+                        errors.join("; ")
+                    ),
+                })
+            }
+        }
+        .await;
+        if let Err(error) = recovery {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn update_workspace_pack_item_outcome(
+    items: &mut [WorkspacePackApplyItem],
+    created: &WorkspacePackCreated,
+    outcome: &str,
+) {
+    for item in items {
+        let matches = match created {
+            WorkspacePackCreated::Agent {
+                reference, tool, ..
+            } => {
+                item.kind == "agent"
+                    && item.source_id == reference.source_id
+                    && item.relative_path == reference.relative_path
+                    && item.target == *tool
+            }
+            WorkspacePackCreated::Skill {
+                reference, runtime, ..
+            } => {
+                item.kind == "skill"
+                    && item.source_id == reference.source_id
+                    && item.relative_path == reference.relative_path
+                    && item.target == *runtime
+            }
+        };
+        if matches {
+            item.outcome = outcome.into();
+        }
+    }
+}
+
+/// Apply only an unchanged, unblocked Workspace Pack plan.
+#[tauri::command]
+pub async fn loadout_apply(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    project_path: Option<String>,
+    revision: String,
+) -> Result<WorkspacePackApplyResponse, AppError> {
+    let pack = read_workspace_pack_file(&app, &state, Path::new(&path)).await?;
+    let plan = build_workspace_pack_plan(&state, pack, project_path).await?;
+    if require_workspace_pack_revision(&plan, &revision).is_err() || !plan.blockers.is_empty() {
+        return Ok(WorkspacePackApplyResponse { plan, result: None });
+    }
+
+    let expected_created = expected_workspace_pack_creations(&plan);
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "workspace_pack_apply",
+                    &WorkspacePackApplyOperation {
+                        revision: plan.revision.clone(),
+                        expected_created,
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+    let mut items = initial_workspace_pack_results(&plan);
+    let mut created = Vec::<WorkspacePackCreated>::new();
+    let mut failure = None;
+
+    for requested in &plan.pack.agents {
+        let root_missing = plan.agents.iter().any(|item| {
+            !item.dependency
+                && item.reference == requested.reference
+                && item.tool == requested.tool
+                && item.state == "missing"
+        });
+        if !root_missing {
+            continue;
+        }
+        let mut mutation = build_mutation_plan(
+            &state,
+            vec![requested.reference.clone()],
+            requested.tool.clone(),
+            plan.project_path.clone(),
+            "install",
+            true,
+        )
+        .await?;
+        mutation.agents.retain(|candidate| {
+            plan.agents.iter().any(|item| {
+                item.reference == candidate.reference
+                    && item.tool == requested.tool
+                    && item.state == "missing"
+            }) && !created.iter().any(|created| {
+                matches!(created, WorkspacePackCreated::Agent { reference, tool, .. }
+                    if reference == &candidate.reference && tool == &requested.tool)
+            })
+        });
+        if mutation.agents.is_empty() {
+            continue;
+        }
+        match execute_install_plan(&app, &state, &mutation, true).await {
+            Ok(records) => {
+                for record in records {
+                    let created_item = WorkspacePackCreated::Agent {
+                        reference: AgentReference {
+                            source_id: record.source_id,
+                            relative_path: record.relative_path,
+                        },
+                        tool: record.tool,
+                        project_path: record.project_path,
+                    };
+                    update_workspace_pack_item_outcome(&mut items, &created_item, "installed");
+                    created.push(created_item);
+                }
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
             }
         }
     }
-    Ok(out)
+
+    if failure.is_none() {
+        for requested in &plan.pack.skills {
+            let root_missing = plan.skills.iter().any(|item| {
+                !item.dependency
+                    && item.reference == requested.reference
+                    && item.runtime == requested.runtime
+                    && item.state == "missing"
+            });
+            let already_created = created.iter().any(|created| {
+                matches!(created, WorkspacePackCreated::Skill { reference, runtime, .. }
+                    if reference == &requested.reference && runtime == &requested.runtime)
+            });
+            if !root_missing || already_created {
+                continue;
+            }
+            match crate::skills::install_skill_with_dependencies(
+                &state,
+                &requested.reference.source_id,
+                &requested.reference.relative_path,
+                &requested.runtime,
+                plan.project_path.as_deref(),
+            )
+            .await
+            {
+                Ok(installed) => {
+                    for record in installed {
+                        let created_item = WorkspacePackCreated::Skill {
+                            reference: SkillReference {
+                                source_id: record.source_id,
+                                relative_path: record.relative_path,
+                            },
+                            runtime: record.runtime,
+                            project_path: record.project_path,
+                        };
+                        update_workspace_pack_item_outcome(&mut items, &created_item, "installed");
+                        if !created.contains(&created_item) {
+                            created.push(created_item);
+                        }
+                    }
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+
+    if failure.is_none() {
+        if let Err(error) = mcp_reconcile_agent_installs(&state).await {
+            failure = Some(error);
+        } else {
+            let projects = registered_projects(&state.app_data_dir)
+                .await?
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if let Err(error) = crate::skills::reconcile_skill_installs(&state, &projects).await {
+                failure = Some(error);
+            }
+        }
+    }
+
+    if let Some(error) = failure {
+        let rollback_errors = rollback_workspace_pack_created(&app, &state, &created).await;
+        let rollback_outcome = if rollback_errors.is_empty() {
+            "rolledBack"
+        } else {
+            "rollbackFailed"
+        };
+        for created_item in &created {
+            update_workspace_pack_item_outcome(&mut items, created_item, rollback_outcome);
+        }
+        if let Some(item) = items.iter_mut().find(|item| item.outcome == "pending") {
+            item.outcome = "failed".into();
+            item.message = Some(error.to_string());
+        }
+        for item in items.iter_mut().filter(|item| item.outcome == "pending") {
+            item.outcome = "skipped".into();
+        }
+        if let (Some(database), Some(operation)) = (&database, &operation) {
+            if rollback_errors.is_empty() {
+                database.abort_filesystem_operation(&operation.id).await?;
+            } else {
+                database
+                    .retain_filesystem_operation_error(
+                        &operation.id,
+                        &format!("{error}; rollback: {}", rollback_errors.join("; ")),
+                    )
+                    .await?;
+            }
+        }
+        let projects = registered_projects(&state.app_data_dir)
+            .await?
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let _ = mcp_reconcile_agent_installs(&state).await;
+        let _ = crate::skills::reconcile_skill_installs(&state, &projects).await;
+        return Ok(WorkspacePackApplyResponse {
+            result: Some(WorkspacePackApplyResult {
+                revision: plan.revision.clone(),
+                outcome: rollback_outcome.into(),
+                items,
+                rolled_back: rollback_errors.is_empty(),
+                rollback_errors,
+            }),
+            plan,
+        });
+    }
+
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
+    }
+    Ok(WorkspacePackApplyResponse {
+        result: Some(WorkspacePackApplyResult {
+            revision: plan.revision.clone(),
+            outcome: "succeeded".into(),
+            items,
+            rolled_back: false,
+            rollback_errors: Vec::new(),
+        }),
+        plan,
+    })
 }
 
 #[cfg(test)]
@@ -5219,6 +6556,329 @@ mod tests {
         let back: Agentfile = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.installs.len(), 2);
         assert_eq!(back.installs[1].tool, "cursor");
+    }
+
+    fn workspace_pack_fixture() -> WorkspacePack {
+        WorkspacePack {
+            workspace_pack: 1,
+            name: "Review workspace".into(),
+            scope: WorkspacePackScope::Project,
+            agents: vec![
+                WorkspacePackAgent {
+                    reference: AgentReference {
+                        source_id: "source-b".into(),
+                        relative_path: "nested/writer.md".into(),
+                    },
+                    tool: "claudeCode".into(),
+                },
+                WorkspacePackAgent {
+                    reference: AgentReference {
+                        source_id: "source-a".into(),
+                        relative_path: "reviewer.md".into(),
+                    },
+                    tool: "codex".into(),
+                },
+            ],
+            skills: vec![WorkspacePackSkill {
+                reference: crate::types::SkillReference {
+                    source_id: "skills".into(),
+                    relative_path: "audit".into(),
+                },
+                runtime: "codex".into(),
+            }],
+            runbook: Some("startup-mvp".into()),
+            instructions: vec!["AGENTS.md conventions".into()],
+            mcp_servers: vec!["memory".into()],
+        }
+    }
+
+    #[test]
+    fn workspace_pack_v1_is_deterministic_bounded_and_path_private() {
+        let mut pack = workspace_pack_fixture();
+        pack.agents.reverse();
+        pack.agents.push(pack.agents[0].clone());
+        let normalized = normalize_workspace_pack(pack).unwrap();
+        let bytes = serialize_workspace_pack(&normalized).unwrap();
+        assert_eq!(bytes, serialize_workspace_pack(&normalized).unwrap());
+        assert_eq!(normalized.agents.len(), 2);
+        assert_eq!(normalized.agents[0].reference.source_id, "source-a");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"workspacePack\": 1"));
+        assert!(!text.contains("/Users/") && !text.contains("projectPath"));
+
+        let mut oversize = workspace_pack_fixture();
+        oversize.name = "x".repeat(161);
+        assert!(normalize_workspace_pack(oversize).is_err());
+        let mut too_many = workspace_pack_fixture();
+        too_many.instructions = (0..257)
+            .map(|index| format!("requirement-{index}"))
+            .collect();
+        assert!(normalize_workspace_pack(too_many).is_err());
+        let mut credential = workspace_pack_fixture();
+        credential.mcp_servers = vec!["token=secret123".into()];
+        assert!(normalize_workspace_pack(credential).is_err());
+    }
+
+    #[test]
+    fn workspace_pack_reader_rejects_versions_and_preserves_legacy_for_planning() {
+        let pack = serialize_workspace_pack(&workspace_pack_fixture()).unwrap();
+        assert!(matches!(
+            parse_workspace_pack_input(&pack).unwrap(),
+            WorkspacePackInput::Pack(_)
+        ));
+        let legacy = br#"{"agentfile":1,"installs":[{"slug":"reviewer","tool":"claudeCode","projectPath":null}]}"#;
+        let WorkspacePackInput::Legacy(legacy) = parse_workspace_pack_input(legacy).unwrap() else {
+            panic!("legacy Agentfile must enter review conversion")
+        };
+        assert_eq!(legacy.installs.len(), 1);
+        assert!(parse_workspace_pack_input(
+            br#"{"workspacePack":2,"name":"future","scope":"user","agents":[],"skills":[]}"#
+        )
+        .is_err());
+        assert!(parse_workspace_pack_input(br#"{"agentfile":2,"installs":[]}"#).is_err());
+        assert!(parse_workspace_pack_input(br#"{"workspacePack":1,"name":"hidden path","scope":"user","agents":[{"reference":{"sourceId":"source-a","relativePath":"reviewer.md","projectPath":"/Users/private"},"tool":"codex"}],"skills":[]}"#).is_err());
+    }
+
+    #[test]
+    fn workspace_pack_export_selects_one_scope_and_strips_project_paths() {
+        let project = "/Users/private/workspace";
+        let agents = vec![
+            row("global", "codex", None),
+            row("project", "claudeCode", Some(project)),
+        ];
+        let skills = vec![crate::types::SkillInstallRecord {
+            source_id: "skills".into(),
+            relative_path: "audit".into(),
+            name: "audit".into(),
+            runtime: "codex".into(),
+            scope: "project".into(),
+            project_path: Some(project.into()),
+            dest: format!("{project}/.agents/skills/audit"),
+            source_hash: "a".repeat(64),
+            installed_hash: "b".repeat(64),
+            installed_at: "now".into(),
+            disabled_path: None,
+        }];
+        let pack = workspace_pack_from_ledgers(
+            "Project".into(),
+            WorkspacePackScope::Project,
+            Some(project),
+            &agents,
+            &skills,
+        )
+        .unwrap();
+        let text = String::from_utf8(serialize_workspace_pack(&pack).unwrap()).unwrap();
+        assert_eq!(pack.agents.len(), 1);
+        assert_eq!(pack.skills.len(), 1);
+        assert!(text.contains("project.md") && text.contains("\"audit\""));
+        assert!(!text.contains(project) && !text.contains("global.md"));
+    }
+
+    #[test]
+    fn legacy_agentfile_conversion_requires_unambiguous_valid_entries() {
+        let sources = vec![built_in_result(&[("reviewer", "review/reviewer.md")])];
+        let WorkspacePackInput::Legacy(legacy) = parse_workspace_pack_input(
+            br#"{"agentfile":1,"installs":[{"slug":"reviewer","tool":"codex","projectPath":null}]}"#,
+        )
+        .unwrap()
+        else {
+            panic!("expected legacy input")
+        };
+        let pack = convert_legacy_agentfile(legacy, &sources).unwrap();
+        assert_eq!(pack.agents[0].reference.relative_path, "review/reviewer.md");
+        assert_eq!(pack.scope, WorkspacePackScope::User);
+
+        let ambiguous = vec![built_in_result(&[
+            ("reviewer", "one/reviewer.md"),
+            ("reviewer", "two/reviewer.md"),
+        ])];
+        let legacy = Agentfile {
+            agentfile: 1,
+            installs: vec![LoadoutEntry {
+                slug: "reviewer".into(),
+                tool: "codex".into(),
+                project_path: None,
+            }],
+        };
+        assert!(convert_legacy_agentfile(legacy, &ambiguous).is_err());
+    }
+
+    #[test]
+    fn workspace_pack_plan_revision_covers_complete_sorted_review() {
+        let mut plan = WorkspacePackPlan {
+            pack: workspace_pack_fixture(),
+            project_path: Some("/bound/project".into()),
+            agents: vec![WorkspacePackAgentPlan {
+                reference: AgentReference {
+                    source_id: "source-a".into(),
+                    relative_path: "reviewer.md".into(),
+                },
+                name: "Reviewer".into(),
+                tool: "codex".into(),
+                destinations: vec!["/bound/project/.codex/agents/reviewer.md".into()],
+                dependency: false,
+                state: "missing".into(),
+            }],
+            skills: vec![WorkspacePackSkillPlan {
+                reference: SkillReference {
+                    source_id: "skills".into(),
+                    relative_path: "audit".into(),
+                },
+                name: "Audit".into(),
+                runtime: "codex".into(),
+                destinations: vec!["/bound/project/.agents/skills/audit".into()],
+                dependency: false,
+                state: "current".into(),
+                permissions: vec!["Read".into()],
+            }],
+            warnings: vec!["z".into(), "a".into(), "a".into()],
+            blockers: Vec::new(),
+            rollback_scope: vec!["/bound/project/.codex/agents/reviewer.md".into()],
+            revision: String::new(),
+        };
+        finalize_workspace_pack_plan(&mut plan).unwrap();
+        let revision = plan.revision.clone();
+        assert_eq!(plan.warnings, vec!["a", "z"]);
+        finalize_workspace_pack_plan(&mut plan).unwrap();
+        assert_eq!(plan.revision, revision);
+        plan.blockers.push("changed truth".into());
+        finalize_workspace_pack_plan(&mut plan).unwrap();
+        assert_ne!(plan.revision, revision);
+    }
+
+    #[test]
+    fn workspace_pack_apply_requires_exact_revision_and_retains_noops() {
+        let mut plan = WorkspacePackPlan {
+            pack: workspace_pack_fixture(),
+            project_path: Some("/bound/project".into()),
+            agents: vec![WorkspacePackAgentPlan {
+                reference: AgentReference {
+                    source_id: "source-a".into(),
+                    relative_path: "reviewer.md".into(),
+                },
+                name: "Reviewer".into(),
+                tool: "codex".into(),
+                destinations: vec!["/bound/project/reviewer.md".into()],
+                dependency: false,
+                state: "current".into(),
+            }],
+            skills: Vec::new(),
+            warnings: Vec::new(),
+            blockers: Vec::new(),
+            rollback_scope: Vec::new(),
+            revision: String::new(),
+        };
+        finalize_workspace_pack_plan(&mut plan).unwrap();
+        assert!(require_workspace_pack_revision(&plan, &plan.revision).is_ok());
+        assert!(require_workspace_pack_revision(&plan, "stale").is_err());
+        let items = initial_workspace_pack_results(&plan);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].outcome, "current");
+        assert_eq!(items[0].destination, "/bound/project/reviewer.md");
+    }
+
+    #[tokio::test]
+    async fn workspace_pack_parent_operation_is_durable_and_idempotently_abortable() {
+        let app = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        let operation = database
+            .prepare_filesystem_operation(
+                "workspace_pack_apply",
+                &WorkspacePackApplyOperation {
+                    revision: "a".repeat(64),
+                    expected_created: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .pending_filesystem_operations()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        database
+            .abort_filesystem_operation(&operation.id)
+            .await
+            .unwrap();
+        database
+            .abort_filesystem_operation(&operation.id)
+            .await
+            .unwrap();
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_pack_plan_expands_dependencies_and_writes_nothing() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let tool_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source_root.path().join("base.md"),
+            "---\nname: Base\ndescription: Foundation.\n---\nBase.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_root.path().join("lead.md"),
+            "---\nname: Lead\ndescription: Leads.\nrequired-agents: [base.md]\n---\nLead.\n",
+        )
+        .unwrap();
+        let source = crate::agents::add_local_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "claudeCode".into(),
+            tool_home.path().to_string_lossy().into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let pack = WorkspacePack {
+            workspace_pack: 1,
+            name: "Local review".into(),
+            scope: WorkspacePackScope::User,
+            agents: vec![WorkspacePackAgent {
+                reference: AgentReference {
+                    source_id: source.id,
+                    relative_path: "lead.md".into(),
+                },
+                tool: "claudeCode".into(),
+            }],
+            skills: Vec::new(),
+            runbook: Some("review-flow".into()),
+            instructions: vec!["Follow AGENTS.md".into()],
+            mcp_servers: vec!["memory".into()],
+        };
+
+        let plan = build_workspace_pack_plan(&state, pack, None).await.unwrap();
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(plan.agents.len(), 2);
+        assert!(plan.agents.iter().any(|item| item.dependency));
+        assert!(plan.agents.iter().all(|item| item.state == "missing"));
+        assert_eq!(plan.rollback_scope.len(), 2);
+        assert_eq!(plan.revision.len(), 64);
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Instruction")));
+        assert!(plan.warnings.iter().any(|warning| warning.contains("MCP")));
+        assert!(plan
+            .agents
+            .iter()
+            .flat_map(|item| &item.destinations)
+            .all(|destination| !Path::new(destination).exists()));
+        assert!(!ledger_path_for(app_data.path()).exists());
+        assert!(!crate::skills::install::ledger_path(app_data.path()).exists());
     }
 
     /// A minimal ledger row for the prune test.

@@ -84,3 +84,10 @@ including every attempted item, exact changed or known planned destination, term
 privacy-safe failure detail, and exact Activity navigation from existing completion surfaces.
 OpenSpec, frontend, backend, Rust quality, Svelte, build, safety, and diff gates passed. See
 [260814_phase12-post-action-receipts.md](./260814_phase12-post-action-receipts.md).
+
+### 2026-08-14: Phase 13 Portable Workspace Packs
+
+Added deterministic path-private Workspace Pack export, strict legacy conversion, complete read-only
+Agent/Skill planning, revision-bound recoverable apply, Teams review, and mixed Activity receipts.
+OpenSpec, frontend, backend, Rust quality, Svelte, build, safety, and diff gates passed. See
+[260814_phase13-portable-workspace-packs.md](./260814_phase13-portable-workspace-packs.md).
