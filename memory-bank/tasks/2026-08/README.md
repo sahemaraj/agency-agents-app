@@ -1,11 +1,5 @@
 # Tasks — 2026-08
 
-## In Progress
-
-### 2026-08-14: Phase 15 MCP Inventory Manager
-
-[IN-PROGRESS] Extending the existing MCP settings workflow with bounded, privacy-safe Claude Code/Codex inventory, passive validation, honest tool evidence, and one trusted Agency Agents template. Focused backend and frontend TDD checks pass; full QA and integration remain.
-
 ## Completed
 
 ### 2026-08-03: Expert MCP Lifecycle — Release 1
@@ -105,3 +99,7 @@ files, complete deterministic diff plans, revision-bound atomic apply, verified 
 recovery, plus the existing Projects review and Activity surfaces. OpenSpec, frontend, backend, Rust
 quality, Svelte, build, safety, and diff gates passed. See
 [260814_phase14-project-instruction-manager.md](./260814_phase14-project-instruction-manager.md).
+
+### 2026-08-14: Phase 15 MCP Inventory Manager
+
+Added bounded privacy-safe Claude Code/Codex MCP inventory, passive validation, exact Agency Agents tool evidence, one trusted template, isolated failures, and read-only foreign-server evidence in the existing Settings workflow. OpenSpec, frontend, backend, Rust quality, Svelte, build, safety, and diff gates passed. See [260814_phase15-mcp-inventory-manager.md](./260814_phase15-mcp-inventory-manager.md).

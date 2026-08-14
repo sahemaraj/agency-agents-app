@@ -26,4 +26,4 @@
 
 - [x] 5.1 Run focused/full Rust/frontend tests, strict Clippy, formatting, Svelte diagnostics, production build, OpenSpec, and diff gates.
 - [x] 5.2 Audit for no secret retention, arbitrary path, unsafe link, network, external-server execution, generic install/edit/remove/login, dependency, persistence, route, telemetry, notification, or unrelated mutation.
-- [ ] 5.3 Sync/archive OpenSpec, update Phase records and roadmap rank 10, commit/merge locally with protected fingerprints unchanged, and rerun integration gates.
+- [x] 5.3 Sync/archive OpenSpec, update Phase records and roadmap rank 10, commit/merge locally with protected fingerprints unchanged, and rerun integration gates.

@@ -1,8 +1,8 @@
 # Active Context — Agency Agents
 
-## 🚧 v2.0 Phase 15 — MCP Inventory Manager [APPLY] (2026-08-14)
+## ✅ v2.0 Phase 15 — MCP Inventory Manager [COMPLETE] (2026-08-14)
 
-The approved `feat/phase-15-mcp-inventory` branch passed DIFF and QA and is in APPLY under the standing final-goal approval. It extends the existing MCP client command and Settings section with a bounded, privacy-safe Claude Code/Codex inventory, exact Agency Agents router tool evidence, passive validation, isolated source failures, and one trusted auto-configurable template. Foreign servers remain read-only and unknown tools remain explicitly unavailable; Claude inventory reads only no-follow supported config files and Codex uses only literal `mcp list --json` through the existing no-shell bounded runner. Verification passed with 108 frontend tests, 566 executed Rust library tests plus three existing ignores, 2 binary tests, strict Clippy/format/Svelte/build/OpenSpec/diff and safety gates. OpenSpec sync/archive, final documentation, local merge, and post-merge verification remain.
+The approved `feat/phase-15-mcp-inventory` branch now extends the existing MCP client command and Settings section with bounded privacy-safe Claude Code/Codex inventory, exact Agency Agents router tool evidence, passive validation, isolated source failures, and one trusted auto-configurable template. Foreign servers remain read-only and unknown tools remain explicitly unavailable; Claude inventory reads only no-follow supported config files and Codex uses only literal `mcp list --json` through the existing no-shell bounded runner. Verification: OpenSpec 15/15 and strict validation passed, canonical specs validate 9/9, 108 frontend tests and 566 executed Rust library tests passed with 3 existing environment-gated ignores, 2 binary tests passed, and strict Clippy/format/Svelte/build/diff and safety gates passed. Implementation commit: `4d4d89d`. Record: `tasks/2026-08/260814_phase15-mcp-inventory-manager.md`.
 
 ## ✅ v2.0 Phase 14 — Project Instruction Manager [COMPLETE] (2026-08-14)
 
