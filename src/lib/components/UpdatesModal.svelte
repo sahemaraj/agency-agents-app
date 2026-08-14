@@ -9,6 +9,7 @@
   import { projects } from "$lib/stores/projects.svelte";
   import { activity, safeActivityDetail } from "$lib/stores/activity.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
+  import { ui } from "$lib/stores/ui.svelte";
   import { appErrorMessage, isAppError } from "$lib/types";
   import type { AgentMutationPlan, InstalledAgent, InstalledSkill, InstallState, SkillInstallState, SkillMutationPlan } from "$lib/types";
 
@@ -57,6 +58,7 @@
   let applying = $state(false);
   let progress = $state(0);
   let results = $state<RepairResult[]>([]);
+  let receiptId = $state<string | null>(null);
   let reviewPlans = $state<ReviewPlan[]>([]);
   let reviewedSignature = $state("");
   let staleMessage = $state<string | null>(null);
@@ -114,6 +116,13 @@
 
   function errorMessage(error: unknown): string {
     return isAppError(error) ? appErrorMessage(error) : error instanceof Error ? error.message : String(error);
+  }
+
+  function viewReceipt() {
+    if (!receiptId) return;
+    const id = receiptId;
+    onClose();
+    ui.openActivityReceipt(id);
   }
 
   async function buildPlans(items: RepairCandidate[]): Promise<ReviewPlan[]> {
@@ -214,6 +223,7 @@
       applying = true;
       progress = 0;
       results = [];
+      receiptId = null;
       for (const item of freshPlans) {
         let result: RepairResult;
         try {
@@ -249,12 +259,24 @@
       ]);
       const repaired = results.filter((result) => result.ok).length;
       const failed = results.length - repaired;
-      activity.log({
+      receiptId = activity.log({
         action: "bulk",
         subject: "agentLibrary",
         subjectName: i18n.optional("agentUpdates.repairActivity", "Safe repair"),
         outcome: failed === 0 ? "ok" : "error",
         detail: `${repaired} repaired · ${failed} failed`,
+        receipt: {
+          operation: "repair",
+          succeeded: repaired,
+          failed,
+          items: results.map((result) => ({
+            kind: result.candidate.kind,
+            name: result.candidate.row.name,
+            destination: destination(result.candidate),
+            outcome: result.ok ? "ok" : "error",
+            ...(result.error ? { detail: result.error } : {}),
+          })),
+        },
       });
       stage = "results";
     } finally {
@@ -371,6 +393,7 @@
           <span class="details">
             <span class="name">{result.candidate.row.name}</span>
             <span class="meta">{result.ok ? `${i18n.optional("agentUpdates.repaired", "Repaired")} · ${finalState(result.candidate)}` : result.error}</span>
+            <span class="path" title={destination(result.candidate)}>{destination(result.candidate)}</span>
           </span>
         </li>
       {/each}
@@ -382,6 +405,9 @@
       <Button variant="secondary" modalAction="cancel" disabled={planning} onclick={() => (stage = "select")}>{i18n.optional("agentUpdates.back", "Back")}</Button>
     {:else}
       <Button variant="secondary" modalAction="cancel" onclick={onClose}>{i18n.t("common.close")}</Button>
+    {/if}
+    {#if stage === "results" && receiptId}
+      <Button variant="primary" onclick={viewReceipt}>{i18n.t("activity.viewReceipt")}</Button>
     {/if}
     {#if stage !== "results"}
       <Button

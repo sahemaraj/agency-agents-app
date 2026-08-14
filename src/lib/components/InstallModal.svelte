@@ -29,6 +29,7 @@
   import { install, SUPPORTED_TOOLS, type ToolDef } from "$lib/stores/install.svelte";
   import { projects } from "$lib/stores/projects.svelte";
   import { toast } from "$lib/stores/toast.svelte";
+  import { ui } from "$lib/stores/ui.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
   import { canApplyAgentPlan, installStateMessageKey, sameAgent } from "$lib/agents/libraryModel";
@@ -299,12 +300,11 @@
     busy = cellKey(plan.tool, plan.projectPath);
     actionError = null;
     try {
+      let receiptId: string | null = null;
       if (pendingCollection) {
-        await install.applyCollection(
-          pendingCollection, operation, plan.tool, plan.projectPath,
-        );
+        ({ receiptId } = await install.applyCollection(pendingCollection, plan));
       } else if (batchReferences.length) {
-        await install.applyBatch(plan);
+        ({ receiptId } = await install.applyBatch(plan));
       } else if (operation === "install" && reference) {
         await install.installReference(reference, plan.tool, plan.projectPath, true);
       } else if (operation === "update" && reference) {
@@ -314,7 +314,10 @@
       } else {
         throw new Error("Agent mutation plan has no exact target");
       }
-      toast.success(i18n.t("agents.lifecycleApplied", { operation }));
+      const receiptAction = receiptId
+        ? { label: i18n.t("activity.viewReceipt"), onClick: () => ui.openActivityReceipt(receiptId) }
+        : undefined;
+      toast.success(i18n.t("agents.lifecycleApplied", { operation }), undefined, receiptAction);
       pending = null;
       onApplied?.(plan);
     } catch (error) {
@@ -421,13 +424,14 @@
     if (missing.length === 0) return;
     busy = cellKey(tool, target);
     try {
-      const { ok, fail } = await install.bulk(
+      const { ok, fail, receiptId } = await install.bulk(
         "install",
         missing.map((a) => ({ slug: a.slug, tool, projectPath: target })),
       );
+      const receiptAction = { label: i18n.t("activity.viewReceipt"), onClick: () => ui.openActivityReceipt(receiptId) };
       const where = target ? labelOf(target) : i18n.t("common.global");
-      if (fail === 0) toast.success(i18n.t("install.installedToast", { count: ok, tool: install.toolLabel(tool), where }));
-      else toast.error(i18n.t("install.installFailedToast", { tool: install.toolLabel(tool), ok, fail }));
+      if (fail === 0) toast.success(i18n.t("install.installedToast", { count: ok, tool: install.toolLabel(tool), where }), undefined, receiptAction);
+      else toast.error(i18n.t("install.installFailedToast", { tool: install.toolLabel(tool), ok, fail }), undefined, receiptAction);
     } finally {
       busy = null;
     }
@@ -437,12 +441,13 @@
     if (!install.reconciled || install.reconciling || install.reconcileError) return;
     busy = cellKey(tool, target);
     try {
-      const { ok, fail } = await install.bulk(
+      const { ok, fail, receiptId } = await install.bulk(
         "uninstall",
         rs.map((r) => ({ slug: r.slug, tool: r.tool, projectPath: r.projectPath })),
       );
-      if (fail === 0) toast.success(i18n.t("install.removedToast", { count: ok, tool: install.toolLabel(tool) }));
-      else toast.error(i18n.t("install.removeFailedToast", { tool: install.toolLabel(tool), ok, fail }));
+      const receiptAction = { label: i18n.t("activity.viewReceipt"), onClick: () => ui.openActivityReceipt(receiptId) };
+      if (fail === 0) toast.success(i18n.t("install.removedToast", { count: ok, tool: install.toolLabel(tool) }), undefined, receiptAction);
+      else toast.error(i18n.t("install.removeFailedToast", { tool: install.toolLabel(tool), ok, fail }), undefined, receiptAction);
     } finally {
       busy = null;
     }

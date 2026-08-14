@@ -12,6 +12,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { activity, safeActivityDetail } from "$lib/stores/activity.svelte";
+import type { ActivityReceiptItem, ActivityReceiptOperation } from "$lib/stores/activity.svelte";
 import { i18n } from "$lib/stores/i18n.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
 import { wiredTools } from "$lib/data/toolRegistry";
@@ -47,6 +48,35 @@ import type {
   ToolInfo,
   ToolVersion,
 } from "$lib/types";
+
+function planReceiptOperation(operation: string): ActivityReceiptOperation {
+  if (operation === "install" || operation === "update" || operation === "uninstall") return operation;
+  throw new Error(`Unsupported receipt operation: ${operation}`);
+}
+
+function planReceiptItems(plan: AgentMutationPlan, records: InstallRecord[]): ActivityReceiptItem[] {
+  return records.map((record) => {
+    const planned = plan.agents.find((item) =>
+      item.reference.sourceId === record.sourceId && item.reference.relativePath === record.relativePath);
+    return {
+      kind: "agent",
+      name: planned?.name ?? record.relativePath,
+      destination: record.dest,
+      outcome: "ok",
+    };
+  });
+}
+
+function failedPlanReceiptItems(plan: AgentMutationPlan, error: unknown): ActivityReceiptItem[] {
+  const detail = error instanceof Error ? error.message : String(error);
+  return plan.agents.map((item) => ({
+    kind: "agent",
+    name: item.name,
+    destination: item.destination,
+    outcome: "error",
+    detail,
+  }));
+}
 
 /** The tools Phase 2 can install to. Mirrors the Rust `SUPPORTED` set and the
     `supports_user()`/`supports_project()` capabilities in `render/mod.rs`.
@@ -385,7 +415,7 @@ class InstallStore {
     return agentBatchInstallPlan(references, tool, projectPath);
   }
 
-  async applyBatch(plan: AgentMutationPlan): Promise<InstallRecord[]> {
+  async applyBatch(plan: AgentMutationPlan): Promise<{ records: InstallRecord[]; receiptId: string }> {
     this.busy = JSON.stringify(["batch", plan.revision]);
     try {
       const records = await agentBatchApply(
@@ -396,7 +426,7 @@ class InstallStore {
       );
       await this.reconcile();
       void this.loadTools();
-      activity.log({
+      const receiptId = activity.log({
         action: "bulk",
         subject: "agentLibrary",
         subjectName: i18n.t("firstRun.deployTitle"),
@@ -405,8 +435,14 @@ class InstallStore {
         projectPath: plan.projectPath ?? undefined,
         outcome: "ok",
         detail: `${i18n.t("common.install")} · ${records.length}`,
+        receipt: {
+          operation: planReceiptOperation(plan.operation),
+          succeeded: records.length,
+          failed: 0,
+          items: planReceiptItems(plan, records),
+        },
       });
-      return records;
+      return { records, receiptId };
     } catch (error) {
       activity.log({
         action: "bulk",
@@ -417,6 +453,12 @@ class InstallStore {
         projectPath: plan.projectPath ?? undefined,
         outcome: "error",
         detail: safeActivityDetail(error instanceof Error ? error.message : error),
+        receipt: {
+          operation: planReceiptOperation(plan.operation),
+          succeeded: 0,
+          failed: plan.agents.length,
+          items: failedPlanReceiptItems(plan, error),
+        },
       });
       throw error;
     } finally {
@@ -426,36 +468,48 @@ class InstallStore {
 
   async applyCollection(
     name: string,
-    operation: "install" | "update" | "uninstall",
-    tool: Tool,
-    projectPath: string | null,
-  ): Promise<InstallRecord[]> {
-    this.busy = JSON.stringify(["collection", name, operation, tool, projectPath]);
+    plan: AgentMutationPlan,
+  ): Promise<{ records: InstallRecord[]; receiptId: string }> {
+    const operation = planReceiptOperation(plan.operation);
+    if (operation === "track" || operation === "repair") throw new Error(`Unsupported collection operation: ${operation}`);
+    this.busy = JSON.stringify(["collection", name, operation, plan.tool, plan.projectPath]);
     try {
-      const records = await agentCollectionApply(name, operation, tool, projectPath, true);
+      const records = await agentCollectionApply(name, operation, plan.tool, plan.projectPath, true);
       await this.reconcile();
       void this.loadTools();
-      activity.log({
+      const receiptId = activity.log({
         action: "bulk",
         subject: "agentLibrary",
         subjectName: name,
-        tool,
-        scope: this.scopeOf(projectPath),
-        projectPath: projectPath ?? undefined,
+        tool: plan.tool,
+        scope: this.scopeOf(plan.projectPath),
+        projectPath: plan.projectPath ?? undefined,
         outcome: "ok",
         detail: `${i18n.t(`common.${operation}`)} · ${records.length}`,
+        receipt: {
+          operation,
+          succeeded: records.length,
+          failed: 0,
+          items: planReceiptItems(plan, records),
+        },
       });
-      return records;
+      return { records, receiptId };
     } catch (error) {
       activity.log({
         action: "bulk",
         subject: "agentLibrary",
         subjectName: name,
-        tool,
-        scope: this.scopeOf(projectPath),
-        projectPath: projectPath ?? undefined,
+        tool: plan.tool,
+        scope: this.scopeOf(plan.projectPath),
+        projectPath: plan.projectPath ?? undefined,
         outcome: "error",
         detail: safeActivityDetail(error instanceof Error ? error.message : error),
+        receipt: {
+          operation,
+          succeeded: 0,
+          failed: plan.agents.length,
+          items: failedPlanReceiptItems(plan, error),
+        },
       });
       throw error;
     } finally {
@@ -630,7 +684,7 @@ class InstallStore {
   async bulk(
     action: "install" | "update" | "track" | "uninstall",
     targets: { slug: string; tool: Tool; projectPath: string | null }[],
-  ): Promise<{ ok: number; fail: number }> {
+  ): Promise<{ ok: number; fail: number; receiptId: string }> {
     const cmd =
       action === "install"
         ? "install_agent"
@@ -641,14 +695,33 @@ class InstallStore {
             : "update_agent";
     let ok = 0;
     let fail = 0;
-    const failures: { target: (typeof targets)[number]; error: unknown }[] = [];
+    const before = new Map(this.installed.map((row) => [
+      JSON.stringify([row.slug, row.tool, row.projectPath ?? null]),
+      row.dest,
+    ]));
+    const items: import("$lib/stores/activity.svelte").ActivityReceiptItem[] = [];
     for (const t of targets) {
+      const priorDestination = before.get(JSON.stringify([t.slug, t.tool, t.projectPath ?? null])) ?? null;
       try {
-        await invoke(cmd, { slug: t.slug, tool: t.tool, projectPath: t.projectPath });
+        const record = action === "uninstall"
+          ? (await invoke<void>(cmd, { slug: t.slug, tool: t.tool, projectPath: t.projectPath }), null)
+          : await invoke<InstallRecord>(cmd, { slug: t.slug, tool: t.tool, projectPath: t.projectPath });
         ok++;
+        items.push({
+          kind: "agent",
+          name: this.agentName(t.slug) ?? t.slug,
+          destination: record?.dest ?? priorDestination,
+          outcome: "ok",
+        });
       } catch (error) {
         fail++;
-        failures.push({ target: t, error });
+        items.push({
+          kind: "agent",
+          name: this.agentName(t.slug) ?? t.slug,
+          destination: priorDestination,
+          outcome: "error",
+          detail: safeActivityDetail(error instanceof Error ? error.message : error),
+        });
       }
     }
     await this.reconcile();
@@ -665,24 +738,13 @@ class InstallStore {
           : action === "track"
             ? `${i18n.t("activity.action.track")} ${i18n.count(ok, "common.agent.one", "common.agent.many")}`
             : `${i18n.t("activity.action.uninstall")} ${i18n.count(ok, "common.agent.one", "common.agent.many")}`;
-    activity.log({
+    const receiptId = activity.log({
       action: action === "update" ? "sync" : "bulk",
       outcome: fail > 0 ? "error" : "ok",
       detail: fail > 0 ? i18n.t("activity.bulkFailed", { summary, fail }) : summary,
+      receipt: { operation: action, succeeded: ok, failed: fail, items },
     });
-    for (const { target, error } of failures) {
-      activity.log({
-        action: action === "update" ? "sync" : "bulk",
-        subject: "agent",
-        subjectName: target.slug,
-        tool: target.tool,
-        scope: this.scopeOf(target.projectPath),
-        projectPath: target.projectPath ?? undefined,
-        outcome: "error",
-        detail: safeActivityDetail(error instanceof Error ? error.message : error),
-      });
-    }
-    return { ok, fail };
+    return { ok, fail, receiptId };
   }
 
   /**

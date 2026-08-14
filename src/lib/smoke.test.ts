@@ -15,19 +15,27 @@ import dashboardSource from "$lib/components/AgencyDashboard.svelte?raw";
 import toolsViewSource from "$lib/components/ToolsView.svelte?raw";
 import teamsSource from "$lib/components/Teams.svelte?raw";
 import projectsSource from "$lib/components/Projects.svelte?raw";
-import { activity, mergeActivityEntries, safeActivityDetail, selectMcpAuditEntries } from "$lib/stores/activity.svelte";
+import {
+  activity,
+  mergeActivityEntries,
+  normalizeActivityReceipt,
+  normalizePersistedActivityEntries,
+  safeActivityDetail,
+  selectMcpAuditEntries,
+} from "$lib/stores/activity.svelte";
 import type { JournalEntry } from "$lib/stores/activity.svelte";
 import { catalog } from "$lib/stores/catalog.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
 import { experts } from "$lib/stores/experts.svelte";
 import { install } from "$lib/stores/install.svelte";
+import { i18n } from "$lib/stores/i18n.svelte";
 import { projects } from "$lib/stores/projects.svelte";
 import { settings } from "$lib/stores/settings.svelte";
 import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import type { Agent, AgentPackageResult, AgentSource, DoctorReport, ExpertResolved, InstalledAgent, InstalledSkill, McpAuditEntry } from "$lib/types";
+import type { Agent, AgentMutationPlan, AgentPackageResult, AgentSource, DoctorReport, ExpertResolved, InstalledAgent, InstalledSkill, InstallRecord, McpAuditEntry } from "$lib/types";
 
 const skillRecommendation = (sourceId = "skills-b") => ({
   kind: "skill" as const,
@@ -82,6 +90,12 @@ const staleControlTool = {
   tool: "claudeCode" as const, label: "Claude Code", detected: true, scope: "user" as const,
   userDest: "/tmp", installedCount: 1, customPath: null,
 };
+const installRecord = (slug: string, dest: string): InstallRecord => ({
+  slug, sourceId: "built-in", relativePath: `${slug}.md`, tool: "claudeCode", scope: "user",
+  projectPath: null, dest, sourceHash: "source", bodyHash: "body", renderedHash: "rendered",
+  disabledPath: null, sourceSnapshotHash: "snapshot", capabilities: [], publisherKey: null,
+  publisherVerified: false, installedAt: "2026-08-14T01:00:00Z", corpusVersion: "test",
+});
 const staleControlPackage: AgentPackageResult = {
   reference: { sourceId: "built-in", relativePath: "reviewer.md" }, agent: staleControlAgent,
   sourceHash: "source", frontmatterHash: "frontmatter", bodyHash: "body", version: null,
@@ -146,6 +160,7 @@ beforeEach(async () => {
   ui.projectsSelected = null;
   ui.teamsSelected = null;
   ui.toolsSelected = null;
+  ui.activityReceiptId = null;
   ui.agentsReference = null;
   ui.skillsSelected = null;
   ui.paletteOpen = false;
@@ -465,6 +480,221 @@ describe("frontend test harness", () => {
     expect(detail).toHaveLength(512);
     expect(detail).not.toContain("secret123");
     expect(detail).toContain("token=[redacted]");
+  });
+
+  it("normalizes exact Activity receipts and preserves additive v2 entries", () => {
+    const legacy: JournalEntry = {
+      id: "legacy", ts: "2026-08-14T01:00:00Z", action: "bulk", outcome: "ok", detail: "Installed 1 agent",
+    };
+    const normalized = normalizeActivityReceipt({
+      operation: "update",
+      succeeded: 99,
+      failed: 99,
+      items: [
+        { kind: "agent", name: "Reviewer", destination: `/tmp/\0reviewer-${"x".repeat(5000)}`, outcome: "ok" },
+        { kind: "skill", name: "Audit", destination: "/tmp/audit", outcome: "error", detail: "token=secret123\nfailed" },
+      ],
+    });
+    expect(normalized).toMatchObject({ operation: "update", succeeded: 1, failed: 1 });
+    expect(normalized?.items).toHaveLength(2);
+    expect(normalized?.items[0]?.destination).not.toContain("\0");
+    expect(normalized?.items[0]?.destination?.length).toBeLessThanOrEqual(4096);
+    expect(normalized?.items[1]?.detail).toContain("token=[redacted]");
+    expect(normalized?.items[1]?.detail).not.toContain("secret123");
+    expect(normalized?.items[1]?.detail).not.toContain("\n");
+
+    const restored = normalizePersistedActivityEntries([
+      legacy,
+      { ...legacy, id: "receipt", receipt: normalized },
+      { ...legacy, id: "invalid", receipt: { operation: "execute", items: [] } },
+    ]);
+    expect(restored[0]).toEqual(legacy);
+    expect(restored[1]?.receipt).toEqual(normalized);
+    expect(restored[2]?.receipt).toBeUndefined();
+  });
+
+  it("returns the generated id for one normalized Activity receipt", () => {
+    const id = activity.log({
+      action: "bulk",
+      outcome: "error",
+      detail: "1 repaired · 1 failed",
+      receipt: {
+        operation: "repair",
+        succeeded: 0,
+        failed: 0,
+        items: [
+          { kind: "agent", name: "Reviewer", destination: "/tmp/reviewer.md", outcome: "ok" },
+          { kind: "skill", name: "Audit", destination: "/tmp/audit", outcome: "error", detail: "failed" },
+        ],
+      },
+    });
+    expect(id).toEqual(expect.any(String));
+    expect(activity.entries.find((entry) => entry.id === id)?.receipt).toMatchObject({
+      operation: "repair", succeeded: 1, failed: 1,
+    });
+  });
+
+  it("keeps a completed receipt in memory when journal persistence fails", () => {
+    vi.useFakeTimers();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    try {
+      const id = activity.log({
+        action: "bulk",
+        outcome: "ok",
+        receipt: {
+          operation: "repair",
+          succeeded: 1,
+          failed: 0,
+          items: [{ kind: "agent", name: "Reviewer", destination: "/tmp/reviewer.md", outcome: "ok" }],
+        },
+      });
+      vi.advanceTimersByTime(400);
+      expect(activity.entries.find((entry) => entry.id === id)?.receipt?.items).toHaveLength(1);
+      expect(setItem).toHaveBeenCalledOnce();
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("persistNow failed"));
+    } finally {
+      setItem.mockRestore();
+      warning.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens, discloses, and focuses the exact Activity receipt with locale fallback", async () => {
+    const id = activity.log({
+      action: "bulk",
+      outcome: "error",
+      detail: "1 updated · 1 failed",
+      receipt: {
+        operation: "update",
+        succeeded: 1,
+        failed: 1,
+        items: [
+          { kind: "agent", name: "Reviewer", destination: "/tmp/reviewer.md", outcome: "ok" },
+          { kind: "skill", name: "Audit", destination: "/tmp/audit", outcome: "error", detail: "permission denied" },
+        ],
+      },
+    });
+    await i18n.setLocale("fr");
+    ui.openActivityReceipt(id);
+    expect(ui.section).toBe("activity");
+    expect(ui.activityReceiptId).toBe(id);
+
+    const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(ActivityHistory, { target });
+    try {
+      const details = await vi.waitFor(() => {
+        const value = target.querySelector<HTMLDetailsElement>(`details[data-activity-id="${id}"]`);
+        expect(value).not.toBeNull();
+        expect(value?.open).toBe(true);
+        return value!;
+      });
+      const summary = details.querySelector<HTMLElement>("summary")!;
+      expect(document.activeElement).toBe(summary);
+      expect(summary.textContent).toContain("Receipt details");
+      expect(details.textContent).toContain("Reviewer");
+      expect(details.textContent).toContain("/tmp/reviewer.md");
+      expect(details.textContent).toContain(i18n.t("common.succeeded"));
+      expect(details.textContent).toContain(i18n.t("common.failed"));
+      expect(details.textContent).toContain("permission denied");
+    } finally {
+      unmount(component);
+      target.remove();
+      await i18n.setLocale("en");
+    }
+  });
+
+  it("opens Activity and announces an expired receipt without focusing another row", async () => {
+    ui.openActivityReceipt("receipt-no-longer-retained");
+    const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(ActivityHistory, { target });
+    try {
+      await vi.waitFor(() => {
+        expect(target.querySelector('[role="status"]')?.textContent).toContain("Receipt is no longer available");
+      });
+      expect(ui.section).toBe("activity");
+      expect(ui.activityReceiptId).toBeNull();
+      expect(target.querySelector("details[open]")).toBeNull();
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it.each(["install", "update", "track", "uninstall"] as const)(
+    "records one exact %s bulk receipt and continues after failure",
+    async (action) => {
+      install.installed = action === "install" ? [] : [
+        { ...staleControlRow, slug: "good", name: "Good", dest: "/before/good.md", state: "outdated", tracked: true },
+        { ...staleControlRow, slug: "broken", name: "Broken", dest: "/before/broken.md", state: "outdated", tracked: true },
+      ];
+      vi.mocked(invoke).mockImplementation(async (command: string, args?: unknown) => {
+        if (command === "installs_reconcile" || command === "tools_list") return [] as never;
+        const slug = (args as { slug?: string } | undefined)?.slug;
+        if (slug === "broken") throw new Error("token=secret123 failed");
+        if (command === "uninstall_agent") return undefined as never;
+        return installRecord(slug ?? "unknown", `/after/${slug}.md`) as never;
+      });
+      const priorIds = new Set(activity.entries.map((entry) => entry.id));
+
+      const result = await install.bulk(action, [
+        { slug: "good", tool: "claudeCode", projectPath: null },
+        { slug: "broken", tool: "claudeCode", projectPath: null },
+      ]);
+      expect(result).toMatchObject({ ok: 1, fail: 1, receiptId: expect.any(String) });
+      const receipt = activity.entries.find((entry) => entry.id === result.receiptId)?.receipt;
+      expect(receipt).toMatchObject({ operation: action, succeeded: 1, failed: 1 });
+      expect(receipt?.items).toHaveLength(2);
+      expect(receipt?.items[0]).toMatchObject({ name: "good", outcome: "ok" });
+      expect(receipt?.items[0]?.destination).toBe(action === "uninstall" ? "/before/good.md" : "/after/good.md");
+      expect(receipt?.items[1]).toMatchObject({ name: "broken", outcome: "error" });
+      expect(receipt?.items[1]?.destination).toBe(action === "install" ? null : "/before/broken.md");
+      expect(receipt?.items[1]?.detail).toContain("token=[redacted]");
+      expect(receipt?.items[1]?.detail).not.toContain("secret123");
+      expect(activity.entries.filter((entry) => !priorIds.has(entry.id))).toHaveLength(1);
+    },
+  );
+
+  it.each(["batch", "collection"] as const)(
+    "records exact destinations for reviewed Agent %s application",
+    async (kind) => {
+      const plan: AgentMutationPlan = {
+        revision: "revision-1", operation: "install", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [
+          { reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "one", dependency: false, destination: "/plan/reviewer.md", renderedFileCount: 1, capabilities: [] },
+          { reference: { sourceId: "built-in", relativePath: "audit.md" }, name: "Audit", sourceHash: "two", dependency: false, destination: "/plan/audit.md", renderedFileCount: 1, capabilities: [] },
+        ],
+        warnings: [], blockers: [], rollbackAvailable: false,
+      };
+      const records = [installRecord("reviewer", "/actual/reviewer.md"), installRecord("audit", "/actual/audit.md")];
+      vi.mocked(invoke).mockImplementation(async (command: string) => {
+        if (command === "agent_batch_apply" || command === "agent_collection_apply") return records as never;
+        if (command === "installs_reconcile" || command === "tools_list") return [] as never;
+        return [] as never;
+      });
+
+      const result = kind === "batch"
+        ? await install.applyBatch(plan)
+        : await install.applyCollection("Review team", plan);
+      expect(result).toMatchObject({ records, receiptId: expect.any(String) });
+      const receipt = activity.entries.find((entry) => entry.id === result.receiptId)?.receipt;
+      expect(receipt).toMatchObject({ operation: "install", succeeded: 2, failed: 0 });
+      expect(receipt?.items.map((item) => item.destination)).toEqual(["/actual/reviewer.md", "/actual/audit.md"]);
+      expect(receipt?.items.map((item) => item.name)).toEqual(["Reviewer", "Audit"]);
+    },
+  );
+
+  it("links every Agent bulk completion surface to its exact Activity receipt", () => {
+    for (const source of [agentsWorkspaceSource, toolsViewSource, deployBrowserSource, installModalSource]) {
+      expect(source).toContain("ui.openActivityReceipt(receiptId)");
+    }
+    expect(installModalSource).toContain("install.applyCollection(pendingCollection, plan)");
   });
 
   it("renders semantic AppErrors in both Agent source alerts", async () => {
@@ -2531,7 +2761,7 @@ describe("frontend test harness", () => {
     }
   });
 
-  it("continues exact repairs after failure and records every result plus one summary", async () => {
+  it("continues exact repairs after failure and opens one mixed exact receipt", async () => {
     const agent = { ...staleControlRow, sourceId: "built-in", relativePath: "reviewer.md", state: "outdated" as const, tracked: true };
     const skill: InstalledSkill = { sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/audit", state: "missing", tracked: true };
     const currentSkill = { ...skill, state: "current" as const };
@@ -2556,13 +2786,14 @@ describe("frontend test harness", () => {
       if (command === "installs_reconcile") return [agent] as never;
       if (command === "skill_installs_reconcile") return [skillRepaired ? currentSkill : skill] as never;
       if (command === "skill_backups_list") return [] as never;
-      if (command === "update_agent") throw new Error("agent write failed");
+      if (command === "update_agent") throw new Error("token=secret123 agent write failed");
       if (command === "skill_update") { skillRepaired = true; return currentSkill as never; }
       return [] as never;
     });
     const target = document.createElement("div");
     document.body.append(target);
-    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    const onClose = vi.fn();
+    const component = mount(UpdatesModal, { target, props: { onClose } });
     try {
       await tick();
       target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
@@ -2571,7 +2802,10 @@ describe("frontend test harness", () => {
       target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
       await vi.waitFor(() => expect(target.textContent).toContain("Repair results"));
       expect(target.textContent).toContain("Reviewer");
-      expect(target.textContent).toContain("agent write failed");
+      expect(target.textContent).toContain("token=[redacted] agent write failed");
+      expect(target.textContent).not.toContain("secret123");
+      expect(target.textContent).toContain("/tmp/reviewer.md");
+      expect(target.textContent).toContain("/tmp/audit");
       expect(target.textContent).toContain("Audit");
       expect(target.textContent).toContain("Repaired");
       expect(target.textContent).toContain("In sync");
@@ -2582,7 +2816,20 @@ describe("frontend test harness", () => {
       const entries = activity.entries.slice(0, activity.entries.length - startingEntries);
       expect(entries.filter((entry) => entry.action === "update" && entry.subject === "agent" && entry.outcome === "error")).toHaveLength(1);
       expect(entries.filter((entry) => entry.action === "update" && entry.subject === "skill" && entry.outcome === "ok")).toHaveLength(1);
-      expect(entries.filter((entry) => entry.action === "bulk" && entry.subject === "agentLibrary" && entry.detail === "1 repaired · 1 failed")).toHaveLength(1);
+      const summaries = entries.filter((entry) => entry.action === "bulk" && entry.subject === "agentLibrary" && entry.detail === "1 repaired · 1 failed");
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]?.receipt).toMatchObject({ operation: "repair", succeeded: 1, failed: 1 });
+      expect(summaries[0]?.receipt?.items).toEqual([
+        { kind: "agent", name: "Reviewer", destination: "/tmp/reviewer.md", outcome: "error", detail: "token=[redacted] agent write failed" },
+        { kind: "skill", name: "Audit", destination: "/tmp/audit", outcome: "ok" },
+      ]);
+      const viewActivity = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("View Activity"));
+      expect(viewActivity).toBeTruthy();
+      viewActivity!.click();
+      expect(onClose).toHaveBeenCalledOnce();
+      expect(ui.section).toBe("activity");
+      expect(ui.activityReceiptId).toBe(summaries[0]?.id);
     } finally {
       unmount(component);
       target.remove();
