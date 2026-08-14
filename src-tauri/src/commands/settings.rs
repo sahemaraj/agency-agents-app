@@ -96,6 +96,11 @@ pub struct Settings {
     #[serde(default)]
     pub update_auto_check: bool,
 
+    /// Phase 16 — native alerts for newly actionable local Agent or Skill
+    /// drift while the running app is backgrounded. Explicit opt-in only.
+    #[serde(default)]
+    pub drift_notifications: bool,
+
     /// Phase 15 — versions the user explicitly dismissed via the
     /// title-bar indicator's `×` button. Bounded at 10 entries with
     /// oldest-evicted-on-push (see [`Settings::push_skipped_version`]).
@@ -173,6 +178,7 @@ pub struct GeneralSettingsPatch {
     pub github_enabled: Option<bool>,
     pub ai_features_enabled: Option<bool>,
     pub update_auto_check: Option<bool>,
+    pub drift_notifications: Option<bool>,
     pub tool_paths: Option<HashMap<String, String>>,
 }
 
@@ -190,6 +196,7 @@ impl GeneralSettingsPatch {
         apply!(github_enabled);
         apply!(ai_features_enabled);
         apply!(update_auto_check);
+        apply!(drift_notifications);
         apply!(tool_paths);
     }
 }
@@ -218,6 +225,7 @@ impl Default for Settings {
             // stays cold until the user explicitly opts in (or hits the
             // manual "Check for updates" button).
             update_auto_check: false,
+            drift_notifications: false,
             // Empty by default — populated as the user dismisses
             // individual versions via the title-bar indicator's `×`.
             skipped_update_versions: Vec::new(),
@@ -1010,6 +1018,7 @@ mod tests {
             github_enabled: true,
             ai_features_enabled: false,
             update_auto_check: true,
+            drift_notifications: true,
             skipped_update_versions: vec!["0.3.0".into(), "0.3.1".into()],
             tool_paths: HashMap::from([("claudeCode".to_string(), "/wsl/home/me".to_string())]),
             mcp_source_access: true,
@@ -1074,6 +1083,7 @@ mod tests {
             github_enabled: false,
             ai_features_enabled: true,
             update_auto_check: false,
+            drift_notifications: false,
             skipped_update_versions: Vec::new(),
             tool_paths: HashMap::new(),
             mcp_source_access: false,
@@ -1144,6 +1154,8 @@ mod tests {
                 // `update_auto_check` was added in Phase 15 — must default
                 // to false for forward compat with pre-15 settings files.
                 assert!(!s.update_auto_check);
+                // Phase 16 native drift alerts are always explicit opt-in.
+                assert!(!s.drift_notifications);
                 // `skipped_update_versions` was added in Phase 15 — must
                 // default to an empty vec.
                 assert!(s.skipped_update_versions.is_empty());
@@ -1377,6 +1389,25 @@ mod tests {
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn phase16_drift_notifications_are_opt_in_and_camel_case() {
+        assert!(!Settings::default().drift_notifications);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut settings = Settings::default();
+        GeneralSettingsPatch {
+            drift_notifications: Some(true),
+            ..GeneralSettingsPatch::default()
+        }
+        .apply(&mut settings);
+        persist(tmp.path(), settings).await.expect("persist");
+
+        let raw = tokio::fs::read_to_string(settings_path(tmp.path()))
+            .await
+            .expect("read raw");
+        assert!(raw.contains("\"driftNotifications\": true"), "{raw}");
+        assert!(!raw.contains("drift_notifications"), "{raw}");
     }
 
     /// Phase 13 — `ai_features_enabled` defaults to true.

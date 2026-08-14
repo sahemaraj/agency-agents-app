@@ -16,12 +16,17 @@
   import CheckCircle from "@lucide/svelte/icons/check-circle-2";
   import XCircle from "@lucide/svelte/icons/x-circle";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
+  import {
+    isPermissionGranted,
+    requestPermission,
+  } from "@tauri-apps/plugin-notification";
 
   import { settings } from "$lib/stores/settings.svelte";
   import SettingsSectionUpdates from "$lib/components/SettingsSectionUpdates.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
 
   const offlineModeDescription = $derived(i18n.t("network.offlineDescription"));
+  let driftNotificationError = $state<string | null>(null);
 
   function toggleParanoid(e: Event) {
     const v = (e.currentTarget as HTMLInputElement).checked;
@@ -30,6 +35,28 @@
 
   function handleReset() {
     void settings.reset();
+  }
+
+  async function toggleDriftNotifications(event: Event): Promise<void> {
+    const input = event.currentTarget as HTMLInputElement;
+    driftNotificationError = null;
+    if (!input.checked) {
+      await settings.save({ driftNotifications: false });
+      return;
+    }
+    try {
+      const granted = await isPermissionGranted()
+        || await requestPermission() === "granted";
+      if (!granted) {
+        input.checked = false;
+        driftNotificationError = "Notification permission was not granted.";
+        return;
+      }
+      await settings.save({ driftNotifications: true });
+    } catch (error) {
+      input.checked = false;
+      driftNotificationError = `Could not enable notification permission. ${String(error)}`;
+    }
   }
 
   type PathStatus = { label: string; desc: string; allowed: boolean };
@@ -121,6 +148,23 @@
         {/each}
       </ol>
       <p class="hint">{i18n.t("network.everyCall")}</p>
+    </div>
+
+    <div class="field">
+      <label class="toggle" title="Notify only when newly actionable local drift is found while the app is backgrounded.">
+        <input
+          type="checkbox"
+          data-drift-notifications
+          checked={settings.data.driftNotifications}
+          onchange={toggleDriftNotifications}
+          disabled={settings.loading}
+          aria-describedby="drift-notifications-hint"
+        />
+        <span class="toggle-track" aria-hidden="true"></span>
+        <span class="toggle-label">Drift notifications</span>
+      </label>
+      <p class="hint" id="drift-notifications-hint">Every 15 minutes while Agency Agents is backgrounded, check local managed files and notify once about newly outdated, modified, or missing items.</p>
+      {#if driftNotificationError}<p class="callout-error" data-drift-notification-error>{driftNotificationError}</p>{/if}
     </div>
 
     {#if settings.error}<p class="callout-error">{settings.error}</p>{/if}
