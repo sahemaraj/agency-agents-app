@@ -15,6 +15,7 @@ import { activity, safeActivityDetail } from "$lib/stores/activity.svelte";
 import type { ActivityReceiptItem, ActivityReceiptOperation } from "$lib/stores/activity.svelte";
 import { i18n } from "$lib/stores/i18n.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
+import { skillSources } from "$lib/stores/skillSources.svelte";
 import { wiredTools } from "$lib/data/toolRegistry";
 import {
   agentBatchApply,
@@ -47,6 +48,9 @@ import type {
   Tool,
   ToolInfo,
   ToolVersion,
+  WorkspacePackApplyResponse,
+  WorkspacePackPlan,
+  WorkspacePackScope,
 } from "$lib/types";
 
 function planReceiptOperation(operation: string): ActivityReceiptOperation {
@@ -779,17 +783,77 @@ class InstallStore {
     return SUPPORTED_TOOLS.find((t) => t.id === tool)?.label ?? tool;
   }
 
-  /** Export the current install set to an Agentfile at `path`. Returns count. */
-  async exportLoadout(path: string): Promise<number> {
-    return invoke<number>("loadout_export", { path });
+  /** Export one current logical scope as a path-private Workspace Pack. */
+  async exportLoadout(
+    path: string,
+    name: string,
+    scope: WorkspacePackScope,
+    projectPath: string | null,
+  ): Promise<number> {
+    return invoke<number>("loadout_export", { path, name, scope, projectPath });
   }
 
-  /** Restore an Agentfile from `path`; installs each entry. Returns records. */
-  async importLoadout(path: string): Promise<InstallRecord[]> {
-    const recs = await invoke<InstallRecord[]>("loadout_import", { path });
-    await this.reconcile();
+  /** Parse and completely plan a Workspace Pack without applying it. */
+  inspectWorkspacePack(path: string, projectPath: string | null): Promise<WorkspacePackPlan> {
+    return invoke<WorkspacePackPlan>("loadout_import", { path, projectPath });
+  }
+
+  /** Apply one unchanged reviewed plan, refresh both ledgers, and retain one receipt. */
+  async applyWorkspacePack(
+    path: string,
+    projectPath: string | null,
+    plan: WorkspacePackPlan,
+    projectPaths: string[],
+  ): Promise<{ response: WorkspacePackApplyResponse; receiptId: string | null }> {
+    let response = await invoke<WorkspacePackApplyResponse>("loadout_apply", {
+      path,
+      projectPath,
+      revision: plan.revision,
+    });
+    if (!response.result) return { response, receiptId: null };
+    const result = {
+      ...response.result,
+      rollbackErrors: response.result.rollbackErrors.map(safeActivityDetail),
+      items: response.result.items.map((item) => ({
+        ...item,
+        message: item.message == null ? null : safeActivityDetail(item.message),
+      })),
+    };
+    response = {
+      ...response,
+      result,
+    };
+    await Promise.all([this.reconcile(), skillSources.reconcileInstalls(projectPaths)]);
     void this.loadTools();
-    return recs;
+    const names = new Map<string, string>();
+    for (const item of [...response.plan.agents, ...response.plan.skills]) {
+      names.set(`${item.reference.sourceId}\0${item.reference.relativePath}`, item.name);
+    }
+    const receiptItems: ActivityReceiptItem[] = result.items.map((item) => {
+      const ok = item.outcome === "installed" || item.outcome === "current";
+      return {
+        kind: item.kind,
+        name: names.get(`${item.sourceId}\0${item.relativePath}`) ?? item.relativePath,
+        destination: item.destination,
+        outcome: ok ? "ok" : "error",
+        ...(!ok ? { detail: safeActivityDetail(item.message ?? item.outcome) } : {}),
+      };
+    });
+    const succeeded = receiptItems.filter((item) => item.outcome === "ok").length;
+    const failed = receiptItems.length - succeeded;
+    const receiptId = activity.log({
+      action: "bulk",
+      subject: "agentLibrary",
+      outcome: failed === 0 ? "ok" : "error",
+      detail: `${succeeded} applied · ${failed} failed`,
+      receipt: {
+        operation: "install",
+        succeeded,
+        failed,
+        items: receiptItems,
+      },
+    });
+    return { response, receiptId };
   }
 }
 

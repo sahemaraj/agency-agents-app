@@ -35,7 +35,7 @@ import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import type { Agent, AgentMutationPlan, AgentPackageResult, AgentSource, DoctorReport, ExpertResolved, InstalledAgent, InstalledSkill, InstallRecord, McpAuditEntry } from "$lib/types";
+import type { Agent, AgentMutationPlan, AgentPackageResult, AgentSource, DoctorReport, ExpertResolved, InstalledAgent, InstalledSkill, InstallRecord, McpAuditEntry, WorkspacePackPlan } from "$lib/types";
 
 const skillRecommendation = (sourceId = "skills-b") => ({
   kind: "skill" as const,
@@ -532,6 +532,64 @@ describe("frontend test harness", () => {
     expect(activity.entries.find((entry) => entry.id === id)?.receipt).toMatchObject({
       operation: "repair", succeeded: 1, failed: 1,
     });
+  });
+
+  it("reviews then applies one mixed Workspace Pack and records exact retained results", async () => {
+    const plan: WorkspacePackPlan = {
+      pack: {
+        workspacePack: 1, name: "Review workspace", scope: "project",
+        agents: [{ reference: { sourceId: "agents", relativePath: "reviewer.md" }, tool: "codex" }],
+        skills: [{ reference: { sourceId: "skills", relativePath: "audit" }, runtime: "codex" }],
+        runbook: "review-flow", instructions: ["Follow AGENTS.md"], mcpServers: ["memory"],
+      },
+      projectPath: "/project",
+      agents: [{ reference: { sourceId: "agents", relativePath: "reviewer.md" }, name: "Reviewer", tool: "codex", destinations: ["/project/.codex/agents/reviewer.toml"], dependency: false, state: "missing" }],
+      skills: [{ reference: { sourceId: "skills", relativePath: "audit" }, name: "Audit", runtime: "codex", destinations: ["/project/.agents/skills/audit"], dependency: false, state: "current", permissions: [] }],
+      warnings: ["MCP requirements are declarative"], blockers: [],
+      rollbackScope: ["/project/.codex/agents/reviewer.toml"], revision: "revision-1",
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "loadout_import") return plan as never;
+      if (command === "loadout_apply") return {
+        plan,
+        result: {
+          revision: plan.revision, outcome: "succeeded", rolledBack: false, rollbackErrors: [],
+          items: [
+            { kind: "agent", sourceId: "agents", relativePath: "reviewer.md", target: "codex", destination: "/project/.codex/agents/reviewer.toml", outcome: "installed", message: null },
+            { kind: "skill", sourceId: "skills", relativePath: "audit", target: "codex", destination: "/project/.agents/skills/audit", outcome: "current", message: "token=secret123 retained" },
+          ],
+        },
+      } as never;
+      if (["installs_reconcile", "tools_list", "skill_installs_reconcile", "skill_backups_list"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    const inspected = await install.inspectWorkspacePack("/tmp/review.json", "/project");
+    expect(inspected).toEqual(plan);
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("loadout_import", { path: "/tmp/review.json", projectPath: "/project" });
+    const applied = await install.applyWorkspacePack("/tmp/review.json", "/project", plan, ["/project"]);
+    expect(applied.response.result?.items.map((item) => item.outcome)).toEqual(["installed", "current"]);
+    expect(applied.response.result?.items[1]?.message).toContain("token=[redacted]");
+    expect(applied.response.result?.items[1]?.message).not.toContain("secret123");
+    const receipt = activity.entries.find((entry) => entry.id === applied.receiptId)?.receipt;
+    expect(receipt).toMatchObject({ operation: "install", succeeded: 2, failed: 0 });
+    expect(receipt?.items.map((item) => [item.kind, item.destination])).toEqual([
+      ["agent", "/project/.codex/agents/reviewer.toml"],
+      ["skill", "/project/.agents/skills/audit"],
+    ]);
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toContain("skill_installs_reconcile");
+  });
+
+  it("keeps Workspace Pack review, approval, passive requirements, focus, and Activity handoff in Teams", () => {
+    for (const marker of [
+      /packPlan = await install\.inspectWorkspacePack\(picked, null\)/,
+      /packPlan\.pack\.instructions\.length[^]*?not applied automatically/,
+      /packPlan\.pack\.mcpServers\.length[^]*?not configured automatically/,
+      /reviewedPack\.pack\.scope === "user"[^]*?disabled=\{!packTruthFresh \|\| reviewedPack\.blockers\.length > 0\}/,
+      /role="status" aria-live="polite"/,
+      /packTrigger\?\.focus\(\{ preventScroll: true \}\)/,
+      /ui\.openActivityReceipt\(receiptId\)/,
+    ]) expect(teamsSource).toMatch(marker);
+    expect(teamsSource).not.toContain("install.importLoadout(");
   });
 
   it("keeps a completed receipt in memory when journal persistence fails", () => {
@@ -2970,7 +3028,7 @@ describe("frontend test harness", () => {
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(44);
+      .toHaveLength(46);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -2985,7 +3043,7 @@ describe("frontend test harness", () => {
     for (const [name, marker] of propagationEdges) {
       expect(installSource.match(marker) ?? [], name).toHaveLength(1);
     }
-    expect(installSource.match(/safeActivityDetail\(/g) ?? []).toHaveLength(8); // seven live edges + retained legacy install()
+    expect(installSource.match(/safeActivityDetail\(/g) ?? []).toHaveLength(10); // seven live edges + legacy install() + Workspace Pack retained-result and receipt boundaries
 
     const rawFallbacks = Object.entries(rel01Sources).flatMap(([path, source]) =>
       [...source.matchAll(/^\s*toast\.error\([^\n]*,\s*String\((?:e|error)\)\);?$/gm)]
@@ -3031,7 +3089,7 @@ describe("frontend test harness", () => {
         /const managed = \$derived\(install\.installed\.filter/,
         /\{:else if managed\.length === 0\}/,
         /disabled=\{!installTruthFresh\} onclick=\{openSave\}/,
-        /disabled=\{!installTruthFresh \|\| busy \|\| managed\.length === 0\}/,
+        /disabled=\{!packTruthFresh \|\| busy \|\| portableManagedCount === 0\}/,
         /\{#if install\.reconcileError\}[^]*?retryReconcile\(event\)/,
       ] }],
       ["Projects", { source: projectsSource, markers: [

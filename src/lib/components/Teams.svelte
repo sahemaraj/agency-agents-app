@@ -31,6 +31,8 @@
 
   import StarterPrompt from "./StarterPrompt.svelte";
   import { install } from "$lib/stores/install.svelte";
+  import { projects } from "$lib/stores/projects.svelte";
+  import { skillSources } from "$lib/stores/skillSources.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
   import { teams, type SavedTeam } from "$lib/stores/teams.svelte";
   import { toast } from "$lib/stores/toast.svelte";
@@ -41,10 +43,11 @@
   import { PRESET_TEAMS } from "$lib/data/presetTeams";
   import { TEAM_EXAMPLES } from "$lib/data/playbook";
   import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-  import { appErrorMessage, isAppError, type InstalledAgent, type Agent } from "$lib/types";
+  import { appErrorMessage, isAppError, type InstalledAgent, type Agent, type WorkspacePackApplyResult, type WorkspacePackPlan, type WorkspacePackScope } from "$lib/types";
   import type { Component } from "svelte";
 
   const installTruthFresh = $derived(install.reconciled && !install.reconcileError);
+  const packTruthFresh = $derived(installTruthFresh && !install.reconciling && skillSources.reconciled && !skillSources.reconciling && !skillSources.reconcileError);
   const installTruthMessage = $derived(install.reconcileError ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.") : i18n.optional("reconcile.checking", "Checking installation status…"));
   let currentTab: HTMLButtonElement | undefined = $state();
   let reconcileAnnouncement = $state("");
@@ -75,6 +78,7 @@
   // ── "Your team" = what WE installed (foreign isn't part of it until tracked). ──
   const managed = $derived(install.installed.filter((i) => i.state !== "foreign"));
   const managedSlugs = $derived([...new Set(managed.map((m) => m.slug))]);
+  const portableManagedCount = $derived(managed.length + skillSources.installed.filter((item) => item.tracked).length);
 
   // Group the loadout by division (collapsible). Agents missing from the current
   // corpus (e.g. removed upstream) fall into "Other".
@@ -248,13 +252,25 @@
     toast.success(i18n.t("teams.deletedToast", { name: t.name }));
   }
 
-  // ── Agentfile export / restore (your current team) ──
+  // ── Portable Workspace Pack export / reviewed apply ──
+  let exportOpen = $state(false);
+  let exportName = $state("My workspace");
+  let exportScope = $state<WorkspacePackScope>("user");
+  let exportProject = $state("");
+  function openExport() {
+    exportName = "My workspace";
+    exportScope = "user";
+    exportProject = projects.list[0]?.path ?? "";
+    exportOpen = true;
+  }
   async function exportLoadout() {
-    const path = await saveDialog({ title: i18n.t("teams.saveAgentfileTitle"), defaultPath: "Agentfile.json", filters: [{ name: "Agentfile", extensions: ["json"] }] });
+    if (!packTruthFresh || !exportName.trim() || (exportScope === "project" && !exportProject)) return;
+    const path = await saveDialog({ title: i18n.optional("teams.saveWorkspacePackTitle", "Save Workspace Pack"), defaultPath: "WorkspacePack.json", filters: [{ name: "Workspace Pack", extensions: ["json"] }] });
     if (!path) return;
     busy = true;
     try {
-      const n = await install.exportLoadout(path);
+      const n = await install.exportLoadout(path, exportName.trim(), exportScope, exportScope === "project" ? exportProject : null);
+      exportOpen = false;
       toast.success(i18n.t("teams.exportedToast", { count: n }), path);
     } catch (e) {
       toast.error(i18n.t("teams.exportFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
@@ -262,18 +278,78 @@
       busy = false;
     }
   }
-  async function importLoadout() {
-    const picked = await openDialog({ title: i18n.t("teams.restoreAgentfileTitle"), multiple: false, filters: [{ name: "Agentfile", extensions: ["json"] }] });
+
+  let packTrigger: HTMLButtonElement | undefined = $state();
+  let packPath = $state("");
+  let packProject = $state("");
+  let packPlan: WorkspacePackPlan | null = $state(null);
+  let packResult: WorkspacePackApplyResult | null = $state(null);
+  let packReceiptId: string | null = $state(null);
+  let packOpen = $state(false);
+  let packBusy = $state(false);
+  let packAnnouncement = $state("");
+  async function closePack() {
+    if (packBusy) return;
+    packOpen = false;
+    await tick();
+    packTrigger?.focus({ preventScroll: true });
+  }
+  async function importLoadout(event: MouseEvent) {
+    packTrigger = event.currentTarget as HTMLButtonElement;
+    const picked = await openDialog({ title: i18n.optional("teams.openWorkspacePackTitle", "Open Workspace Pack"), multiple: false, filters: [{ name: "Workspace Pack or Agentfile", extensions: ["json"] }] });
     if (!picked || Array.isArray(picked)) return;
     busy = true;
     try {
-      const recs = await install.importLoadout(picked);
-      toast.success(i18n.t("teams.restoredToast", { count: recs.length }), picked);
+      packPath = picked;
+      packProject = "";
+      packResult = null;
+      packReceiptId = null;
+      packPlan = await install.inspectWorkspacePack(picked, null);
+      packOpen = true;
+      packAnnouncement = i18n.optional("teams.workspacePackReady", "Workspace Pack review ready.");
     } catch (e) {
       toast.error(i18n.t("teams.restoreFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
     } finally {
       busy = false;
     }
+  }
+  async function bindPackProject() {
+    if (!packProject) return;
+    packBusy = true;
+    packAnnouncement = i18n.optional("teams.workspacePackPlanning", "Planning exact destinations…");
+    try {
+      packPlan = await install.inspectWorkspacePack(packPath, packProject);
+      packAnnouncement = i18n.optional("teams.workspacePackReady", "Workspace Pack review ready.");
+    } catch (e) {
+      toast.error(i18n.t("teams.restoreFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
+    } finally {
+      packBusy = false;
+    }
+  }
+  async function applyPack() {
+    if (!packPlan || !packTruthFresh || packPlan.blockers.length > 0) return;
+    packBusy = true;
+    packAnnouncement = i18n.optional("teams.workspacePackApplying", "Applying Workspace Pack…");
+    try {
+      const applied = await install.applyWorkspacePack(packPath, packPlan.projectPath, packPlan, projects.list.map((project) => project.path));
+      packPlan = applied.response.plan;
+      packResult = applied.response.result;
+      packReceiptId = applied.receiptId;
+      packAnnouncement = packResult
+        ? i18n.optional("teams.workspacePackComplete", "Workspace Pack apply complete.")
+        : i18n.optional("teams.workspacePackChanged", "Workspace Pack plan changed. Review the refreshed plan.");
+    } catch (e) {
+      packAnnouncement = i18n.optional("teams.workspacePackFailed", "Workspace Pack apply failed.");
+      toast.error(i18n.t("teams.restoreFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
+    } finally {
+      packBusy = false;
+    }
+  }
+  async function viewPackActivity() {
+    if (!packReceiptId) return;
+    const receiptId = packReceiptId;
+    await closePack();
+    ui.openActivityReceipt(receiptId);
   }
 </script>
 
@@ -296,7 +372,7 @@
           <button class="btn" disabled={!installTruthFresh} onclick={openSave}><SaveIcon size={15} /><span>{i18n.t("teams.saveAsTeam")}</span></button>
         {/if}
         <button class="btn" disabled={busy} onclick={importLoadout}><DownloadIcon size={15} /><span>{i18n.t("teams.restore")}</span></button>
-        <button class="btn primary" disabled={!installTruthFresh || busy || managed.length === 0} onclick={exportLoadout}><UploadIcon size={15} /><span>{i18n.t("teams.export")}</span></button>
+        <button class="btn primary" disabled={!packTruthFresh || busy || portableManagedCount === 0} onclick={openExport}><UploadIcon size={15} /><span>{i18n.t("teams.export")}</span></button>
       </div>
     {/if}
   </header>
@@ -451,6 +527,47 @@
   <InstallModal title={deployTarget.title} agentSlugs={deployTarget.agents} onClose={() => (deployTarget = null)} />
 {/if}
 
+{#if exportOpen}
+  <Modal open title={i18n.optional("teams.exportWorkspacePack", "Export Workspace Pack")} defaultFocus="first" onClose={() => (exportOpen = false)}>
+    <Input bind:value={exportName} placeholder={i18n.optional("teams.workspacePackName", "Workspace name")} ariaLabel={i18n.optional("teams.workspacePackName", "Workspace name")} />
+    <label class="pack-field"><span>{i18n.optional("teams.workspacePackScope", "Scope")}</span><select bind:value={exportScope}><option value="user">{i18n.optional("teams.workspacePackGlobal", "Global")}</option><option value="project">{i18n.optional("teams.workspacePackProject", "Project")}</option></select></label>
+    {#if exportScope === "project"}
+      <label class="pack-field"><span>{i18n.optional("teams.workspacePackProjectBinding", "Project")}</span><select bind:value={exportProject}><option value="">{i18n.optional("teams.workspacePackChooseProject", "Choose a registered project")}</option>{#each projects.list as project (project.path)}<option value={project.path}>{project.label}</option>{/each}</select></label>
+    {/if}
+    {#snippet actions()}
+      <Button variant="secondary" modalAction="cancel" onclick={() => (exportOpen = false)}>{i18n.t("common.cancel")}</Button>
+      <Button variant="primary" modalAction="confirm" loading={busy} disabled={!packTruthFresh || !exportName.trim() || (exportScope === "project" && !exportProject)} onclick={exportLoadout}>{i18n.t("teams.export")}</Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+{#if packOpen && packPlan}
+  {@const reviewedPack = packPlan}
+  <Modal open size="wide" title={i18n.optional("teams.workspacePackReview", "Review Workspace Pack")} dismissible={!packBusy} defaultFocus="cancel" onClose={closePack}>
+    <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{packAnnouncement}</div>
+    <div class="pack-summary"><strong>{packPlan.pack.name}</strong><span>{packPlan.pack.scope === "project" ? i18n.optional("teams.workspacePackProject", "Project") : i18n.optional("teams.workspacePackGlobal", "Global")}</span></div>
+    {#if packPlan.pack.scope === "project" && !packPlan.projectPath}
+      <div class="pack-bind"><label class="pack-field"><span>{i18n.optional("teams.workspacePackProjectBinding", "Bind to a registered project")}</span><select bind:value={packProject}><option value="">{i18n.optional("teams.workspacePackChooseProject", "Choose a registered project")}</option>{#each projects.list as project (project.path)}<option value={project.path}>{project.label}</option>{/each}</select></label><Button size="sm" loading={packBusy} disabled={!packProject} onclick={bindPackProject}>{i18n.optional("teams.workspacePackPlan", "Review destinations")}</Button></div>
+    {:else}
+      <div class="pack-plan" aria-busy={packBusy}>
+        <h2>{i18n.optional("teams.workspacePackPlanHeading", "Complete plan")}</h2>
+        <ul>{#each packPlan.agents as item (`agent:${item.reference.sourceId}:${item.reference.relativePath}:${item.tool}`)}<li><strong>{item.name}</strong><span>Agent · {item.tool} · {item.state}{item.dependency ? " · dependency" : ""}</span>{#each item.destinations as destination}<code>{destination}</code>{/each}</li>{/each}{#each packPlan.skills as item (`skill:${item.reference.sourceId}:${item.reference.relativePath}:${item.runtime}`)}<li><strong>{item.name}</strong><span>Skill · {item.runtime} · {item.state}{item.dependency ? " · dependency" : ""}</span>{#each item.destinations as destination}<code>{destination}</code>{/each}</li>{/each}</ul>
+        {#if packPlan.pack.runbook}<p><strong>Runbook requirement:</strong> {packPlan.pack.runbook} — not executed automatically.</p>{/if}
+        {#if packPlan.pack.instructions.length}<p><strong>Instruction requirements:</strong> {packPlan.pack.instructions.join(", ")} — not applied automatically.</p>{/if}
+        {#if packPlan.pack.mcpServers.length}<p><strong>MCP requirements:</strong> {packPlan.pack.mcpServers.join(", ")} — not configured automatically.</p>{/if}
+        {#if packPlan.warnings.length}<aside class="pack-warning"><strong>Warnings</strong><ul>{#each packPlan.warnings as warning (warning)}<li>{warning}</li>{/each}</ul></aside>{/if}
+        {#if packPlan.blockers.length}<aside class="pack-blocker"><strong>Approval blocked</strong><ul>{#each packPlan.blockers as blocker (blocker)}<li>{blocker}</li>{/each}</ul></aside>{/if}
+        {#if packResult}<section class="pack-results"><h2>Results</h2><p>{packResult.outcome}</p><ul>{#each packResult.items as item (`${item.kind}:${item.sourceId}:${item.relativePath}:${item.target}:${item.destination}`)}<li><strong>{item.kind} · {item.outcome}</strong><code>{item.destination}</code>{#if item.message}<span>{item.message}</span>{/if}</li>{/each}</ul></section>{/if}
+      </div>
+    {/if}
+    {#snippet actions()}
+      <Button variant="secondary" modalAction="cancel" disabled={packBusy} onclick={closePack}>{i18n.t("common.close")}</Button>
+      {#if packResult && packReceiptId}<Button variant="secondary" onclick={viewPackActivity}>View Activity</Button>{/if}
+      {#if !packResult && (reviewedPack.pack.scope === "user" || reviewedPack.projectPath !== null)}<Button variant="primary" modalAction="confirm" loading={packBusy} disabled={!packTruthFresh || reviewedPack.blockers.length > 0} onclick={applyPack}>Approve and apply</Button>{/if}
+    {/snippet}
+  </Modal>
+{/if}
+
 {#if saveOpen}
   <Modal open title={i18n.t("teams.saveModalTitle")} defaultFocus="first" onClose={() => (saveOpen = false)}>
     <p class="save-sub">{i18n.t("teams.saveModalBody", { count: managedSlugs.length })}</p>
@@ -544,6 +661,18 @@
   .card-del:hover { background: var(--color-surface-sunken); color: var(--color-danger); }
 
   .save-sub { font-size: var(--text-body-sm); color: var(--color-text-secondary); margin-bottom: var(--space-3); }
+  .pack-field { display: flex; flex-direction: column; gap: var(--space-1); font-size: var(--text-body-sm); }
+  .pack-field select { min-height: 36px; padding: 0 var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); color: var(--color-text-primary); }
+  .pack-summary, .pack-bind { display: flex; align-items: end; justify-content: space-between; gap: var(--space-3); }
+  .pack-summary span { color: var(--color-text-muted); }
+  .pack-bind .pack-field { flex: 1; }
+  .pack-plan { display: flex; flex-direction: column; gap: var(--space-3); max-height: min(62vh, 640px); overflow-y: auto; }
+  .pack-plan h2 { font-size: var(--text-body); color: var(--color-text-primary); }
+  .pack-plan > ul, .pack-results ul { display: flex; flex-direction: column; gap: var(--space-2); }
+  .pack-plan li { display: flex; flex-direction: column; gap: 2px; }
+  .pack-plan code { overflow-wrap: anywhere; color: var(--color-text-secondary); font-size: var(--text-caption); }
+  .pack-warning, .pack-blocker, .pack-results { padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); }
+  .pack-blocker { border-color: var(--color-danger); }
 
   .empty-cta { display: flex; flex-direction: column; align-items: center; gap: var(--space-2); }
   .link-btn { background: transparent; color: var(--color-text-link, var(--color-brand)); font-size: var(--text-body-sm); cursor: pointer; padding: 2px; }

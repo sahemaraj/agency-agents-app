@@ -355,6 +355,7 @@ pub fn run() {
             install::projects_list,
             install::loadout_export,
             install::loadout_import,
+            install::loadout_apply,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

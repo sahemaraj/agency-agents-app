@@ -794,6 +794,7 @@ fn validate_filesystem_operation_kind(kind: &str) -> Result<(), AppError> {
             | "agent_enable"
             | "agent_uninstall"
             | "expert_activate"
+            | "workspace_pack_apply"
     ) {
         Ok(())
     } else {
