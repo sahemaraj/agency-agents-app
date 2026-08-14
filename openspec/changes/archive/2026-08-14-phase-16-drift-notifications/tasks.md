@@ -19,4 +19,4 @@
 
 - [x] 4.1 Run focused/full frontend and Rust tests, strict Clippy, formatting, Svelte diagnostics, production build, and strict OpenSpec validation.
 - [x] 4.2 Audit for opt-in default, prompt context, background-only/local-only checks, complete-baseline dedupe, bounded path-private copy, least-privilege ACL, no network, no telemetry, no automatic repair, no new route/store, and no unrelated user-file changes.
-- [ ] 4.3 Sync and archive the canonical spec, update approved Memory Bank/roadmap evidence, merge the verified branch, and repeat post-merge smoke checks.
+- [x] 4.3 Sync and archive the canonical spec, update approved Memory Bank/roadmap evidence, merge the verified branch, and repeat post-merge smoke checks.

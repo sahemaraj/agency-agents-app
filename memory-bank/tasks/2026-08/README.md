@@ -103,3 +103,7 @@ quality, Svelte, build, safety, and diff gates passed. See
 ### 2026-08-14: Phase 15 MCP Inventory Manager
 
 Added bounded privacy-safe Claude Code/Codex MCP inventory, passive validation, exact Agency Agents tool evidence, one trusted template, isolated failures, and read-only foreign-server evidence in the existing Settings workflow. OpenSpec, frontend, backend, Rust quality, Svelte, build, safety, and diff gates passed. See [260814_phase15-mcp-inventory-manager.md](./260814_phase15-mcp-inventory-manager.md).
+
+### 2026-08-14: Phase 16 Drift Notifications
+
+Added explicit permission-backed native drift alerts that reuse bounded local Agent and Skill reconciliation only while the running app is backgrounded, establish a silent complete baseline, deduplicate exact managed identities, retain truth after partial failures, omit private paths, and route activation to existing review surfaces without repair. OpenSpec, frontend, backend, Rust quality, Svelte, build, dependency, safety, and diff gates passed. See [260814_phase16-drift-notifications.md](./260814_phase16-drift-notifications.md).

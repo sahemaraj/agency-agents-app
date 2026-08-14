@@ -1,5 +1,9 @@
 # Active Context — Agency Agents
 
+## ✅ v2.0 Phase 16 — Drift Notifications [COMPLETE] (2026-08-14)
+
+The approved `feat/phase-16-drift-notifications` branch now adds explicit permission-backed native alerts for newly actionable tracked Agent and Skill drift while the running app is backgrounded. It reuses the existing bounded local reconciliation every 15 minutes, creates a silent complete baseline, deduplicates exact logical identities, retains the prior baseline after partial failure, omits private paths and content, and routes activation to existing review surfaces without repair. Verification: OpenSpec 11/11 and strict validation passed, canonical specs validate 10/10, 111 frontend tests and 567 executed Rust library tests passed with 3 existing environment-gated ignores, 2 binary tests passed, strict Clippy/format/Svelte/build/dependency/diff and safety gates passed. Implementation commit: `0f6a269`. Record: `tasks/2026-08/260814_phase16-drift-notifications.md`.
+
 ## ✅ v2.0 Phase 15 — MCP Inventory Manager [COMPLETE] (2026-08-14)
 
 The approved `feat/phase-15-mcp-inventory` branch now extends the existing MCP client command and Settings section with bounded privacy-safe Claude Code/Codex inventory, exact Agency Agents router tool evidence, passive validation, isolated source failures, and one trusted auto-configurable template. Foreign servers remain read-only and unknown tools remain explicitly unavailable; Claude inventory reads only no-follow supported config files and Codex uses only literal `mcp list --json` through the existing no-shell bounded runner. Verification: OpenSpec 15/15 and strict validation passed, canonical specs validate 9/9, 108 frontend tests and 566 executed Rust library tests passed with 3 existing environment-gated ignores, 2 binary tests passed, and strict Clippy/format/Svelte/build/diff and safety gates passed. Implementation commit: `4d4d89d`. Record: `tasks/2026-08/260814_phase15-mcp-inventory-manager.md`.
