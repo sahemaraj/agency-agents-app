@@ -7,7 +7,7 @@
   import Plus from "@lucide/svelte/icons/plus";
   import Modal from "./Modal.svelte";
   import Runbooks from "./Runbooks.svelte";
-  import { experts } from "$lib/stores/experts.svelte";
+  import { experts, summarizeExpertPerformance } from "$lib/stores/experts.svelte";
   import { projects } from "$lib/stores/projects.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
   import { ui } from "$lib/stores/ui.svelte";
@@ -383,9 +383,23 @@
       <article class="detail">
         {#if experts.selected}
           {@const expert = experts.selected}
+          {@const performance = summarizeExpertPerformance(expert, experts.runs)}
           <div class="title"><div><h2>{expert.name}</h2><p>{expert.summary}</p></div><span class="source">{expert.source}</span></div>
           <section><h3>Expected outcome</h3><p>{expert.summary}</p></section>
           <section><h3>Quality contract</h3><p>{expert.qualityContract.checks.length ? expert.qualityContract.checks.map((check) => `${check.name} · ${check.required ? "required" : "optional"}`).join(" · ") : "No checks configured"}</p></section>
+          <section class="performance">
+            <h3>Performance and Improvement Coach</h3>
+            {#if performance.eligible}
+              <p>Based on {performance.comparableRuns} comparable terminal runs with this Expert version and quality contract.</p>
+              <div class="metrics">
+                <strong>Acceptance rate {performance.acceptanceRate}%</strong>
+                <span>Rework {performance.rework} · Rejected {performance.rejected} · Runs with waivers {performance.waiverRate}%</span>
+              </div>
+              <ul>{#each performance.suggestions as suggestion}<li>{suggestion}</li>{/each}</ul>
+            {:else}
+              <p>{performance.comparableRuns} of 5 comparable terminal runs. Metrics and suggestions appear after five quality verdicts for this exact Expert version and contract.</p>
+            {/if}
+          </section>
           <section>
             <h3>Roster</h3>
             <button class="link" onclick={() => ui.openAgents(null)}>{knownAgents.get(expert.leadAgent)?.name ?? expert.leadAgent} · lead</button>
@@ -505,6 +519,7 @@
   .list>button.selected { border-color:var(--color-brand); background:var(--color-brand-subtle); } .row-title { font-weight:var(--fw-semibold); }
   .status { font-size:var(--text-caption); color:var(--color-warning); }.status.ready,.ok { color:var(--color-success); }
   .detail { overflow:auto; padding:var(--space-4); } .detail section { margin-top:var(--space-4); } .title { justify-content:space-between; }.source { text-transform:capitalize; }
+  .metrics { display:flex; gap:var(--space-2); flex-wrap:wrap; align-items:center; margin-top:var(--space-2); }.performance ul { margin:var(--space-2) 0 0; padding-left:var(--space-4); }.performance li { margin-top:4px; font-size:var(--text-body-sm); }
   .link { display:block; border:0; background:transparent; color:var(--color-brand); padding-left:0; }.chips { flex-wrap:wrap; }.grid { align-items:flex-start; justify-content:space-between; }
   label { display:flex; flex-direction:column; gap:5px; font-size:var(--text-body-sm); }.detail footer { justify-content:flex-end; margin-top:var(--space-4); }
   pre { white-space:pre-wrap; padding:var(--space-3); background:var(--color-surface-sunken); border-radius:var(--radius-md); font-size:var(--text-body-sm); }

@@ -27,7 +27,7 @@ import {
 import type { JournalEntry } from "$lib/stores/activity.svelte";
 import { catalog } from "$lib/stores/catalog.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
-import { experts } from "$lib/stores/experts.svelte";
+import { experts, summarizeExpertPerformance } from "$lib/stores/experts.svelte";
 import { install } from "$lib/stores/install.svelte";
 import { i18n } from "$lib/stores/i18n.svelte";
 import { projects } from "$lib/stores/projects.svelte";
@@ -36,7 +36,7 @@ import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type DoctorReport, type ExpertResolved, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type WorkspacePackPlan } from "$lib/types";
+import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type DoctorReport, type ExpertResolved, type ExpertRun, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type WorkspacePackPlan } from "$lib/types";
 
 const notificationMocks = vi.hoisted(() => ({
   isPermissionGranted: vi.fn(async () => true),
@@ -135,6 +135,31 @@ const repairSkillInspection = (sha256: string) => [{
   errors: [],
 }];
 
+const performanceExpert = (): ExpertResolved => ({
+  id: "reviewer", name: "Reviewer", summary: "Reviews code", category: "Engineering", tags: [],
+  version: 2, leadAgent: "reviewer", supportingAgents: [], requiredSkills: [], optionalSkills: [],
+  runbook: null, preferredClient: null, starterPrompt: "Review carefully.", source: "curated",
+  qualityContract: { version: 3, checks: [
+    { name: "Tests", kind: "command", required: true, evidenceMode: "clientReported" },
+    { name: "Review", kind: "human", required: true, evidenceMode: "userConfirmed" },
+  ] },
+  unresolvedAgents: [], unresolvedSkills: [], unresolvedRunbook: false,
+});
+
+const performanceRun = (
+  id: string,
+  state: ExpertRun["state"],
+  evidence: ExpertRun["evidence"] = [],
+  waivers: ExpertRun["waivers"] = [],
+  changes: Partial<ExpertRun> = {},
+): ExpertRun => ({
+  id, expertId: "reviewer", expertVersion: 2, projectPath: "/tmp/project", client: "codex",
+  leadAgent: "reviewer", supportingAgents: [], requiredSkills: [], optionalSkills: [], runbook: null,
+  contract: structuredClone(performanceExpert().qualityContract), state,
+  startedAt: "2026-08-14T01:00:00Z", endedAt: "2026-08-14T02:00:00Z",
+  evidence, blockers: [], waivers, ...changes,
+});
+
 beforeEach(async () => {
   vi.unstubAllGlobals();
   const storage = new Map<string, string>();
@@ -206,6 +231,77 @@ afterEach(async () => {
 describe("frontend test harness", () => {
   it("runs unit tests", () => {
     expect(true).toBe(true);
+  });
+
+  it("summarizes only five or more exact comparable Expert quality verdicts", () => {
+    const evidence = (id: string, checkName: string, result: "pass" | "fail" | "skipped") => ({
+      id, idempotencyKey: id, checkName, result, commandLabel: null, summary: result,
+      submittedAt: `2026-08-14T01:0${id.at(-1) ?? "0"}:00Z`,
+    });
+    const comparable = [
+      performanceRun("run-1", "accepted", [evidence("e-1", "Tests", "fail"), evidence("e-2", "Tests", "pass"), evidence("e-3", "Review", "pass")]),
+      performanceRun("run-2", "rework", [evidence("e-4", "Tests", "pass")], [{ checkName: "Review", reason: "Unavailable", createdAt: "2026-08-14T02:00:00Z" }]),
+      performanceRun("run-3", "rejected", [evidence("e-5", "Tests", "fail"), evidence("e-6", "Review", "pass")]),
+      performanceRun("run-4", "accepted", [evidence("e-7", "Tests", "pass"), evidence("e-8", "Review", "skipped")], [{ checkName: "Review", reason: "Unavailable", createdAt: "2026-08-14T02:00:00Z" }]),
+      performanceRun("run-5", "accepted", [evidence("e-9", "Tests", "pass"), evidence("e-0", "Review", "pass")]),
+    ];
+    const excluded = [
+      performanceRun("cancelled", "cancelled"),
+      performanceRun("pending", "awaitingReview"),
+      performanceRun("old-version", "accepted", [], [], { expertVersion: 1 }),
+      performanceRun("old-contract", "accepted", [], [], { contract: { version: 2, checks: [] } }),
+    ];
+
+    const belowThreshold = summarizeExpertPerformance(performanceExpert(), comparable.slice(0, 4));
+    expect(belowThreshold).toMatchObject({ comparableRuns: 4, eligible: false });
+    expect(belowThreshold.acceptanceRate).toBeNull();
+    expect(belowThreshold.suggestions).toEqual([]);
+
+    const summary = summarizeExpertPerformance(performanceExpert(), [...comparable, ...excluded]);
+    expect(summary).toMatchObject({
+      comparableRuns: 5, eligible: true, accepted: 3, rework: 1, rejected: 1,
+      acceptanceRate: 60, waiverRate: 40,
+    });
+    expect(summary.checks).toEqual([
+      { name: "Tests", issueRuns: 1, waiverRuns: 0 },
+      { name: "Review", issueRuns: 2, waiverRuns: 2 },
+    ]);
+    expect(summary.suggestions).toEqual([
+      "2 of 5 runs ended in rework or rejection; review the Expert instructions and roster for recurring gaps.",
+      "Review had missing, skipped, or failed evidence in 2 of 5 runs; review its instructions or tooling.",
+      "Review was waived in 2 of 5 runs; clarify the check or improve its evidence path.",
+    ]);
+  });
+
+  it("gates the Expert Improvement Coach until five comparable terminal runs", async () => {
+    const expert = performanceExpert();
+    const accepted = Array.from({ length: 5 }, (_, index) => performanceRun(`run-${index}`, "accepted", [
+      { id: `tests-${index}`, idempotencyKey: `tests-${index}`, checkName: "Tests", result: "pass", commandLabel: null, summary: "Passed", submittedAt: "2026-08-14T02:00:00Z" },
+      { id: `review-${index}`, idempotencyKey: `review-${index}`, checkName: "Review", result: "pass", commandLabel: null, summary: "Passed", submittedAt: "2026-08-14T02:00:00Z" },
+    ]));
+    let runs = accepted.slice(0, 4);
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "experts_list") return [expert] as never;
+      if (command === "expert_runs_list") return runs as never;
+      return [] as never;
+    });
+    const { default: Experts } = await import("$lib/components/Experts.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    let component = mount(Experts, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain("4 of 5 comparable terminal runs"));
+      expect(target.textContent).not.toContain("Acceptance rate");
+      unmount(component);
+      target.replaceChildren();
+      runs = accepted;
+      component = mount(Experts, { target });
+      await vi.waitFor(() => expect(target.textContent).toContain("Acceptance rate 100%"));
+      expect(target.textContent).toContain("No recurring improvement signal was detected");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
   });
 
   it("renders the canonical Doctor report, copies it, and routes every safe action without mutation", async () => {
