@@ -91,3 +91,11 @@ Added deterministic path-private Workspace Pack export, strict legacy conversion
 Agent/Skill planning, revision-bound recoverable apply, Teams review, and mixed Activity receipts.
 OpenSpec, frontend, backend, Rust quality, Svelte, build, safety, and diff gates passed. See
 [260814_phase13-portable-workspace-packs.md](./260814_phase13-portable-workspace-packs.md).
+
+### 2026-08-14: Phase 14 Project Instruction Manager
+
+Added bounded inspection and byte-preserving app-owned snippets for four known project instruction
+files, complete deterministic diff plans, revision-bound atomic apply, verified backup and startup
+recovery, plus the existing Projects review and Activity surfaces. OpenSpec, frontend, backend, Rust
+quality, Svelte, build, safety, and diff gates passed. See
+[260814_phase14-project-instruction-manager.md](./260814_phase14-project-instruction-manager.md).

@@ -1327,6 +1327,56 @@ export interface ProjectInfo {
   installedCount: number;
 }
 
+export type ProjectInstructionOperation = "upsert" | "remove";
+
+export interface ProjectInstructionSnippet {
+  id: string;
+  content: string;
+}
+
+export interface ProjectInstructionTarget {
+  id: string;
+  label: string;
+  relativePath: string;
+  destination: string;
+  state: "absent" | "existingUnmanaged" | "managed" | "blocked";
+  exists: boolean;
+  current: string;
+  snippets: ProjectInstructionSnippet[];
+  blockers: string[];
+}
+
+export interface ProjectInstructionPlan {
+  projectPath: string;
+  target: string;
+  label: string;
+  relativePath: string;
+  destination: string;
+  operation: ProjectInstructionOperation;
+  snippetId: string;
+  current: string;
+  proposed: string;
+  exists: boolean;
+  adoption: boolean;
+  backupRequired: boolean;
+  noOp: boolean;
+  warnings: string[];
+  blockers: string[];
+  revision: string;
+}
+
+export interface ProjectInstructionApplyResult {
+  destination: string;
+  outcome: "succeeded" | "rolledBack" | "rollbackFailed";
+  backupPath: string | null;
+  message: string | null;
+}
+
+export interface ProjectInstructionApplyResponse {
+  plan: ProjectInstructionPlan;
+  result: ProjectInstructionApplyResult | null;
+}
+
 export type McpClient = "claude" | "codex";
 export type McpClientState = "missing" | "exact" | "conflict" | "unavailable";
 

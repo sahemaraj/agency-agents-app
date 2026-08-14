@@ -4824,6 +4824,996 @@ pub async fn projects_list(
         .collect())
 }
 
+// ---------- Project instruction snippets ----------
+
+const MAX_PROJECT_INSTRUCTION_BYTES: u64 = MAX_INSTALLED_BYTES;
+const MAX_PROJECT_INSTRUCTION_SNIPPETS: usize = 32;
+const MAX_PROJECT_INSTRUCTION_ID_BYTES: usize = 64;
+const MAX_PROJECT_INSTRUCTION_CONTENT_BYTES: usize = 64 * 1024;
+const PROJECT_INSTRUCTION_MARKER_PREFIX: &str = "<!-- agency-agents:instruction:v1:";
+
+#[derive(Clone, Copy)]
+struct ProjectInstructionTargetDef {
+    id: &'static str,
+    label: &'static str,
+    relative_path: &'static str,
+}
+
+const PROJECT_INSTRUCTION_TARGETS: [ProjectInstructionTargetDef; 4] = [
+    ProjectInstructionTargetDef {
+        id: "agents",
+        label: "AGENTS.md",
+        relative_path: "AGENTS.md",
+    },
+    ProjectInstructionTargetDef {
+        id: "claude",
+        label: "CLAUDE.md",
+        relative_path: "CLAUDE.md",
+    },
+    ProjectInstructionTargetDef {
+        id: "gemini",
+        label: "GEMINI.md",
+        relative_path: "GEMINI.md",
+    },
+    ProjectInstructionTargetDef {
+        id: "copilot",
+        label: "GitHub Copilot",
+        relative_path: ".github/copilot-instructions.md",
+    },
+];
+
+fn project_instruction_targets() -> &'static [ProjectInstructionTargetDef] {
+    &PROJECT_INSTRUCTION_TARGETS
+}
+
+fn project_instruction_target(id: &str) -> Result<ProjectInstructionTargetDef, AppError> {
+    project_instruction_targets()
+        .iter()
+        .copied()
+        .find(|target| target.id == id)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "project instruction target is unsupported".into(),
+        })
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectInstructionOperation {
+    Upsert,
+    Remove,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedProjectInstructionSnippet {
+    id: String,
+    content: String,
+    span_start: usize,
+    marker_start: usize,
+    span_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectInstructionComposition {
+    proposed: String,
+    adoption: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInstructionSnippet {
+    id: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInstructionTarget {
+    id: String,
+    label: String,
+    relative_path: String,
+    destination: String,
+    state: String,
+    exists: bool,
+    current: String,
+    snippets: Vec<ProjectInstructionSnippet>,
+    blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInstructionPlan {
+    project_path: String,
+    target: String,
+    label: String,
+    relative_path: String,
+    destination: String,
+    operation: ProjectInstructionOperation,
+    snippet_id: String,
+    current: String,
+    proposed: String,
+    exists: bool,
+    adoption: bool,
+    backup_required: bool,
+    no_op: bool,
+    warnings: Vec<String>,
+    blockers: Vec<String>,
+    revision: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInstructionApplyResult {
+    destination: String,
+    outcome: String,
+    backup_path: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInstructionApplyResponse {
+    plan: ProjectInstructionPlan,
+    result: Option<ProjectInstructionApplyResult>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectInstructionApplyOperation {
+    project_path: String,
+    target: String,
+    destination: String,
+    before_hash: Option<String>,
+    after_hash: String,
+    backup_path: Option<String>,
+}
+
+fn invalid_project_instruction(message: impl Into<String>) -> AppError {
+    AppError::InvalidArgument {
+        message: message.into(),
+    }
+}
+
+fn validate_project_instruction_id(id: &str) -> Result<(), AppError> {
+    if id.is_empty()
+        || id.len() > MAX_PROJECT_INSTRUCTION_ID_BYTES
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        || !id.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(invalid_project_instruction(
+            "instruction snippet id must be a lowercase portable slug",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_instruction_content(content: &str) -> Result<(), AppError> {
+    if content.is_empty()
+        || content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES
+        || content
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t')
+        || content.contains("agency-agents:instruction")
+    {
+        return Err(invalid_project_instruction(
+            "instruction snippet content is invalid or exceeds its limit",
+        ));
+    }
+    let lower = content.to_ascii_lowercase();
+    if contains_workspace_pack_credential(content)
+        || ["sk-", "ghp_", "github_pat_", "xoxb-", "akia"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+    {
+        return Err(invalid_project_instruction(
+            "instruction snippet must not contain credentials",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_project_instruction_marker(marker: &str) -> Result<(&str, &str), AppError> {
+    let value = marker
+        .strip_prefix(PROJECT_INSTRUCTION_MARKER_PREFIX)
+        .and_then(|value| value.strip_suffix(" -->"))
+        .ok_or_else(|| invalid_project_instruction("instruction ownership marker is malformed"))?;
+    let (id, kind) = value
+        .rsplit_once(':')
+        .ok_or_else(|| invalid_project_instruction("instruction ownership marker is malformed"))?;
+    validate_project_instruction_id(id)?;
+    if !matches!(kind, "begin" | "end") {
+        return Err(invalid_project_instruction(
+            "instruction ownership marker is malformed",
+        ));
+    }
+    Ok((id, kind))
+}
+
+fn parse_project_instruction_snippets(
+    current: &str,
+) -> Result<Vec<ParsedProjectInstructionSnippet>, AppError> {
+    if current.matches("agency-agents:instruction").count()
+        != current.matches(PROJECT_INSTRUCTION_MARKER_PREFIX).count()
+    {
+        return Err(invalid_project_instruction(
+            "instruction ownership marker is malformed",
+        ));
+    }
+    let mut snippets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut open: Option<(String, usize, usize)> = None;
+    let mut cursor = 0;
+    while let Some(offset) = current[cursor..].find(PROJECT_INSTRUCTION_MARKER_PREFIX) {
+        let marker_start = cursor + offset;
+        let marker_end = current[marker_start..]
+            .find("-->")
+            .map(|end| marker_start + end + 3)
+            .ok_or_else(|| {
+                invalid_project_instruction("instruction ownership marker is malformed")
+            })?;
+        let (id, kind) = parse_project_instruction_marker(&current[marker_start..marker_end])?;
+        match kind {
+            "begin" => {
+                if open.is_some() || !seen.insert(id.to_owned()) {
+                    return Err(invalid_project_instruction(
+                        "instruction ownership markers are nested or duplicated",
+                    ));
+                }
+                if current.as_bytes().get(marker_end) != Some(&b'\n') {
+                    return Err(invalid_project_instruction(
+                        "instruction ownership marker is malformed",
+                    ));
+                }
+                open = Some((id.to_owned(), marker_start, marker_end + 1));
+            }
+            "end" => {
+                let (open_id, begin_start, content_start) = open.take().ok_or_else(|| {
+                    invalid_project_instruction("instruction ownership marker is malformed")
+                })?;
+                if open_id != id
+                    || marker_start == 0
+                    || current.as_bytes().get(marker_start - 1) != Some(&b'\n')
+                {
+                    return Err(invalid_project_instruction(
+                        "instruction ownership marker is malformed",
+                    ));
+                }
+                let content_end = marker_start - 1;
+                let content = &current[content_start..content_end];
+                validate_project_instruction_content(content)?;
+                let span_start = if begin_start >= 2
+                    && &current.as_bytes()[begin_start - 2..begin_start] == b"\n\n"
+                {
+                    begin_start - 2
+                } else {
+                    begin_start
+                };
+                snippets.push(ParsedProjectInstructionSnippet {
+                    id: open_id,
+                    content: content.to_owned(),
+                    span_start,
+                    marker_start: begin_start,
+                    span_end: marker_end,
+                });
+            }
+            _ => unreachable!(),
+        }
+        cursor = marker_end;
+    }
+    if open.is_some() || current[cursor..].contains("agency-agents:instruction") {
+        return Err(invalid_project_instruction(
+            "instruction ownership marker is malformed",
+        ));
+    }
+    if snippets.len() > MAX_PROJECT_INSTRUCTION_SNIPPETS {
+        return Err(invalid_project_instruction(
+            "instruction file exceeds its managed snippet limit",
+        ));
+    }
+    Ok(snippets)
+}
+
+fn project_instruction_block(id: &str, content: &str) -> String {
+    format!(
+        "{PROJECT_INSTRUCTION_MARKER_PREFIX}{id}:begin -->\n{content}\n{PROJECT_INSTRUCTION_MARKER_PREFIX}{id}:end -->"
+    )
+}
+
+fn compose_project_instruction(
+    current: &str,
+    operation: ProjectInstructionOperation,
+    snippet_id: &str,
+    content: &str,
+) -> Result<ProjectInstructionComposition, AppError> {
+    validate_project_instruction_id(snippet_id)?;
+    let snippets = parse_project_instruction_snippets(current)?;
+    let existing = snippets.iter().find(|snippet| snippet.id == snippet_id);
+    let adoption = operation == ProjectInstructionOperation::Upsert
+        && existing.is_none()
+        && snippets.is_empty()
+        && !current.is_empty();
+    let proposed = match operation {
+        ProjectInstructionOperation::Upsert => {
+            validate_project_instruction_content(content)?;
+            let block = project_instruction_block(snippet_id, content);
+            if let Some(existing) = existing {
+                let owned_separator = &current[existing.span_start..existing.marker_start];
+                format!(
+                    "{}{}{}{}",
+                    &current[..existing.span_start],
+                    owned_separator,
+                    block,
+                    &current[existing.span_end..]
+                )
+            } else {
+                if snippets.len() >= MAX_PROJECT_INSTRUCTION_SNIPPETS {
+                    return Err(invalid_project_instruction(
+                        "instruction file reached its managed snippet limit",
+                    ));
+                }
+                format!(
+                    "{current}{}{block}",
+                    if current.is_empty() { "" } else { "\n\n" }
+                )
+            }
+        }
+        ProjectInstructionOperation::Remove => existing.map_or_else(
+            || current.to_owned(),
+            |existing| {
+                format!(
+                    "{}{}",
+                    &current[..existing.span_start],
+                    &current[existing.span_end..]
+                )
+            },
+        ),
+    };
+    if proposed.len() as u64 > MAX_PROJECT_INSTRUCTION_BYTES {
+        return Err(invalid_project_instruction(
+            "proposed instruction file exceeds its byte limit",
+        ));
+    }
+    parse_project_instruction_snippets(&proposed)?;
+    Ok(ProjectInstructionComposition { proposed, adoption })
+}
+
+async fn read_project_instruction_target(
+    project: &Path,
+    target: ProjectInstructionTargetDef,
+) -> Result<Option<String>, AppError> {
+    let relative = Path::new(target.relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid_project_instruction(
+            "instruction target path is invalid",
+        ));
+    }
+    let mut candidate = project.to_path_buf();
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        candidate.push(component.as_os_str());
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect instruction target: {error}"),
+                })
+            }
+        };
+        if metadata.file_type().is_symlink()
+            || (index + 1 < components.len() && !metadata.is_dir())
+            || (index + 1 == components.len() && !metadata.is_file())
+        {
+            return Err(invalid_project_instruction(
+                "instruction target must be a regular file beneath real directories",
+            ));
+        }
+    }
+    let bytes = read_capped(&candidate, MAX_PROJECT_INSTRUCTION_BYTES).await?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| invalid_project_instruction("instruction target must be valid UTF-8"))
+}
+
+async fn canonical_registered_instruction_project(
+    state: &AppState,
+    project_path: &str,
+) -> Result<PathBuf, AppError> {
+    if project_path.is_empty()
+        || project_path.len() > 4096
+        || project_path.chars().any(char::is_control)
+    {
+        return Err(invalid_project_instruction("project path is invalid"));
+    }
+    let supplied = PathBuf::from(project_path);
+    if !supplied.is_absolute()
+        || supplied
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(invalid_project_instruction(
+            "project path must be absolute and normalized",
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&supplied).map_err(|error| AppError::Io {
+        message: format!("inspect instruction project: {error}"),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid_project_instruction(
+            "instruction project must be a real directory",
+        ));
+    }
+    let canonical = std::fs::canonicalize(&supplied).map_err(|error| AppError::Io {
+        message: format!("canonicalize instruction project: {error}"),
+    })?;
+    if supplied != canonical
+        || !registered_projects(&state.app_data_dir)
+            .await?
+            .contains(&canonical)
+    {
+        return Err(invalid_project_instruction(
+            "instruction project must be the exact registered canonical path",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn project_instruction_target_view(
+    project: &Path,
+    target: ProjectInstructionTargetDef,
+    current: Result<Option<String>, AppError>,
+) -> ProjectInstructionTarget {
+    let destination = project.join(target.relative_path);
+    match current {
+        Err(error) => ProjectInstructionTarget {
+            id: target.id.into(),
+            label: target.label.into(),
+            relative_path: target.relative_path.into(),
+            destination: destination.to_string_lossy().into_owned(),
+            state: "blocked".into(),
+            exists: destination.exists(),
+            current: String::new(),
+            snippets: Vec::new(),
+            blockers: vec![error.to_string()],
+        },
+        Ok(None) => ProjectInstructionTarget {
+            id: target.id.into(),
+            label: target.label.into(),
+            relative_path: target.relative_path.into(),
+            destination: destination.to_string_lossy().into_owned(),
+            state: "absent".into(),
+            exists: false,
+            current: String::new(),
+            snippets: Vec::new(),
+            blockers: Vec::new(),
+        },
+        Ok(Some(current)) => match parse_project_instruction_snippets(&current) {
+            Err(error) => ProjectInstructionTarget {
+                id: target.id.into(),
+                label: target.label.into(),
+                relative_path: target.relative_path.into(),
+                destination: destination.to_string_lossy().into_owned(),
+                state: "blocked".into(),
+                exists: true,
+                current,
+                snippets: Vec::new(),
+                blockers: vec![error.to_string()],
+            },
+            Ok(snippets) => ProjectInstructionTarget {
+                id: target.id.into(),
+                label: target.label.into(),
+                relative_path: target.relative_path.into(),
+                destination: destination.to_string_lossy().into_owned(),
+                state: if snippets.is_empty() {
+                    "existingUnmanaged"
+                } else {
+                    "managed"
+                }
+                .into(),
+                exists: true,
+                current,
+                snippets: snippets
+                    .into_iter()
+                    .map(|snippet| ProjectInstructionSnippet {
+                        id: snippet.id,
+                        content: snippet.content,
+                    })
+                    .collect(),
+                blockers: Vec::new(),
+            },
+        },
+    }
+}
+
+async fn inspect_project_instruction_targets(
+    state: &AppState,
+    project_path: &str,
+) -> Result<Vec<ProjectInstructionTarget>, AppError> {
+    let project = canonical_registered_instruction_project(state, project_path).await?;
+    let mut inspected = Vec::with_capacity(PROJECT_INSTRUCTION_TARGETS.len());
+    for target in project_instruction_targets() {
+        inspected.push(project_instruction_target_view(
+            &project,
+            *target,
+            read_project_instruction_target(&project, *target).await,
+        ));
+    }
+    Ok(inspected)
+}
+
+fn finalize_project_instruction_plan(plan: &mut ProjectInstructionPlan) -> Result<(), AppError> {
+    plan.warnings.sort();
+    plan.warnings.dedup();
+    plan.blockers.sort();
+    plan.blockers.dedup();
+    plan.revision.clear();
+    plan.revision =
+        render::sha256_hex(
+            &serde_json::to_vec(plan).map_err(|error| AppError::Internal {
+                message: format!("serialize project instruction plan: {error}"),
+            })?,
+        );
+    Ok(())
+}
+
+async fn build_project_instruction_plan(
+    state: &AppState,
+    project_path: &str,
+    target_id: &str,
+    operation: ProjectInstructionOperation,
+    snippet_id: &str,
+    content: &str,
+) -> Result<ProjectInstructionPlan, AppError> {
+    let project = canonical_registered_instruction_project(state, project_path).await?;
+    let target = project_instruction_target(target_id)?;
+    let destination = project.join(target.relative_path);
+    let current = read_project_instruction_target(&project, target).await;
+    let (exists, current, mut blockers) = match current {
+        Ok(Some(current)) => (true, current, Vec::new()),
+        Ok(None) => (false, String::new(), Vec::new()),
+        Err(error) => (destination.exists(), String::new(), vec![error.to_string()]),
+    };
+    let composition = if blockers.is_empty() {
+        match compose_project_instruction(&current, operation, snippet_id, content) {
+            Ok(composition) => Some(composition),
+            Err(error) => {
+                blockers.push(error.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let proposed = composition.as_ref().map_or_else(
+        || current.clone(),
+        |composition| composition.proposed.clone(),
+    );
+    let adoption = composition
+        .as_ref()
+        .is_some_and(|composition| composition.adoption);
+    let no_op = current == proposed;
+    if no_op && blockers.is_empty() {
+        blockers.push("instruction plan has no changes to apply".into());
+    }
+    let mut warnings = Vec::new();
+    if adoption {
+        warnings.push("Existing user-authored content will be adopted without being owned".into());
+    }
+    if exists && !no_op {
+        warnings.push("Exact current bytes will be backed up before the change".into());
+    }
+    if state.completed_state_database().await?.is_none() {
+        blockers.push("Storage migration must complete before instruction changes".into());
+    }
+    let mut plan = ProjectInstructionPlan {
+        project_path: project.to_string_lossy().into_owned(),
+        target: target.id.into(),
+        label: target.label.into(),
+        relative_path: target.relative_path.into(),
+        destination: destination.to_string_lossy().into_owned(),
+        operation,
+        snippet_id: snippet_id.into(),
+        current,
+        proposed,
+        exists,
+        adoption,
+        backup_required: exists && !no_op,
+        no_op,
+        warnings,
+        blockers,
+        revision: String::new(),
+    };
+    finalize_project_instruction_plan(&mut plan)?;
+    Ok(plan)
+}
+
+fn project_instruction_missing_directories(
+    project: &Path,
+    destination: &Path,
+) -> Result<Vec<PathBuf>, AppError> {
+    let parent = destination.parent().ok_or_else(|| {
+        invalid_project_instruction("instruction destination has no parent directory")
+    })?;
+    let mut missing = Vec::new();
+    let relative = parent
+        .strip_prefix(project)
+        .map_err(|_| invalid_project_instruction("instruction destination escapes the project"))?;
+    let mut candidate = project.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(invalid_project_instruction(
+                "instruction destination is invalid",
+            ));
+        }
+        candidate.push(component.as_os_str());
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(invalid_project_instruction(
+                    "instruction destination parent is unsafe",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(candidate.clone())
+            }
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect instruction destination parent: {error}"),
+                })
+            }
+        }
+    }
+    Ok(missing)
+}
+
+async fn rollback_project_instruction_operation(
+    app_data_dir: &Path,
+    payload: &ProjectInstructionApplyOperation,
+) -> Result<(), AppError> {
+    let target = project_instruction_target(&payload.target)?;
+    let project = PathBuf::from(&payload.project_path);
+    let destination = PathBuf::from(&payload.destination);
+    let project_is_exact = std::fs::symlink_metadata(&project)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        && std::fs::canonicalize(&project).is_ok_and(|canonical| canonical == project);
+    if !project_is_exact || project.join(target.relative_path) != destination {
+        return Err(AppError::StorageCorrupt {
+            message: "project instruction recovery path is invalid".into(),
+        });
+    }
+    let current = read_project_instruction_target(&project, target)
+        .await?
+        .map(String::into_bytes);
+    let current_hash = current.as_deref().map(render::sha256_hex);
+    match &payload.before_hash {
+        Some(before_hash) if current_hash.as_ref() == Some(before_hash) => {}
+        Some(before_hash) if current_hash.as_deref() == Some(payload.after_hash.as_str()) => {
+            let backup =
+                payload
+                    .backup_path
+                    .as_deref()
+                    .ok_or_else(|| AppError::StorageCorrupt {
+                        message: "project instruction recovery backup is missing".into(),
+                    })?;
+            let backup = Path::new(backup);
+            let backup_root = backups_dir_for(app_data_dir);
+            let backup_is_safe = backup.parent() == Some(backup_root.as_path())
+                && std::fs::symlink_metadata(&backup_root).is_ok_and(|metadata| {
+                    metadata.is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && !crate::skills::metadata_is_reparse_point(&metadata)
+                })
+                && std::fs::symlink_metadata(backup).is_ok_and(|metadata| {
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && !crate::skills::metadata_is_reparse_point(&metadata)
+                });
+            if !backup_is_safe {
+                return Err(AppError::StorageCorrupt {
+                    message: "project instruction recovery backup path is unsafe".into(),
+                });
+            }
+            let bytes = read_capped(backup, MAX_PROJECT_INSTRUCTION_BYTES).await?;
+            if render::sha256_hex(&bytes) != *before_hash {
+                return Err(AppError::StorageCorrupt {
+                    message: "project instruction recovery backup hash is invalid".into(),
+                });
+            }
+            atomic_write(&destination, &bytes).await?;
+        }
+        None if current.is_none() => {}
+        None if current_hash.as_deref() == Some(payload.after_hash.as_str()) => {
+            tokio::fs::remove_file(&destination)
+                .await
+                .map_err(|error| AppError::Io {
+                    message: format!("remove recovered instruction target: {error}"),
+                })?;
+        }
+        _ => {
+            return Err(AppError::StorageCorrupt {
+                message: "project instruction recovery found unexpected destination bytes".into(),
+            })
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn recover_project_instruction_operations(
+    state: &AppState,
+) -> Result<(), AppError> {
+    let Some(database) = state.completed_state_database().await? else {
+        return Ok(());
+    };
+    for operation in database
+        .pending_filesystem_operations()
+        .await?
+        .into_iter()
+        .filter(|operation| operation.kind == "project_instruction_apply")
+    {
+        let recovery = async {
+            let payload: ProjectInstructionApplyOperation =
+                serde_json::from_value(operation.payload.clone()).map_err(|error| {
+                    AppError::StorageCorrupt {
+                        message: format!("parse project instruction recovery operation: {error}"),
+                    }
+                })?;
+            rollback_project_instruction_operation(&state.app_data_dir, &payload).await?;
+            match operation.phase {
+                crate::state_db::FilesystemOperationPhase::Prepared => {
+                    database.abort_filesystem_operation(&operation.id).await
+                }
+                crate::state_db::FilesystemOperationPhase::FilesystemApplied => {
+                    database.commit_filesystem_operation(&operation.id).await
+                }
+                crate::state_db::FilesystemOperationPhase::Committed => Ok(()),
+            }
+        }
+        .await;
+        if let Err(error) = recovery {
+            database
+                .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn project_instructions_inspect(
+    state: State<'_, AppState>,
+    project_path: String,
+) -> Result<Vec<ProjectInstructionTarget>, AppError> {
+    inspect_project_instruction_targets(&state, &project_path).await
+}
+
+#[tauri::command]
+pub async fn project_instruction_plan(
+    state: State<'_, AppState>,
+    project_path: String,
+    target: String,
+    operation: ProjectInstructionOperation,
+    snippet_id: String,
+    content: String,
+) -> Result<ProjectInstructionPlan, AppError> {
+    build_project_instruction_plan(
+        &state,
+        &project_path,
+        &target,
+        operation,
+        &snippet_id,
+        &content,
+    )
+    .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn project_instruction_apply(
+    state: State<'_, AppState>,
+    project_path: String,
+    target: String,
+    operation: ProjectInstructionOperation,
+    snippet_id: String,
+    content: String,
+    revision: String,
+    confirmed: bool,
+) -> Result<ProjectInstructionApplyResponse, AppError> {
+    apply_project_instruction(
+        &state,
+        project_path,
+        target,
+        operation,
+        snippet_id,
+        content,
+        revision,
+        confirmed,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_project_instruction(
+    state: &AppState,
+    project_path: String,
+    target: String,
+    operation: ProjectInstructionOperation,
+    snippet_id: String,
+    content: String,
+    revision: String,
+    confirmed: bool,
+) -> Result<ProjectInstructionApplyResponse, AppError> {
+    if !confirmed {
+        return Err(invalid_project_instruction(
+            "project instruction apply requires explicit confirmation",
+        ));
+    }
+    // ponytail: one existing registry lock serializes instruction writes; split
+    // per project only if contention becomes measurable.
+    let _project_lock = lock_project_registry(&state.app_data_dir)?;
+    let plan = build_project_instruction_plan(
+        state,
+        &project_path,
+        &target,
+        operation,
+        &snippet_id,
+        &content,
+    )
+    .await?;
+    if plan.revision != revision || !plan.blockers.is_empty() || plan.no_op {
+        return Ok(ProjectInstructionApplyResponse { plan, result: None });
+    }
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "storage migration is incomplete".into(),
+            })?;
+    let destination = PathBuf::from(&plan.destination);
+    let backup_path = plan.backup_required.then(|| {
+        backups_dir_for(&state.app_data_dir).join(format!(
+            "project-instruction-{}-{}-{}.bak",
+            plan.target,
+            plan.snippet_id,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    });
+    let created_directories =
+        project_instruction_missing_directories(Path::new(&plan.project_path), &destination)?;
+    let payload = ProjectInstructionApplyOperation {
+        project_path: plan.project_path.clone(),
+        target: plan.target.clone(),
+        destination: plan.destination.clone(),
+        before_hash: plan
+            .exists
+            .then(|| render::sha256_hex(plan.current.as_bytes())),
+        after_hash: render::sha256_hex(plan.proposed.as_bytes()),
+        backup_path: backup_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+    };
+    let journal = database
+        .prepare_filesystem_operation("project_instruction_apply", &payload)
+        .await?;
+    let mut filesystem_applied = false;
+    let attempt = async {
+        let target_def = project_instruction_target(&plan.target)?;
+        let current_before_backup =
+            read_project_instruction_target(Path::new(&plan.project_path), target_def).await?;
+        if current_before_backup.as_deref() != plan.exists.then_some(plan.current.as_str()) {
+            return Err(invalid_project_instruction(
+                "instruction target changed during apply",
+            ));
+        }
+        if let Some(backup) = &backup_path {
+            tokio::fs::create_dir_all(backups_dir_for(&state.app_data_dir))
+                .await
+                .map_err(|error| AppError::Io {
+                    message: format!("create instruction backup directory: {error}"),
+                })?;
+            atomic_write(
+                backup,
+                current_before_backup
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            )
+            .await?;
+            let verified = read_capped(backup, MAX_PROJECT_INSTRUCTION_BYTES).await?;
+            if verified != plan.current.as_bytes() {
+                return Err(AppError::Internal {
+                    message: "instruction backup verification failed".into(),
+                });
+            }
+        }
+        for directory in &created_directories {
+            tokio::fs::create_dir(directory)
+                .await
+                .map_err(|error| AppError::Io {
+                    message: format!("create instruction target directory: {error}"),
+                })?;
+        }
+        let current =
+            read_project_instruction_target(Path::new(&plan.project_path), target_def).await?;
+        if current.as_deref() != plan.exists.then_some(plan.current.as_str()) {
+            return Err(invalid_project_instruction(
+                "instruction target changed during apply",
+            ));
+        }
+        atomic_write(&destination, plan.proposed.as_bytes()).await?;
+        database.mark_filesystem_applied(&journal.id).await?;
+        filesystem_applied = true;
+        database.commit_filesystem_operation(&journal.id).await
+    }
+    .await;
+    match attempt {
+        Ok(()) => Ok(ProjectInstructionApplyResponse {
+            result: Some(ProjectInstructionApplyResult {
+                destination: plan.destination.clone(),
+                outcome: "succeeded".into(),
+                backup_path: payload.backup_path.clone(),
+                message: None,
+            }),
+            plan,
+        }),
+        Err(error) => {
+            let rollback =
+                rollback_project_instruction_operation(&state.app_data_dir, &payload).await;
+            let journal_close = match &rollback {
+                Ok(()) if filesystem_applied => {
+                    database.commit_filesystem_operation(&journal.id).await
+                }
+                Ok(()) => database.abort_filesystem_operation(&journal.id).await,
+                Err(rollback_error) => {
+                    database
+                        .retain_filesystem_operation_error(
+                            &journal.id,
+                            &format!("{error}; rollback: {rollback_error}"),
+                        )
+                        .await
+                }
+            };
+            let journal_close_error = journal_close.err().map(|error| error.to_string());
+            if let Some(close_error) = &journal_close_error {
+                let _ = database
+                    .retain_filesystem_operation_error(
+                        &journal.id,
+                        &format!("{error}; journal close: {close_error}"),
+                    )
+                    .await;
+            }
+            Ok(ProjectInstructionApplyResponse {
+                result: Some(ProjectInstructionApplyResult {
+                    destination: plan.destination.clone(),
+                    outcome: if rollback.is_ok() && journal_close_error.is_none() {
+                        "rolledBack"
+                    } else {
+                        "rollbackFailed"
+                    }
+                    .into(),
+                    backup_path: payload.backup_path,
+                    message: Some(match (rollback, journal_close_error) {
+                        (Ok(()), None) => error.to_string(),
+                        (Ok(()), Some(close_error)) => {
+                            format!("{error}; journal close: {close_error}")
+                        }
+                        (Err(rollback_error), _) => {
+                            format!("{error}; rollback: {rollback_error}")
+                        }
+                    }),
+                }),
+                plan,
+            })
+        }
+    }
+}
+
 // ---------- Loadouts (Agentfile) ----------
 
 const WORKSPACE_PACK_VERSION: u32 = 1;
@@ -8549,5 +9539,631 @@ mod tests {
         assert!(register_project(app.path(), linked.to_str().unwrap())
             .await
             .is_err());
+    }
+
+    #[test]
+    fn project_instruction_targets_are_closed_and_deterministic() {
+        let targets = project_instruction_targets();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.id, target.relative_path))
+                .collect::<Vec<_>>(),
+            vec![
+                ("agents", "AGENTS.md"),
+                ("claude", "CLAUDE.md"),
+                ("gemini", "GEMINI.md"),
+                ("copilot", ".github/copilot-instructions.md"),
+            ]
+        );
+        assert!(project_instruction_target("../AGENTS.md").is_err());
+    }
+
+    #[test]
+    fn project_instruction_snippets_preserve_unowned_bytes_exactly() {
+        let original = "# Existing\n\nKeep these bytes.\n";
+        let created = compose_project_instruction(
+            original,
+            ProjectInstructionOperation::Upsert,
+            "review-rules",
+            "Review every diff.",
+        )
+        .unwrap();
+        assert!(created.adoption);
+        assert!(created.proposed.starts_with(original));
+        assert_eq!(
+            parse_project_instruction_snippets(&created.proposed)
+                .unwrap()
+                .into_iter()
+                .map(|snippet| snippet.id)
+                .collect::<Vec<_>>(),
+            vec!["review-rules"]
+        );
+
+        let replaced = compose_project_instruction(
+            &created.proposed,
+            ProjectInstructionOperation::Upsert,
+            "review-rules",
+            "Review the complete diff.",
+        )
+        .unwrap();
+        assert!(!replaced.adoption);
+        assert_eq!(replaced.proposed.matches("review-rules:begin").count(), 1);
+
+        let removed = compose_project_instruction(
+            &replaced.proposed,
+            ProjectInstructionOperation::Remove,
+            "review-rules",
+            "",
+        )
+        .unwrap();
+        assert_eq!(removed.proposed, original);
+        assert!(parse_project_instruction_snippets(&removed.proposed)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn project_instruction_parser_rejects_malformed_duplicate_and_unsafe_content() {
+        assert!(parse_project_instruction_snippets(
+            "<!-- agency-agents:instruction:v1:a:begin -->\nmissing end"
+        )
+        .is_err());
+        let duplicate = "<!-- agency-agents:instruction:v1:a:begin -->\none\n<!-- agency-agents:instruction:v1:a:end -->\n\n<!-- agency-agents:instruction:v1:a:begin -->\ntwo\n<!-- agency-agents:instruction:v1:a:end -->";
+        assert!(parse_project_instruction_snippets(duplicate).is_err());
+        assert!(compose_project_instruction(
+            "",
+            ProjectInstructionOperation::Upsert,
+            "bad marker",
+            "safe",
+        )
+        .is_err());
+        assert!(compose_project_instruction(
+            "",
+            ProjectInstructionOperation::Upsert,
+            "safe-id",
+            "api_key=sk-1234567890abcdef",
+        )
+        .is_err());
+        assert!(compose_project_instruction(
+            "",
+            ProjectInstructionOperation::Upsert,
+            "safe-id",
+            "Use ghp_1234567890abcdef",
+        )
+        .is_err());
+        assert!(compose_project_instruction(
+            "",
+            ProjectInstructionOperation::Upsert,
+            "safe-id",
+            "unsafe\u{0}control",
+        )
+        .is_err());
+
+        let mut bounded = String::new();
+        for index in 0..MAX_PROJECT_INSTRUCTION_SNIPPETS {
+            bounded = compose_project_instruction(
+                &bounded,
+                ProjectInstructionOperation::Upsert,
+                &format!("rule-{index}"),
+                "Review.",
+            )
+            .unwrap()
+            .proposed;
+        }
+        assert!(compose_project_instruction(
+            &bounded,
+            ProjectInstructionOperation::Upsert,
+            "one-too-many",
+            "Review.",
+        )
+        .is_err());
+        assert!(validate_project_instruction_content(
+            &"x".repeat(MAX_PROJECT_INSTRUCTION_CONTENT_BYTES)
+        )
+        .is_ok());
+        assert!(validate_project_instruction_content(
+            &"x".repeat(MAX_PROJECT_INSTRUCTION_CONTENT_BYTES + 1)
+        )
+        .is_err());
+    }
+
+    async fn project_instruction_test_state(app_data: &Path, project: &Path) -> AppState {
+        let canonical = std::fs::canonicalize(project).unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.to_path_buf();
+        let database = crate::state_db::StateDatabase::open(app_data).unwrap();
+        database
+            .mutate(projects_spec(), Vec::new(), move |projects| {
+                projects.push(canonical);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn project_instruction_plan_is_deterministic_complete_and_write_free() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let destination = project.path().join("AGENTS.md");
+        let original = "# Existing project rules\n";
+        std::fs::write(&destination, original).unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let first = build_project_instruction_plan(
+            &state,
+            &project_path,
+            "agents",
+            ProjectInstructionOperation::Upsert,
+            "review-rules",
+            "Review every diff.",
+        )
+        .await
+        .unwrap();
+        let second = build_project_instruction_plan(
+            &state,
+            &project_path,
+            "agents",
+            ProjectInstructionOperation::Upsert,
+            "review-rules",
+            "Review every diff.",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.blockers.is_empty());
+        assert!(first.adoption);
+        assert!(first.backup_required);
+        assert_eq!(first.current, original);
+        assert!(first.proposed.contains("review-rules:begin"));
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), original);
+        assert!(!backups_dir_for(app_data.path()).exists());
+        assert!(state
+            .completed_state_database()
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+
+        let no_op = build_project_instruction_plan(
+            &state,
+            &project_path,
+            "agents",
+            ProjectInstructionOperation::Remove,
+            "missing-rule",
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(no_op.no_op);
+        assert_eq!(no_op.current, no_op.proposed);
+        assert_eq!(
+            no_op.blockers,
+            vec!["instruction plan has no changes to apply"]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_instruction_inspection_classifies_all_targets_without_writes() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let unmanaged = "# Existing project rules\n";
+        let managed = project_instruction_block("team-rules", "Review every diff.");
+        let malformed = "<!-- agency-agents:instruction:v1:broken:begin -->\nmissing end";
+        std::fs::write(project.path().join("AGENTS.md"), unmanaged).unwrap();
+        std::fs::write(project.path().join("CLAUDE.md"), &managed).unwrap();
+        std::fs::write(project.path().join("GEMINI.md"), malformed).unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let inspected = inspect_project_instruction_targets(&state, &project_path)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            inspected
+                .iter()
+                .map(|target| (target.id.as_str(), target.state.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("agents", "existingUnmanaged"),
+                ("claude", "managed"),
+                ("gemini", "blocked"),
+                ("copilot", "absent"),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("AGENTS.md")).unwrap(),
+            unmanaged
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("CLAUDE.md")).unwrap(),
+            managed
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("GEMINI.md")).unwrap(),
+            malformed
+        );
+        assert!(!project.path().join(".github").exists());
+        assert!(state
+            .completed_state_database()
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_instruction_inspection_blocks_invalid_utf8_oversize_and_unregistered_roots() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let unregistered = tempfile::tempdir().unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let target = project_instruction_target("agents").unwrap();
+        let destination = project.path().join("AGENTS.md");
+
+        std::fs::write(&destination, [0xff]).unwrap();
+        assert!(read_project_instruction_target(project.path(), target)
+            .await
+            .is_err());
+        let file = std::fs::File::create(&destination).unwrap();
+        file.set_len(MAX_PROJECT_INSTRUCTION_BYTES + 1).unwrap();
+        assert!(read_project_instruction_target(project.path(), target)
+            .await
+            .is_err());
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        assert!(read_project_instruction_target(project.path(), target)
+            .await
+            .is_err());
+        assert!(build_project_instruction_plan(
+            &state,
+            unregistered.path().to_str().unwrap(),
+            "agents",
+            ProjectInstructionOperation::Upsert,
+            "review-rules",
+            "Review every diff.",
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            canonical_registered_instruction_project(&state, &project_path)
+                .await
+                .unwrap()
+                .to_string_lossy(),
+            project_path
+        );
+    }
+
+    #[tokio::test]
+    async fn project_instruction_apply_creates_replaces_and_removes_one_owned_snippet() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let destination = project.path().join("AGENTS.md");
+
+        for (operation, content) in [
+            (ProjectInstructionOperation::Upsert, "Review every diff."),
+            (
+                ProjectInstructionOperation::Upsert,
+                "Review the complete diff.",
+            ),
+            (ProjectInstructionOperation::Remove, ""),
+        ] {
+            let plan = build_project_instruction_plan(
+                &state,
+                &project_path,
+                "agents",
+                operation,
+                "review-rules",
+                content,
+            )
+            .await
+            .unwrap();
+            let applied = apply_project_instruction(
+                &state,
+                project_path.clone(),
+                "agents".into(),
+                operation,
+                "review-rules".into(),
+                content.into(),
+                plan.revision,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(applied.result.unwrap().outcome, "succeeded");
+            assert_eq!(
+                std::fs::read_to_string(&destination).unwrap(),
+                applied.plan.proposed
+            );
+        }
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn project_instruction_apply_rejects_drift_then_backs_up_exact_bytes() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let destination = project.path().join("CLAUDE.md");
+        std::fs::write(&destination, b"original\n").unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let plan = build_project_instruction_plan(
+            &state,
+            &project_path,
+            "claude",
+            ProjectInstructionOperation::Upsert,
+            "team-rules",
+            "Use the reviewed team.",
+        )
+        .await
+        .unwrap();
+        std::fs::write(&destination, b"external drift\n").unwrap();
+
+        let stale = apply_project_instruction(
+            &state,
+            project_path.clone(),
+            "claude".into(),
+            ProjectInstructionOperation::Upsert,
+            "team-rules".into(),
+            "Use the reviewed team.".into(),
+            plan.revision,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(stale.result.is_none());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"external drift\n");
+        assert!(!backups_dir_for(app_data.path()).exists());
+
+        let fresh_revision = stale.plan.revision;
+        let applied = apply_project_instruction(
+            &state,
+            project_path,
+            "claude".into(),
+            ProjectInstructionOperation::Upsert,
+            "team-rules".into(),
+            "Use the reviewed team.".into(),
+            fresh_revision,
+            true,
+        )
+        .await
+        .unwrap();
+        let result = applied.result.unwrap();
+        assert_eq!(result.outcome, "succeeded");
+        let backup = PathBuf::from(result.backup_path.unwrap());
+        assert_eq!(std::fs::read(backup).unwrap(), b"external drift\n");
+        assert_eq!(
+            std::fs::read_to_string(destination).unwrap(),
+            applied.plan.proposed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_instruction_write_failure_rolls_back_without_losing_original() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let destination = project.path().join("AGENTS.md");
+        let original = b"original\n";
+        std::fs::write(&destination, original).unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let plan = build_project_instruction_plan(
+            &state,
+            &project_path,
+            "agents",
+            ProjectInstructionOperation::Upsert,
+            "review-rules",
+            "Review every diff.",
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let applied = apply_project_instruction(
+            &state,
+            project_path,
+            "agents".into(),
+            ProjectInstructionOperation::Upsert,
+            "review-rules".into(),
+            "Review every diff.".into(),
+            plan.revision,
+            true,
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(applied.result.unwrap().outcome, "rolledBack");
+        assert_eq!(std::fs::read(destination).unwrap(), original);
+        assert!(state
+            .completed_state_database()
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_instruction_parent_recovery_is_idempotent_and_exact() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let database = state.completed_state_database().await.unwrap().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let directory = project_path.join(".github");
+        let destination = directory.join("copilot-instructions.md");
+        let proposed = project_instruction_block("guardrails", "Review before applying.");
+        let payload = ProjectInstructionApplyOperation {
+            project_path: project_path.to_string_lossy().into_owned(),
+            target: "copilot".into(),
+            destination: destination.to_string_lossy().into_owned(),
+            before_hash: None,
+            after_hash: render::sha256_hex(proposed.as_bytes()),
+            backup_path: None,
+        };
+        let operation = database
+            .prepare_filesystem_operation("project_instruction_apply", &payload)
+            .await
+            .unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&destination, proposed).unwrap();
+        database
+            .mark_filesystem_applied(&operation.id)
+            .await
+            .unwrap();
+
+        recover_project_instruction_operations(&state)
+            .await
+            .unwrap();
+        recover_project_instruction_operations(&state)
+            .await
+            .unwrap();
+
+        assert!(!destination.exists());
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_instruction_recovery_aborts_prepared_and_retains_unexpected_bytes() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let database = state.completed_state_database().await.unwrap().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project_path.join("AGENTS.md");
+        let proposed = project_instruction_block("guardrails", "Review before applying.");
+        let payload = ProjectInstructionApplyOperation {
+            project_path: project_path.to_string_lossy().into_owned(),
+            target: "agents".into(),
+            destination: destination.to_string_lossy().into_owned(),
+            before_hash: None,
+            after_hash: render::sha256_hex(proposed.as_bytes()),
+            backup_path: None,
+        };
+        database
+            .prepare_filesystem_operation("project_instruction_apply", &payload)
+            .await
+            .unwrap();
+
+        recover_project_instruction_operations(&state)
+            .await
+            .unwrap();
+        assert!(!destination.exists());
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+
+        database
+            .prepare_filesystem_operation("project_instruction_apply", &payload)
+            .await
+            .unwrap();
+        std::fs::write(&destination, b"external bytes\n").unwrap();
+        recover_project_instruction_operations(&state)
+            .await
+            .unwrap();
+
+        let pending = database.pending_filesystem_operations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].recovery_error.is_some());
+        assert_eq!(std::fs::read(destination).unwrap(), b"external bytes\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_instruction_inspection_rejects_linked_target_components() {
+        use std::os::unix::fs::symlink;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), project.path().join(".github")).unwrap();
+        let target = project_instruction_target("copilot").unwrap();
+        assert!(read_project_instruction_target(project.path(), target)
+            .await
+            .is_err());
+        assert!(!outside.path().join("copilot-instructions.md").exists());
+
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let database = state.completed_state_database().await.unwrap().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project_path.join(".github/copilot-instructions.md");
+        let proposed = project_instruction_block("guardrails", "Review before applying.");
+        let payload = ProjectInstructionApplyOperation {
+            project_path: project_path.to_string_lossy().into_owned(),
+            target: "copilot".into(),
+            destination: destination.to_string_lossy().into_owned(),
+            before_hash: None,
+            after_hash: render::sha256_hex(proposed.as_bytes()),
+            backup_path: None,
+        };
+        let operation = database
+            .prepare_filesystem_operation("project_instruction_apply", &payload)
+            .await
+            .unwrap();
+        std::fs::write(outside.path().join("copilot-instructions.md"), &proposed).unwrap();
+        database
+            .mark_filesystem_applied(&operation.id)
+            .await
+            .unwrap();
+
+        recover_project_instruction_operations(&state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("copilot-instructions.md")).unwrap(),
+            proposed
+        );
+        let pending = database.pending_filesystem_operations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].recovery_error.is_some());
     }
 }

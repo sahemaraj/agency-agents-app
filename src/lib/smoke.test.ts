@@ -35,7 +35,7 @@ import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import type { Agent, AgentMutationPlan, AgentPackageResult, AgentSource, DoctorReport, ExpertResolved, InstalledAgent, InstalledSkill, InstallRecord, McpAuditEntry, WorkspacePackPlan } from "$lib/types";
+import type { Agent, AgentMutationPlan, AgentPackageResult, AgentSource, DoctorReport, ExpertResolved, InstalledAgent, InstalledSkill, InstallRecord, McpAuditEntry, ProjectInstructionPlan, ProjectInstructionTarget, WorkspacePackPlan } from "$lib/types";
 
 const skillRecommendation = (sourceId = "skills-b") => ({
   kind: "skill" as const,
@@ -3015,20 +3015,20 @@ describe("frontend test harness", () => {
       ["./components/InstallModal.svelte", [/async function reviewPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewCollection[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollback[^]*?actionError = isAppError[^\n]*appErrorMessage/]],
       ["./components/DiffModal.svelte", [/install\.diff[^]*?appErrorMessage/]],
       ["./components/AgencyDashboard.svelte", [/async function updateCatalog[^]*?appErrorMessage/]],
-      ["./components/Projects.svelte", [/async function reveal[^]*?appErrorMessage/, /async function forgetProject[^]*?appErrorMessage/, /async function uninstallAndRemove[^]*?appErrorMessage/]],
+      ["./components/Projects.svelte", [/async function reveal[^]*?appErrorMessage/, /async function forgetProject[^]*?appErrorMessage/, /async function uninstallAndRemove[^]*?appErrorMessage/, /async function refreshProjectInstructions[^]*?appErrorMessage/, /async function reviewInstruction[^]*?appErrorMessage/, /async function applyInstruction[^]*?appErrorMessage/]],
       ["./stores/catalog.svelte.ts", [/catalog_status[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_check_updates[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_detect[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /async setSource[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /async provisionManaged[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_pull[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/settings.svelte.ts", [/corruptOnDisk = true[^]*?this\.error = appErrorMessage/, /else if \(isAppError\(e\)\)[^]*?this\.error = appErrorMessage/, /async save[^]*?this\.error = appErrorMessage/, /async reset[^]*?this\.error = appErrorMessage/]],
       ["./stores/experts.svelte.ts", [/expert_runs_list[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/activity.svelte.ts", [/safeActivityDetail[^]*?isAppError\(value\) \? appErrorMessage\(value\)/]],
     ]);
-    expect([...inventory.values()].flat()).toHaveLength(43);
+    expect([...inventory.values()].flat()).toHaveLength(46);
     for (const [path, markers] of inventory) {
       const source = rel01Sources[path];
       expect(source, path).toBeTruthy();
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(46);
+      .toHaveLength(49);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -3171,5 +3171,63 @@ describe("frontend test harness", () => {
       expect(source).not.toMatch(/\.reconcile-warning[^}]*overflow-x:\s*(auto|scroll|hidden)/s);
       expect(source).not.toMatch(/\.reconcile-message[^}]*text-overflow:\s*ellipsis/s);
     }
+  });
+
+  it("binds project instruction inspection, revision apply, exact evidence, and redaction", async () => {
+    const target: ProjectInstructionTarget = {
+      id: "agents", label: "AGENTS.md", relativePath: "AGENTS.md",
+      destination: "/tmp/project/AGENTS.md", state: "existingUnmanaged", exists: true,
+      current: "existing\n", snippets: [], blockers: [],
+    };
+    const plan: ProjectInstructionPlan = {
+      projectPath: "/tmp/project", target: "agents", label: "AGENTS.md",
+      relativePath: "AGENTS.md", destination: "/tmp/project/AGENTS.md",
+      operation: "upsert", snippetId: "review-rules", current: "existing\n",
+      proposed: "existing\n\nmanaged\n", exists: true, adoption: true,
+      backupRequired: true, noOp: false, warnings: ["adoption"], blockers: [], revision: "rev-1",
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string, args) => {
+      if (command === "project_instructions_inspect") return [target] as never;
+      if (command === "project_instruction_plan") return plan as never;
+      if (command === "project_instruction_apply") {
+        expect(args as Record<string, unknown>).toMatchObject({ revision: "rev-1", confirmed: true });
+        return {
+          plan,
+          result: {
+            destination: "/tmp/project/AGENTS.md", outcome: "succeeded",
+            backupPath: "/tmp/backups/AGENTS.md.bak",
+            message: "token=should-not-survive",
+          },
+        } as never;
+      }
+      return [] as never;
+    });
+    const before = activity.entries.length;
+
+    expect(await projects.inspectInstructions("/tmp/project")).toEqual([target]);
+    expect(await projects.planInstruction("/tmp/project", "agents", "upsert", "review-rules", "Review.")).toEqual(plan);
+    const applied = await projects.applyInstruction(plan, "Review.");
+
+    expect(applied.result?.outcome).toBe("succeeded");
+    expect(activity.entries).toHaveLength(before + 1);
+    expect(activity.entries[0]).toMatchObject({
+      action: "update", scope: "project", projectPath: "/tmp/project",
+      subjectName: "AGENTS.md", detail: "/tmp/project/AGENTS.md · token=[redacted]",
+    });
+  });
+
+  it("keeps the project instruction workflow in the existing Projects review surface", () => {
+    for (const marker of [
+      /projects\.inspectInstructions\(selected\.path\)/,
+      /projects\.planInstruction\(/,
+      /projects\.applyInstruction\(instructionPlan, instructionDraft\.content\)/,
+      /diffLines\(instructionPlan\.current, instructionPlan\.proposed\)/,
+      /Apply reviewed change/,
+      /instructionPlan\.blockers\.length > 0 \|\| instructionPlan\.noOp/,
+      /aria-live="polite"/,
+      /restoreInstructionFocus/,
+    ]) expect(projectsSource.match(marker) ?? [], String(marker)).toHaveLength(1);
+    expect(projectsSource).not.toContain("window.fetch");
+    expect(projectsSource).not.toContain("execute(");
   });
 });

@@ -1056,6 +1056,7 @@ pub(crate) async fn recover_filesystem_operations(
         crate::skills::recover_install_operations(state).await,
         crate::install::recover_agent_operations(state).await,
         crate::install::recover_workspace_pack_operations(app, state).await,
+        crate::install::recover_project_instruction_operations(state).await,
         crate::experts::recover_activation_operations(app, state).await,
     ] {
         if let Err(error) = result {

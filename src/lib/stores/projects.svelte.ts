@@ -13,7 +13,14 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { i18n } from "$lib/stores/i18n.svelte";
 import { install } from "$lib/stores/install.svelte";
-import type { ProjectInfo } from "$lib/types";
+import { activity, safeActivityDetail } from "$lib/stores/activity.svelte";
+import type {
+  ProjectInfo,
+  ProjectInstructionApplyResponse,
+  ProjectInstructionOperation,
+  ProjectInstructionPlan,
+  ProjectInstructionTarget,
+} from "$lib/types";
 
 const STORAGE_KEY = "agency-agents:projects:v1";
 
@@ -55,6 +62,64 @@ class ProjectsStore {
   async unregister(path: string): Promise<void> {
     await invoke("project_unregister", { path });
     this.list = await invoke<ProjectInfo[]>("projects_list");
+  }
+
+  inspectInstructions(projectPath: string): Promise<ProjectInstructionTarget[]> {
+    return invoke<ProjectInstructionTarget[]>("project_instructions_inspect", { projectPath });
+  }
+
+  planInstruction(
+    projectPath: string,
+    target: string,
+    operation: ProjectInstructionOperation,
+    snippetId: string,
+    content: string,
+  ): Promise<ProjectInstructionPlan> {
+    return invoke<ProjectInstructionPlan>("project_instruction_plan", {
+      projectPath, target, operation, snippetId, content,
+    });
+  }
+
+  async applyInstruction(
+    plan: ProjectInstructionPlan,
+    content: string,
+  ): Promise<ProjectInstructionApplyResponse> {
+    try {
+      const response = await invoke<ProjectInstructionApplyResponse>("project_instruction_apply", {
+        projectPath: plan.projectPath,
+        target: plan.target,
+        operation: plan.operation,
+        snippetId: plan.snippetId,
+        content,
+        revision: plan.revision,
+        confirmed: true,
+      });
+      if (response.result?.message) response.result.message = safeActivityDetail(response.result.message);
+      if (response.result) {
+        const message = response.result.message ? ` · ${safeActivityDetail(response.result.message)}` : "";
+        activity.log({
+          action: "update",
+          subject: "agentLibrary",
+          subjectName: response.plan.label,
+          scope: "project",
+          projectPath: response.plan.projectPath,
+          outcome: response.result.outcome === "succeeded" ? "ok" : "error",
+          detail: `${response.result.destination}${message}`,
+        });
+      }
+      return response;
+    } catch (error) {
+      activity.log({
+        action: "update",
+        subject: "agentLibrary",
+        subjectName: plan.label,
+        scope: "project",
+        projectPath: plan.projectPath,
+        outcome: "error",
+        detail: `${plan.destination} · ${safeActivityDetail(error)}`,
+      });
+      throw error;
+    }
   }
 
   /** Native folder picker → registers and returns the chosen path (or null). */
