@@ -26,4 +26,4 @@
 
 - [x] 5.1 Run focused/full frontend tests, Svelte diagnostics, production build, Rust formatting, strict Clippy, focused/full backend tests, and diff checks; fix only Phase 12 regressions.
 - [x] 5.2 Run strict OpenSpec validation and audit the diff for no dependency, backend audit table, network, telemetry, notification, new route/modal, or mutation-authority expansion.
-- [ ] 5.3 Sync and archive the OpenSpec change, update the existing Phase records, commit the branch, merge locally while preserving user-owned main changes, and re-run integration smoke gates.
+- [x] 5.3 Sync and archive the OpenSpec change, update the existing Phase records, commit the branch, merge locally while preserving user-owned main changes, and re-run integration smoke gates.

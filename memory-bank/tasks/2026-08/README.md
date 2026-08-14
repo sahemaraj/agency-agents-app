@@ -76,3 +76,11 @@ Added bounded, deterministic, local Agent and Skill recommendations to the exist
 ### 2026-08-13: Phase 11 Doctor Health Check
 
 Added one bounded, read-only local health report with independent classifications, privacy-safe deterministic copying, and handoff to existing recovery surfaces. OpenSpec, frontend, backend, Rust quality, Svelte, build, mutation-spy, dependency, route, and diff gates passed. See [260813_phase11-doctor-health-check.md](./260813_phase11-doctor-health-check.md).
+
+### 2026-08-14: Phase 12 Post-Action Receipts
+
+Added one bounded local receipt for completed Agent bulk and mixed Agent/Skill repair operations,
+including every attempted item, exact changed or known planned destination, terminal outcome,
+privacy-safe failure detail, and exact Activity navigation from existing completion surfaces.
+OpenSpec, frontend, backend, Rust quality, Svelte, build, safety, and diff gates passed. See
+[260814_phase12-post-action-receipts.md](./260814_phase12-post-action-receipts.md).
