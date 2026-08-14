@@ -31,4 +31,4 @@
 
 - [x] 6.1 Run focused/full frontend tests, Svelte diagnostics, production build, Rust formatting, strict Clippy, focused/full backend tests, crash-recovery tests, and diff checks; fix only Phase 13 regressions.
 - [x] 6.2 Run strict OpenSpec validation and audit for deterministic/path-private export, no dependency, network, telemetry, notification, instruction write, MCP configuration/install, new route, runtime execution, or unrelated mutation authority.
-- [ ] 6.3 Sync and archive the OpenSpec change, update existing Phase records and the canonical feature roadmap, commit the branch, merge locally while preserving user-owned main changes, and re-run integration smoke gates.
+- [x] 6.3 Sync and archive the OpenSpec change, update existing Phase records and the canonical feature roadmap, commit the branch, merge locally while preserving user-owned main changes, and re-run integration smoke gates.
