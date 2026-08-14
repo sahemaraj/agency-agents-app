@@ -36,6 +36,7 @@ import type {
   McpAuditEntry,
   McpClient,
   McpClientStatus,
+  McpInventoryReport,
   SkillSourceResult,
   SkillVersionSnapshot,
   SkillMutationPlan,
@@ -459,6 +460,10 @@ export function mcpAuditList(): Promise<McpAuditEntry[]> {
 
 export function mcpClientsStatus(): Promise<McpClientStatus[]> {
   return invoke<McpClientStatus[]>("mcp_clients_status");
+}
+
+export function mcpInventory(): Promise<McpInventoryReport> {
+  return invoke<McpInventoryReport>("mcp_inventory");
 }
 
 export function mcpClientConnect(client: McpClient): Promise<McpClientStatus> {

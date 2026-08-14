@@ -2,12 +2,14 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     thread,
     time::Duration,
 };
 
+use tauri::State;
 use tokio::{
     io::AsyncReadExt,
     process::Command,
@@ -16,13 +18,23 @@ use tokio::{
 
 use crate::{
     error::AppError,
-    types::{McpClient, McpClientState, McpClientStatus},
+    state::AppState,
+    types::{
+        McpClient, McpClientState, McpClientStatus, McpInventoryReport, McpInventoryServer,
+        McpInventoryValidation, McpServerScope, McpToolDiscovery, McpTrustedTemplate,
+    },
 };
 
 const SERVER_NAME: &str = "agency-agents";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const INVENTORY_CONFIG_LIMIT: u64 = 1024 * 1024;
+const INVENTORY_SERVER_LIMIT: usize = 256;
+const INVENTORY_FIELD_LIMIT: usize = 256;
+const INVENTORY_NAME_LIMIT: usize = 128;
+const INVENTORY_LIST_LIMIT: usize = 256;
+const INVENTORY_ISSUE_LIMIT: usize = 64;
 
 impl McpClient {
     fn executable(self) -> &'static str {
@@ -52,6 +64,418 @@ struct Registration {
     command: String,
     args: Vec<String>,
     scope: Option<String>,
+}
+
+fn bounded_inventory_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= INVENTORY_NAME_LIMIT
+        && !value.chars().any(char::is_control))
+    .then(|| value.to_owned())
+}
+
+fn bounded_inventory_list<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut values = values
+        .into_iter()
+        .filter_map(|value| {
+            let value = value.trim();
+            (!value.is_empty()
+                && value.len() <= INVENTORY_FIELD_LIMIT
+                && !value.chars().any(char::is_control))
+            .then(|| value.to_owned())
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values.truncate(INVENTORY_LIST_LIMIT);
+    values
+}
+
+fn inventory_transport(value: &serde_json::Value) -> &serde_json::Value {
+    value.get("transport").unwrap_or(value)
+}
+
+fn inventory_registration(value: &serde_json::Value) -> Option<Registration> {
+    let config = inventory_transport(value);
+    let command = config.get("command")?.as_str()?.to_owned();
+    let args = config
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .unwrap_or_else(|| Some(Vec::new()))?;
+    Some(Registration {
+        command,
+        args,
+        scope: None,
+    })
+}
+
+fn environment_keys(config: &serde_json::Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    for key in ["env", "environment"] {
+        if let Some(values) = config.get(key).and_then(serde_json::Value::as_object) {
+            keys.extend(values.keys().map(String::as_str));
+        }
+    }
+    if let Some(values) = config.get("env_vars").and_then(serde_json::Value::as_array) {
+        keys.extend(values.iter().filter_map(serde_json::Value::as_str));
+    }
+    let mut normalized = bounded_inventory_list(keys);
+    for key in ["headers", "http_headers", "env_http_headers"] {
+        if let Some(values) = config.get(key).and_then(serde_json::Value::as_object) {
+            normalized.extend(
+                bounded_inventory_list(values.keys().map(String::as_str))
+                    .into_iter()
+                    .map(|name| format!("header:{name}")),
+            );
+        }
+    }
+    normalized.sort();
+    normalized.dedup();
+    normalized.truncate(INVENTORY_LIST_LIMIT);
+    normalized
+}
+
+fn is_environment_reference(value: &str) -> bool {
+    let value = value.trim();
+    (value.starts_with("${") && value.ends_with('}'))
+        || (!value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'))
+}
+
+fn has_inline_inventory_credentials(config: &serde_json::Value) -> bool {
+    for key in ["env", "environment", "headers", "http_headers"] {
+        if config
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|values| {
+                values.values().any(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty() && !is_environment_reference(value))
+                })
+            })
+        {
+            return true;
+        }
+    }
+    config
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|args| {
+            args.iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|value| {
+                    let lower = value.to_ascii_lowercase();
+                    [
+                        "token=",
+                        "api_key=",
+                        "api-key=",
+                        "apikey=",
+                        "authorization:",
+                        "password=",
+                        "sk-",
+                        "ghp_",
+                        "github_pat_",
+                    ]
+                    .iter()
+                    .any(|marker| lower.contains(marker))
+                })
+        })
+}
+
+fn command_endpoint(command: &str) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty()
+        || command.len() > INVENTORY_FIELD_LIMIT
+        || command.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Path::new(command)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(bounded_inventory_name)
+}
+
+fn safe_remote_endpoint(raw: &str, blockers: &mut Vec<String>) -> Option<String> {
+    let parsed = match url::Url::parse(raw) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            blockers.push("Remote MCP URL is invalid".into());
+            return None;
+        }
+    };
+    let Some(host) = parsed.host_str() else {
+        blockers.push("Remote MCP URL has no host".into());
+        return None;
+    };
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        blockers.push("Remote MCP URL contains inline credential or private parameters".into());
+    }
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        blockers.push("Remote MCP URL must use HTTPS or loopback HTTP".into());
+    }
+    let host_summary = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let port = parsed
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let endpoint = format!("{}://{host_summary}{port}", parsed.scheme());
+    if endpoint.len() > INVENTORY_FIELD_LIMIT {
+        blockers.push("Remote MCP endpoint exceeds its limit".into());
+        return None;
+    }
+    Some(endpoint)
+}
+
+fn declared_tool_names(value: &serde_json::Value) -> Vec<String> {
+    let values = ["enabled_tools", "disabled_tools"]
+        .into_iter()
+        .filter_map(|key| value.get(key).and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(serde_json::Value::as_str);
+    bounded_inventory_list(values)
+}
+
+fn normalize_inventory_server(
+    client: McpClient,
+    name: &str,
+    scope: McpServerScope,
+    project_path: Option<String>,
+    value: &serde_json::Value,
+    expected: Option<&Registration>,
+    trusted_tools: &[String],
+) -> McpInventoryServer {
+    let mut warnings = Vec::new();
+    let mut blockers = Vec::new();
+    let name = bounded_inventory_name(name).unwrap_or_else(|| {
+        blockers.push("MCP server name is invalid or exceeds its limit".into());
+        "invalid-server".into()
+    });
+    let enabled = value
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if !enabled {
+        warnings.push("MCP server is disabled".into());
+    }
+    let config = inventory_transport(value);
+    let raw_transport = config
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            if config.get("url").is_some() {
+                "http"
+            } else {
+                "stdio"
+            }
+        });
+    let transport = match raw_transport {
+        "stdio" => "stdio",
+        "http" | "streamable_http" => "http",
+        "sse" => "sse",
+        _ => {
+            blockers.push("MCP transport is unsupported".into());
+            "unsupported"
+        }
+    }
+    .to_owned();
+    let endpoint = if transport == "stdio" {
+        let command = config
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let endpoint = command_endpoint(command).unwrap_or_else(|| {
+            blockers.push("Stdio MCP command is missing or invalid".into());
+            "unknown-command".into()
+        });
+        if matches!(
+            endpoint.to_ascii_lowercase().as_str(),
+            "npx" | "npx.cmd" | "uvx" | "docker" | "podman" | "bunx"
+        ) {
+            warnings.push("Configured runtime launcher may fetch or start external code".into());
+        }
+        endpoint
+    } else if matches!(transport.as_str(), "http" | "sse") {
+        safe_remote_endpoint(
+            config
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            &mut blockers,
+        )
+        .unwrap_or_else(|| "invalid-url".into())
+    } else {
+        "unsupported".into()
+    };
+    if has_inline_inventory_credentials(config) {
+        warnings.push("Configuration contains inline credential material".into());
+    }
+    let exact_trusted = name == SERVER_NAME
+        && scope == McpServerScope::User
+        && expected.is_some_and(|expected| {
+            inventory_registration(value).is_some_and(|registration| {
+                registration.command == expected.command && registration.args == expected.args
+            })
+        });
+    let declared_tools = declared_tool_names(value);
+    let (tool_names, tool_discovery) = if exact_trusted {
+        (trusted_tools.to_vec(), McpToolDiscovery::Known)
+    } else if declared_tools.is_empty() {
+        (Vec::new(), McpToolDiscovery::Unavailable)
+    } else {
+        (declared_tools, McpToolDiscovery::Declared)
+    };
+    warnings.sort();
+    warnings.dedup();
+    blockers.sort();
+    blockers.dedup();
+    let validation = if !blockers.is_empty() {
+        McpInventoryValidation::Blocked
+    } else if !warnings.is_empty() {
+        McpInventoryValidation::Warning
+    } else {
+        McpInventoryValidation::Valid
+    };
+    McpInventoryServer {
+        client,
+        name,
+        scope,
+        project_path,
+        transport,
+        endpoint,
+        enabled,
+        environment_keys: environment_keys(config),
+        tool_names,
+        tool_discovery,
+        validation,
+        warnings,
+        blockers,
+        trusted_template: exact_trusted,
+    }
+}
+
+fn parse_server_map(
+    client: McpClient,
+    servers: &serde_json::Map<String, serde_json::Value>,
+    scope: McpServerScope,
+    project_path: Option<String>,
+    expected: Option<&Registration>,
+    trusted_tools: &[String],
+    output: &mut Vec<McpInventoryServer>,
+) {
+    let mut entries = servers.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(name, _)| *name);
+    for (name, value) in entries.into_iter().take(INVENTORY_SERVER_LIMIT) {
+        output.push(normalize_inventory_server(
+            client,
+            name,
+            scope,
+            project_path.clone(),
+            value,
+            expected,
+            trusted_tools,
+        ));
+    }
+}
+
+fn parse_codex_inventory(
+    output: &str,
+    expected: Option<&Registration>,
+    trusted_tools: &[String],
+) -> Result<Vec<McpInventoryServer>, AppError> {
+    let values = serde_json::from_str::<serde_json::Value>(output)
+        .map_err(|_| invalid("Codex MCP inventory JSON is invalid"))?;
+    let values = values
+        .as_array()
+        .ok_or_else(|| invalid("Codex MCP inventory must be a JSON array"))?;
+    let mut servers = values
+        .iter()
+        .map(|value| {
+            let name = value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            normalize_inventory_server(
+                McpClient::Codex,
+                name,
+                McpServerScope::User,
+                None,
+                value,
+                expected,
+                trusted_tools,
+            )
+        })
+        .collect::<Vec<_>>();
+    servers.sort_by(|left, right| left.name.cmp(&right.name));
+    servers.dedup_by(|left, right| left.name == right.name);
+    servers.truncate(INVENTORY_SERVER_LIMIT);
+    Ok(servers)
+}
+
+fn parse_claude_user_config(
+    root: &serde_json::Value,
+    projects: &[PathBuf],
+    expected: Option<&Registration>,
+    trusted_tools: &[String],
+    output: &mut Vec<McpInventoryServer>,
+) -> Result<(), AppError> {
+    let root = root
+        .as_object()
+        .ok_or_else(|| invalid("Claude MCP user config must be a JSON object"))?;
+    let configured_projects = root.get("projects").and_then(serde_json::Value::as_object);
+    let mut projects = projects.to_vec();
+    projects.sort();
+    for project in projects {
+        let identity = project.to_string_lossy().into_owned();
+        let servers = configured_projects
+            .and_then(|configured| configured.get(&identity))
+            .and_then(|value| value.get("mcpServers"))
+            .and_then(serde_json::Value::as_object);
+        if let Some(servers) = servers {
+            parse_server_map(
+                McpClient::Claude,
+                servers,
+                McpServerScope::Local,
+                Some(identity),
+                expected,
+                trusted_tools,
+                output,
+            );
+        }
+    }
+    if let Some(servers) = root
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+    {
+        parse_server_map(
+            McpClient::Claude,
+            servers,
+            McpServerScope::User,
+            None,
+            expected,
+            trusted_tools,
+            output,
+        );
+    }
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> AppError {
@@ -621,6 +1045,247 @@ async fn statuses_for_app(app_exe: &Path) -> Result<Vec<McpClientStatus>, AppErr
     ])
 }
 
+fn expected_inventory_registration(app_exe: &Path, client: McpClient) -> Option<Registration> {
+    app_command(app_exe, client)
+        .ok()
+        .map(|(command, args)| Registration {
+            command,
+            args,
+            scope: None,
+        })
+}
+
+fn push_inventory_issue(issues: &mut Vec<String>, message: impl Into<String>) {
+    if issues.len() >= INVENTORY_ISSUE_LIMIT {
+        return;
+    }
+    let message = message.into();
+    let bounded = message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(INVENTORY_FIELD_LIMIT)
+        .collect::<String>();
+    if !bounded.is_empty() {
+        issues.push(bounded);
+    }
+}
+
+async fn read_inventory_json(path: &Path) -> Result<Option<serde_json::Value>, AppError> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("MCP inventory source has no parent"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("MCP inventory source has no file name"))?;
+        let directory =
+            cap_primitives::fs::open_ambient_dir(parent, cap_primitives::ambient_authority())
+                .map_err(AppError::from)?;
+        let mut options = cap_primitives::fs::OpenOptions::new();
+        options
+            .read(true)
+            ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+        let file = match cap_primitives::fs::open(&directory, Path::new(name), &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(AppError::from(error)),
+        };
+        let metadata = file.metadata().map_err(AppError::from)?;
+        if !metadata.is_file() || crate::skills::metadata_is_reparse_point(&metadata) {
+            return Err(invalid("MCP inventory source must be a regular file"));
+        }
+        if metadata.len() > INVENTORY_CONFIG_LIMIT {
+            return Err(invalid("MCP inventory source exceeds its size limit"));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(INVENTORY_CONFIG_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(AppError::from)?;
+        if bytes.len() as u64 > INVENTORY_CONFIG_LIMIT {
+            return Err(invalid("MCP inventory source exceeds its size limit"));
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| invalid("MCP inventory source contains invalid JSON"))
+    })
+    .await
+    .map_err(|error| invalid(format!("MCP inventory read task failed: {error}")))?
+}
+
+async fn collect_claude_inventory(
+    home: &Path,
+    projects: &[PathBuf],
+    expected: Option<&Registration>,
+    trusted_tools: &[String],
+    servers: &mut Vec<McpInventoryServer>,
+    issues: &mut Vec<String>,
+) {
+    match read_inventory_json(&home.join(".claude.json")).await {
+        Ok(Some(root)) => {
+            if parse_claude_user_config(&root, projects, expected, trusted_tools, servers).is_err()
+            {
+                push_inventory_issue(issues, "Claude user MCP configuration is malformed");
+            }
+        }
+        Ok(None) => {}
+        Err(_) => push_inventory_issue(issues, "Claude user MCP configuration is unavailable"),
+    }
+
+    let mut sorted_projects = projects.to_vec();
+    sorted_projects.sort();
+    for project in sorted_projects {
+        let exact_project = std::fs::symlink_metadata(&project).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && !crate::skills::metadata_is_reparse_point(&metadata)
+        }) && std::fs::canonicalize(&project)
+            .is_ok_and(|canonical| canonical == project);
+        if !exact_project {
+            push_inventory_issue(
+                issues,
+                format!(
+                    "Claude project MCP source is unavailable for {}",
+                    project.display()
+                ),
+            );
+            continue;
+        }
+        match read_inventory_json(&project.join(".mcp.json")).await {
+            Ok(Some(root)) => match root
+                .get("mcpServers")
+                .and_then(serde_json::Value::as_object)
+            {
+                Some(configured) => parse_server_map(
+                    McpClient::Claude,
+                    configured,
+                    McpServerScope::Project,
+                    Some(project.to_string_lossy().into_owned()),
+                    expected,
+                    trusted_tools,
+                    servers,
+                ),
+                None => push_inventory_issue(
+                    issues,
+                    format!(
+                        "Claude project MCP configuration is malformed for {}",
+                        project.display()
+                    ),
+                ),
+            },
+            Ok(None) => {}
+            Err(_) => push_inventory_issue(
+                issues,
+                format!(
+                    "Claude project MCP configuration is unavailable for {}",
+                    project.display()
+                ),
+            ),
+        }
+    }
+}
+
+async fn collect_codex_inventory(
+    expected: Option<&Registration>,
+    trusted_tools: &[String],
+    servers: &mut Vec<McpInventoryServer>,
+    issues: &mut Vec<String>,
+) {
+    let Some(client_path) = find_client(McpClient::Codex) else {
+        push_inventory_issue(issues, "Codex CLI is unavailable for MCP inventory");
+        return;
+    };
+    collect_codex_inventory_at(&client_path, expected, trusted_tools, servers, issues).await;
+}
+
+async fn collect_codex_inventory_at(
+    client_path: &Path,
+    expected: Option<&Registration>,
+    trusted_tools: &[String],
+    servers: &mut Vec<McpInventoryServer>,
+    issues: &mut Vec<String>,
+) {
+    let result = match run(client_path, &["mcp".into(), "list".into(), "--json".into()]).await {
+        Ok(result) if result.success => result,
+        _ => {
+            push_inventory_issue(issues, "Codex MCP inventory command failed");
+            return;
+        }
+    };
+    match parse_codex_inventory(&result.stdout, expected, trusted_tools) {
+        Ok(mut parsed) => servers.append(&mut parsed),
+        Err(_) => push_inventory_issue(issues, "Codex MCP inventory output is malformed"),
+    }
+}
+
+#[tauri::command]
+pub async fn mcp_inventory(state: State<'_, AppState>) -> Result<McpInventoryReport, AppError> {
+    let trusted_tools = crate::skills::mcp::agency_agents_tool_names();
+    let app_exe = env::current_exe().map_err(AppError::from)?;
+    let claude_expected = expected_inventory_registration(&app_exe, McpClient::Claude);
+    let codex_expected = expected_inventory_registration(&app_exe, McpClient::Codex);
+    let projects = crate::install::registered_projects(&state.app_data_dir).await?;
+    let mut servers = Vec::new();
+    let mut issues = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        collect_claude_inventory(
+            &home,
+            &projects,
+            claude_expected.as_ref(),
+            &trusted_tools,
+            &mut servers,
+            &mut issues,
+        )
+        .await;
+    } else {
+        push_inventory_issue(&mut issues, "Claude home is unavailable for MCP inventory");
+    }
+    collect_codex_inventory(
+        codex_expected.as_ref(),
+        &trusted_tools,
+        &mut servers,
+        &mut issues,
+    )
+    .await;
+    servers.sort_by(|left, right| {
+        (
+            left.client,
+            left.scope,
+            left.project_path.as_deref(),
+            left.name.as_str(),
+        )
+            .cmp(&(
+                right.client,
+                right.scope,
+                right.project_path.as_deref(),
+                right.name.as_str(),
+            ))
+    });
+    servers.dedup_by(|left, right| {
+        left.client == right.client
+            && left.scope == right.scope
+            && left.project_path == right.project_path
+            && left.name == right.name
+    });
+    if servers.len() > INVENTORY_SERVER_LIMIT {
+        servers.truncate(INVENTORY_SERVER_LIMIT);
+        push_inventory_issue(&mut issues, "MCP inventory reached its server limit");
+    }
+    issues.sort();
+    issues.dedup();
+    Ok(McpInventoryReport {
+        servers,
+        trusted_templates: vec![McpTrustedTemplate {
+            id: SERVER_NAME.into(),
+            name: "Agency Agents".into(),
+            clients: vec![McpClient::Claude, McpClient::Codex],
+            tool_names: trusted_tools,
+            automatic_configuration: true,
+        }],
+        issues,
+    })
+}
+
 #[tauri::command]
 pub async fn mcp_client_connect(client: McpClient) -> Result<McpClientStatus, AppError> {
     let app_exe = env::current_exe().map_err(AppError::from)?;
@@ -788,6 +1453,208 @@ async fn repair_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_normalization_redacts_secrets_and_blocks_unsafe_remote_urls() {
+        let raw = serde_json::json!({
+            "name": "remote",
+            "enabled": true,
+            "transport": {
+                "type": "streamable_http",
+                "url": "http://user:password@example.com/mcp?token=secret#fragment",
+                "http_headers": {"Authorization": "Bearer super-secret"},
+                "env_http_headers": {"X-Api-Key": "MCP_API_KEY"}
+            }
+        });
+
+        let server = normalize_inventory_server(
+            McpClient::Codex,
+            "remote",
+            McpServerScope::User,
+            None,
+            &raw,
+            None,
+            &[],
+        );
+        let serialized = serde_json::to_string(&server).unwrap();
+
+        assert_eq!(server.endpoint, "http://example.com");
+        assert_eq!(server.validation, McpInventoryValidation::Blocked);
+        assert_eq!(
+            server.environment_keys,
+            vec!["header:Authorization", "header:X-Api-Key"]
+        );
+        for secret in ["password", "token=", "super-secret", "Bearer"] {
+            assert!(!serialized.contains(secret), "secret leaked: {secret}");
+        }
+    }
+
+    #[test]
+    fn codex_inventory_is_sorted_bounded_and_reports_honest_tools() {
+        let output = serde_json::json!([
+            {
+                "name": "z-foreign",
+                "enabled": true,
+                "enabled_tools": ["read", "write", "read"],
+                "transport": {"type": "stdio", "command": "npx", "args": ["-y", "pkg"], "env": {}}
+            },
+            {
+                "name": "agency-agents",
+                "enabled": true,
+                "transport": {"type": "stdio", "command": "/Applications/Agency Agents.app/app", "args": ["--mcp", "--client", "codex"], "env": {}}
+            },
+            {
+                "name": "a-foreign",
+                "enabled": false,
+                "transport": {"type": "stdio", "command": "local-server", "args": [], "env": {}}
+            }
+        ])
+        .to_string();
+        let expected = Registration {
+            command: "/Applications/Agency Agents.app/app".into(),
+            args: vec!["--mcp".into(), "--client".into(), "codex".into()],
+            scope: None,
+        };
+        let trusted_tools = vec!["skills_search".into(), "agents_search".into()];
+
+        let servers = parse_codex_inventory(&output, Some(&expected), &trusted_tools).unwrap();
+
+        assert_eq!(
+            servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-foreign", "agency-agents", "z-foreign"]
+        );
+        assert_eq!(servers[0].tool_discovery, McpToolDiscovery::Unavailable);
+        assert_eq!(servers[1].tool_discovery, McpToolDiscovery::Known);
+        assert_eq!(servers[1].tool_names, trusted_tools);
+        assert_eq!(servers[2].tool_discovery, McpToolDiscovery::Declared);
+        assert_eq!(servers[2].tool_names, vec!["read", "write"]);
+        assert!(servers[2]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("launcher")));
+    }
+
+    #[test]
+    fn claude_inventory_keeps_scope_and_exact_registered_project_identity() {
+        let project = "/projects/example";
+        let root = serde_json::json!({
+            "mcpServers": {
+                "user-server": {"command": "user-bin", "args": [], "env": {}}
+            },
+            "projects": {
+                (project): {
+                    "mcpServers": {
+                        "local-server": {"command": "local-bin", "args": [], "env": {}}
+                    }
+                }
+            }
+        });
+        let mut servers = Vec::new();
+        parse_claude_user_config(&root, &[PathBuf::from(project)], None, &[], &mut servers)
+            .unwrap();
+
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].scope, McpServerScope::Local);
+        assert_eq!(servers[0].project_path.as_deref(), Some(project));
+        assert_eq!(servers[1].scope, McpServerScope::User);
+        assert_eq!(servers[1].project_path, None);
+    }
+
+    #[test]
+    fn inventory_caps_after_deterministic_sorting() {
+        let values = (0..(INVENTORY_SERVER_LIMIT + 2))
+            .rev()
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("server-{index:03}"),
+                    "transport": {"type": "stdio", "command": "server", "args": []}
+                })
+            })
+            .collect::<Vec<_>>();
+        let servers =
+            parse_codex_inventory(&serde_json::to_string(&values).unwrap(), None, &[]).unwrap();
+
+        assert_eq!(servers.len(), INVENTORY_SERVER_LIMIT);
+        assert_eq!(servers.first().unwrap().name, "server-000");
+        assert_eq!(servers.last().unwrap().name, "server-255");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn inventory_sources_reject_links_and_oversize_files() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.json");
+        let link = temp.path().join("linked.json");
+        std::fs::write(&target, b"{}").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(read_inventory_json(&link).await.is_err());
+
+        let oversized = temp.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b' '; INVENTORY_CONFIG_LIMIT as usize + 1]).unwrap();
+        assert!(read_inventory_json(&oversized).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn claude_source_failure_keeps_independent_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            temp.path().join(".claude.json"),
+            br#"{"mcpServers":{"user-server":{"command":"user-bin","args":[]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join(".mcp.json"), b"not JSON").unwrap();
+        let mut servers = Vec::new();
+        let mut issues = Vec::new();
+
+        collect_claude_inventory(
+            temp.path(),
+            &[project],
+            None,
+            &[],
+            &mut servers,
+            &mut issues,
+        )
+        .await;
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "user-server");
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn codex_inventory_invokes_only_literal_json_list_argv() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = temp.path().join("fake codex");
+        let argv = temp.path().join("argv");
+        std::fs::write(
+            &client,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '[]'\n",
+                argv.display()
+            ),
+        )
+        .unwrap();
+        executable(&client);
+        let mut servers = Vec::new();
+        let mut issues = Vec::new();
+
+        collect_codex_inventory_at(&client, None, &[], &mut servers, &mut issues).await;
+
+        assert_eq!(
+            std::fs::read_to_string(argv).unwrap(),
+            "mcp\nlist\n--json\n"
+        );
+        assert!(servers.is_empty());
+        assert!(issues.is_empty());
+    }
 
     #[cfg(unix)]
     fn executable(path: &Path) {

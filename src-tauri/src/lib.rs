@@ -168,6 +168,7 @@ pub fn run() {
             mcp_agent_policy_set,
             mcp_agent_client_policy_set,
             mcp_clients_status,
+            mcp_inventory,
             mcp_client_connect,
             mcp_client_disconnect,
             mcp_client_repair,

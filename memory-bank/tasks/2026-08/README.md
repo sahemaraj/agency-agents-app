@@ -1,5 +1,11 @@
 # Tasks — 2026-08
 
+## In Progress
+
+### 2026-08-14: Phase 15 MCP Inventory Manager
+
+[IN-PROGRESS] Extending the existing MCP settings workflow with bounded, privacy-safe Claude Code/Codex inventory, passive validation, honest tool evidence, and one trusted Agency Agents template. Focused backend and frontend TDD checks pass; full QA and integration remain.
+
 ## Completed
 
 ### 2026-08-03: Expert MCP Lifecycle — Release 1

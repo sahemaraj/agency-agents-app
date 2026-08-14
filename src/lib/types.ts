@@ -1388,6 +1388,41 @@ export interface McpClientStatus {
   detail: string;
 }
 
+export type McpServerScope = "user" | "project" | "local";
+export type McpInventoryValidation = "valid" | "warning" | "blocked";
+export type McpToolDiscovery = "known" | "declared" | "unavailable";
+
+export interface McpInventoryServer {
+  client: McpClient;
+  name: string;
+  scope: McpServerScope;
+  projectPath: string | null;
+  transport: string;
+  endpoint: string;
+  enabled: boolean;
+  environmentKeys: string[];
+  toolNames: string[];
+  toolDiscovery: McpToolDiscovery;
+  validation: McpInventoryValidation;
+  warnings: string[];
+  blockers: string[];
+  trustedTemplate: boolean;
+}
+
+export interface McpTrustedTemplate {
+  id: string;
+  name: string;
+  clients: McpClient[];
+  toolNames: string[];
+  automaticConfiguration: boolean;
+}
+
+export interface McpInventoryReport {
+  servers: McpInventoryServer[];
+  trustedTemplates: McpTrustedTemplate[];
+  issues: string[];
+}
+
 export type StorageMigrationState = "legacy" | "inProgress" | "complete" | "corrupt" | "unsupported";
 
 export interface StorageMigrationStatus {
