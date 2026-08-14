@@ -26,4 +26,4 @@
 
 - [x] 5.1 Run focused and full Rust/frontend tests, crash-recovery checks, strict Clippy, formatting, Svelte diagnostics, production build, and diff checks; fix only Phase 14 regressions.
 - [x] 5.2 Audit for no arbitrary paths, links, secret retention, network, execution, dependency, MCP mutation, telemetry, notification, new route, or unrelated state document.
-- [ ] 5.3 Sync and archive OpenSpec, update Phase records and the canonical roadmap, commit and merge locally while preserving user-owned main changes, and rerun integration gates.
+- [x] 5.3 Sync and archive OpenSpec, update Phase records and the canonical roadmap, commit and merge locally while preserving user-owned main changes, and rerun integration gates.
