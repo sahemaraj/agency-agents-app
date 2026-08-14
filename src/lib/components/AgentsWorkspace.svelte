@@ -393,10 +393,11 @@
     menuOpen = false;
     bulkBusy = true;
     try {
-      const { ok, fail } = await install.bulk(action, targets);
+      const { ok, fail, receiptId } = await install.bulk(action, targets);
       const verb = i18n.t(verbKey);
-      if (fail === 0) toast.success(i18n.t("agents.bulkSuccess", { verb, count: ok }));
-      else toast.error(i18n.t("agents.bulkError", { verb, ok, fail }));
+      const receiptAction = { label: i18n.t("activity.viewReceipt"), onClick: () => ui.openActivityReceipt(receiptId) };
+      if (fail === 0) toast.success(i18n.t("agents.bulkSuccess", { verb, count: ok }), undefined, receiptAction);
+      else toast.error(i18n.t("agents.bulkError", { verb, ok, fail }), undefined, receiptAction);
       selected = new Set();
     } finally {
       bulkBusy = false;

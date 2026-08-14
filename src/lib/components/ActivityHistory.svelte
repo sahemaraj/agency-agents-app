@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import ActivityIcon from "@lucide/svelte/icons/activity";
   import DownloadIcon from "@lucide/svelte/icons/download";
   import Trash2 from "@lucide/svelte/icons/trash-2";
@@ -13,10 +13,34 @@
   import { activity, type JournalEntry } from "$lib/stores/activity.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { install } from "$lib/stores/install.svelte";
+  import { ui } from "$lib/stores/ui.svelte";
   import type { MessageKey } from "$lib/i18n/messages";
 
   onMount(() => {
     void activity.refreshMcpAudit();
+  });
+
+  let root: HTMLElement | undefined = $state();
+  let receiptAnnouncement = $state("");
+
+  $effect(() => {
+    const id = ui.activityReceiptId;
+    if (!id) return;
+    void tick().then(() => {
+      if (ui.activityReceiptId !== id) return;
+      const details = [...(root?.querySelectorAll<HTMLDetailsElement>("details[data-activity-id]") ?? [])]
+        .find((candidate) => candidate.dataset.activityId === id);
+      if (!details) {
+        receiptAnnouncement = i18n.optional("activity.receiptUnavailable", "Receipt is no longer available.");
+        ui.activityReceiptId = null;
+        return;
+      }
+      details.open = true;
+      details.scrollIntoView?.({ block: "center" });
+      details.querySelector<HTMLElement>("summary")?.focus({ preventScroll: true });
+      receiptAnnouncement = i18n.optional("activity.receiptOpened", "Receipt opened in Activity.");
+      ui.activityReceiptId = null;
+    });
   });
 
   /** Lucide icon per journal action. */
@@ -144,7 +168,8 @@
   }
 </script>
 
-<section class="hist">
+<section class="hist" bind:this={root}>
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{receiptAnnouncement}</div>
   {#if activity.hasLocalEntries}
     <header class="panel-head" data-tauri-drag-region>
       <span class="action-wrap" data-tauri-drag-region="false">
@@ -170,11 +195,29 @@
         <ul class="list">
           {#each group.entries as e (e.id)}
             {@const Icon = ACTION_ICON[e.action]}
-            <li class="row">
+            <li class="row" class:with-receipt={!!e.receipt}>
               <span class="ico" aria-hidden="true"><Icon size={15} /></span>
-              <span class="text truncate" title={e.outcome === "error" && e.detail ? e.detail : rowText(e)}>
-                {rowText(e)}
-              </span>
+              <div class="text" title={e.outcome === "error" && e.detail ? e.detail : rowText(e)}>
+                <span class="truncate">{rowText(e)}</span>
+                {#if e.receipt}
+                  <details data-activity-id={e.id}>
+                    <summary>
+                      {i18n.optional("activity.receiptDetails", "Receipt details")}
+                      <span class="receipt-counts">{i18n.optional("activity.receiptSummary", "{succeeded} succeeded · {failed} failed", { succeeded: e.receipt.succeeded, failed: e.receipt.failed })}</span>
+                    </summary>
+                    <ul class="receipt-items">
+                      {#each e.receipt.items as item, index (`${item.kind}:${item.destination}:${index}`)}
+                        <li>
+                          <span class="receipt-name">{item.name}</span>
+                          <span class="receipt-meta">{item.kind === "agent" ? "Agent" : "Skill"} · {item.outcome === "ok" ? i18n.t("common.succeeded") : i18n.t("common.failed")}</span>
+                          <span class="receipt-path" title={item.destination ?? undefined}>{item.destination ?? i18n.optional("activity.destinationUnavailable", "No destination was changed or returned")}</span>
+                          {#if item.detail}<span class="receipt-error">{item.detail}</span>{/if}
+                        </li>
+                      {/each}
+                    </ul>
+                  </details>
+                {/if}
+              </div>
               <span class="time" title={new Date(e.ts).toLocaleString()}>{relTime(e.ts)}</span>
               <span
                 class="status-dot"
@@ -238,8 +281,20 @@
     gap: var(--space-3);
   }
 
+  .row.with-receipt { align-items: start; }
+  .text { min-width: 0; font-weight: var(--fw-medium); }
+  details { margin-top: 2px; font-weight: var(--fw-normal); }
+  summary { width: fit-content; color: var(--color-brand); font-size: var(--text-body-sm); cursor: pointer; }
+  summary:focus-visible { outline: 2px solid var(--color-brand); outline-offset: 2px; border-radius: var(--radius-sm); }
+  .receipt-counts { margin-left: var(--space-2); color: var(--color-text-muted); }
+  .receipt-items { display: grid; gap: var(--space-2); margin-top: var(--space-2); }
+  .receipt-items li { display: grid; gap: 2px; padding: var(--space-2); border-radius: var(--radius-sm); background: var(--color-surface-sunken); }
+  .receipt-name { font-weight: var(--fw-medium); }
+  .receipt-meta, .receipt-path, .receipt-error { color: var(--color-text-muted); font-size: var(--text-body-sm); }
+  .receipt-path { overflow-wrap: anywhere; }
+  .receipt-error { color: var(--color-danger); }
+
   .ico { display: inline-flex; color: var(--color-text-muted); }
-  .text { font-weight: var(--fw-medium); }
   .time {
     text-align: right;
     color: var(--color-text-muted);

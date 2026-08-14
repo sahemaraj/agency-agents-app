@@ -106,6 +106,8 @@ class UiStore {
 
   drawerOpen: boolean = $state(false);
   drawerMinimized: boolean = $state(false);
+  /** Transient post-action receipt target consumed by Activity after render. */
+  activityReceiptId: string | null = $state(null);
   paletteOpen: boolean = $state(false);
   /** Settings modal (Phase 12b). Opened via the top-right gear icon or ⌘,. */
   settingsOpen: boolean = $state(false);
@@ -197,6 +199,11 @@ class UiStore {
     this.agentsReference = null;
     this.skillsSelected = null;
     this.commitNav();
+  }
+
+  openActivityReceipt(id: string) {
+    this.activityReceiptId = id;
+    this.setSection("activity");
   }
 
   /** Open the Projects detail pane for a project path (null = back to the list).

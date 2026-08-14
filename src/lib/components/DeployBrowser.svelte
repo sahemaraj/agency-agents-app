@@ -23,6 +23,7 @@
   import { install, SUPPORTED_TOOLS } from "$lib/stores/install.svelte";
   import { teams } from "$lib/stores/teams.svelte";
   import { toast } from "$lib/stores/toast.svelte";
+  import { ui } from "$lib/stores/ui.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { PRESET_TEAMS } from "$lib/data/presetTeams";
@@ -227,12 +228,13 @@
     if (missing.length === 0) return;
     busy = tool;
     try {
-      const { ok, fail } = await install.bulk(
+      const { ok, fail, receiptId } = await install.bulk(
         "install",
         missing.map((a) => ({ slug: a.slug, tool, projectPath })),
       );
-      if (fail === 0) toast.success(i18n.t("install.installedToast", { count: ok, tool: install.toolLabel(tool), where: projectName }));
-      else toast.error(i18n.t("install.installFailedToast", { tool: install.toolLabel(tool), ok, fail }));
+      const receiptAction = { label: i18n.t("activity.viewReceipt"), onClick: () => ui.openActivityReceipt(receiptId) };
+      if (fail === 0) toast.success(i18n.t("install.installedToast", { count: ok, tool: install.toolLabel(tool), where: projectName }), undefined, receiptAction);
+      else toast.error(i18n.t("install.installFailedToast", { tool: install.toolLabel(tool), ok, fail }), undefined, receiptAction);
     } finally {
       busy = null;
     }
@@ -242,12 +244,13 @@
     if (!install.reconciled || install.reconciling || install.reconcileError) return;
     busy = tool;
     try {
-      const { ok, fail } = await install.bulk(
+      const { ok, fail, receiptId } = await install.bulk(
         "uninstall",
         rows.map((r) => ({ slug: r.slug, tool: r.tool, projectPath: r.projectPath })),
       );
-      if (fail === 0) toast.success(i18n.t("install.removedToast", { count: ok, tool: install.toolLabel(tool) }));
-      else toast.error(i18n.t("install.removeFailedToast", { tool: install.toolLabel(tool), ok, fail }));
+      const receiptAction = { label: i18n.t("activity.viewReceipt"), onClick: () => ui.openActivityReceipt(receiptId) };
+      if (fail === 0) toast.success(i18n.t("install.removedToast", { count: ok, tool: install.toolLabel(tool) }), undefined, receiptAction);
+      else toast.error(i18n.t("install.removeFailedToast", { tool: install.toolLabel(tool), ok, fail }), undefined, receiptAction);
     } finally {
       busy = null;
     }

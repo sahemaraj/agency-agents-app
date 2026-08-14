@@ -315,9 +315,10 @@
     if (targets.length === 0) return;
     busy = true;
     try {
-      const { ok, fail } = await install.bulk(action, targets);
-      if (fail === 0) toast.success(i18n.t("tools.bulkSuccess", { verb, count: ok }), sel?.label);
-      else toast.error(i18n.t("tools.bulkError", { verb, ok, fail }));
+      const { ok, fail, receiptId } = await install.bulk(action, targets);
+      const receiptAction = { label: i18n.t("activity.viewReceipt"), onClick: () => ui.openActivityReceipt(receiptId) };
+      if (fail === 0) toast.success(i18n.t("tools.bulkSuccess", { verb, count: ok }), sel?.label, receiptAction);
+      else toast.error(i18n.t("tools.bulkError", { verb, ok, fail }), undefined, receiptAction);
     } finally {
       busy = false;
     }
