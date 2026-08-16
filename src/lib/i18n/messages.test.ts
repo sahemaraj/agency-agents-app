@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import { defaultMessages, LOCALES, loadMessages } from "./messages";
 
 describe("locale message loading", () => {
+  it("loads Persian through the supported locale registry", async () => {
+    expect(LOCALES).toContain("fa");
+    expect((await loadMessages("fa"))["nav.dashboard"]).toBe("داشبورد");
+  });
+
   it("loads every supported locale with the complete English fallback", async () => {
     const agentKeys = Object.keys(defaultMessages).filter((key) => key.startsWith("agents."));
     expect(agentKeys.length).toBeGreaterThan(100);

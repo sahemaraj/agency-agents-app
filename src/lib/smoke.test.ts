@@ -233,6 +233,16 @@ describe("frontend test harness", () => {
     expect(true).toBe(true);
   });
 
+  it("uses right-to-left document direction for Persian", async () => {
+    try {
+      await i18n.setLocale("fa");
+      expect(document.documentElement.dir).toBe("rtl");
+    } finally {
+      await i18n.setLocale("en");
+    }
+    expect(document.documentElement.dir).toBe("ltr");
+  });
+
   it("summarizes only five or more exact comparable Expert quality verdicts", () => {
     const evidence = (id: string, checkName: string, result: "pass" | "fail" | "skipped") => ({
       id, idempotencyKey: id, checkName, result, commandLabel: null, summary: result,
