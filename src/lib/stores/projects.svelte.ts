@@ -82,8 +82,13 @@ class ProjectsStore {
     return invoke<ProjectInstructionTarget[]>("project_instructions_inspect", { projectPath });
   }
 
-  saveTeamBaseline(projectPath: string, label: string, slugs: string[]): Promise<ProjectReadinessBaseline> {
-    return projectBaselineSaveTeam(projectPath, label, slugs);
+  saveTeamBaseline(
+    projectPath: string,
+    label: string,
+    requirements: ProjectReadinessBaseline["agentRequirements"],
+    subscribe: boolean,
+  ): Promise<ProjectReadinessBaseline> {
+    return projectBaselineSaveTeam(projectPath, label, requirements, subscribe);
   }
 
   importPackBaseline(projectPath: string, pack: WorkspacePack): Promise<ProjectReadinessBaseline> {

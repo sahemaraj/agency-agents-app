@@ -1343,9 +1343,21 @@ export interface BaselineRequirement {
   known: boolean;
 }
 
+export interface BaselineAgentRequirement {
+  reference: AgentReference;
+  tool: Tool;
+}
+
+export interface BaselineSkillRequirement {
+  reference: SkillReference;
+  runtime: string;
+}
+
 export interface ProjectReadinessBaseline {
   projectPath: string;
   label: string;
+  agentRequirements: BaselineAgentRequirement[];
+  skillRequirements: BaselineSkillRequirement[];
   agents: AgentReference[];
   skills: SkillReference[];
   instructions: BaselineRequirement[];
@@ -1387,8 +1399,15 @@ export interface ProjectRecommendation {
   batchAt: string;
   lifecycle: RecommendationLifecycle;
   summary: string;
+  changeKind: "added" | "updated" | "removed" | "renamed";
   baselineReference: AgentReference;
   agentReferences: AgentReference[];
+  targets: Array<{
+    reference: AgentReference;
+    tool: Tool;
+    projectPath: string;
+    operation: "install" | "update" | "informational";
+  }>;
 }
 
 export interface AgentVersionSnapshot {

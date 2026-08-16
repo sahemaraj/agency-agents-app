@@ -56,10 +56,16 @@
     agentReferences?: AgentReference[];
     allowedTools?: Tool[];
     collectionName?: string;
+    reviewIntent?: {
+      operation: "install" | "update";
+      reference: AgentReference;
+      tool: Tool;
+      projectPath: string;
+    };
     onClose: () => void;
     onApplied?: (plan: AgentMutationPlan) => void;
   }
-  let { title, agentSlugs = [], agentPackage, agentReferences = [], allowedTools, collectionName, onClose, onApplied }: Props = $props();
+  let { title, agentSlugs = [], agentPackage, agentReferences = [], allowedTools, collectionName, reviewIntent, onClose, onApplied }: Props = $props();
   const installTruthFresh = $derived(install.reconciled && !install.reconciling && !install.reconcileError);
 
   onMount(() => {
@@ -251,6 +257,20 @@
       planLoading = false;
     }
   }
+
+  let startedReviewIntent = $state("");
+  $effect(() => {
+    if (!reviewIntent || !installTruthFresh) return;
+    const key = `${reviewIntent.operation}:${reviewIntent.reference.sourceId}:${reviewIntent.reference.relativePath}:${reviewIntent.tool}:${reviewIntent.projectPath}`;
+    if (startedReviewIntent === key) return;
+    startedReviewIntent = key;
+    void reviewPlan(
+      reviewIntent.operation,
+      reviewIntent.reference,
+      reviewIntent.tool,
+      reviewIntent.projectPath,
+    );
+  });
 
   async function reviewCollection(
     operation: "install" | "update" | "uninstall",

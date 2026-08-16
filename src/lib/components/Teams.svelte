@@ -78,14 +78,36 @@
   let baselineProject = $state("");
   let baselineBusy = $state(false);
   let baselineAnnouncement = $state("");
+  let baselineGeneration = 0;
+  const baselineRequirements = $derived.by(() => {
+    if (!openedTeam || !baselineProject) return [];
+    const seen = new Set<string>();
+    return install.installed.flatMap((row) => {
+      const key = `${row.sourceId}:${row.relativePath}:${row.tool}`;
+      if (row.projectPath !== baselineProject || !openedTeam!.agents.includes(row.slug)
+        || !row.sourceId || !row.relativePath || row.state === "missing" || seen.has(key)) return [];
+      seen.add(key);
+      return [{
+        reference: { sourceId: row.sourceId, relativePath: row.relativePath },
+        tool: row.tool,
+      }];
+    });
+  });
 
   async function applyTeamBaseline(subscribe: boolean): Promise<void> {
-    if (!openedTeam || !baselineProject || baselineBusy) return;
+    if (!openedTeam || !baselineProject || baselineBusy || baselineRequirements.length === 0) return;
+    const projectPath = baselineProject;
+    const teamKey = openedTeam.key;
+    const teamLabel = openedTeam.label;
+    const requirements = baselineRequirements.map((item) => ({
+      reference: { ...item.reference }, tool: item.tool,
+    }));
+    const generation = ++baselineGeneration;
     baselineBusy = true;
-    baselineAnnouncement = "Resolving exact Team references…";
+    baselineAnnouncement = "Saving reviewed Team deployment targets…";
     try {
-      await projects.saveTeamBaseline(baselineProject, openedTeam.label, openedTeam.agents);
-      if (subscribe) await projects.subscribe(baselineProject, true);
+      await projects.saveTeamBaseline(projectPath, teamLabel, requirements, subscribe);
+      if (generation !== baselineGeneration || baselineProject !== projectPath || openedTeam?.key !== teamKey) return;
       baselineAnnouncement = subscribe
         ? "Team baseline saved and catalog recommendations enabled."
         : "Team baseline saved.";
@@ -311,23 +333,29 @@
   let packOpen = $state(false);
   let packBusy = $state(false);
   let packAnnouncement = $state("");
+  let packGeneration = 0;
   async function closePack() {
     if (packBusy) return;
+    packGeneration += 1;
     packOpen = false;
     await tick();
     packTrigger?.focus({ preventScroll: true });
   }
   async function importLoadout(event: MouseEvent) {
     packTrigger = event.currentTarget as HTMLButtonElement;
+    const generation = ++packGeneration;
     const picked = await openDialog({ title: i18n.optional("teams.openWorkspacePackTitle", "Open Workspace Pack"), multiple: false, filters: [{ name: "Workspace Pack or Agentfile", extensions: ["json"] }] });
-    if (!picked || Array.isArray(picked)) return;
+    if (!picked || Array.isArray(picked) || generation !== packGeneration) return;
+    const capturedPath = picked;
     busy = true;
     try {
-      packPath = picked;
+      packPath = capturedPath;
       packProject = "";
       packResult = null;
       packReceiptId = null;
-      packPlan = await install.inspectWorkspacePack(picked, null);
+      const inspected = await install.inspectWorkspacePack(capturedPath, null);
+      if (generation !== packGeneration) return;
+      packPlan = inspected;
       packOpen = true;
       packAnnouncement = i18n.optional("teams.workspacePackReady", "Workspace Pack review ready.");
     } catch (e) {
@@ -338,10 +366,15 @@
   }
   async function bindPackProject() {
     if (!packProject) return;
+    const capturedPath = packPath;
+    const capturedProject = packProject;
+    const generation = ++packGeneration;
     packBusy = true;
     packAnnouncement = i18n.optional("teams.workspacePackPlanning", "Planning exact destinations…");
     try {
-      packPlan = await install.inspectWorkspacePack(packPath, packProject);
+      const inspected = await install.inspectWorkspacePack(capturedPath, capturedProject);
+      if (generation !== packGeneration || packProject !== capturedProject || packPath !== capturedPath) return;
+      packPlan = inspected;
       packAnnouncement = i18n.optional("teams.workspacePackReady", "Workspace Pack review ready.");
     } catch (e) {
       toast.error(i18n.t("teams.restoreFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
@@ -351,10 +384,16 @@
   }
   async function applyPack() {
     if (!packPlan || !packTruthFresh || packPlan.blockers.length > 0) return;
+    const reviewedPlan = packPlan;
+    const capturedPath = packPath;
+    const capturedProject = reviewedPlan.projectPath;
+    const registeredProjects = projects.list.map((project) => project.path);
+    const generation = ++packGeneration;
     packBusy = true;
     packAnnouncement = i18n.optional("teams.workspacePackApplying", "Applying Workspace Pack…");
     try {
-      const applied = await install.applyWorkspacePack(packPath, packPlan.projectPath, packPlan, projects.list.map((project) => project.path));
+      const applied = await install.applyWorkspacePack(capturedPath, capturedProject, reviewedPlan, registeredProjects);
+      if (generation !== packGeneration || packPath !== capturedPath) return;
       packPlan = applied.response.plan;
       packResult = applied.response.result;
       packReceiptId = applied.receiptId;
@@ -469,9 +508,9 @@
         <Button variant="primary" onclick={() => deploy(i18n.t("teams.deployTeamTitle", { team: team.label }), team.agents)}>{i18n.t("teams.deploy")}</Button>
       </div>
       <div class="team-baseline" aria-busy={baselineBusy}>
-        <label><span>Apply readiness baseline to project</span><select bind:value={baselineProject}><option value="">Choose a registered project</option>{#each projects.list as project (project.path)}<option value={project.path}>{project.label}</option>{/each}</select></label>
-        <Button size="sm" disabled={!baselineProject || baselineBusy} loading={baselineBusy} onclick={() => void applyTeamBaseline(false)}>Save baseline</Button>
-        <Button size="sm" variant="primary" disabled={!baselineProject || baselineBusy} loading={baselineBusy} onclick={() => void applyTeamBaseline(true)}>Save and subscribe</Button>
+        <label><span>Apply readiness baseline to project</span><select bind:value={baselineProject} disabled={baselineBusy}><option value="">Choose a registered project</option>{#each projects.list as project (project.path)}<option value={project.path}>{project.label}</option>{/each}</select></label>
+        <Button size="sm" disabled={!baselineProject || baselineBusy || baselineRequirements.length === 0} loading={baselineBusy} onclick={() => void applyTeamBaseline(false)}>Save {baselineRequirements.length} reviewed targets</Button>
+        <Button size="sm" variant="primary" disabled={!baselineProject || baselineBusy || baselineRequirements.length === 0} loading={baselineBusy} onclick={() => void applyTeamBaseline(true)}>Save targets and subscribe</Button>
         <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{baselineAnnouncement}</div>
       </div>
 
@@ -576,7 +615,7 @@
     <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{packAnnouncement}</div>
     <div class="pack-summary"><strong>{packPlan.pack.name}</strong><span>{packPlan.pack.scope === "project" ? i18n.optional("teams.workspacePackProject", "Project") : i18n.optional("teams.workspacePackGlobal", "Global")}</span></div>
     {#if packPlan.pack.scope === "project" && !packPlan.projectPath}
-      <div class="pack-bind"><label class="pack-field"><span>{i18n.optional("teams.workspacePackProjectBinding", "Bind to a registered project")}</span><select bind:value={packProject}><option value="">{i18n.optional("teams.workspacePackChooseProject", "Choose a registered project")}</option>{#each projects.list as project (project.path)}<option value={project.path}>{project.label}</option>{/each}</select></label><Button size="sm" loading={packBusy} disabled={!packProject} onclick={bindPackProject}>{i18n.optional("teams.workspacePackPlan", "Review destinations")}</Button></div>
+      <div class="pack-bind"><label class="pack-field"><span>{i18n.optional("teams.workspacePackProjectBinding", "Bind to a registered project")}</span><select bind:value={packProject} disabled={packBusy}><option value="">{i18n.optional("teams.workspacePackChooseProject", "Choose a registered project")}</option>{#each projects.list as project (project.path)}<option value={project.path}>{project.label}</option>{/each}</select></label><Button size="sm" loading={packBusy} disabled={!packProject || packBusy} onclick={bindPackProject}>{i18n.optional("teams.workspacePackPlan", "Review destinations")}</Button></div>
     {:else}
       <div class="pack-plan" aria-busy={packBusy}>
         <h2>{i18n.optional("teams.workspacePackPlanHeading", "Complete plan")}</h2>

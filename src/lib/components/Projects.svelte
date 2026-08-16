@@ -32,6 +32,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
   import { install } from "$lib/stores/install.svelte";
+  import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
   import { projects } from "$lib/stores/projects.svelte";
   import { skillSources } from "$lib/stores/skillSources.svelte";
@@ -39,7 +40,7 @@
   import { toast } from "$lib/stores/toast.svelte";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import { appErrorMessage, isAppError, type InstalledAgent, type ProjectReadinessBaseline, type ProjectReadinessReport, type ProjectRecommendation } from "$lib/types";
+  import { appErrorMessage, isAppError, type AgentPackageResult, type InstalledAgent, type ProjectReadinessBaseline, type ProjectReadinessReport, type ProjectRecommendation } from "$lib/types";
   import type { ProjectInstructionApplyResult, ProjectInstructionOperation, ProjectInstructionPlan, ProjectInstructionSnippet, ProjectInstructionTarget } from "$lib/types";
   import { diffLines, diffStat, type DiffRow } from "$lib/util/diff";
 
@@ -153,6 +154,10 @@
   let readinessError = $state<string | null>(null);
   let readinessAnnouncement = $state("");
   let recommendationPlan = $state<ProjectRecommendation | null>(null);
+  let recommendationPackage = $state<AgentPackageResult | null>(null);
+  let recommendationTargetIndex = $state(0);
+  let recommendationTrigger: HTMLButtonElement | undefined = $state();
+  let recommendationTriggerId = $state("");
   let instructionManager: HTMLElement | undefined = $state();
   let readinessGeneration = 0;
   const newRecommendationCount = $derived(
@@ -223,57 +228,129 @@
 
   async function importReadinessPack(): Promise<void> {
     if (!selected || readinessBusy) return;
+    const projectPath = selected.path;
+    const generation = readinessGeneration;
     const picked = await openDialog({
       title: "Import Workspace Pack readiness baseline",
       multiple: false,
       filters: [{ name: "Workspace Pack", extensions: ["json"] }],
     });
-    if (typeof picked !== "string") return;
+    if (typeof picked !== "string" || generation !== readinessGeneration || selected?.path !== projectPath) return;
     readinessBusy = true;
     readinessError = null;
     try {
-      const plan = await install.inspectWorkspacePack(picked, selected.path);
+      const plan = await install.inspectWorkspacePack(picked, projectPath);
+      if (generation !== readinessGeneration || selected?.path !== projectPath) return;
       if (plan.blockers.length > 0) throw new Error(plan.blockers.join(" "));
-      await projects.importPackBaseline(selected.path, plan.pack);
+      await projects.importPackBaseline(projectPath, plan.pack);
+      if (generation !== readinessGeneration || selected?.path !== projectPath) return;
       readinessAnnouncement = "Workspace Pack baseline saved.";
     } catch (error) {
       readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
-      readinessBusy = false;
+      if (generation === readinessGeneration) readinessBusy = false;
     }
-    await refreshReadiness();
+    if (generation === readinessGeneration && selected?.path === projectPath) await refreshReadiness();
   }
 
   async function setReadinessSubscription(enabled: boolean): Promise<void> {
     if (!selected || readinessBusy) return;
+    const projectPath = selected.path;
+    const generation = readinessGeneration;
     readinessBusy = true;
     readinessError = null;
     try {
-      await projects.subscribe(selected.path, enabled);
+      await projects.subscribe(projectPath, enabled);
+      if (generation !== readinessGeneration || selected?.path !== projectPath) return;
       readinessAnnouncement = enabled ? "Catalog recommendations enabled." : "Catalog recommendations disabled.";
     } catch (error) {
       readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
-      readinessBusy = false;
+      if (generation === readinessGeneration) readinessBusy = false;
     }
-    await refreshReadiness();
+    if (generation === readinessGeneration && selected?.path === projectPath) await refreshReadiness();
   }
 
-  async function openRecommendation(recommendation: ProjectRecommendation): Promise<void> {
-    if (!selected) return;
+  async function openRecommendation(event: MouseEvent, recommendation: ProjectRecommendation): Promise<void> {
+    if (!selected || readinessBusy) return;
+    const projectPath = selected.path;
+    const generation = readinessGeneration;
+    recommendationTrigger = event.currentTarget as HTMLButtonElement;
+    recommendationTriggerId = recommendation.id;
+    readinessBusy = true;
+    readinessError = null;
     try {
-      recommendationPlan = await projects.openRecommendation(selected.path, recommendation.id);
+      const opened = await projects.openRecommendation(projectPath, recommendation.id);
+      await agentLibrary.load(true);
+      if (generation !== readinessGeneration || selected?.path !== projectPath) return;
+      if (agentLibrary.error) throw new Error(agentLibrary.error);
+      const references = [...opened.agentReferences, ...opened.targets.map((target) => target.reference)]
+        .filter((reference, index, all) => all.findIndex((candidate) =>
+          candidate.sourceId === reference.sourceId && candidate.relativePath === reference.relativePath,
+        ) === index);
+      const packages = references.map((reference) => agentLibrary.packages.find(
+        (item) => item.reference.sourceId === reference.sourceId
+          && item.reference.relativePath === reference.relativePath,
+      ));
+      if (packages.some((item) => !item)) {
+        throw new Error("Recommendation references are absent from the refreshed Agent library");
+      }
+      const target = opened.targets.find((item) => item.operation !== "informational");
+      if (!target) throw new Error("Recommendation has no safe deployment review target");
+      recommendationPackage = packages.find((item) => item?.reference.sourceId === target.reference.sourceId
+        && item.reference.relativePath === target.reference.relativePath) ?? null;
+      if (!recommendationPackage) throw new Error("Recommendation target is absent from the refreshed Agent library");
+      recommendationTargetIndex = 0;
+      recommendationPlan = opened;
     } catch (error) {
       readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
-      await refreshReadiness();
+      readinessAnnouncement = `Recommendation could not be opened. ${readinessError}`;
+    } finally {
+      if (generation === readinessGeneration) readinessBusy = false;
     }
   }
 
   async function dismissRecommendation(recommendation: ProjectRecommendation): Promise<void> {
-    if (!selected) return;
-    await projects.dismissRecommendation(selected.path, recommendation.id);
-    readinessAnnouncement = "Recommendation dismissed.";
-    await refreshReadiness();
+    if (!selected || readinessBusy) return;
+    const projectPath = selected.path;
+    const generation = readinessGeneration;
+    readinessBusy = true;
+    readinessError = null;
+    try {
+      await projects.dismissRecommendation(projectPath, recommendation.id);
+      if (generation !== readinessGeneration || selected?.path !== projectPath) return;
+      readinessAnnouncement = "Recommendation dismissed.";
+    } catch (error) {
+      if (generation === readinessGeneration) {
+        readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
+        readinessAnnouncement = `Recommendation could not be dismissed. ${readinessError}`;
+      }
+    } finally {
+      if (generation === readinessGeneration) readinessBusy = false;
+    }
+    if (generation === readinessGeneration && selected?.path === projectPath) await refreshReadiness();
+  }
+
+  async function closeRecommendation(): Promise<void> {
+    recommendationPlan = null;
+    recommendationPackage = null;
+    await tick();
+    const trigger = [...(projectsRoot?.querySelectorAll<HTMLButtonElement>("button[data-recommendation-id]") ?? [])]
+      .find((button) => button.dataset.recommendationId === recommendationTriggerId)
+      ?? recommendationTrigger;
+    trigger?.focus({ preventScroll: true });
+  }
+
+  function recommendationApplied(): void {
+    if (!recommendationPlan) return;
+    const targets = recommendationPlan.targets.filter((target) => target.operation !== "informational");
+    if (recommendationTargetIndex + 1 < targets.length) {
+      recommendationTargetIndex += 1;
+      return;
+    }
+    recommendationPlan = null;
+    recommendationPackage = null;
+    void refreshReadiness();
   }
 
   function readinessRepairLabel(
@@ -295,15 +372,19 @@
   ): Promise<void> {
     if (!readiness?.baseline) return;
     if (category === "agentRoster") {
-      const reference = readiness.baseline.agents.find(
-        (item) => `${item.sourceId}:${item.relativePath}` === row.id,
+      const reference = readiness.baseline.agentRequirements.find(
+        (item) => `${item.reference.sourceId}:${item.reference.relativePath}:${item.tool}` === row.id,
+      )?.reference ?? readiness.baseline.agents.find(
+        (item) => row.id.startsWith(`${item.sourceId}:${item.relativePath}:`),
       );
       if (reference) ui.openAgentReference(reference);
       return;
     }
     if (category === "skills") {
-      const reference = readiness.baseline.skills.find(
-        (item) => `${item.sourceId}:${item.relativePath}` === row.id,
+      const reference = readiness.baseline.skillRequirements.find(
+        (item) => `${item.reference.sourceId}:${item.reference.relativePath}:${item.runtime}` === row.id,
+      )?.reference ?? readiness.baseline.skills.find(
+        (item) => row.id.startsWith(`${item.sourceId}:${item.relativePath}:`),
       );
       if (reference) ui.openSkill(reference);
       return;
@@ -603,8 +684,8 @@
               {#each recommendations as recommendation (recommendation.id)}
                 <li>
                   <div><strong>{recommendation.lifecycle}</strong><span>{recommendation.summary}</span></div>
-                  <button class="btn" disabled={recommendation.lifecycle !== "new"} onclick={() => void openRecommendation(recommendation)}>Open review</button>
-                  {#if recommendation.lifecycle !== "dismissed"}<button class="btn" onclick={() => void dismissRecommendation(recommendation)}>Dismiss</button>{/if}
+                  <button class="btn" data-recommendation-id={recommendation.id} disabled={readinessBusy || recommendation.lifecycle !== "new" || recommendation.changeKind === "removed"} onclick={(event) => void openRecommendation(event, recommendation)}>Open review</button>
+                  {#if recommendation.lifecycle !== "dismissed"}<button class="btn" disabled={readinessBusy} onclick={() => void dismissRecommendation(recommendation)}>Dismiss</button>{/if}
                 </li>
               {/each}
             </ul>
@@ -734,12 +815,20 @@
   <DeployBrowser projectPath={browseFor} onClose={() => (browseFor = null)} />
 {/if}
 
-{#if recommendationPlan}
+{#if recommendationPlan && recommendationPackage}
+  {@const recommendationTarget = recommendationPlan.targets.filter((target) => target.operation !== "informational")[recommendationTargetIndex]}
   <InstallModal
     title="Review catalog recommendation"
-    agentReferences={recommendationPlan.agentReferences}
-    allowedTools={readiness?.baseline?.tools.length ? readiness.baseline.tools : undefined}
-    onClose={() => (recommendationPlan = null)}
+    agentPackage={recommendationPackage}
+    reviewIntent={{
+      operation: recommendationTarget.operation as "install" | "update",
+      reference: recommendationTarget.reference,
+      tool: recommendationTarget.tool,
+      projectPath: recommendationTarget.projectPath,
+    }}
+    allowedTools={[recommendationTarget.tool]}
+    onClose={closeRecommendation}
+    onApplied={recommendationApplied}
   />
 {/if}
 

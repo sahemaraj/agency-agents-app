@@ -61,6 +61,7 @@ import type {
   AgentVersionSnapshot,
   AgentWorkspaceProfile,
   AgentDiff,
+  BaselineAgentRequirement,
   InstallRecord,
   Tool,
   StorageMigrationStatus,
@@ -118,8 +119,11 @@ export const catalogSourceTransitionRecover = () =>
 export const projectBaselineSaveTeam = (
   projectPath: string,
   label: string,
-  slugs: string[],
-) => invoke<ProjectReadinessBaseline>("project_baseline_save_team", { projectPath, label, slugs });
+  requirements: BaselineAgentRequirement[],
+  subscribe: boolean,
+) => invoke<ProjectReadinessBaseline>("project_baseline_save_team", {
+  projectPath, label, requirements, subscribe,
+});
 export const projectBaselineImportPack = (projectPath: string, pack: WorkspacePack) =>
   invoke<ProjectReadinessBaseline>("project_baseline_import_pack", { projectPath, pack });
 export const projectReadinessGet = (projectPath: string) =>

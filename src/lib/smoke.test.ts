@@ -148,6 +148,14 @@ const readinessFixture = (projectPath = "/tmp/project", subscribed = true): Proj
   baseline: {
     projectPath,
     label: "Review baseline",
+    agentRequirements: [{
+      reference: { sourceId: "built-in", relativePath: "engineering/old-reviewer.md" },
+      tool: "claudeCode",
+    }],
+    skillRequirements: [{
+      reference: { sourceId: "skills", relativePath: "audit" },
+      runtime: "codex",
+    }],
     agents: [{ sourceId: "built-in", relativePath: "engineering/old-reviewer.md" }],
     skills: [{ sourceId: "skills", relativePath: "audit" }],
     instructions: [{ id: "agents", known: true }],
@@ -155,8 +163,8 @@ const readinessFixture = (projectPath = "/tmp/project", subscribed = true): Proj
     tools: ["claudeCode"],
   },
   categories: [
-    { category: "agentRoster", state: "needsAttention", rows: [{ id: "built-in:engineering/old-reviewer.md", label: "Old reviewer", state: "needsAttention", evidence: "Drifted" }] },
-    { category: "skills", state: "needsAttention", rows: [{ id: "skills:audit", label: "Audit", state: "needsAttention", evidence: "Missing" }] },
+    { category: "agentRoster", state: "needsAttention", rows: [{ id: "built-in:engineering/old-reviewer.md:claudeCode", label: "Old reviewer", state: "needsAttention", evidence: "Drifted" }] },
+    { category: "skills", state: "needsAttention", rows: [{ id: "skills:audit:codex", label: "Audit", state: "needsAttention", evidence: "Missing" }] },
     { category: "instructions", state: "needsAttention", rows: [{ id: "agents", label: "AGENTS.md", state: "needsAttention", evidence: "Missing" }] },
     { category: "mcp", state: "unavailable", rows: [{ id: "agency-agents", label: "agency-agents", state: "unavailable", evidence: "Inspection failed" }] },
     { category: "tools", state: "needsAttention", rows: [{ id: "claudeCode", label: "Claude Code", state: "needsAttention", evidence: "Not detected" }] },
@@ -168,8 +176,31 @@ const renamedProjectRecommendation = (projectPath = "/tmp/project"): ProjectReco
   batchAt: "2026-08-17T01:00:00Z",
   lifecycle: "new",
   summary: "Required Agent was renamed: engineering/old-reviewer.md → engineering/new-reviewer.md",
+  changeKind: "renamed",
   baselineReference: { sourceId: "built-in", relativePath: "engineering/old-reviewer.md" },
   agentReferences: [{ sourceId: "built-in", relativePath: "engineering/new-reviewer.md" }],
+  targets: [{
+    reference: { sourceId: "built-in", relativePath: "engineering/new-reviewer.md" },
+    tool: "claudeCode",
+    projectPath,
+    operation: "install",
+  }],
+});
+const updatedProjectRecommendation = (projectPath = "/tmp/project"): ProjectRecommendation => ({
+  id: "b".repeat(64),
+  projectPath,
+  batchAt: "2026-08-17T02:00:00Z",
+  lifecycle: "new",
+  summary: "Required Agent was updated in a successful catalog refresh",
+  changeKind: "updated",
+  baselineReference: { sourceId: "built-in", relativePath: "engineering/reviewer.md" },
+  agentReferences: [{ sourceId: "built-in", relativePath: "engineering/reviewer.md" }],
+  targets: [{
+    reference: { sourceId: "built-in", relativePath: "engineering/reviewer.md" },
+    tool: "claudeCode",
+    projectPath,
+    operation: "update",
+  }],
 });
 const staleControlPackage: AgentPackageResult = {
   reference: { sourceId: "built-in", relativePath: "reviewer.md" }, agent: staleControlAgent,
@@ -777,7 +808,9 @@ describe("frontend test harness", () => {
 
   it("keeps Workspace Pack review, approval, passive requirements, focus, and Activity handoff in Teams", () => {
     for (const marker of [
-      /packPlan = await install\.inspectWorkspacePack\(picked, null\)/,
+      /const capturedPath = picked/,
+      /install\.inspectWorkspacePack\(capturedPath, null\)/,
+      /install\.applyWorkspacePack\(capturedPath, capturedProject, reviewedPlan, registeredProjects\)/,
       /packPlan\.pack\.instructions\.length[^]*?not applied automatically/,
       /packPlan\.pack\.mcpServers\.length[^]*?not configured automatically/,
       /reviewedPack\.pack\.scope === "user"[^]*?disabled=\{!packTruthFresh \|\| reviewedPack\.blockers\.length > 0\}/,
@@ -795,13 +828,17 @@ describe("frontend test harness", () => {
       /Import Workspace Pack baseline/,
       /type="checkbox" checked=\{readiness\.subscribed\}/,
       /role="status" aria-live="polite" aria-atomic="true"/,
-      /agentReferences=\{recommendationPlan\.agentReferences\}/,
-      /disabled=\{recommendation\.lifecycle !== "new"\}/,
+      /await agentLibrary\.load\(true\)/,
+      /agentPackage=\{recommendationPackage\}/,
+      /reviewIntent=\{\{/,
+      /recommendation\.changeKind === "removed"/,
+      /Recommendation could not be dismissed/,
+      /trigger\?\.focus\(\{ preventScroll: true \}\)/,
     ]) expect(projectsSource).toMatch(marker);
     for (const marker of [
-      /projects\.saveTeamBaseline\(baselineProject, openedTeam\.label, openedTeam\.agents\)/,
-      /projects\.subscribe\(baselineProject, true\)/,
-      /Save and subscribe/,
+      /projects\.saveTeamBaseline\(projectPath, teamLabel, requirements, subscribe\)/,
+      /baselineRequirements\.map/,
+      /Save targets and subscribe/,
       /role="status" aria-live="polite" aria-atomic="true"/,
     ]) expect(teamsSource).toMatch(marker);
     expect(projectsSource).not.toContain("autoApply");
@@ -3670,7 +3707,7 @@ describe("frontend test harness", () => {
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(55);
+      .toHaveLength(56);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -3777,7 +3814,7 @@ describe("frontend test harness", () => {
         /modalAction="confirm" disabled=\{!installTruthFresh \|\| plan\.blockers\.length > 0\}/,
         /confirmDisabled=\{!installTruthFresh \|\| \(uninstallCandidate/,
       ] }],
-      ["InstallModal", { source: installModalSource, freshnessUses: 17, markers: [
+      ["InstallModal", { source: installModalSource, freshnessUses: 18, markers: [
         /disabled: !installTruthFresh \|\| total === 0,/,
         /disabled=\{!installTruthFresh\}[^\n]*reviewPlan\("update"/,
         /disabled=\{!installTruthFresh\}[^\n]*runLifecycle\("track"/,
@@ -3876,10 +3913,21 @@ describe("frontend test harness", () => {
       reference: recommendation.agentReferences[0],
       agent: { ...staleControlAgent, slug: "new-reviewer", name: "New Reviewer" },
     };
-    agentLibrary.results = [{
-      source: { id: "built-in", label: "Built in", enabled: true, kind: { kind: "builtIn" } },
-      agents: [newPackage], errors: [], revision: "test",
-    }];
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "agent_sources_inspect") return [{
+        source: { id: "built-in", label: "Built in", enabled: true, kind: { kind: "builtIn" } },
+        agents: [{
+          ...newPackage,
+          reference: recommendation.baselineReference,
+          agent: { ...staleControlAgent, slug: "old-reviewer", name: "Old Reviewer" },
+        }], errors: [], revision: "stale",
+      }] as never;
+      if (command === "agent_drafts_list") return [] as never;
+      if (command === "agent_library_list") return emptyFolderState() as never;
+      return [] as never;
+    });
+    await agentLibrary.load(true);
     install.tools = [staleControlTool];
     projects.list = projectRows;
     ui.projectsSelected = projectPath;
@@ -3887,7 +3935,6 @@ describe("frontend test harness", () => {
     corpus.categories = [{ slug: "engineering", label: "Engineering", color: "#2563eb", icon: "Code", count: 1 }];
     const target = document.createElement("div");
     document.body.append(target);
-    const invokeMock = vi.mocked(invoke);
     invokeMock.mockImplementation(async (command: string, args) => {
       if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
       if (command === "projects_list") return projectRows as never;
@@ -3905,8 +3952,19 @@ describe("frontend test harness", () => {
         return true as never;
       }
       if (command === "project_recommendation_open") return recommendation as never;
-      if (command === "agent_batch_install_plan") {
-        expect(args).toMatchObject({ references: recommendation.agentReferences });
+      if (command === "agent_sources_inspect") return [{
+        source: { id: "built-in", label: "Built in", enabled: true, kind: { kind: "builtIn" } },
+        agents: [newPackage], errors: [], revision: "refreshed",
+      }] as never;
+      if (command === "agent_drafts_list") return [] as never;
+      if (command === "agent_library_list") return emptyFolderState() as never;
+      if (command === "agent_install_plan") {
+        expect(args).toMatchObject({
+          sourceId: recommendation.agentReferences[0].sourceId,
+          relativePath: recommendation.agentReferences[0].relativePath,
+          tool: "claudeCode",
+          projectPath,
+        });
         throw new Error("review boundary reached");
       }
       return [] as never;
@@ -3919,11 +3977,119 @@ describe("frontend test harness", () => {
         .find((button) => button.textContent?.trim() === "Open review")!;
       open.click();
       await vi.waitFor(() => expect(target.textContent).toContain("Review catalog recommendation"));
-      await vi.waitFor(() => expect(target.querySelector<HTMLButtonElement>(".grid .toggle:not(:disabled)")).toBeTruthy());
-      const exactCell = target.querySelector<HTMLButtonElement>(".grid .toggle:not(:disabled)")!;
-      exactCell.click();
       await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) =>
-        command === "agent_batch_install_plan")).toBe(true));
+        command === "agent_install_plan")).toBe(true));
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("opens an Updated recommendation in the exact update review with no remove action", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/project";
+    const recommendation = updatedProjectRecommendation(projectPath);
+    const projectRows = [{ path: projectPath, label: "project", installedCount: 1 }];
+    const pkg: AgentPackageResult = {
+      ...staleControlPackage,
+      reference: recommendation.agentReferences[0],
+      agent: { ...staleControlAgent, slug: "reviewer", name: "Reviewer" },
+    };
+    const outdated = {
+      ...staleControlRow,
+      sourceId: recommendation.agentReferences[0].sourceId,
+      relativePath: recommendation.agentReferences[0].relativePath,
+      projectPath,
+      scope: "project" as const,
+      state: "outdated" as const,
+      tracked: true,
+    };
+    const plan: AgentMutationPlan = {
+      revision: "update-review", operation: "update", tool: "claudeCode", scope: "project", projectPath,
+      agents: [{ reference: recommendation.agentReferences[0], name: "Reviewer", sourceHash: "hash", dependency: false, destination: outdated.dest, renderedFileCount: 1, capabilities: [] }],
+      warnings: [], blockers: [], rollbackAvailable: true,
+    };
+    install.tools = [staleControlTool];
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    const target = document.createElement("div");
+    document.body.append(target);
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile") return [outdated] as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "tools_list") return [staleControlTool] as never;
+      if (command === "project_instructions_inspect") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath) as never;
+      if (command === "project_recommendations_list") return [recommendation] as never;
+      if (command === "project_recommendations_acknowledge") return true as never;
+      if (command === "project_recommendation_open") return recommendation as never;
+      if (command === "agent_sources_inspect") return [{
+        source: { id: "built-in", label: "Built in", enabled: true, kind: { kind: "builtIn" } },
+        agents: [pkg], errors: [], revision: "fresh",
+      }] as never;
+      if (command === "agent_drafts_list") return [] as never;
+      if (command === "agent_library_list") return emptyFolderState() as never;
+      if (command === "agent_update_plan") {
+        expect(args).toMatchObject({
+          sourceId: recommendation.agentReferences[0].sourceId,
+          relativePath: recommendation.agentReferences[0].relativePath,
+          tool: "claudeCode",
+          projectPath,
+        });
+        return plan as never;
+      }
+      return [] as never;
+    });
+    const component = mount(Projects, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain(recommendation.summary));
+      const open = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Open review")!;
+      open.focus();
+      open.click();
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) => command === "agent_update_plan")).toBe(true));
+      expect(target.textContent).toContain("update");
+      expect([...target.querySelectorAll<HTMLButtonElement>("button")]
+        .some((button) => button.textContent?.trim() === "Uninstall")).toBe(false);
+      target.querySelector<HTMLButtonElement>("button.close")!.click();
+      await vi.waitFor(() => expect((document.activeElement as HTMLElement).dataset.recommendationId)
+        .toBe(recommendation.id));
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("fails visibly when a cold refreshed Agent library lacks the backend recommendation ref", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/project";
+    const recommendation = renamedProjectRecommendation(projectPath);
+    const projectRows = [{ path: projectPath, label: "project", installedCount: 0 }];
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    const target = document.createElement("div");
+    document.body.append(target);
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_instructions_inspect") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath) as never;
+      if (command === "project_recommendations_list") return [recommendation] as never;
+      if (command === "project_recommendations_acknowledge") return true as never;
+      if (command === "project_recommendation_open") return recommendation as never;
+      if (command === "agent_sources_inspect" || command === "agent_drafts_list") return [] as never;
+      if (command === "agent_library_list") return emptyFolderState() as never;
+      return [] as never;
+    });
+    const component = mount(Projects, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain(recommendation.summary));
+      [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Open review")!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("absent from the refreshed Agent library"));
+      expect(target.textContent).not.toContain("Review catalog recommendation");
     } finally {
       unmount(component);
       target.remove();

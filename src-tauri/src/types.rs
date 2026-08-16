@@ -824,15 +824,41 @@ pub struct BaselineRequirement {
     pub known: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineAgentRequirement {
+    pub reference: AgentReference,
+    pub tool: Tool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineSkillRequirement {
+    pub reference: SkillReference,
+    pub runtime: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectReadinessBaseline {
     pub project_path: String,
     pub label: String,
+    #[serde(default)]
+    pub agent_requirements: Vec<BaselineAgentRequirement>,
+    #[serde(default)]
+    pub skill_requirements: Vec<BaselineSkillRequirement>,
+    /// Legacy reference-only projection retained for persisted v1 documents.
+    #[serde(default)]
     pub agents: Vec<AgentReference>,
+    /// Legacy reference-only projection retained for persisted v1 documents.
+    #[serde(default)]
     pub skills: Vec<SkillReference>,
+    #[serde(default)]
     pub instructions: Vec<BaselineRequirement>,
+    #[serde(default)]
     pub mcp_servers: Vec<BaselineRequirement>,
+    /// Legacy target-only projection retained for persisted v1 documents.
+    #[serde(default)]
     pub tools: Vec<Tool>,
 }
 
@@ -918,6 +944,32 @@ pub enum RecommendationLifecycle {
     Blocked,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecommendationChangeKind {
+    Added,
+    Updated,
+    Removed,
+    Renamed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecommendationOperation {
+    Install,
+    Update,
+    Informational,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRecommendationTarget {
+    pub reference: AgentReference,
+    pub tool: Tool,
+    pub project_path: String,
+    pub operation: RecommendationOperation,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectRecommendation {
@@ -926,8 +978,10 @@ pub struct ProjectRecommendation {
     pub batch_at: String,
     pub lifecycle: RecommendationLifecycle,
     pub summary: String,
+    pub change_kind: RecommendationChangeKind,
     pub baseline_reference: AgentReference,
     pub agent_references: Vec<AgentReference>,
+    pub targets: Vec<ProjectRecommendationTarget>,
 }
 
 /// Bounded UI projection; the potentially 10,000-item snapshot never crosses

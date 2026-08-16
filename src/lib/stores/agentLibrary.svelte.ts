@@ -67,6 +67,7 @@ class AgentLibraryStore {
   busy = $state(false);
   error: string | null = $state(null);
   private loaded = false;
+  private loadPromise: Promise<void> | null = null;
 
   get sources(): AgentSource[] {
     return this.results.map((result) => result.source);
@@ -77,18 +78,29 @@ class AgentLibraryStore {
   }
 
   async load(force = false): Promise<void> {
-    if (this.loading || (this.loaded && !force)) return;
-    this.loading = true;
-    this.error = null;
+    if (this.loadPromise) {
+      await this.loadPromise;
+      if (!force) return;
+    }
+    if (this.loaded && !force) return;
+    this.loadPromise = (async () => {
+      this.loading = true;
+      this.error = null;
+      try {
+        [this.results, this.drafts, this.library] = await Promise.all([
+          agentSourcesInspect(), agentDraftsList(), agentLibraryList(),
+        ]);
+        this.loaded = true;
+      } catch (error) {
+        this.error = message(error);
+      } finally {
+        this.loading = false;
+      }
+    })();
     try {
-      [this.results, this.drafts, this.library] = await Promise.all([
-        agentSourcesInspect(), agentDraftsList(), agentLibraryList(),
-      ]);
-      this.loaded = true;
-    } catch (error) {
-      this.error = message(error);
+      await this.loadPromise;
     } finally {
-      this.loading = false;
+      this.loadPromise = null;
     }
   }
 

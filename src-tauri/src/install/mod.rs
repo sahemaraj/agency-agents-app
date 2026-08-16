@@ -26,12 +26,13 @@ use crate::render;
 use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
     AgentApprovalAction, AgentDiff, AgentInstallIdentity, AgentMutationPlan, AgentPlanItem,
-    AgentReference, AgentSourceResult, AgentVersionSnapshot, BaselineRequirement, CatalogChange,
-    CatalogFeedBatch, InstallRecord, InstallState, InstalledAgent, ProjectInfo,
-    ProjectReadinessBaseline, ProjectReadinessOverall, ProjectReadinessReport,
-    ProjectRecommendation, ProjectSubscription, ReadinessCategoryKind, ReadinessCategoryReport,
-    ReadinessCategoryState, ReadinessRow, ReadinessRowState, RecommendationLifecycle,
-    SkillReference, Tool, ToolInfo, ToolVersion, UpdateKind,
+    AgentReference, AgentSourceResult, AgentVersionSnapshot, BaselineAgentRequirement,
+    BaselineRequirement, BaselineSkillRequirement, CatalogChange, CatalogFeedBatch, InstallRecord,
+    InstallState, InstalledAgent, ProjectInfo, ProjectReadinessBaseline, ProjectReadinessOverall,
+    ProjectReadinessReport, ProjectRecommendation, ProjectRecommendationTarget,
+    ProjectSubscription, ReadinessCategoryKind, ReadinessCategoryReport, ReadinessCategoryState,
+    ReadinessRow, ReadinessRowState, RecommendationChangeKind, RecommendationLifecycle,
+    RecommendationOperation, SkillReference, Tool, ToolInfo, ToolVersion, UpdateKind,
 };
 use crate::util::fs::{atomic_write, read_capped};
 
@@ -4849,11 +4850,50 @@ pub async fn projects_list(
 // ---------- Project readiness and opt-in catalog subscriptions ----------
 
 struct ReadinessEvidence {
-    agents: Result<BTreeMap<AgentReference, ReadinessRowState>, String>,
-    skills: Result<BTreeMap<SkillReference, ReadinessRowState>, String>,
+    agents: Result<BTreeMap<BaselineAgentRequirement, ReadinessRowState>, String>,
+    skills: Result<BTreeMap<BaselineSkillRequirement, ReadinessRowState>, String>,
     instructions: Result<BTreeMap<String, ReadinessRowState>, String>,
     mcp_servers: Result<BTreeMap<String, ReadinessRowState>, String>,
     tools: Result<BTreeMap<Tool, ReadinessRowState>, String>,
+}
+
+const LEGACY_UNREVIEWED_TARGET: &str = "legacyUnreviewed";
+
+fn exact_agent_requirements(baseline: &ProjectReadinessBaseline) -> Vec<BaselineAgentRequirement> {
+    if !baseline.agent_requirements.is_empty() {
+        return baseline.agent_requirements.clone();
+    }
+    let tool = baseline
+        .tools
+        .as_slice()
+        .first()
+        .filter(|_| baseline.tools.len() == 1)
+        .cloned()
+        .unwrap_or_else(|| LEGACY_UNREVIEWED_TARGET.into());
+    baseline
+        .agents
+        .iter()
+        .cloned()
+        .map(|reference| BaselineAgentRequirement {
+            reference,
+            tool: tool.clone(),
+        })
+        .collect()
+}
+
+fn exact_skill_requirements(baseline: &ProjectReadinessBaseline) -> Vec<BaselineSkillRequirement> {
+    if !baseline.skill_requirements.is_empty() {
+        return baseline.skill_requirements.clone();
+    }
+    baseline
+        .skills
+        .iter()
+        .cloned()
+        .map(|reference| BaselineSkillRequirement {
+            reference,
+            runtime: LEGACY_UNREVIEWED_TARGET.into(),
+        })
+        .collect()
 }
 
 impl ReadinessEvidence {
@@ -4998,17 +5038,31 @@ fn build_readiness_report(
         };
     };
     let agent_rows = readiness_rows(
-        baseline.agents.iter().cloned().map(|reference| {
-            let id = format!("{}:{}", reference.source_id, reference.relative_path);
-            (reference, id.clone(), id)
-        }),
+        exact_agent_requirements(baseline)
+            .into_iter()
+            .map(|requirement| {
+                let id = format!(
+                    "{}:{}:{}",
+                    requirement.reference.source_id,
+                    requirement.reference.relative_path,
+                    requirement.tool
+                );
+                (requirement, id.clone(), id)
+            }),
         &evidence.agents,
     );
     let skill_rows = readiness_rows(
-        baseline.skills.iter().cloned().map(|reference| {
-            let id = format!("{}:{}", reference.source_id, reference.relative_path);
-            (reference, id.clone(), id)
-        }),
+        exact_skill_requirements(baseline)
+            .into_iter()
+            .map(|requirement| {
+                let id = format!(
+                    "{}:{}:{}",
+                    requirement.reference.source_id,
+                    requirement.reference.relative_path,
+                    requirement.runtime
+                );
+                (requirement, id.clone(), id)
+            }),
         &evidence.skills,
     );
     let instruction_rows = requirement_rows(&baseline.instructions, &evidence.instructions);
@@ -5084,6 +5138,7 @@ async fn exact_registered_project(
 async fn persist_project_baseline(
     state: &AppState,
     baseline: ProjectReadinessBaseline,
+    subscribe: bool,
 ) -> Result<ProjectReadinessBaseline, AppError> {
     let returned = baseline.clone();
     control_center_database(state)
@@ -5091,21 +5146,44 @@ async fn persist_project_baseline(
         .mutate(
             corpus::control_center_spec(),
             crate::types::ControlCenterDocument::default(),
-            move |document| {
-                document
-                    .project_baselines
-                    .retain(|existing| existing.project_path != baseline.project_path);
-                document.project_baselines.push(baseline);
-                document
-                    .project_baselines
-                    .sort_by(|left, right| left.project_path.cmp(&right.project_path));
-                Ok(())
-            },
+            move |document| apply_project_baseline_and_subscription(document, baseline, subscribe),
         )
         .await?;
     Ok(returned)
 }
 
+async fn persist_registered_project_baseline(
+    state: &AppState,
+    supplied_project_path: &str,
+    mut baseline: ProjectReadinessBaseline,
+    subscribe: bool,
+) -> Result<ProjectReadinessBaseline, AppError> {
+    let _project_lock = lock_project_registry(&state.app_data_dir)?;
+    baseline.project_path = exact_registered_project(state, supplied_project_path).await?;
+    persist_project_baseline(state, baseline, subscribe).await
+}
+
+fn apply_project_baseline_and_subscription(
+    document: &mut crate::types::ControlCenterDocument,
+    baseline: ProjectReadinessBaseline,
+    subscribe: bool,
+) -> Result<(), AppError> {
+    let mut next = document.clone();
+    let project_path = baseline.project_path.clone();
+    next.project_baselines
+        .retain(|existing| existing.project_path != project_path);
+    next.project_baselines.push(baseline);
+    next.project_baselines
+        .sort_by(|left, right| left.project_path.cmp(&right.project_path));
+    if subscribe {
+        set_project_subscription(&mut next, project_path, true)?;
+    }
+    corpus::validate_control_center(&next)?;
+    *document = next;
+    Ok(())
+}
+
+#[cfg(test)]
 fn resolve_team_references(
     mut slugs: Vec<String>,
     sources: &[AgentSourceResult],
@@ -5154,6 +5232,22 @@ fn baseline_from_workspace_pack(
     project_path: String,
     pack: WorkspacePack,
 ) -> ProjectReadinessBaseline {
+    let mut agent_requirements = pack
+        .agents
+        .iter()
+        .map(|item| BaselineAgentRequirement {
+            reference: item.reference.clone(),
+            tool: item.tool.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut skill_requirements = pack
+        .skills
+        .iter()
+        .map(|item| BaselineSkillRequirement {
+            reference: item.reference.clone(),
+            runtime: item.runtime.clone(),
+        })
+        .collect::<Vec<_>>();
     let mut agents = pack
         .agents
         .iter()
@@ -5175,9 +5269,15 @@ fn baseline_from_workspace_pack(
     skills.dedup();
     tools.sort();
     tools.dedup();
+    agent_requirements.sort();
+    agent_requirements.dedup();
+    skill_requirements.sort();
+    skill_requirements.dedup();
     ProjectReadinessBaseline {
         project_path,
         label: pack.name,
+        agent_requirements,
+        skill_requirements,
         agents,
         skills,
         instructions: pack
@@ -5194,27 +5294,95 @@ fn baseline_from_workspace_pack(
     }
 }
 
+fn validate_team_requirements(
+    mut requirements: Vec<BaselineAgentRequirement>,
+    sources: &[AgentSourceResult],
+    installed: &[InstalledAgent],
+    project_path: &str,
+) -> Result<Vec<BaselineAgentRequirement>, AppError> {
+    requirements.sort();
+    requirements.dedup();
+    if requirements.is_empty() || requirements.len() > 256 {
+        return Err(AppError::InvalidArgument {
+            message: "Team baseline requires at least one reviewed Agent target".into(),
+        });
+    }
+    if sources.iter().any(|source| !source.errors.is_empty()) {
+        return Err(AppError::InvalidArgument {
+            message: "Agent source inspection is incomplete; retry before saving the Team baseline"
+                .into(),
+        });
+    }
+    for requirement in &requirements {
+        if !render::supports_project(&requirement.tool)
+            || sources
+                .iter()
+                .flat_map(|source| &source.agents)
+                .filter(|package| package.installable && package.reference == requirement.reference)
+                .count()
+                != 1
+            || !installed.iter().any(|row| {
+                row.tracked
+                    && row.project_path.as_deref() == Some(project_path)
+                    && row.source_id == requirement.reference.source_id
+                    && row.relative_path == requirement.reference.relative_path
+                    && row.tool == requirement.tool
+                    && !matches!(
+                        row.state,
+                        InstallState::Missing
+                            | InstallState::Foreign
+                            | InstallState::SourceUnavailable
+                    )
+            })
+        {
+            return Err(AppError::InvalidArgument {
+                message: "Team baseline contains an unavailable or ambiguous Agent target".into(),
+            });
+        }
+    }
+    Ok(requirements)
+}
+
 #[tauri::command]
 pub async fn project_baseline_save_team(
     state: State<'_, AppState>,
     project_path: String,
     label: String,
-    slugs: Vec<String>,
+    requirements: Vec<BaselineAgentRequirement>,
+    subscribe: bool,
 ) -> Result<ProjectReadinessBaseline, AppError> {
-    let project_path = exact_registered_project(&state, &project_path).await?;
+    let reviewed_project_path = exact_registered_project(&state, &project_path).await?;
     let sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
-    let agents = resolve_team_references(slugs, &sources)?;
-    persist_project_baseline(
+    let installed = mcp_reconcile_agent_installs(&state).await?;
+    let agent_requirements =
+        validate_team_requirements(requirements, &sources, &installed, &reviewed_project_path)?;
+    let mut agents = agent_requirements
+        .iter()
+        .map(|requirement| requirement.reference.clone())
+        .collect::<Vec<_>>();
+    let mut tools = agent_requirements
+        .iter()
+        .map(|requirement| requirement.tool.clone())
+        .collect::<Vec<_>>();
+    agents.sort();
+    agents.dedup();
+    tools.sort();
+    tools.dedup();
+    persist_registered_project_baseline(
         &state,
+        &project_path,
         ProjectReadinessBaseline {
-            project_path,
+            project_path: String::new(),
             label,
+            agent_requirements,
+            skill_requirements: Vec::new(),
             agents,
             skills: Vec::new(),
             instructions: Vec::new(),
             mcp_servers: Vec::new(),
-            tools: Vec::new(),
+            tools,
         },
+        subscribe,
     )
     .await
 }
@@ -5225,10 +5393,9 @@ pub async fn project_baseline_import_pack(
     project_path: String,
     pack: WorkspacePack,
 ) -> Result<ProjectReadinessBaseline, AppError> {
-    let project_path = exact_registered_project(&state, &project_path).await?;
     let pack = normalize_workspace_pack(pack)?;
-    let baseline = baseline_from_workspace_pack(project_path, pack);
-    persist_project_baseline(&state, baseline).await
+    let baseline = baseline_from_workspace_pack(String::new(), pack);
+    persist_registered_project_baseline(&state, &project_path, baseline, false).await
 }
 
 fn status_from_agent_install(state: InstallState) -> ReadinessRowState {
@@ -5284,17 +5451,17 @@ pub async fn project_readiness_get(
                     .filter(|package| package.installable)
                     .map(|package| package.reference.clone())
                     .collect::<BTreeSet<_>>();
-                baseline
-                    .agents
-                    .iter()
-                    .cloned()
-                    .map(|reference| {
+                exact_agent_requirements(&baseline)
+                    .into_iter()
+                    .map(|requirement| {
+                        let reference = &requirement.reference;
                         let state = installed
                             .iter()
                             .filter(|row| {
                                 row.project_path.as_deref() == Some(project_path.as_str())
                                     && row.source_id == reference.source_id
                                     && row.relative_path == reference.relative_path
+                                    && row.tool == requirement.tool
                             })
                             .map(|row| status_from_agent_install(row.state))
                             .min_by_key(|state| match state {
@@ -5303,12 +5470,12 @@ pub async fn project_readiness_get(
                                 ReadinessRowState::Unavailable => 2,
                                 ReadinessRowState::Unverifiable => 3,
                             })
-                            .unwrap_or(if available.contains(&reference) {
+                            .unwrap_or(if available.contains(reference) {
                                 ReadinessRowState::NeedsAttention
                             } else {
                                 ReadinessRowState::Unavailable
                             });
-                        (reference, state)
+                        (requirement, state)
                     })
                     .collect()
             })
@@ -5335,17 +5502,17 @@ pub async fn project_readiness_get(
                         relative_path: package.relative_path.clone(),
                     })
                     .collect::<BTreeSet<_>>();
-                baseline
-                    .skills
-                    .iter()
-                    .cloned()
-                    .map(|reference| {
+                exact_skill_requirements(&baseline)
+                    .into_iter()
+                    .map(|requirement| {
+                        let reference = &requirement.reference;
                         let status = installed
                             .iter()
                             .filter(|row| {
                                 row.project_path.as_deref() == Some(project_path.as_str())
                                     && row.source_id == reference.source_id
                                     && row.relative_path == reference.relative_path
+                                    && row.runtime == requirement.runtime
                             })
                             .map(|row| status_from_skill_install(row.state))
                             .min_by_key(|state| match state {
@@ -5354,12 +5521,12 @@ pub async fn project_readiness_get(
                                 ReadinessRowState::Unavailable => 2,
                                 ReadinessRowState::Unverifiable => 3,
                             })
-                            .unwrap_or(if available.contains(&reference) {
+                            .unwrap_or(if available.contains(reference) {
                                 ReadinessRowState::NeedsAttention
                             } else {
                                 ReadinessRowState::Unavailable
                             });
-                        (reference, status)
+                        (requirement, status)
                     })
                     .collect()
             }),
@@ -5492,7 +5659,17 @@ fn derive_project_recommendations(
     available: &BTreeMap<AgentReference, usize>,
 ) -> Vec<ProjectRecommendation> {
     let mut recommendations = Vec::new();
-    let required = baseline.agents.iter().cloned().collect::<BTreeSet<_>>();
+    let required = baseline
+        .agents
+        .iter()
+        .cloned()
+        .chain(
+            baseline
+                .agent_requirements
+                .iter()
+                .map(|requirement| requirement.reference.clone()),
+        )
+        .collect::<BTreeSet<_>>();
     for baseline_reference in required {
         let mut current_reference = baseline_reference.clone();
         let mut relevant = Vec::new();
@@ -5512,6 +5689,35 @@ fn derive_project_recommendations(
         let latest_relevant = relevant.len().checked_sub(1);
         for (index, (batch, change, action_reference, summary)) in relevant.into_iter().enumerate()
         {
+            let (change_kind, operation) = match change {
+                CatalogChange::Added { .. } => (
+                    RecommendationChangeKind::Added,
+                    RecommendationOperation::Install,
+                ),
+                CatalogChange::Updated { .. } => (
+                    RecommendationChangeKind::Updated,
+                    RecommendationOperation::Update,
+                ),
+                CatalogChange::Removed { .. } => (
+                    RecommendationChangeKind::Removed,
+                    RecommendationOperation::Informational,
+                ),
+                CatalogChange::Renamed { .. } => (
+                    RecommendationChangeKind::Renamed,
+                    RecommendationOperation::Install,
+                ),
+            };
+            let targets = exact_agent_requirements(baseline)
+                .into_iter()
+                .filter(|requirement| requirement.reference == baseline_reference)
+                .filter(|requirement| requirement.tool != LEGACY_UNREVIEWED_TARGET)
+                .map(|requirement| ProjectRecommendationTarget {
+                    reference: action_reference.clone(),
+                    tool: requirement.tool,
+                    project_path: baseline.project_path.clone(),
+                    operation,
+                })
+                .collect::<Vec<_>>();
             let id = render::sha256_hex(
                 &serde_json::to_vec(&(
                     baseline.project_path.as_str(),
@@ -5525,7 +5731,10 @@ fn derive_project_recommendations(
                 RecommendationLifecycle::Dismissed
             } else if Some(index) != latest_relevant {
                 RecommendationLifecycle::Superseded
-            } else if available.get(&action_reference) != Some(&1) {
+            } else if matches!(change_kind, RecommendationChangeKind::Removed)
+                || targets.is_empty()
+                || available.get(&action_reference) != Some(&1)
+            {
                 RecommendationLifecycle::Blocked
             } else if subscription
                 .last_seen_batch
@@ -5545,8 +5754,10 @@ fn derive_project_recommendations(
                 batch_at: batch.at.clone(),
                 lifecycle,
                 summary,
+                change_kind,
                 baseline_reference: baseline_reference.clone(),
                 agent_references: vec![action_reference],
+                targets,
             });
         }
     }
@@ -5597,6 +5808,7 @@ pub async fn project_subscription_set(
     project_path: String,
     enabled: bool,
 ) -> Result<bool, AppError> {
+    let _project_lock = lock_project_registry(&state.app_data_dir)?;
     let project_path = exact_registered_project(&state, &project_path).await?;
     control_center_database(&state)
         .await?
@@ -5800,32 +6012,53 @@ pub async fn project_recommendation_dismiss(
             message: "Recommendation is not current for this project subscription".into(),
         });
     }
+    let represented_ids = recommendations
+        .iter()
+        .map(|recommendation| recommendation.id.clone())
+        .collect::<BTreeSet<_>>();
     control_center_database(&state)
         .await?
         .mutate(
             corpus::control_center_spec(),
             crate::types::ControlCenterDocument::default(),
             move |document| {
-                let subscription = document
-                    .project_subscriptions
-                    .iter_mut()
-                    .find(|subscription| subscription.project_path == project_path)
-                    .ok_or_else(|| AppError::InvalidArgument {
-                        message: "Project is not subscribed".into(),
-                    })?;
-                if !subscription
-                    .dismissed_recommendation_ids
-                    .contains(&recommendation_id)
-                {
-                    subscription
-                        .dismissed_recommendation_ids
-                        .push(recommendation_id);
-                    subscription.dismissed_recommendation_ids.sort();
-                }
-                Ok(())
+                dismiss_project_recommendation(
+                    document,
+                    &project_path,
+                    recommendation_id,
+                    &represented_ids,
+                )
             },
         )
         .await
+}
+
+fn dismiss_project_recommendation(
+    document: &mut crate::types::ControlCenterDocument,
+    project_path: &str,
+    recommendation_id: String,
+    represented_ids: &BTreeSet<String>,
+) -> Result<(), AppError> {
+    let subscription = document
+        .project_subscriptions
+        .iter_mut()
+        .find(|subscription| subscription.project_path == project_path)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "Project is not subscribed".into(),
+        })?;
+    subscription
+        .dismissed_recommendation_ids
+        .retain(|id| represented_ids.contains(id));
+    if !subscription
+        .dismissed_recommendation_ids
+        .contains(&recommendation_id)
+    {
+        subscription
+            .dismissed_recommendation_ids
+            .push(recommendation_id);
+        subscription.dismissed_recommendation_ids.sort();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5851,6 +6084,35 @@ pub async fn project_recommendation_open(
             }
             .into(),
         });
+    }
+    if recommendation.targets.iter().any(|target| {
+        target.project_path != project_path
+            || target.operation == RecommendationOperation::Informational
+    }) {
+        return Err(AppError::InvalidArgument {
+            message: "Recommendation has no safe deployment operation".into(),
+        });
+    }
+    if recommendation
+        .targets
+        .iter()
+        .any(|target| target.operation == RecommendationOperation::Update)
+    {
+        let installed = mcp_reconcile_agent_installs(&state).await?;
+        if !recommendation.targets.iter().all(|target| {
+            installed.iter().any(|row| {
+                row.project_path.as_deref() == Some(target.project_path.as_str())
+                    && row.source_id == target.reference.source_id
+                    && row.relative_path == target.reference.relative_path
+                    && row.tool == target.tool
+                    && row.state == InstallState::Outdated
+            })
+        }) {
+            return Err(AppError::InvalidArgument {
+                message: "Updated recommendation no longer targets an exact outdated install"
+                    .into(),
+            });
+        }
     }
     Ok(recommendation)
 }
@@ -8616,27 +8878,33 @@ mod tests {
 
     #[test]
     fn project_readiness_uses_locked_precedence_and_empty_categories() {
+        let agent_requirement = BaselineAgentRequirement {
+            reference: AgentReference {
+                source_id: "source-a".into(),
+                relative_path: "reviewer.md".into(),
+            },
+            tool: "codex".into(),
+        };
         let baseline = ProjectReadinessBaseline {
             project_path: "/registered/project".into(),
             label: "Team baseline".into(),
-            agents: vec![AgentReference {
-                source_id: "source-a".into(),
-                relative_path: "reviewer.md".into(),
-            }],
+            agent_requirements: vec![agent_requirement.clone()],
+            skill_requirements: Vec::new(),
+            agents: vec![agent_requirement.reference.clone()],
             skills: Vec::new(),
             instructions: vec![BaselineRequirement {
                 id: "Follow the repository conventions".into(),
                 known: false,
             }],
             mcp_servers: Vec::new(),
-            tools: Vec::new(),
+            tools: vec![agent_requirement.tool.clone()],
         };
         let report = build_readiness_report(
             "/registered/project",
             Some(&baseline),
             ReadinessEvidence {
                 agents: Ok(BTreeMap::from([(
-                    baseline.agents[0].clone(),
+                    baseline.agent_requirements[0].clone(),
                     ReadinessRowState::Ready,
                 )])),
                 ..ReadinessEvidence::ready()
@@ -8694,9 +8962,10 @@ mod tests {
             Some(&ready_baseline),
             ReadinessEvidence {
                 agents: Ok(BTreeMap::from([(
-                    ready_baseline.agents[0].clone(),
+                    ready_baseline.agent_requirements[0].clone(),
                     ReadinessRowState::Ready,
                 )])),
+                tools: Ok(BTreeMap::from([("codex".into(), ReadinessRowState::Ready)])),
                 ..ReadinessEvidence::ready()
             },
         );
@@ -8708,9 +8977,10 @@ mod tests {
             ReadinessEvidence {
                 skills: Err("Skill inspection failed".into()),
                 agents: Ok(BTreeMap::from([(
-                    ready_baseline.agents[0].clone(),
+                    ready_baseline.agent_requirements[0].clone(),
                     ReadinessRowState::Ready,
                 )])),
+                tools: Ok(BTreeMap::from([("codex".into(), ReadinessRowState::Ready)])),
                 ..ReadinessEvidence::ready()
             },
         );
@@ -8720,6 +8990,13 @@ mod tests {
         );
 
         let required_skill = ProjectReadinessBaseline {
+            skill_requirements: vec![BaselineSkillRequirement {
+                reference: SkillReference {
+                    source_id: "skills".into(),
+                    relative_path: "audit".into(),
+                },
+                runtime: "codex".into(),
+            }],
             skills: vec![SkillReference {
                 source_id: "skills".into(),
                 relative_path: "audit".into(),
@@ -8732,9 +9009,10 @@ mod tests {
             ReadinessEvidence {
                 skills: Err("Skill inspection failed".into()),
                 agents: Ok(BTreeMap::from([(
-                    required_skill.agents[0].clone(),
+                    required_skill.agent_requirements[0].clone(),
                     ReadinessRowState::Ready,
                 )])),
+                tools: Ok(BTreeMap::from([("codex".into(), ReadinessRowState::Ready)])),
                 ..ReadinessEvidence::ready()
             },
         );
@@ -8762,6 +9040,11 @@ mod tests {
         let baseline = baseline_from_workspace_pack("/registered/project".into(), pack);
         assert_eq!(baseline.agents[0].source_id, "source-a");
         assert_eq!(baseline.skills[0].source_id, "skills");
+        assert_eq!(baseline.agent_requirements.len(), 2);
+        assert!(baseline.agent_requirements.iter().any(|requirement| {
+            requirement.reference.source_id == "source-a" && requirement.tool == "codex"
+        }));
+        assert_eq!(baseline.skill_requirements[0].runtime, "codex");
         assert!(baseline.instructions.iter().all(|item| !item.known));
         assert!(baseline.mcp_servers.iter().all(|item| !item.known));
         let report = build_readiness_report(
@@ -8780,6 +9063,249 @@ mod tests {
     }
 
     #[test]
+    fn legacy_baseline_defaults_exact_tuples_and_migrates_only_one_unambiguous_tool() {
+        let baseline: ProjectReadinessBaseline = serde_json::from_value(serde_json::json!({
+            "projectPath": "/registered/project",
+            "label": "Legacy",
+            "agents": [{"sourceId": "source-a", "relativePath": "reviewer.md"}],
+            "skills": [{"sourceId": "skills", "relativePath": "audit"}],
+            "instructions": [],
+            "mcpServers": [],
+            "tools": ["codex"]
+        }))
+        .unwrap();
+        assert!(baseline.agent_requirements.is_empty());
+        assert!(baseline.skill_requirements.is_empty());
+        assert_eq!(exact_agent_requirements(&baseline)[0].tool, "codex");
+        assert_eq!(
+            exact_skill_requirements(&baseline)[0].runtime,
+            LEGACY_UNREVIEWED_TARGET
+        );
+
+        let ambiguous: ProjectReadinessBaseline = serde_json::from_value(serde_json::json!({
+            "projectPath": "/registered/project",
+            "label": "Legacy",
+            "agents": [{"sourceId": "source-a", "relativePath": "reviewer.md"}],
+            "tools": ["codex", "claudeCode"]
+        }))
+        .unwrap();
+        assert_eq!(
+            exact_agent_requirements(&ambiguous)[0].tool,
+            LEGACY_UNREVIEWED_TARGET
+        );
+    }
+
+    #[test]
+    fn readiness_requires_the_exact_agent_tool_and_skill_runtime_tuple() {
+        let agent = BaselineAgentRequirement {
+            reference: AgentReference {
+                source_id: "source-a".into(),
+                relative_path: "reviewer.md".into(),
+            },
+            tool: "codex".into(),
+        };
+        let skill = BaselineSkillRequirement {
+            reference: SkillReference {
+                source_id: "skills".into(),
+                relative_path: "audit".into(),
+            },
+            runtime: "codex".into(),
+        };
+        let baseline = ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Exact targets".into(),
+            agent_requirements: vec![agent.clone()],
+            skill_requirements: vec![skill.clone()],
+            agents: vec![agent.reference.clone()],
+            skills: vec![skill.reference.clone()],
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: vec![agent.tool.clone()],
+        };
+        let report = build_readiness_report(
+            &baseline.project_path,
+            Some(&baseline),
+            ReadinessEvidence {
+                agents: Ok(BTreeMap::from([(
+                    BaselineAgentRequirement {
+                        tool: "claudeCode".into(),
+                        ..agent
+                    },
+                    ReadinessRowState::Ready,
+                )])),
+                skills: Ok(BTreeMap::from([(
+                    BaselineSkillRequirement {
+                        runtime: "cursor".into(),
+                        ..skill
+                    },
+                    ReadinessRowState::Ready,
+                )])),
+                ..ReadinessEvidence::ready()
+            },
+        );
+        assert_eq!(
+            report.categories[0].state,
+            ReadinessCategoryState::NeedsAttention
+        );
+        assert_eq!(
+            report.categories[1].state,
+            ReadinessCategoryState::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn atomic_baseline_subscription_failure_leaves_the_document_unchanged() {
+        let mut document = crate::types::ControlCenterDocument::default();
+        for index in 0..64 {
+            let project_path = format!("/registered/project-{index}");
+            document.project_baselines.push(ProjectReadinessBaseline {
+                project_path: project_path.clone(),
+                label: format!("Project {index}"),
+                agent_requirements: Vec::new(),
+                skill_requirements: Vec::new(),
+                agents: Vec::new(),
+                skills: Vec::new(),
+                instructions: Vec::new(),
+                mcp_servers: Vec::new(),
+                tools: Vec::new(),
+            });
+            document.project_subscriptions.push(ProjectSubscription {
+                project_path,
+                last_seen_batch: None,
+                dismissed_recommendation_ids: Vec::new(),
+            });
+        }
+        let before = document.clone();
+        let extra = ProjectReadinessBaseline {
+            project_path: "/registered/extra".into(),
+            label: "Extra".into(),
+            agent_requirements: Vec::new(),
+            skill_requirements: Vec::new(),
+            agents: Vec::new(),
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        };
+        assert!(apply_project_baseline_and_subscription(&mut document, extra, true).is_err());
+        assert_eq!(document, before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregister_cleanup_holds_the_project_lock_against_a_racing_baseline_save() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(
+            project_instruction_test_state(app_data.path(), project.path()).await,
+        );
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let database = control_center_database(&state).await.unwrap();
+        let initial_path = project_path.clone();
+        database
+            .mutate(
+                corpus::control_center_spec(),
+                crate::types::ControlCenterDocument::default(),
+                move |document| {
+                    apply_project_baseline_and_subscription(
+                        document,
+                        ProjectReadinessBaseline {
+                            project_path: initial_path,
+                            label: "Initial".into(),
+                            agent_requirements: Vec::new(),
+                            skill_requirements: Vec::new(),
+                            agents: Vec::new(),
+                            skills: Vec::new(),
+                            instructions: Vec::new(),
+                            mcp_servers: Vec::new(),
+                            tools: Vec::new(),
+                        },
+                        true,
+                    )
+                },
+            )
+            .await
+            .unwrap();
+
+        let unregister_lock = lock_project_registry(&state.app_data_dir).unwrap();
+        save_registered_projects(&state.app_data_dir, &[])
+            .await
+            .unwrap();
+        let racing_state = state.clone();
+        let racing_path = project_path.clone();
+        let save = tokio::spawn(async move {
+            persist_registered_project_baseline(
+                &racing_state,
+                &racing_path,
+                ProjectReadinessBaseline {
+                    project_path: String::new(),
+                    label: "Racing save".into(),
+                    agent_requirements: Vec::new(),
+                    skill_requirements: Vec::new(),
+                    agents: Vec::new(),
+                    skills: Vec::new(),
+                    instructions: Vec::new(),
+                    mcp_servers: Vec::new(),
+                    tools: Vec::new(),
+                },
+                true,
+            )
+            .await
+        });
+        let removed_path = project_path.clone();
+        database
+            .mutate(
+                corpus::control_center_spec(),
+                crate::types::ControlCenterDocument::default(),
+                move |document| {
+                    document
+                        .project_baselines
+                        .retain(|baseline| baseline.project_path != removed_path);
+                    document
+                        .project_subscriptions
+                        .retain(|subscription| subscription.project_path != removed_path);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        drop(unregister_lock);
+
+        assert!(save.await.unwrap().is_err());
+        let document = corpus::load_control_center(&database).await.unwrap();
+        assert!(document.project_baselines.is_empty());
+        assert!(document.project_subscriptions.is_empty());
+    }
+
+    #[test]
+    fn dismissal_prunes_ids_no_longer_represented_before_adding_the_current_id() {
+        let mut document = crate::types::ControlCenterDocument {
+            project_subscriptions: vec![ProjectSubscription {
+                project_path: "/registered/project".into(),
+                last_seen_batch: None,
+                dismissed_recommendation_ids: (0..256)
+                    .map(|index| format!("stale-{index}"))
+                    .collect(),
+            }],
+            ..crate::types::ControlCenterDocument::default()
+        };
+        let represented = BTreeSet::from(["current".to_string()]);
+        dismiss_project_recommendation(
+            &mut document,
+            "/registered/project",
+            "current".into(),
+            &represented,
+        )
+        .unwrap();
+        assert_eq!(
+            document.project_subscriptions[0].dismissed_recommendation_ids,
+            vec!["current"]
+        );
+    }
+
+    #[test]
     fn project_subscription_is_explicit_opt_in_and_requires_a_baseline() {
         let mut document = crate::types::ControlCenterDocument::default();
         assert!(
@@ -8788,6 +9314,8 @@ mod tests {
         document.project_baselines.push(ProjectReadinessBaseline {
             project_path: "/registered/project".into(),
             label: "Review".into(),
+            agent_requirements: Vec::new(),
+            skill_requirements: Vec::new(),
             agents: Vec::new(),
             skills: Vec::new(),
             instructions: Vec::new(),
@@ -8808,6 +9336,8 @@ mod tests {
         let baseline = ProjectReadinessBaseline {
             project_path: "/registered/project".into(),
             label: "Review".into(),
+            agent_requirements: Vec::new(),
+            skill_requirements: Vec::new(),
             agents: vec![AgentReference {
                 source_id: "source-a".into(),
                 relative_path: "reviewer.md".into(),
@@ -8885,11 +9415,16 @@ mod tests {
                     document.project_baselines = vec![ProjectReadinessBaseline {
                         project_path: persisted_path.clone(),
                         label: "Reviewers".into(),
+                        agent_requirements: vec![BaselineAgentRequirement {
+                            reference: reference.clone(),
+                            tool: "codex".into(),
+                        }],
+                        skill_requirements: Vec::new(),
                         agents: vec![reference],
                         skills: Vec::new(),
                         instructions: Vec::new(),
                         mcp_servers: Vec::new(),
-                        tools: Vec::new(),
+                        tools: vec!["codex".into()],
                     }];
                     document.project_subscriptions = vec![ProjectSubscription {
                         project_path: persisted_path,
@@ -8909,6 +9444,15 @@ mod tests {
 
         assert_eq!(recommendations.len(), 1);
         assert_eq!(
+            recommendations[0].change_kind,
+            RecommendationChangeKind::Updated
+        );
+        assert_eq!(
+            recommendations[0].targets[0].operation,
+            RecommendationOperation::Update
+        );
+        assert_eq!(recommendations[0].targets[0].tool, "codex");
+        assert_eq!(
             corpus::load_control_center(&database).await.unwrap(),
             before
         );
@@ -8925,11 +9469,16 @@ mod tests {
         let baseline = ProjectReadinessBaseline {
             project_path: "/registered/project".into(),
             label: "Reviewers".into(),
+            agent_requirements: vec![BaselineAgentRequirement {
+                reference: reference.clone(),
+                tool: "codex".into(),
+            }],
+            skill_requirements: Vec::new(),
             agents: vec![reference.clone()],
             skills: Vec::new(),
             instructions: Vec::new(),
             mcp_servers: Vec::new(),
-            tools: Vec::new(),
+            tools: vec!["codex".into()],
         };
         let batches = vec![
             CatalogFeedBatch {
@@ -8977,7 +9526,18 @@ mod tests {
             recommendations[0].lifecycle,
             RecommendationLifecycle::Superseded
         );
-        assert_eq!(recommendations[1].lifecycle, RecommendationLifecycle::New);
+        assert_eq!(
+            recommendations[1].lifecycle,
+            RecommendationLifecycle::Blocked
+        );
+        assert_eq!(
+            recommendations[1].change_kind,
+            RecommendationChangeKind::Removed
+        );
+        assert_eq!(
+            recommendations[1].targets[0].operation,
+            RecommendationOperation::Informational
+        );
         assert_eq!(
             derive_project_recommendations(&baseline, &subscription, &batches, &BTreeMap::new(),)
                 [1]
@@ -9017,11 +9577,16 @@ mod tests {
         let baseline = ProjectReadinessBaseline {
             project_path: "/registered/project".into(),
             label: "Reviewers".into(),
+            agent_requirements: vec![BaselineAgentRequirement {
+                reference: old.clone(),
+                tool: "codex".into(),
+            }],
+            skill_requirements: Vec::new(),
             agents: vec![old.clone()],
             skills: Vec::new(),
             instructions: Vec::new(),
             mcp_servers: Vec::new(),
-            tools: Vec::new(),
+            tools: vec!["codex".into()],
         };
         let batches = vec![CatalogFeedBatch {
             at: "2026-08-17T01:00:00Z".into(),
@@ -9055,6 +9620,13 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].baseline_reference, old);
         assert_eq!(ready[0].agent_references, vec![new.clone()]);
+        assert_eq!(ready[0].change_kind, RecommendationChangeKind::Renamed);
+        assert_eq!(ready[0].targets[0].reference, new.clone());
+        assert_eq!(ready[0].targets[0].tool, "codex");
+        assert_eq!(
+            ready[0].targets[0].operation,
+            RecommendationOperation::Install
+        );
         assert!(ready[0].summary.contains("old-reviewer.md"));
         assert!(ready[0].summary.contains("new-reviewer.md"));
         assert_eq!(ready[0].lifecycle, RecommendationLifecycle::New);
@@ -9081,11 +9653,16 @@ mod tests {
         let baseline = ProjectReadinessBaseline {
             project_path: "/registered/project".into(),
             label: "Reviewers".into(),
+            agent_requirements: vec![BaselineAgentRequirement {
+                reference: first.clone(),
+                tool: "codex".into(),
+            }],
+            skill_requirements: Vec::new(),
             agents: vec![first.clone()],
             skills: Vec::new(),
             instructions: Vec::new(),
             mcp_servers: Vec::new(),
-            tools: Vec::new(),
+            tools: vec!["codex".into()],
         };
         let change = |reference: &AgentReference, at: &str, hash: char| CatalogFeedBatch {
             at: at.into(),

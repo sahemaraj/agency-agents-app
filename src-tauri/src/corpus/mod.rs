@@ -590,6 +590,8 @@ fn validate_project_baseline(baseline: &ProjectReadinessBaseline) -> Result<(), 
         || !valid_text(&baseline.label)
         || baseline.agents.len() > CONTROL_CENTER_MAX_PROJECT_AGENTS
         || baseline.skills.len() > CONTROL_CENTER_MAX_PROJECT_SKILLS
+        || baseline.agent_requirements.len() > CONTROL_CENTER_MAX_PROJECT_AGENTS
+        || baseline.skill_requirements.len() > CONTROL_CENTER_MAX_PROJECT_SKILLS
         || baseline.instructions.len() > CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS
         || baseline.mcp_servers.len() > CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS
         || baseline.tools.len() > CONTROL_CENTER_MAX_PROJECT_TOOLS
@@ -597,6 +599,46 @@ fn validate_project_baseline(baseline: &ProjectReadinessBaseline) -> Result<(), 
         return Err(AppError::InvalidArgument {
             message: "control-center project baseline exceeds its limits".into(),
         });
+    }
+    let mut exact_agent_keys = BTreeSet::new();
+    for requirement in &baseline.agent_requirements {
+        crate::library::validate_reference(
+            &requirement.reference.source_id,
+            &requirement.reference.relative_path,
+        )?;
+        if requirement.reference.relative_path.chars().count() > CONTROL_CENTER_MAX_PATH_CHARS
+            || !valid_text(&requirement.tool)
+            || !exact_agent_keys.insert((
+                &requirement.reference.source_id,
+                &requirement.reference.relative_path,
+                &requirement.tool,
+            ))
+        {
+            return Err(AppError::InvalidArgument {
+                message: "control-center project baseline has duplicate Agent target requirements"
+                    .into(),
+            });
+        }
+    }
+    let mut exact_skill_keys = BTreeSet::new();
+    for requirement in &baseline.skill_requirements {
+        crate::library::validate_reference(
+            &requirement.reference.source_id,
+            &requirement.reference.relative_path,
+        )?;
+        if requirement.reference.relative_path.chars().count() > CONTROL_CENTER_MAX_PATH_CHARS
+            || !valid_text(&requirement.runtime)
+            || !exact_skill_keys.insert((
+                &requirement.reference.source_id,
+                &requirement.reference.relative_path,
+                &requirement.runtime,
+            ))
+        {
+            return Err(AppError::InvalidArgument {
+                message: "control-center project baseline has duplicate Skill runtime requirements"
+                    .into(),
+            });
+        }
     }
     let mut agent_keys = BTreeSet::new();
     for reference in &baseline.agents {
@@ -649,7 +691,7 @@ fn validate_project_baseline(baseline: &ProjectReadinessBaseline) -> Result<(), 
     Ok(())
 }
 
-fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppError> {
+pub(crate) fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppError> {
     if document.project_baselines.len() > CONTROL_CENTER_MAX_PROJECT_BASELINES {
         return Err(AppError::InvalidArgument {
             message: "control-center exceeds its project baseline limit".into(),
@@ -3118,6 +3160,8 @@ mod tests {
         let baseline = ProjectReadinessBaseline {
             project_path: "/registered/project".into(),
             label: "Review".into(),
+            agent_requirements: Vec::new(),
+            skill_requirements: Vec::new(),
             agents: vec![AgentReference {
                 source_id: "source-a".into(),
                 relative_path: "reviewer.md".into(),
@@ -3242,6 +3286,8 @@ mod tests {
         ProjectReadinessBaseline {
             project_path: format!("/registered/project-{index}"),
             label: format!("Project {index}"),
+            agent_requirements: Vec::new(),
+            skill_requirements: Vec::new(),
             agents: Vec::new(),
             skills: Vec::new(),
             instructions: Vec::new(),
