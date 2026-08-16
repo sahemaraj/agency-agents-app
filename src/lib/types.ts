@@ -897,6 +897,31 @@ export interface CatalogStatus {
   agentCount: number;
 }
 
+export interface CatalogSnapshotItem {
+  category: string;
+  relativePath: string;
+  sourceHash: string;
+  bodyHash: string;
+}
+
+export type CatalogChange =
+  | { kind: "added"; item: CatalogSnapshotItem }
+  | { kind: "updated"; before: CatalogSnapshotItem; after: CatalogSnapshotItem }
+  | { kind: "removed"; item: CatalogSnapshotItem }
+  | { kind: "renamed"; before: CatalogSnapshotItem; after: CatalogSnapshotItem };
+
+export interface CatalogFeedBatch {
+  at: string;
+  changes: CatalogChange[];
+}
+
+export interface CatalogFeedState {
+  lastSuccessAt: string | null;
+  stale: boolean;
+  error: string | null;
+  batches: CatalogFeedBatch[];
+}
+
 /** Result of checking the active catalog for upstream updates (diff stats). */
 /** A named sub-team within a runbook (e.g. "Core Team"), its activation timing,
     and its member agents BY SLUG (the corpus id). */

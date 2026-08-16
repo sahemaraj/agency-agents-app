@@ -22,20 +22,37 @@
   import ExternalLink from "@lucide/svelte/icons/external-link";
 
   import { catalog } from "$lib/stores/catalog.svelte";
+  import { catalogFeedList } from "$lib/api";
   import { github, type RepoStatsOutcome } from "$lib/stores/github.svelte";
   import { toast } from "$lib/stores/toast.svelte";
   import { safeOpenUrl } from "$lib/util/url";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import { appErrorMessage, isAppError, type CatalogCandidate } from "$lib/types";
+  import {
+    appErrorMessage,
+    isAppError,
+    type CatalogCandidate,
+    type CatalogChange,
+    type CatalogFeedBatch,
+    type CatalogFeedState,
+  } from "$lib/types";
 
   let manage = $state(true);
   let repoStats = $state<RepoStatsOutcome>({ kind: "loading" });
+  let feed = $state<CatalogFeedState | null>(null);
+  let feedLoading = $state(true);
+  let feedError = $state<string | null>(null);
+  const formatCatalogFeedError = appErrorMessage;
+
+  function catalogFeedError(e: unknown): string {
+    return isAppError(e) ? formatCatalogFeedError(e) : String(e);
+  }
 
   onMount(() => {
     void catalog.load();
     void catalog.loadStatus();
     void catalog.detect(false);
     void github.loadStatus();
+    void loadFeed().catch(() => {});
   });
 
   // Catalog repo homepage (for GitHub stats / links), derived from the remote.
@@ -53,6 +70,32 @@
       toast.success(ok);
     } catch (e) {
       toast.error(i18n.t("catalog.actionFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
+    }
+  }
+
+  async function loadFeed() {
+    feedLoading = true;
+    try {
+      feed = await catalogFeedList();
+      feedError = null;
+    } catch (e) {
+      feedError = catalogFeedError(e);
+      throw e;
+    } finally {
+      feedLoading = false;
+    }
+  }
+
+  async function refreshCatalog() {
+    try {
+      await catalog.pull();
+      await loadFeed();
+      toast.success(i18n.t("catalog.updated"));
+    } catch (e) {
+      const message = catalog.error ?? catalogFeedError(e);
+      feedError = message;
+      if (feed) feed = { ...feed, stale: true, error: message };
+      toast.error(i18n.t("catalog.actionFailed"), message);
     }
   }
 
@@ -85,6 +128,25 @@
     if (!iso) return "—";
     const d = new Date(iso);
     return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString();
+  }
+
+  function timestamp(iso: string | null): string {
+    if (!iso) return "—";
+    const date = new Date(iso);
+    return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
+  }
+
+  function newestFirst(batches: CatalogFeedBatch[]): CatalogFeedBatch[] {
+    return [...batches].reverse();
+  }
+
+  function changeSummary(change: CatalogChange): string {
+    switch (change.kind) {
+      case "added": return `${i18n.optional("catalog.change.added", "Added")} · ${change.item.relativePath}`;
+      case "updated": return `${i18n.optional("catalog.change.updated", "Updated")} · ${change.after.relativePath}`;
+      case "removed": return `${i18n.optional("catalog.change.removed", "Removed")} · ${change.item.relativePath}`;
+      case "renamed": return `${i18n.optional("catalog.change.renamed", "Renamed")} · ${change.before.relativePath} → ${change.after.relativePath}`;
+    }
   }
 </script>
 
@@ -124,7 +186,7 @@
           <Search size={14} /><span>{catalog.checking ? i18n.t("common.checking") : i18n.t("catalog.checkUpdates")}</span>
         </button>
       {/if}
-      <button class="primary" disabled={catalog.busy || isReadOnly} onclick={() => run(() => catalog.pull(), i18n.t("catalog.updated"))}>
+      <button class="primary" disabled={catalog.busy || isReadOnly} onclick={refreshCatalog}>
         <RefreshCw size={14} /><span>{catalog.busy ? i18n.t("common.working") : st?.isGit ? i18n.t("catalog.pullLatest") : i18n.t("catalog.refreshSnapshot")}</span>
       </button>
       {#if isReadOnly}<span class="hint">{i18n.t("catalog.readOnlyHint")}</span>{/if}
@@ -143,6 +205,45 @@
           {#if uc.diffstat}<pre class="diffstat">{uc.diffstat}</pre>{/if}
         </div>
       {/if}
+    {/if}
+  </div>
+
+  <div class="feed" aria-live="polite">
+    <div class="feed-head">
+      <h3>{i18n.optional("catalog.changeFeed", "Catalog changes")}</h3>
+      <span class="hint">
+        {i18n.optional("catalog.lastSuccessfulRefresh", "Last successful refresh")}: {timestamp(feed?.lastSuccessAt ?? null)}
+      </span>
+    </div>
+    {#if feedLoading && !feed}
+      <p class="hint">{i18n.t("common.loading")}</p>
+    {:else if feed?.stale || feedError}
+      <div class="feed-error">
+        <p class="err">{feed?.error ?? feedError ?? i18n.optional("catalog.refreshFailed", "Catalog refresh failed")}</p>
+        <button class="ghost" disabled={catalog.busy || isReadOnly} onclick={refreshCatalog}>
+          <RefreshCw size={14} />{i18n.optional("common.retry", "Retry")}
+        </button>
+      </div>
+    {/if}
+    {#if feed?.batches?.length}
+      <ol class="batches">
+        {#each newestFirst(feed.batches) as batch, index (`${batch.at}-${index}`)}
+          <li class="batch">
+            <div class="batch-time">{timestamp(batch.at)}</div>
+            {#if batch.changes.length}
+              <ul class="changes">
+                {#each batch.changes as change, changeIndex (`${change.kind}-${changeIndex}`)}
+                  <li>{changeSummary(change)}</li>
+                {/each}
+              </ul>
+            {:else}
+              <span class="hint">{i18n.optional("catalog.noChanges", "No catalog changes")}</span>
+            {/if}
+          </li>
+        {/each}
+      </ol>
+    {:else if !feedLoading && !feedError}
+      <p class="hint">{i18n.optional("catalog.noRefreshes", "No successful catalog refreshes yet")}</p>
     {/if}
   </div>
 
@@ -250,6 +351,14 @@
   .diff { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-3); background: var(--color-surface-sunken); }
   .diff-head { font-size: var(--text-body-sm); color: var(--color-text-primary); margin-bottom: var(--space-2); }
   .diffstat { font-family: var(--font-mono); font-size: var(--text-mono); color: var(--color-text-secondary); white-space: pre-wrap; max-height: 200px; overflow-y: auto; margin: 0; }
+  .feed { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); }
+  .feed h3 { margin: 0; }
+  .feed-head, .feed-error { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+  .feed-error .err { margin: 0; flex: 1; }
+  .batches { display: flex; flex-direction: column; gap: var(--space-2); max-height: 280px; overflow-y: auto; }
+  .batch { padding-top: var(--space-2); border-top: 1px solid var(--color-border); }
+  .batch-time { font-size: var(--text-caption); color: var(--color-text-muted); margin-bottom: 4px; }
+  .changes { display: flex; flex-direction: column; gap: 3px; font-family: var(--font-mono); font-size: var(--text-mono); color: var(--color-text-secondary); overflow-wrap: anywhere; }
   .primary {
     display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 var(--space-4);
     border: 1px solid var(--color-brand); border-radius: var(--radius-md);

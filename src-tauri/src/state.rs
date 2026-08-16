@@ -60,6 +60,12 @@ pub(crate) const PERSISTENCE_INVENTORY: &[PersistenceDocument] = &[
     PersistenceDocument::json("settings", "settings.json", 1_048_576, "settings"),
     PersistenceDocument::json("catalog", "state/catalog.json", 65_536, "catalog_source"),
     PersistenceDocument::json(
+        "control_center",
+        "state/control-center.json",
+        4_194_304,
+        "control_center",
+    ),
+    PersistenceDocument::json(
         "skill_sources",
         "state/skill-sources.json",
         1_048_576,
@@ -610,6 +616,7 @@ fn migration_import_specs() -> Vec<crate::state_db::ImportSpec> {
     vec![
         crate::commands::settings::settings_import_spec(),
         crate::corpus::catalog_source_import_spec(),
+        crate::corpus::control_center_import_spec(),
         crate::skills::skill_sources_import_spec(),
         crate::skills::skill_trust_import_spec(),
         crate::skills::drafts::import_spec(),
@@ -1379,6 +1386,7 @@ mod tests {
             actual,
             "settings|settings.json|1|1048576|json|settings\n\
 catalog|state/catalog.json|1|65536|json|catalog_source\n\
+control_center|state/control-center.json|1|4194304|json|control_center\n\
 skill_sources|state/skill-sources.json|1|1048576|json|skill_sources\n\
 skill_trust|state/skill-trust.json|1|1048576|json|skill_trust\n\
 skill_drafts|state/skill-drafts.json|1|16777216|json|skill_drafts\n\

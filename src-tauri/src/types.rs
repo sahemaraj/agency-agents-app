@@ -739,6 +739,66 @@ pub struct CatalogUpdateCheck {
     pub up_to_date: bool,
 }
 
+/// One Agent in the durable snapshot of the active built-in catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSnapshotItem {
+    pub category: String,
+    pub relative_path: String,
+    pub source_hash: String,
+    pub body_hash: String,
+}
+
+/// A deterministic change between two successful active-catalog snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CatalogChange {
+    Added {
+        item: CatalogSnapshotItem,
+    },
+    Updated {
+        before: CatalogSnapshotItem,
+        after: CatalogSnapshotItem,
+    },
+    Removed {
+        item: CatalogSnapshotItem,
+    },
+    Renamed {
+        before: CatalogSnapshotItem,
+        after: CatalogSnapshotItem,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogFeedBatch {
+    pub at: String,
+    pub changes: Vec<CatalogChange>,
+}
+
+/// The single forward-compatible control-center document. Later capabilities
+/// extend this document; Task 1 stores only active-catalog feed truth.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct ControlCenterDocument {
+    pub(crate) active_catalog_snapshot: Vec<CatalogSnapshotItem>,
+    pub(crate) catalog_feed: Vec<CatalogFeedBatch>,
+    pub(crate) catalog_last_success_at: Option<String>,
+    pub(crate) catalog_stale: bool,
+    pub(crate) catalog_error: Option<String>,
+}
+
+/// Bounded UI projection; the potentially 10,000-item snapshot never crosses
+/// the Tauri boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogFeedState {
+    pub last_success_at: Option<String>,
+    pub stale: bool,
+    pub error: Option<String>,
+    pub batches: Vec<CatalogFeedBatch>,
+}
+
 // ---------- Agent (parsed from the corpus) ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1530,6 +1590,56 @@ mod tests {
         assert_eq!(value["kind"]["kind"], "github");
         assert_eq!(value["kind"]["gitRef"], "main");
         assert_eq!(value["kind"]["subdirectory"], "catalog");
+    }
+
+    #[test]
+    fn catalog_feed_dto_serializes_bounded_typed_changes_in_camel_case() {
+        let before = CatalogSnapshotItem {
+            category: "engineering".into(),
+            relative_path: "engineering/old.md".into(),
+            source_hash: "a".repeat(64),
+            body_hash: "b".repeat(64),
+        };
+        let after = CatalogSnapshotItem {
+            relative_path: "engineering/new.md".into(),
+            ..before.clone()
+        };
+        let state = CatalogFeedState {
+            last_success_at: Some("2026-08-17T00:00:00Z".into()),
+            stale: false,
+            error: None,
+            batches: vec![CatalogFeedBatch {
+                at: "2026-08-17T00:00:00Z".into(),
+                changes: vec![CatalogChange::Renamed { before, after }],
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_value(state).unwrap(),
+            serde_json::json!({
+                "lastSuccessAt": "2026-08-17T00:00:00Z",
+                "stale": false,
+                "error": null,
+                "batches": [{
+                    "at": "2026-08-17T00:00:00Z",
+                    "changes": [{
+                        "kind": "renamed",
+                        "before": {
+                            "category": "engineering",
+                            "relativePath": "engineering/old.md",
+                            "sourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "bodyHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        },
+                        "after": {
+                            "category": "engineering",
+                            "relativePath": "engineering/new.md",
+                            "sourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "bodyHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        }
+                    }]
+                }]
+            })
+        );
     }
 
     #[test]

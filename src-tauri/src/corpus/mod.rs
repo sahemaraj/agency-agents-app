@@ -38,8 +38,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 use crate::github::extract_github_repo;
 use crate::types::{
-    Agent, CatalogCandidate, CatalogDetection, CatalogSource, CatalogStatus, CatalogUpdateCheck,
-    Category, CorpusEntry, CorpusMeta,
+    Agent, CatalogCandidate, CatalogChange, CatalogDetection, CatalogFeedBatch, CatalogFeedState,
+    CatalogSnapshotItem, CatalogSource, CatalogStatus, CatalogUpdateCheck, Category,
+    ControlCenterDocument, CorpusEntry, CorpusMeta,
 };
 use crate::util::fs::atomic_write;
 
@@ -182,6 +183,8 @@ pub struct Corpus {
     /// Index rows keyed by slug — `BTreeMap` so the serialized
     /// `corpus-index.json` has stable key order.
     index: BTreeMap<String, CorpusEntry>,
+    /// Durable-feed identity and hashes, ordered by `(category, relative path)`.
+    active_catalog_snapshot: Vec<CatalogSnapshotItem>,
     /// The category directories this corpus was built from, in tooling order
     /// (from [`discover_categories`]). Drives the Discover grid so the tiles
     /// match the active catalog's actual divisions.
@@ -247,6 +250,10 @@ impl Corpus {
     /// The active corpus version (from meta), used to stamp ledger records.
     pub fn version(&self) -> String {
         self.meta.version.clone()
+    }
+
+    fn catalog_snapshot(&self) -> Vec<CatalogSnapshotItem> {
+        self.active_catalog_snapshot.clone()
     }
 
     /// Per-category counts in tooling order (from [`discover_categories`]).
@@ -430,6 +437,336 @@ fn catalog_source_spec() -> crate::state_db::DocumentSpec<CatalogSource> {
 
 pub(crate) fn catalog_source_import_spec() -> crate::state_db::ImportSpec {
     crate::state_db::ImportSpec::document(catalog_source_spec(), CatalogSource::default())
+}
+
+pub(crate) const CONTROL_CENTER_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const CONTROL_CENTER_MAX_SNAPSHOT_ITEMS: usize = 10_000;
+pub(crate) const CONTROL_CENTER_MAX_FEED_BATCHES: usize = 100;
+pub(crate) const CONTROL_CENTER_MAX_FEED_ITEMS: usize = 2_000;
+const CONTROL_CENTER_MAX_TEXT_CHARS: usize = 256;
+const CONTROL_CENTER_MAX_PATH_CHARS: usize = 512;
+
+fn valid_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.chars().count() <= CONTROL_CENTER_MAX_TEXT_CHARS
+}
+
+fn valid_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_snapshot_item(item: &CatalogSnapshotItem) -> Result<(), AppError> {
+    let normalized = crate::library::normalize_relative_path(&item.relative_path)?;
+    if !valid_text(&item.category)
+        || normalized != item.relative_path
+        || item.relative_path.chars().count() > CONTROL_CENTER_MAX_PATH_CHARS
+        || item.relative_path.split('/').next() != Some(item.category.as_str())
+        || !valid_hash(&item.source_hash)
+        || !valid_hash(&item.body_hash)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "control-center catalog item is invalid".into(),
+        });
+    }
+    Ok(())
+}
+
+fn item_key(item: &CatalogSnapshotItem) -> (&str, &str) {
+    (&item.category, &item.relative_path)
+}
+
+fn change_key(change: &CatalogChange) -> (u8, &str, &str) {
+    match change {
+        CatalogChange::Added { item } => (0, &item.category, &item.relative_path),
+        CatalogChange::Updated { after, .. } => (1, &after.category, &after.relative_path),
+        CatalogChange::Removed { item } => (2, &item.category, &item.relative_path),
+        CatalogChange::Renamed { after, .. } => (3, &after.category, &after.relative_path),
+    }
+}
+
+fn validate_change(change: &CatalogChange) -> Result<(), AppError> {
+    match change {
+        CatalogChange::Added { item } | CatalogChange::Removed { item } => {
+            validate_snapshot_item(item)
+        }
+        CatalogChange::Updated { before, after } => {
+            validate_snapshot_item(before)?;
+            validate_snapshot_item(after)?;
+            if item_key(before) != item_key(after)
+                || (before.source_hash == after.source_hash && before.body_hash == after.body_hash)
+            {
+                return Err(AppError::InvalidArgument {
+                    message: "control-center catalog update is invalid".into(),
+                });
+            }
+            Ok(())
+        }
+        CatalogChange::Renamed { before, after } => {
+            validate_snapshot_item(before)?;
+            validate_snapshot_item(after)?;
+            if item_key(before) == item_key(after) || before.source_hash != after.source_hash {
+                return Err(AppError::InvalidArgument {
+                    message: "control-center catalog rename is invalid".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn valid_timestamp(value: &str) -> bool {
+    valid_text(value) && chrono::DateTime::parse_from_rfc3339(value).is_ok()
+}
+
+fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppError> {
+    if document.active_catalog_snapshot.len() > CONTROL_CENTER_MAX_SNAPSHOT_ITEMS
+        || document.catalog_feed.len() > CONTROL_CENTER_MAX_FEED_BATCHES
+        || document
+            .catalog_feed
+            .iter()
+            .map(|batch| batch.changes.len())
+            .sum::<usize>()
+            > CONTROL_CENTER_MAX_FEED_ITEMS
+    {
+        return Err(AppError::InvalidArgument {
+            message: "control-center catalog state exceeds its item limits".into(),
+        });
+    }
+
+    for item in &document.active_catalog_snapshot {
+        validate_snapshot_item(item)?;
+    }
+    if document
+        .active_catalog_snapshot
+        .windows(2)
+        .any(|pair| item_key(&pair[0]) >= item_key(&pair[1]))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "control-center catalog snapshot is not uniquely sorted".into(),
+        });
+    }
+
+    let mut previous_at: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+    for batch in &document.catalog_feed {
+        if !valid_timestamp(&batch.at) {
+            return Err(AppError::InvalidArgument {
+                message: "control-center catalog feed timestamp is invalid".into(),
+            });
+        }
+        let at = chrono::DateTime::parse_from_rfc3339(&batch.at).map_err(|_| {
+            AppError::InvalidArgument {
+                message: "control-center catalog feed timestamp is invalid".into(),
+            }
+        })?;
+        if previous_at.is_some_and(|previous| previous > at) {
+            return Err(AppError::InvalidArgument {
+                message: "control-center catalog feed is not chronological".into(),
+            });
+        }
+        previous_at = Some(at);
+        for change in &batch.changes {
+            validate_change(change)?;
+        }
+        if batch
+            .changes
+            .windows(2)
+            .any(|pair| change_key(&pair[0]) >= change_key(&pair[1]))
+        {
+            return Err(AppError::InvalidArgument {
+                message: "control-center catalog changes are not uniquely sorted".into(),
+            });
+        }
+    }
+
+    if document
+        .catalog_last_success_at
+        .as_deref()
+        .is_some_and(|value| !valid_timestamp(value))
+        || document.catalog_feed.last().is_some_and(|batch| {
+            document.catalog_last_success_at.as_deref() != Some(batch.at.as_str())
+        })
+        || document
+            .catalog_error
+            .as_deref()
+            .is_some_and(|value| !valid_text(value))
+        || (!document.catalog_stale && document.catalog_error.is_some())
+    {
+        return Err(AppError::InvalidArgument {
+            message: "control-center catalog refresh state is invalid".into(),
+        });
+    }
+    Ok(())
+}
+
+fn control_center_spec() -> crate::state_db::DocumentSpec<ControlCenterDocument> {
+    crate::state_db::DocumentSpec::new(
+        "control_center",
+        1,
+        CONTROL_CENTER_MAX_BYTES,
+        validate_control_center,
+    )
+}
+
+pub(crate) fn control_center_import_spec() -> crate::state_db::ImportSpec {
+    crate::state_db::ImportSpec::document(control_center_spec(), ControlCenterDocument::default())
+}
+
+fn diff_catalog_snapshots(
+    old: &[CatalogSnapshotItem],
+    new: &[CatalogSnapshotItem],
+) -> Vec<CatalogChange> {
+    let old_by_key = old
+        .iter()
+        .map(|item| (item_key(item), item))
+        .collect::<BTreeMap<_, _>>();
+    let new_by_key = new
+        .iter()
+        .map(|item| (item_key(item), item))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut removed = old_by_key
+        .iter()
+        .filter(|(key, _)| !new_by_key.contains_key(*key))
+        .map(|(_, item)| (*item).clone())
+        .collect::<Vec<_>>();
+    let mut added = new_by_key
+        .iter()
+        .filter(|(key, _)| !old_by_key.contains_key(*key))
+        .map(|(_, item)| (*item).clone())
+        .collect::<Vec<_>>();
+    let mut changes = old_by_key
+        .iter()
+        .filter_map(|(key, before)| {
+            let after = new_by_key.get(key)?;
+            (before.source_hash != after.source_hash || before.body_hash != after.body_hash).then(
+                || CatalogChange::Updated {
+                    before: (*before).clone(),
+                    after: (*after).clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let rename_candidates = removed
+        .iter()
+        .enumerate()
+        .flat_map(|(removed_index, before)| {
+            added
+                .iter()
+                .enumerate()
+                .filter(move |(_, after)| before.source_hash == after.source_hash)
+                .map(move |(added_index, _)| (removed_index, added_index))
+        })
+        .collect::<Vec<_>>();
+    if let [(removed_index, added_index)] = rename_candidates.as_slice() {
+        let after = added.remove(*added_index);
+        let before = removed.remove(*removed_index);
+        changes.push(CatalogChange::Renamed { before, after });
+    }
+    changes.extend(added.into_iter().map(|item| CatalogChange::Added { item }));
+    changes.extend(
+        removed
+            .into_iter()
+            .map(|item| CatalogChange::Removed { item }),
+    );
+    changes.sort_by(|left, right| {
+        let left = change_key(left);
+        let right = change_key(right);
+        left.cmp(&right)
+    });
+    changes
+}
+
+async fn load_control_center(
+    database: &crate::state_db::StateDatabase,
+) -> Result<ControlCenterDocument, AppError> {
+    Ok(database
+        .read(control_center_spec())
+        .await?
+        .unwrap_or_default())
+}
+
+async fn persist_catalog_refresh(
+    database: &crate::state_db::StateDatabase,
+    snapshot: Vec<CatalogSnapshotItem>,
+    at: String,
+) -> Result<(), AppError> {
+    database
+        .mutate(
+            control_center_spec(),
+            ControlCenterDocument::default(),
+            move |document| {
+                let changes = diff_catalog_snapshots(&document.active_catalog_snapshot, &snapshot);
+                if changes.len() > CONTROL_CENTER_MAX_FEED_ITEMS {
+                    return Err(AppError::InvalidArgument {
+                        message: "catalog refresh has too many changes for the durable feed".into(),
+                    });
+                }
+                document.catalog_feed.push(CatalogFeedBatch {
+                    at: at.clone(),
+                    changes,
+                });
+                while document.catalog_feed.len() > CONTROL_CENTER_MAX_FEED_BATCHES
+                    || document
+                        .catalog_feed
+                        .iter()
+                        .map(|batch| batch.changes.len())
+                        .sum::<usize>()
+                        > CONTROL_CENTER_MAX_FEED_ITEMS
+                {
+                    document.catalog_feed.remove(0);
+                }
+                document.active_catalog_snapshot = snapshot;
+                document.catalog_last_success_at = Some(at);
+                document.catalog_stale = false;
+                document.catalog_error = None;
+                Ok(())
+            },
+        )
+        .await
+}
+
+async fn mark_catalog_feed_stale(
+    database: &crate::state_db::StateDatabase,
+    error: &str,
+) -> Result<(), AppError> {
+    let error = error
+        .trim()
+        .chars()
+        .take(CONTROL_CENTER_MAX_TEXT_CHARS)
+        .collect::<String>();
+    let error = if error.is_empty() {
+        "Catalog refresh failed".to_string()
+    } else {
+        error
+    };
+    database
+        .mutate_quiet(
+            control_center_spec(),
+            ControlCenterDocument::default(),
+            move |document| {
+                document.catalog_stale = true;
+                document.catalog_error = Some(error);
+                Ok(())
+            },
+        )
+        .await
+}
+
+async fn catalog_feed_state(
+    database: &crate::state_db::StateDatabase,
+) -> Result<CatalogFeedState, AppError> {
+    let document = load_control_center(database).await?;
+    Ok(CatalogFeedState {
+        last_success_at: document.catalog_last_success_at,
+        stale: document.catalog_stale,
+        error: document.catalog_error,
+        batches: document.catalog_feed,
+    })
 }
 
 // ---------- Catalog source (where the corpus content lives) ----------
@@ -643,6 +980,33 @@ fn find_md_under(dir: &Path, file_name: &str) -> Option<PathBuf> {
     found
 }
 
+fn normalized_corpus_relative_path(root: &Path, path: &Path) -> Result<String, AppError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| AppError::InvalidArgument {
+            message: "catalog Agent path is outside the active corpus".into(),
+        })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(AppError::InvalidArgument {
+                message: "catalog Agent path is not normalized and relative".into(),
+            });
+        };
+        let part = part.to_str().ok_or_else(|| AppError::InvalidArgument {
+            message: "catalog Agent path is not UTF-8".into(),
+        })?;
+        parts.push(part);
+    }
+    let normalized = crate::library::normalize_relative_path(&parts.join("/"))?;
+    if normalized.chars().count() > CONTROL_CENTER_MAX_PATH_CHARS {
+        return Err(AppError::InvalidArgument {
+            message: "catalog Agent path exceeds its 512-character limit".into(),
+        });
+    }
+    Ok(normalized)
+}
+
 /// Build an in-memory [`Corpus`] by walking `<dir>/<category>/**/<slug>.md`
 /// for every known category (recursively — real clones nest agents in
 /// subdirs). Files without valid frontmatter (READMEs, workflow docs) are
@@ -653,7 +1017,7 @@ async fn build_from_dir(
     version: &str,
     categories: &[String],
 ) -> Result<Corpus, AppError> {
-    let mut rows: Vec<(Agent, CorpusEntry)> = Vec::new();
+    let mut rows: Vec<(Agent, CorpusEntry, CatalogSnapshotItem)> = Vec::new();
 
     for category in categories.iter() {
         let category = category.as_str();
@@ -683,7 +1047,17 @@ async fn build_from_dir(
                 }
             };
             match parse::parse_agent(slug, category, &source) {
-                Ok(Some(pair)) => rows.push(pair),
+                Ok(Some((agent, entry))) => {
+                    let relative_path = normalized_corpus_relative_path(dir, &path)?;
+                    let snapshot = CatalogSnapshotItem {
+                        category: category.to_string(),
+                        relative_path,
+                        source_hash: entry.source_hash.clone(),
+                        body_hash: entry.body_hash.clone(),
+                    };
+                    validate_snapshot_item(&snapshot)?;
+                    rows.push((agent, entry, snapshot));
+                }
                 Ok(None) => {} // not an agent (no frontmatter) — skip silently.
                 Err(e) => tracing::warn!("corpus: {e}"),
             }
@@ -694,15 +1068,18 @@ async fn build_from_dir(
     // `categories` in tooling order and `collect_md_files` sorts by path.
     let mut agents = Vec::with_capacity(rows.len());
     let mut index = BTreeMap::new();
-    for (agent, entry) in rows {
+    let mut active_catalog_snapshot = Vec::with_capacity(rows.len());
+    for (agent, entry, snapshot) in rows {
         index.insert(entry.slug.clone(), entry);
         agents.push(agent);
+        active_catalog_snapshot.push(snapshot);
     }
 
     let count = agents.len() as u32;
     Ok(Corpus {
         agents,
         index,
+        active_catalog_snapshot,
         category_order: categories.to_vec(),
         // Bundled floor; resolve_active overlays the catalog's divisions.json.
         division_meta: bundled_division_meta(),
@@ -723,6 +1100,7 @@ fn empty_corpus(version: &str, categories: &[String]) -> Corpus {
     Corpus {
         agents: Vec::new(),
         index: BTreeMap::new(),
+        active_catalog_snapshot: Vec::new(),
         category_order: categories.to_vec(),
         division_meta: bundled_division_meta(),
         meta: CorpusMeta {
@@ -1495,6 +1873,20 @@ async fn rebuild_corpus(app: &AppHandle, state: &AppState) -> Result<CorpusMeta,
     Ok(meta)
 }
 
+async fn build_active_checked(app_data_dir: &Path) -> Result<Corpus, AppError> {
+    let source = load_catalog_source(app_data_dir).await;
+    let dir = catalog_root(app_data_dir, &source);
+    let categories = discover_categories(&dir);
+    let version = load_stored_meta(app_data_dir)
+        .await
+        .map(|meta| meta.version)
+        .unwrap_or_else(|| BASELINE_VERSION.to_string());
+    let mut corpus = build_from_dir(&dir, &version, &categories).await?;
+    corpus.division_meta = load_division_meta(&dir);
+    persist(app_data_dir, &corpus).await?;
+    Ok(corpus)
+}
+
 /// `catalog_detect(scan)` — discover candidate catalogs (always checks
 /// `~/.agency-agents`; `scan=true` also walks common dev roots).
 #[tauri::command]
@@ -1530,9 +1922,63 @@ pub async fn catalog_pull(
     state: State<'_, AppState>,
 ) -> Result<CorpusMeta, AppError> {
     state.require_network("catalog_pull").await?;
+    let _flight =
+        state
+            .corpus_refresh_in_flight
+            .try_lock()
+            .map_err(|_| AppError::InvalidArgument {
+                message: "catalog refresh already in progress".into(),
+            })?;
     let adir = app_data_dir(&app)?;
-    pull_active(&adir).await?;
-    rebuild_corpus(&app, &state).await
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "SQLite migration must complete before refreshing the catalog".into(),
+            })?;
+    // Validate the durable old snapshot before any catalog bytes change. The
+    // transaction below re-reads it, so concurrent state writers still merge.
+    load_control_center(&database).await?;
+
+    if let Err(error) = pull_active(&adir).await {
+        let _ = mark_catalog_feed_stale(&database, &error.to_string()).await;
+        return Err(error);
+    }
+    let fresh = match build_active_checked(&adir).await {
+        Ok(corpus) => corpus,
+        Err(error) => {
+            let _ = mark_catalog_feed_stale(&database, &error.to_string()).await;
+            return Err(error);
+        }
+    };
+    let meta = fresh.meta();
+    if let Err(error) = persist_catalog_refresh(
+        &database,
+        fresh.catalog_snapshot(),
+        chrono::Utc::now().to_rfc3339(),
+    )
+    .await
+    {
+        let _ = mark_catalog_feed_stale(&database, &error.to_string()).await;
+        return Err(error);
+    }
+    *state.corpus_cache.lock().await = Some(Arc::new(fresh));
+    Ok(meta)
+}
+
+/// Local-only bounded catalog feed projection. The active snapshot remains in
+/// SQLite and never crosses IPC.
+#[tauri::command]
+pub async fn catalog_feed_list(state: State<'_, AppState>) -> Result<CatalogFeedState, AppError> {
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "SQLite migration must complete before reading catalog changes".into(),
+            })?;
+    catalog_feed_state(&database).await
 }
 
 /// `catalog_status()` — provenance + freshness of the active catalog (source,
@@ -1783,12 +2229,189 @@ pub async fn corpus_categories(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{
+        CatalogChange, CatalogFeedBatch, CatalogSnapshotItem, ControlCenterDocument,
+    };
 
     fn write_agent(dir: &Path, category: &str, slug: &str, name: &str, body: &str) {
         let cat = dir.join(category);
         std::fs::create_dir_all(&cat).unwrap();
         let content = format!("---\nname: {name}\ndescription: d\n---\n{body}\n");
         std::fs::write(cat.join(format!("{slug}.md")), content).unwrap();
+    }
+
+    fn snapshot_item(category: &str, path: &str, hash: char) -> CatalogSnapshotItem {
+        CatalogSnapshotItem {
+            category: category.into(),
+            relative_path: path.into(),
+            source_hash: format!("{:064x}", hash as u32),
+            body_hash: format!("{:064x}", hash as u32 + 1),
+        }
+    }
+
+    #[test]
+    fn control_center_validator_enforces_exact_document_and_field_caps() {
+        assert!(validate_control_center(&ControlCenterDocument::default()).is_ok());
+
+        let mut oversized_snapshot = ControlCenterDocument::default();
+        oversized_snapshot.active_catalog_snapshot = (0..=CONTROL_CENTER_MAX_SNAPSHOT_ITEMS)
+            .map(|index| {
+                snapshot_item("engineering", &format!("engineering/agent-{index}.md"), 'a')
+            })
+            .collect();
+        assert!(validate_control_center(&oversized_snapshot).is_err());
+
+        let mut oversized_feed = ControlCenterDocument::default();
+        oversized_feed.catalog_feed = vec![CatalogFeedBatch {
+            at: "2026-08-17T00:00:00Z".into(),
+            changes: (0..=CONTROL_CENTER_MAX_FEED_ITEMS)
+                .map(|index| CatalogChange::Added {
+                    item: snapshot_item(
+                        "engineering",
+                        &format!("engineering/agent-{index}.md"),
+                        'a',
+                    ),
+                })
+                .collect(),
+        }];
+        assert!(validate_control_center(&oversized_feed).is_err());
+
+        let mut too_many_batches = ControlCenterDocument::default();
+        too_many_batches.catalog_feed = (0..=CONTROL_CENTER_MAX_FEED_BATCHES)
+            .map(|_| CatalogFeedBatch {
+                at: "2026-08-17T00:00:00Z".into(),
+                changes: Vec::new(),
+            })
+            .collect();
+        assert!(validate_control_center(&too_many_batches).is_err());
+
+        for invalid in [
+            snapshot_item(&"x".repeat(257), "x/agent.md", 'a'),
+            snapshot_item(
+                "engineering",
+                &format!("engineering/{}.md", "x".repeat(512)),
+                'a',
+            ),
+            snapshot_item("engineering", "engineering/../agent.md", 'a'),
+            CatalogSnapshotItem {
+                source_hash: "z".repeat(64),
+                ..snapshot_item("engineering", "engineering/agent.md", 'a')
+            },
+        ] {
+            let document = ControlCenterDocument {
+                active_catalog_snapshot: vec![invalid],
+                ..ControlCenterDocument::default()
+            };
+            assert!(validate_control_center(&document).is_err());
+        }
+    }
+
+    #[test]
+    fn catalog_diff_is_deterministic_and_classifies_add_update_remove() {
+        let old = vec![
+            snapshot_item("design", "design/removed.md", 'r'),
+            snapshot_item("engineering", "engineering/updated.md", 'a'),
+            snapshot_item("engineering", "engineering/stable.md", 's'),
+        ];
+        let new = vec![
+            snapshot_item("engineering", "engineering/added.md", 'n'),
+            snapshot_item("engineering", "engineering/stable.md", 's'),
+            snapshot_item("engineering", "engineering/updated.md", 'b'),
+        ];
+
+        let changes = diff_catalog_snapshots(&old, &new);
+        assert_eq!(changes.len(), 3);
+        assert!(matches!(changes[0], CatalogChange::Added { .. }));
+        assert!(matches!(changes[1], CatalogChange::Updated { .. }));
+        assert!(matches!(changes[2], CatalogChange::Removed { .. }));
+        assert_eq!(changes, diff_catalog_snapshots(&old, &new));
+    }
+
+    #[test]
+    fn catalog_diff_infers_only_one_unambiguous_same_content_rename() {
+        let old = vec![snapshot_item("engineering", "engineering/old.md", 'a')];
+        let new = vec![snapshot_item("engineering", "engineering/new.md", 'a')];
+        assert!(matches!(
+            diff_catalog_snapshots(&old, &new).as_slice(),
+            [CatalogChange::Renamed { before, after }]
+                if before.relative_path == "engineering/old.md"
+                    && after.relative_path == "engineering/new.md"
+        ));
+
+        let ambiguous_old = vec![
+            snapshot_item("engineering", "engineering/one.md", 'a'),
+            snapshot_item("engineering", "engineering/two.md", 'a'),
+        ];
+        let ambiguous = diff_catalog_snapshots(&ambiguous_old, &new);
+        assert_eq!(ambiguous.len(), 3);
+        assert!(!ambiguous
+            .iter()
+            .any(|change| matches!(change, CatalogChange::Renamed { .. })));
+    }
+
+    #[tokio::test]
+    async fn failed_feed_commit_keeps_old_snapshot_and_replays_the_diff() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let old = vec![snapshot_item("engineering", "engineering/old.md", 'a')];
+        persist_catalog_refresh(&database, old.clone(), "2026-08-17T00:00:00Z".into())
+            .await
+            .unwrap();
+
+        let invalid = vec![snapshot_item(&"x".repeat(257), "x/invalid.md", 'b')];
+        assert!(
+            persist_catalog_refresh(&database, invalid, "2026-08-17T00:01:00Z".into(),)
+                .await
+                .is_err()
+        );
+        let retained = load_control_center(&database).await.unwrap();
+        assert_eq!(retained.active_catalog_snapshot, old);
+        assert_eq!(retained.catalog_feed.len(), 1);
+
+        let new = vec![snapshot_item("engineering", "engineering/new.md", 'a')];
+        persist_catalog_refresh(&database, new, "2026-08-17T00:02:00Z".into())
+            .await
+            .unwrap();
+        let replayed = load_control_center(&database).await.unwrap();
+        assert_eq!(replayed.catalog_feed.len(), 2);
+        assert!(matches!(
+            replayed.catalog_feed[1].changes.as_slice(),
+            [CatalogChange::Renamed { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_retains_last_success_and_feed() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        persist_catalog_refresh(
+            &database,
+            vec![snapshot_item("engineering", "engineering/agent.md", 'a')],
+            "2026-08-17T00:00:00Z".into(),
+        )
+        .await
+        .unwrap();
+
+        mark_catalog_feed_stale(&database, "pull failed")
+            .await
+            .unwrap();
+
+        let state = catalog_feed_state(&database).await.unwrap();
+        assert_eq!(
+            state.last_success_at.as_deref(),
+            Some("2026-08-17T00:00:00Z")
+        );
+        assert_eq!(state.batches.len(), 1);
+        assert!(state.stale);
+        assert_eq!(state.error.as_deref(), Some("pull failed"));
     }
 
     #[tokio::test]
@@ -1833,6 +2456,10 @@ mod tests {
             "game-development",
             "category is the top-level dir, not the subdir"
         );
+        assert!(corpus.active_catalog_snapshot.iter().any(|item| {
+            item.category == "game-development"
+                && item.relative_path == "game-development/godot/godot-shader-developer.md"
+        }));
         assert!(corpus.get("flat-one").is_some(), "flat agent still indexed");
     }
 
@@ -1983,6 +2610,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(corpus.count(), 1);
+        assert_eq!(corpus.active_catalog_snapshot.len(), 1);
         assert!(corpus.get("real").is_some());
         assert!(corpus.get("workflow").is_none());
     }

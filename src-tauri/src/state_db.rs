@@ -1516,6 +1516,33 @@ mod tests {
         assert_eq!(first.visible_revision().await.unwrap(), 2);
     }
 
+    #[tokio::test]
+    async fn rejected_mutation_keeps_the_last_committed_document() {
+        let root = tempfile::tempdir().unwrap();
+        let database = StateDatabase::open(root.path()).unwrap();
+        database
+            .mutate(spec(1024), TestDocument::default(), |document| {
+                document.values.push("durable".into());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let result = database
+            .mutate(spec(1024), TestDocument::default(), |document| {
+                document.values.push(String::new());
+                Ok(())
+            })
+            .await;
+
+        assert!(matches!(result, Err(AppError::InvalidArgument { .. })));
+        assert_eq!(
+            database.read(spec(1024)).await.unwrap().unwrap().values,
+            ["durable"]
+        );
+        assert_eq!(database.visible_revision().await.unwrap(), 1);
+    }
+
     #[test]
     fn shared_process_lease_blocks_exclusive_cutover() {
         let root = tempfile::tempdir().unwrap();

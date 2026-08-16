@@ -65,6 +65,7 @@ import type {
   Tool,
   StorageMigrationStatus,
   TaskRecommendation,
+  CatalogFeedState,
   DoctorReport,
   OllamaMutationPlan,
   OllamaMutationResult,
@@ -105,6 +106,8 @@ export const storageLegacyConflictsDismiss = () =>
 
 export const taskRecommendations = (task: string, limit = 10) =>
   invoke<TaskRecommendation[]>("task_recommendations", { task, limit });
+
+export const catalogFeedList = () => invoke<CatalogFeedState>("catalog_feed_list");
 
 // ============================================================
 // Agent sources, drafts, and personal library
