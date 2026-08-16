@@ -1,6 +1,6 @@
 import en, { type MessageKey, type Messages } from "./locales/en";
 
-export const LOCALES = ["en", "zh-CN", "zh-TW", "ja", "ko", "es", "fr", "de", "pt-BR", "ru"] as const;
+export const LOCALES = ["en", "zh-CN", "zh-TW", "ja", "ko", "es", "fr", "de", "pt-BR", "ru", "fa"] as const;
 export type Locale = (typeof LOCALES)[number];
 
 export const DEFAULT_LOCALE: Locale = "en";
@@ -20,6 +20,7 @@ export const localeLabels: Record<Locale, string> = {
   de: "Deutsch",
   "pt-BR": "Português (Brasil)",
   ru: "Русский",
+  fa: "فارسی",
 };
 
 const loaders = {
@@ -33,6 +34,7 @@ const loaders = {
   de: async () => (await import("./locales/de")).default,
   "pt-BR": async () => (await import("./locales/pt-BR")).default,
   ru: async () => (await import("./locales/ru")).default,
+  fa: async () => (await import("./locales/fa")).default,
 } satisfies Record<Locale, () => Promise<Partial<Messages>>>;
 
 export async function loadMessages(locale: Locale): Promise<Messages> {

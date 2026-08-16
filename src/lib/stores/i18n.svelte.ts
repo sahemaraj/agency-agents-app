@@ -37,7 +37,10 @@ function detectLocale(): Locale {
 }
 
 function applyLocale(locale: Locale) {
-  if (typeof document !== "undefined") document.documentElement.lang = locale;
+  if (typeof document !== "undefined") {
+    document.documentElement.lang = locale;
+    document.documentElement.dir = locale === "fa" ? "rtl" : "ltr";
+  }
 }
 
 function format(template: string, vars?: Record<string, string | number>): string {
