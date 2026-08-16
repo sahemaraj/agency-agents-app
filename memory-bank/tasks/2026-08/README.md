@@ -1,5 +1,11 @@
 # Tasks — 2026-08
 
+## In Progress
+
+### 2026-08-17: Nightly Control Plane Program
+
+Implementing the approved eight-capability local control-plane program in an isolated worktree with sequential subagent implementation, independent spec review, code-quality review, and full regression/E2E validation. Task 1 Catalog Change Feed is accepted at `db9836e` after spec and quality review; current state is BUILD, Task 2 Project Readiness and subscriptions. See `docs/superpowers/plans/2026-08-17-nightly-control-plane.md`.
+
 ## Completed
 
 ### 2026-08-03: Expert MCP Lifecycle — Release 1
