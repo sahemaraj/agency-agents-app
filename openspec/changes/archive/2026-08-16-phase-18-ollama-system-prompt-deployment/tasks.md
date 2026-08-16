@@ -21,4 +21,4 @@
 - [x] 4.1 Run focused and full frontend/Rust tests, Svelte diagnostics, production build, strict Clippy/formatting, dependency audit, diff checks, canonical OpenSpec validation, and strict change validation.
 - [x] 4.2 Exercise one uniquely named temporary deployment against the available local Ollama service, verify the exact system prompt and reconciliation state, remove it, and prove no temporary or recovery model remains; record unavailable rather than fabricate evidence if the daemon is absent.
 - [x] 4.3 Audit fixed-loopback enforcement, response/prompt bounds, no shell or remote endpoints, no pull/push/inference, exact source ownership, stale-plan denial, rollback ordering, prompt-free receipts, no MCP authority, and preservation of unrelated user changes.
-- [ ] 4.4 Sync and archive the canonical spec, update approved Memory Bank and roadmap evidence, merge the verified branch, and repeat post-merge smoke and protected-change checks.
+- [x] 4.4 Sync and archive the canonical spec, update approved Memory Bank and roadmap evidence, merge the verified branch, and repeat post-merge smoke and protected-change checks.

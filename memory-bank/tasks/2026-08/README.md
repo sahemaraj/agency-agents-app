@@ -111,3 +111,7 @@ Added explicit permission-backed native drift alerts that reuse bounded local Ag
 ### 2026-08-14: Phase 17 Expert Improvement Coach
 
 Added five-run-gated local Expert performance summaries for exact versioned quality-contract cohorts, including acceptance, rework/rejection, waiver, and latest-evidence signals plus deterministic non-causal suggestions. No model, network, telemetry, persistence, or mutation authority was added. OpenSpec, frontend, backend regression, Rust quality, Svelte, build, dependency, safety, and diff gates passed. See [260814_phase17-expert-improvement-coach.md](./260814_phase17-expert-improvement-coach.md).
+
+### 2026-08-16: Phase 18 Local Ollama System-Prompt Deployment
+
+Added explicit revision-bound create, update, remove, reconciliation, rollback, and prompt-free receipts for app-owned local Ollama models derived from exact installable Agent prompts and already-installed bases. Fixed-loopback, no-pull, no-inference, no-daemon, no-remote-host, and no-MCP-authority boundaries are enforced. OpenSpec, frontend, backend, Rust quality, Svelte, build, dependency, live Ollama, security, and diff gates passed. See [260816_phase18-ollama-system-prompt-deployment.md](./260816_phase18-ollama-system-prompt-deployment.md).

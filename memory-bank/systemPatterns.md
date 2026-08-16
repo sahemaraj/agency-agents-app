@@ -155,3 +155,14 @@ capped at 500 records / 4 MiB, and scoped to the originating MCP client plus can
 Evidence and blockers append while active; terminal desktop review freezes the run. Acceptance uses
 the latest evidence for every required contract check or an explicit human waiver. MCP views expose
 that a check was waived but redact the human waiver reason.
+
+## 10. Local model runtime deployment
+
+Model runtimes are not file tools. Ollama deployment uses an exact Agent reference plus a separate
+validated record containing the deterministic app-owned target, installed base identity, source and
+prompt hashes, and timestamp. Planning is read-only and revision-bound; reconciliation compares the
+current Agent prompt, tracked prompt hash, runtime prompt, target presence, and base inventory without
+repairing automatically. Update and removal copy the managed target to a deterministic recovery model
+before mutation, then restore runtime and ledger truth on failure. Production requests are limited to
+the fixed loopback tags/show/create/copy/delete API set; prompt text is previewed but never persisted or
+written to Activity receipts.
