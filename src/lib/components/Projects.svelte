@@ -21,6 +21,7 @@
   import Button from "./Button.svelte";
   import Modal from "./Modal.svelte";
   import DeployBrowser from "./DeployBrowser.svelte";
+  import InstallModal from "./InstallModal.svelte";
   import FolderIcon from "@lucide/svelte/icons/folder";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
@@ -28,6 +29,7 @@
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import LayersIcon from "@lucide/svelte/icons/layers";
   import Trash2 from "@lucide/svelte/icons/trash-2";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
   import { install } from "$lib/stores/install.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
@@ -37,7 +39,7 @@
   import { toast } from "$lib/stores/toast.svelte";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import { appErrorMessage, isAppError, type InstalledAgent } from "$lib/types";
+  import { appErrorMessage, isAppError, type InstalledAgent, type ProjectReadinessReport, type ProjectRecommendation } from "$lib/types";
   import type { ProjectInstructionApplyResult, ProjectInstructionOperation, ProjectInstructionPlan, ProjectInstructionSnippet, ProjectInstructionTarget } from "$lib/types";
   import { diffLines, diffStat, type DiffRow } from "$lib/util/diff";
 
@@ -143,6 +145,115 @@
 
   // ── Deploy into a project: the two-pane DeployBrowser. ──
   let browseFor = $state<string | null>(null); // project path, or null = closed
+
+  // ── Readiness baseline + opt-in catalog recommendations. ──
+  let readiness = $state<ProjectReadinessReport | null>(null);
+  let recommendations = $state<ProjectRecommendation[]>([]);
+  let readinessBusy = $state(false);
+  let readinessError = $state<string | null>(null);
+  let readinessAnnouncement = $state("");
+  let recommendationPlan = $state<ProjectRecommendation | null>(null);
+  let readinessGeneration = 0;
+  const newRecommendationCount = $derived(
+    recommendations.filter((recommendation) => recommendation.lifecycle === "new").length,
+  );
+
+  function readinessCategoryLabel(category: ProjectReadinessReport["categories"][number]["category"]): string {
+    return ({ agentRoster: "Agent roster", skills: "Skills", instructions: "Instructions", mcp: "MCP", tools: "Tools" })[category];
+  }
+
+  async function refreshReadiness(): Promise<void> {
+    if (!selected || readinessBusy) return;
+    const projectPath = selected.path;
+    const generation = ++readinessGeneration;
+    readinessBusy = true;
+    readinessError = null;
+    readinessAnnouncement = "Checking project readiness…";
+    try {
+      const report = await projects.readiness(projectPath);
+      const nextRecommendations = report.subscribed
+        ? await projects.recommendations(projectPath)
+        : [];
+      if (generation !== readinessGeneration) return;
+      readiness = report;
+      recommendations = nextRecommendations;
+      readinessAnnouncement = `Readiness ${report.overall}. ${nextRecommendations.filter((item) => item.lifecycle === "new").length} new recommendations.`;
+    } catch (error) {
+      if (generation === readinessGeneration) {
+        readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
+        readinessAnnouncement = `Readiness unavailable. ${readinessError}`;
+      }
+    } finally {
+      if (generation === readinessGeneration) readinessBusy = false;
+    }
+  }
+
+  $effect(() => {
+    const path = selected?.path;
+    untrack(() => {
+      readinessGeneration += 1;
+      readinessBusy = false;
+      readiness = null;
+      recommendations = [];
+      readinessError = null;
+      if (path) void refreshReadiness();
+    });
+  });
+
+  async function importReadinessPack(): Promise<void> {
+    if (!selected || readinessBusy) return;
+    const picked = await openDialog({
+      title: "Import Workspace Pack readiness baseline",
+      multiple: false,
+      filters: [{ name: "Workspace Pack", extensions: ["json"] }],
+    });
+    if (typeof picked !== "string") return;
+    readinessBusy = true;
+    readinessError = null;
+    try {
+      const plan = await install.inspectWorkspacePack(picked, selected.path);
+      if (plan.blockers.length > 0) throw new Error(plan.blockers.join(" "));
+      await projects.importPackBaseline(selected.path, plan.pack);
+      readinessAnnouncement = "Workspace Pack baseline saved.";
+    } catch (error) {
+      readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      readinessBusy = false;
+    }
+    await refreshReadiness();
+  }
+
+  async function setReadinessSubscription(enabled: boolean): Promise<void> {
+    if (!selected || readinessBusy) return;
+    readinessBusy = true;
+    readinessError = null;
+    try {
+      await projects.subscribe(selected.path, enabled);
+      readinessAnnouncement = enabled ? "Catalog recommendations enabled." : "Catalog recommendations disabled.";
+    } catch (error) {
+      readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      readinessBusy = false;
+    }
+    await refreshReadiness();
+  }
+
+  async function openRecommendation(recommendation: ProjectRecommendation): Promise<void> {
+    if (!selected) return;
+    try {
+      recommendationPlan = await projects.openRecommendation(selected.path, recommendation.id);
+    } catch (error) {
+      readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
+      await refreshReadiness();
+    }
+  }
+
+  async function dismissRecommendation(recommendation: ProjectRecommendation): Promise<void> {
+    if (!selected) return;
+    await projects.dismissRecommendation(selected.path, recommendation.id);
+    readinessAnnouncement = "Recommendation dismissed.";
+    await refreshReadiness();
+  }
 
   // ── Project instructions: inspect → compose/remove → review → approve. ──
   type InstructionDraft = {
@@ -389,6 +500,52 @@
       <button class="btn danger-ic" disabled={!mutationTruthFresh} title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: rosterFor(selected.path).length, skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
     </header>
 
+    <section class="readiness" aria-labelledby="project-readiness-heading" aria-busy={readinessBusy}>
+      <div class="readiness-heading">
+        <div>
+          <h3 id="project-readiness-heading">Readiness</h3>
+          <p>{readiness?.baseline?.label ?? "No baseline configured"}{#if readiness} · {readiness.overall}{/if}</p>
+        </div>
+        <button class="btn" disabled={readinessBusy} onclick={() => void refreshReadiness()}>Retry</button>
+        <button class="btn" disabled={readinessBusy} onclick={() => void importReadinessPack()}>Import Workspace Pack baseline</button>
+        {#if readiness?.baseline}
+          <label class="readiness-opt-in"><input type="checkbox" checked={readiness.subscribed} disabled={readinessBusy} onchange={(event) => void setReadinessSubscription(event.currentTarget.checked)} /> Catalog recommendations</label>
+        {/if}
+      </div>
+      <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{readinessAnnouncement}</div>
+      {#if readinessError}<p class="readiness-error">{readinessError}</p>{/if}
+      {#if readiness?.categories?.length}
+        <div class="readiness-categories">
+          {#each readiness.categories as category (category.category)}
+            <section class="readiness-category">
+              <h4>{readinessCategoryLabel(category.category)} <span>{category.state}</span></h4>
+              {#if category.rows.length}
+                <ul>{#each category.rows as row (row.id)}<li><strong>{row.label}</strong><span>{row.state} · {row.evidence}</span></li>{/each}</ul>
+              {:else}<p>Not required</p>{/if}
+            </section>
+          {/each}
+        </div>
+      {:else if !readinessBusy}
+        <p class="readiness-empty">Import a reviewed Workspace Pack or save an explicitly selected Team as this project's baseline.</p>
+      {/if}
+      {#if readiness?.subscribed}
+        <div class="recommendations">
+          <h4>Catalog recommendations <span>{newRecommendationCount} new</span></h4>
+          {#if recommendations.length}
+            <ul>
+              {#each recommendations as recommendation (recommendation.id)}
+                <li>
+                  <div><strong>{recommendation.lifecycle}</strong><span>{recommendation.summary}</span></div>
+                  <button class="btn" disabled={recommendation.lifecycle !== "new"} onclick={() => void openRecommendation(recommendation)}>Open review</button>
+                  {#if recommendation.lifecycle !== "dismissed"}<button class="btn" onclick={() => void dismissRecommendation(recommendation)}>Dismiss</button>{/if}
+                </li>
+              {/each}
+            </ul>
+          {:else}<p>No catalog recommendations.</p>{/if}
+        </div>
+      {/if}
+    </section>
+
     <section class="instruction-manager" aria-labelledby="project-instructions-heading" aria-busy={instructionLoading}>
       <div class="instruction-heading">
         <div>
@@ -510,6 +667,15 @@
   <DeployBrowser projectPath={browseFor} onClose={() => (browseFor = null)} />
 {/if}
 
+{#if recommendationPlan}
+  <InstallModal
+    title="Review catalog recommendation"
+    agentReferences={recommendationPlan.agentReferences}
+    allowedTools={readiness?.baseline?.tools.length ? readiness.baseline.tools : undefined}
+    onClose={() => (recommendationPlan = null)}
+  />
+{/if}
+
 {#if confirm}
   <Modal open title={i18n.t("projects.deleteTitle", { project: confirm.label })} defaultFocus="cancel" onClose={() => (confirm = null)}>
     <p class="del-body">
@@ -594,6 +760,24 @@
   }
   .pr-count { color: var(--color-text-secondary); font-size: var(--text-body-sm); }
   .pr-actions { display: flex; gap: var(--space-2); }
+  .readiness, .instruction-manager { flex: none; max-height: 280px; overflow-y: auto; padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); }
+  .readiness-heading, .instruction-heading { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+  .readiness-heading > div, .instruction-heading > div { flex: 1; min-width: 12rem; }
+  .readiness-heading h3, .instruction-heading h3, .readiness-category h4, .recommendations h4 { margin: 0; }
+  .readiness-heading p, .readiness-category p, .recommendations p { margin: 2px 0 0; color: var(--color-text-muted); font-size: var(--text-caption); }
+  .readiness-opt-in { display: inline-flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); }
+  .readiness-categories { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: var(--space-2); margin-top: var(--space-3); }
+  .readiness-category { padding: var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+  .readiness-category h4, .recommendations h4 { display: flex; justify-content: space-between; gap: var(--space-2); font-size: var(--text-body-sm); }
+  .readiness-category h4 span, .recommendations h4 span { color: var(--color-text-muted); font-weight: var(--fw-regular); }
+  .readiness-category ul, .recommendations ul { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: grid; gap: var(--space-2); }
+  .readiness-category li { display: grid; gap: 2px; min-width: 0; }
+  .readiness-category li strong, .readiness-category li span { overflow-wrap: anywhere; font-size: var(--text-caption); }
+  .readiness-category li span { color: var(--color-text-muted); }
+  .recommendations { margin-top: var(--space-3); }
+  .recommendations li { display: flex; align-items: center; gap: var(--space-2); }
+  .recommendations li > div { flex: 1; display: grid; min-width: 0; font-size: var(--text-caption); }
+  .readiness-error { color: var(--color-danger); overflow-wrap: anywhere; }
 
   /* ── Detail header ── */
   .pr-head.detail { justify-content: flex-start; }

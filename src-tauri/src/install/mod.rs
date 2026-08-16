@@ -10,7 +10,7 @@
 //! installed file is "ours/current" when its bytes equal a fresh render of its
 //! slug for its tool (the deterministic `render/` layer makes that reproducible).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
@@ -26,8 +26,12 @@ use crate::render;
 use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
     AgentApprovalAction, AgentDiff, AgentInstallIdentity, AgentMutationPlan, AgentPlanItem,
-    AgentReference, AgentSourceResult, AgentVersionSnapshot, InstallRecord, InstallState,
-    InstalledAgent, ProjectInfo, SkillReference, Tool, ToolInfo, ToolVersion, UpdateKind,
+    AgentReference, AgentSourceResult, AgentVersionSnapshot, BaselineRequirement, CatalogChange,
+    CatalogFeedBatch, InstallRecord, InstallState, InstalledAgent, ProjectInfo,
+    ProjectReadinessBaseline, ProjectReadinessOverall, ProjectReadinessReport,
+    ProjectRecommendation, ProjectSubscription, ReadinessCategoryKind, ReadinessCategoryReport,
+    ReadinessCategoryState, ReadinessRow, ReadinessRowState, RecommendationLifecycle,
+    SkillReference, Tool, ToolInfo, ToolVersion, UpdateKind,
 };
 use crate::util::fs::{atomic_write, read_capped};
 
@@ -4758,6 +4762,24 @@ async fn unregister_project(app_data_dir: &Path, path: &str) -> Result<bool, App
         return Ok(false);
     }
     save_registered_projects(app_data_dir, &projects).await?;
+    if let Some(database) = crate::state_db::StateDatabase::completed(app_data_dir).await? {
+        let removed = canonical.to_string_lossy().into_owned();
+        database
+            .mutate(
+                corpus::control_center_spec(),
+                crate::types::ControlCenterDocument::default(),
+                move |document| {
+                    document
+                        .project_baselines
+                        .retain(|baseline| baseline.project_path != removed);
+                    document
+                        .project_subscriptions
+                        .retain(|subscription| subscription.project_path != removed);
+                    Ok(())
+                },
+            )
+            .await?;
+    }
     Ok(true)
 }
 
@@ -4822,6 +4844,873 @@ pub async fn projects_list(
             }
         })
         .collect())
+}
+
+// ---------- Project readiness and opt-in catalog subscriptions ----------
+
+struct ReadinessEvidence {
+    agents: Result<BTreeMap<AgentReference, ReadinessRowState>, String>,
+    skills: Result<BTreeMap<SkillReference, ReadinessRowState>, String>,
+    instructions: Result<BTreeMap<String, ReadinessRowState>, String>,
+    mcp_servers: Result<BTreeMap<String, ReadinessRowState>, String>,
+    tools: Result<BTreeMap<Tool, ReadinessRowState>, String>,
+}
+
+impl ReadinessEvidence {
+    #[cfg(test)]
+    fn ready() -> Self {
+        Self {
+            agents: Ok(BTreeMap::new()),
+            skills: Ok(BTreeMap::new()),
+            instructions: Ok(BTreeMap::new()),
+            mcp_servers: Ok(BTreeMap::new()),
+            tools: Ok(BTreeMap::new()),
+        }
+    }
+}
+
+fn readiness_category_state(rows: &[ReadinessRow]) -> ReadinessCategoryState {
+    if rows.is_empty() {
+        ReadinessCategoryState::NotRequired
+    } else if rows
+        .iter()
+        .any(|row| row.state == ReadinessRowState::Unavailable)
+    {
+        ReadinessCategoryState::Unavailable
+    } else if rows
+        .iter()
+        .any(|row| row.state == ReadinessRowState::NeedsAttention)
+    {
+        ReadinessCategoryState::NeedsAttention
+    } else if rows
+        .iter()
+        .any(|row| row.state == ReadinessRowState::Unverifiable)
+    {
+        ReadinessCategoryState::Unverifiable
+    } else {
+        ReadinessCategoryState::Ready
+    }
+}
+
+fn readiness_rows<T: Ord>(
+    required: impl IntoIterator<Item = (T, String, String)>,
+    evidence: &Result<BTreeMap<T, ReadinessRowState>, String>,
+) -> Vec<ReadinessRow> {
+    required
+        .into_iter()
+        .map(|(key, id, label)| {
+            let state = match evidence {
+                Ok(states) => states
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(ReadinessRowState::NeedsAttention),
+                Err(_) => ReadinessRowState::Unavailable,
+            };
+            let detail = match (state, evidence) {
+                (ReadinessRowState::Ready, _) => "Current evidence matches the baseline",
+                (ReadinessRowState::NeedsAttention, _) => {
+                    "Required current evidence is missing or drifted"
+                }
+                (ReadinessRowState::Unavailable, Err(_)) => {
+                    "Required inspection failed; retry for current evidence"
+                }
+                (ReadinessRowState::Unavailable, _) => "Required evidence is unavailable",
+                (ReadinessRowState::Unverifiable, _) => {
+                    "Requirement is not mapped to a known bounded identifier"
+                }
+            };
+            ReadinessRow {
+                id,
+                label,
+                state,
+                evidence: crate::commands::doctor::sanitize_field(
+                    detail,
+                    dirs::home_dir().as_deref(),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn requirement_rows(
+    requirements: &[BaselineRequirement],
+    evidence: &Result<BTreeMap<String, ReadinessRowState>, String>,
+) -> Vec<ReadinessRow> {
+    requirements
+        .iter()
+        .map(|requirement| {
+            let state = if !requirement.known {
+                ReadinessRowState::Unverifiable
+            } else {
+                match evidence {
+                    Ok(states) => states
+                        .get(&requirement.id)
+                        .copied()
+                        .unwrap_or(ReadinessRowState::NeedsAttention),
+                    Err(_) => ReadinessRowState::Unavailable,
+                }
+            };
+            ReadinessRow {
+                id: requirement.id.clone(),
+                label: requirement.id.clone(),
+                state,
+                evidence: match state {
+                    ReadinessRowState::Ready => "Known requirement is present".into(),
+                    ReadinessRowState::NeedsAttention => "Known requirement is not present".into(),
+                    ReadinessRowState::Unavailable => {
+                        "Required inspection failed; retry for current evidence".into()
+                    }
+                    ReadinessRowState::Unverifiable => {
+                        "Opaque requirement; map it to a known bounded identifier to verify it"
+                            .into()
+                    }
+                },
+            }
+        })
+        .collect()
+}
+
+fn build_readiness_report(
+    project_path: &str,
+    baseline: Option<&ProjectReadinessBaseline>,
+    evidence: ReadinessEvidence,
+) -> ProjectReadinessReport {
+    let Some(baseline) = baseline else {
+        return ProjectReadinessReport {
+            project_path: project_path.into(),
+            overall: ProjectReadinessOverall::NotConfigured,
+            baseline: None,
+            subscribed: false,
+            categories: [
+                ReadinessCategoryKind::AgentRoster,
+                ReadinessCategoryKind::Skills,
+                ReadinessCategoryKind::Instructions,
+                ReadinessCategoryKind::Mcp,
+                ReadinessCategoryKind::Tools,
+            ]
+            .into_iter()
+            .map(|category| ReadinessCategoryReport {
+                category,
+                state: ReadinessCategoryState::NotRequired,
+                rows: Vec::new(),
+            })
+            .collect(),
+        };
+    };
+    let agent_rows = readiness_rows(
+        baseline.agents.iter().cloned().map(|reference| {
+            let id = format!("{}:{}", reference.source_id, reference.relative_path);
+            (reference, id.clone(), id)
+        }),
+        &evidence.agents,
+    );
+    let skill_rows = readiness_rows(
+        baseline.skills.iter().cloned().map(|reference| {
+            let id = format!("{}:{}", reference.source_id, reference.relative_path);
+            (reference, id.clone(), id)
+        }),
+        &evidence.skills,
+    );
+    let instruction_rows = requirement_rows(&baseline.instructions, &evidence.instructions);
+    let mcp_rows = requirement_rows(&baseline.mcp_servers, &evidence.mcp_servers);
+    let tool_rows = readiness_rows(
+        baseline
+            .tools
+            .iter()
+            .map(|tool| (tool.clone(), tool.clone(), render::label(tool))),
+        &evidence.tools,
+    );
+    let categories = vec![
+        (ReadinessCategoryKind::AgentRoster, agent_rows),
+        (ReadinessCategoryKind::Skills, skill_rows),
+        (ReadinessCategoryKind::Instructions, instruction_rows),
+        (ReadinessCategoryKind::Mcp, mcp_rows),
+        (ReadinessCategoryKind::Tools, tool_rows),
+    ]
+    .into_iter()
+    .map(|(category, rows)| ReadinessCategoryReport {
+        category,
+        state: readiness_category_state(&rows),
+        rows,
+    })
+    .collect::<Vec<_>>();
+    let overall = if categories
+        .iter()
+        .any(|category| category.state == ReadinessCategoryState::Unavailable)
+    {
+        ProjectReadinessOverall::Unavailable
+    } else if categories.iter().any(|category| {
+        matches!(
+            category.state,
+            ReadinessCategoryState::NeedsAttention | ReadinessCategoryState::Unverifiable
+        )
+    }) {
+        ProjectReadinessOverall::NeedsAttention
+    } else {
+        ProjectReadinessOverall::Ready
+    };
+    ProjectReadinessReport {
+        project_path: project_path.into(),
+        overall,
+        baseline: Some(baseline.clone()),
+        subscribed: false,
+        categories,
+    }
+}
+
+async fn control_center_database(
+    state: &AppState,
+) -> Result<crate::state_db::StateDatabase, AppError> {
+    state
+        .completed_state_database()
+        .await?
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "Storage migration must complete before project readiness changes".into(),
+        })
+}
+
+async fn exact_registered_project(
+    state: &AppState,
+    project_path: &str,
+) -> Result<String, AppError> {
+    Ok(
+        canonical_registered_instruction_project(state, project_path)
+            .await?
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+async fn persist_project_baseline(
+    state: &AppState,
+    baseline: ProjectReadinessBaseline,
+) -> Result<ProjectReadinessBaseline, AppError> {
+    let returned = baseline.clone();
+    control_center_database(state)
+        .await?
+        .mutate(
+            corpus::control_center_spec(),
+            crate::types::ControlCenterDocument::default(),
+            move |document| {
+                document
+                    .project_baselines
+                    .retain(|existing| existing.project_path != baseline.project_path);
+                document.project_baselines.push(baseline);
+                document
+                    .project_baselines
+                    .sort_by(|left, right| left.project_path.cmp(&right.project_path));
+                Ok(())
+            },
+        )
+        .await?;
+    Ok(returned)
+}
+
+fn resolve_team_references(
+    mut slugs: Vec<String>,
+    sources: &[AgentSourceResult],
+) -> Result<Vec<AgentReference>, AppError> {
+    slugs.sort();
+    slugs.dedup();
+    if slugs.len() > 256 || slugs.iter().any(|slug| slug.is_empty()) {
+        return Err(AppError::InvalidArgument {
+            message: "Team baseline exceeds its Agent limit".into(),
+        });
+    }
+    if sources.iter().any(|source| !source.errors.is_empty()) {
+        return Err(AppError::InvalidArgument {
+            message: "Agent source inspection is incomplete; retry before saving the Team baseline"
+                .into(),
+        });
+    }
+    let mut agents = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        let matches = sources
+            .iter()
+            .flat_map(|source| &source.agents)
+            .filter(|package| {
+                package.installable
+                    && package
+                        .agent
+                        .as_ref()
+                        .is_some_and(|agent| agent.slug == slug)
+            })
+            .map(|package| package.reference.clone())
+            .collect::<Vec<_>>();
+        let [reference] = matches.as_slice() else {
+            return Err(AppError::InvalidArgument {
+                message: format!(
+                    "Team Agent '{slug}' is unavailable or ambiguous across current sources"
+                ),
+            });
+        };
+        agents.push(reference.clone());
+    }
+    agents.sort();
+    Ok(agents)
+}
+
+fn baseline_from_workspace_pack(
+    project_path: String,
+    pack: WorkspacePack,
+) -> ProjectReadinessBaseline {
+    let mut agents = pack
+        .agents
+        .iter()
+        .map(|item| item.reference.clone())
+        .collect::<Vec<_>>();
+    let mut skills = pack
+        .skills
+        .iter()
+        .map(|item| item.reference.clone())
+        .collect::<Vec<_>>();
+    let mut tools = pack
+        .agents
+        .iter()
+        .map(|item| item.tool.clone())
+        .collect::<Vec<_>>();
+    agents.sort();
+    agents.dedup();
+    skills.sort();
+    skills.dedup();
+    tools.sort();
+    tools.dedup();
+    ProjectReadinessBaseline {
+        project_path,
+        label: pack.name,
+        agents,
+        skills,
+        instructions: pack
+            .instructions
+            .into_iter()
+            .map(|id| BaselineRequirement { id, known: false })
+            .collect(),
+        mcp_servers: pack
+            .mcp_servers
+            .into_iter()
+            .map(|id| BaselineRequirement { id, known: false })
+            .collect(),
+        tools,
+    }
+}
+
+#[tauri::command]
+pub async fn project_baseline_save_team(
+    state: State<'_, AppState>,
+    project_path: String,
+    label: String,
+    slugs: Vec<String>,
+) -> Result<ProjectReadinessBaseline, AppError> {
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    let sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
+    let agents = resolve_team_references(slugs, &sources)?;
+    persist_project_baseline(
+        &state,
+        ProjectReadinessBaseline {
+            project_path,
+            label,
+            agents,
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn project_baseline_import_pack(
+    state: State<'_, AppState>,
+    project_path: String,
+    pack: WorkspacePack,
+) -> Result<ProjectReadinessBaseline, AppError> {
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    let pack = normalize_workspace_pack(pack)?;
+    let baseline = baseline_from_workspace_pack(project_path, pack);
+    persist_project_baseline(&state, baseline).await
+}
+
+fn status_from_agent_install(state: InstallState) -> ReadinessRowState {
+    match state {
+        InstallState::Current => ReadinessRowState::Ready,
+        InstallState::SourceUnavailable => ReadinessRowState::Unavailable,
+        _ => ReadinessRowState::NeedsAttention,
+    }
+}
+
+fn status_from_skill_install(state: crate::types::SkillInstallState) -> ReadinessRowState {
+    match state {
+        crate::types::SkillInstallState::Current => ReadinessRowState::Ready,
+        crate::types::SkillInstallState::SourceUnavailable => ReadinessRowState::Unavailable,
+        _ => ReadinessRowState::NeedsAttention,
+    }
+}
+
+#[tauri::command]
+pub async fn project_readiness_get(
+    state: State<'_, AppState>,
+    project_path: String,
+) -> Result<ProjectReadinessReport, AppError> {
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    let database = control_center_database(&state).await?;
+    let document = corpus::load_control_center(&database).await?;
+    let baseline = document
+        .project_baselines
+        .iter()
+        .find(|baseline| baseline.project_path == project_path)
+        .cloned();
+    let Some(baseline) = baseline else {
+        return Ok(build_readiness_report(
+            &project_path,
+            None,
+            ReadinessEvidence {
+                agents: Ok(BTreeMap::new()),
+                skills: Ok(BTreeMap::new()),
+                instructions: Ok(BTreeMap::new()),
+                mcp_servers: Ok(BTreeMap::new()),
+                tools: Ok(BTreeMap::new()),
+            },
+        ));
+    };
+
+    let agent_evidence = match mcp_reconcile_agent_installs(&state).await {
+        Ok(installed) => {
+            let sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await;
+            sources.map(|sources| {
+                let available = sources
+                    .iter()
+                    .flat_map(|source| &source.agents)
+                    .filter(|package| package.installable)
+                    .map(|package| package.reference.clone())
+                    .collect::<BTreeSet<_>>();
+                baseline
+                    .agents
+                    .iter()
+                    .cloned()
+                    .map(|reference| {
+                        let state = installed
+                            .iter()
+                            .filter(|row| {
+                                row.project_path.as_deref() == Some(project_path.as_str())
+                                    && row.source_id == reference.source_id
+                                    && row.relative_path == reference.relative_path
+                            })
+                            .map(|row| status_from_agent_install(row.state))
+                            .min_by_key(|state| match state {
+                                ReadinessRowState::Ready => 0,
+                                ReadinessRowState::NeedsAttention => 1,
+                                ReadinessRowState::Unavailable => 2,
+                                ReadinessRowState::Unverifiable => 3,
+                            })
+                            .unwrap_or(if available.contains(&reference) {
+                                ReadinessRowState::NeedsAttention
+                            } else {
+                                ReadinessRowState::Unavailable
+                            });
+                        (reference, state)
+                    })
+                    .collect()
+            })
+        }
+        Err(error) => Err(error),
+    }
+    .map_err(|error| error.to_string());
+
+    let registered = registered_projects(&state.app_data_dir)
+        .await?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let skill_evidence = match crate::skills::reconcile_skill_installs(&state, &registered).await {
+        Ok(installed) => crate::skills::inspect_skill_sources(&state)
+            .await
+            .map(|sources| {
+                let available = sources
+                    .iter()
+                    .flat_map(|source| &source.packages)
+                    .filter(|package| package.installable)
+                    .map(|package| SkillReference {
+                        source_id: package.source_id.clone(),
+                        relative_path: package.relative_path.clone(),
+                    })
+                    .collect::<BTreeSet<_>>();
+                baseline
+                    .skills
+                    .iter()
+                    .cloned()
+                    .map(|reference| {
+                        let status = installed
+                            .iter()
+                            .filter(|row| {
+                                row.project_path.as_deref() == Some(project_path.as_str())
+                                    && row.source_id == reference.source_id
+                                    && row.relative_path == reference.relative_path
+                            })
+                            .map(|row| status_from_skill_install(row.state))
+                            .min_by_key(|state| match state {
+                                ReadinessRowState::Ready => 0,
+                                ReadinessRowState::NeedsAttention => 1,
+                                ReadinessRowState::Unavailable => 2,
+                                ReadinessRowState::Unverifiable => 3,
+                            })
+                            .unwrap_or(if available.contains(&reference) {
+                                ReadinessRowState::NeedsAttention
+                            } else {
+                                ReadinessRowState::Unavailable
+                            });
+                        (reference, status)
+                    })
+                    .collect()
+            }),
+        Err(error) => Err(error),
+    }
+    .map_err(|error| error.to_string());
+
+    let instruction_evidence = inspect_project_instruction_targets(&state, &project_path)
+        .await
+        .map(|targets| {
+            targets
+                .into_iter()
+                .map(|target| {
+                    let state = if target.blockers.is_empty() && target.exists {
+                        ReadinessRowState::Ready
+                    } else if target.blockers.is_empty() {
+                        ReadinessRowState::NeedsAttention
+                    } else {
+                        ReadinessRowState::Unavailable
+                    };
+                    (target.id, state)
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string());
+    let mcp_evidence = crate::commands::mcp_clients::mcp_inventory_for_state(&state)
+        .await
+        .and_then(|inventory| {
+            if !inventory.issues.is_empty() {
+                return Err(AppError::Io {
+                    message: "MCP inventory inspection is incomplete".into(),
+                });
+            }
+            Ok(inventory
+                .servers
+                .into_iter()
+                .filter(|server| {
+                    server.project_path.as_deref() == Some(project_path.as_str())
+                        || server.project_path.is_none()
+                })
+                .map(|server| {
+                    let state = if server.enabled
+                        && server.validation == crate::types::McpInventoryValidation::Valid
+                    {
+                        ReadinessRowState::Ready
+                    } else {
+                        ReadinessRowState::NeedsAttention
+                    };
+                    (server.name, state)
+                })
+                .collect())
+        })
+        .map_err(|error| error.to_string());
+    let mut tool_evidence = BTreeMap::new();
+    for tool in &baseline.tools {
+        match tool_detected(&state, tool).await {
+            Ok(true) => {
+                tool_evidence.insert(tool.clone(), ReadinessRowState::Ready);
+            }
+            Ok(false) => {
+                tool_evidence.insert(tool.clone(), ReadinessRowState::NeedsAttention);
+            }
+            Err(_) => {
+                tool_evidence.insert(tool.clone(), ReadinessRowState::Unavailable);
+            }
+        }
+    }
+    let mut report = build_readiness_report(
+        &project_path,
+        Some(&baseline),
+        ReadinessEvidence {
+            agents: agent_evidence,
+            skills: skill_evidence,
+            instructions: instruction_evidence,
+            mcp_servers: mcp_evidence,
+            tools: Ok(tool_evidence),
+        },
+    );
+    report.subscribed = document
+        .project_subscriptions
+        .iter()
+        .any(|subscription| subscription.project_path == project_path);
+    Ok(report)
+}
+
+fn catalog_change_reference(change: &CatalogChange) -> AgentReference {
+    let item = match change {
+        CatalogChange::Added { item } | CatalogChange::Removed { item } => item,
+        CatalogChange::Updated { after, .. } | CatalogChange::Renamed { after, .. } => after,
+    };
+    AgentReference {
+        source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+        relative_path: item.relative_path.clone(),
+    }
+}
+
+fn derive_project_recommendations(
+    baseline: &ProjectReadinessBaseline,
+    subscription: &ProjectSubscription,
+    batches: &[CatalogFeedBatch],
+    available: &BTreeSet<AgentReference>,
+) -> Vec<ProjectRecommendation> {
+    let required = baseline.agents.iter().cloned().collect::<BTreeSet<_>>();
+    let latest_batch = batches.last().map(|batch| batch.at.as_str());
+    let mut recommendations = Vec::new();
+    for batch in batches {
+        for change in &batch.changes {
+            let reference = catalog_change_reference(change);
+            if !required.contains(&reference) {
+                continue;
+            }
+            let id = render::sha256_hex(
+                &serde_json::to_vec(&(baseline.project_path.as_str(), batch.at.as_str(), change))
+                    .expect("catalog recommendation identity is serializable"),
+            );
+            let lifecycle = if subscription.dismissed_recommendation_ids.contains(&id) {
+                RecommendationLifecycle::Dismissed
+            } else if !available.contains(&reference) {
+                RecommendationLifecycle::Blocked
+            } else if latest_batch != Some(batch.at.as_str()) {
+                RecommendationLifecycle::Superseded
+            } else if subscription
+                .last_seen_batch
+                .as_deref()
+                .is_none_or(|cursor| {
+                    chrono::DateTime::parse_from_rfc3339(&batch.at).ok()
+                        > chrono::DateTime::parse_from_rfc3339(cursor).ok()
+                })
+            {
+                RecommendationLifecycle::New
+            } else {
+                continue;
+            };
+            let change_label = match change {
+                CatalogChange::Added { .. } => "added",
+                CatalogChange::Updated { .. } => "updated",
+                CatalogChange::Removed { .. } => "removed",
+                CatalogChange::Renamed { .. } => "renamed",
+            };
+            recommendations.push(ProjectRecommendation {
+                id,
+                project_path: baseline.project_path.clone(),
+                batch_at: batch.at.clone(),
+                lifecycle,
+                summary: format!(
+                    "Required Agent was {change_label} in a successful catalog refresh"
+                ),
+                agent_references: vec![reference],
+            });
+        }
+    }
+    recommendations
+}
+
+fn set_project_subscription(
+    document: &mut crate::types::ControlCenterDocument,
+    project_path: String,
+    enabled: bool,
+) -> Result<(), AppError> {
+    if enabled
+        && !document
+            .project_baselines
+            .iter()
+            .any(|baseline| baseline.project_path == project_path)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Save a project baseline before subscribing".into(),
+        });
+    }
+    document
+        .project_subscriptions
+        .retain(|subscription| subscription.project_path != project_path);
+    if enabled {
+        document.project_subscriptions.push(ProjectSubscription {
+            project_path,
+            last_seen_batch: None,
+            dismissed_recommendation_ids: Vec::new(),
+        });
+        document
+            .project_subscriptions
+            .sort_by(|left, right| left.project_path.cmp(&right.project_path));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn project_subscription_set(
+    state: State<'_, AppState>,
+    project_path: String,
+    enabled: bool,
+) -> Result<bool, AppError> {
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    control_center_database(&state)
+        .await?
+        .mutate(
+            corpus::control_center_spec(),
+            crate::types::ControlCenterDocument::default(),
+            move |document| set_project_subscription(document, project_path, enabled),
+        )
+        .await?;
+    Ok(enabled)
+}
+
+async fn current_recommendations(
+    state: &AppState,
+    project_path: &str,
+    include_seen_latest: bool,
+) -> Result<(ProjectSubscription, Vec<ProjectRecommendation>), AppError> {
+    let database = control_center_database(state).await?;
+    let document = corpus::load_control_center(&database).await?;
+    let baseline = document
+        .project_baselines
+        .iter()
+        .find(|baseline| baseline.project_path == project_path)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "Project has no readiness baseline".into(),
+        })?;
+    let subscription = document
+        .project_subscriptions
+        .iter()
+        .find(|subscription| subscription.project_path == project_path)
+        .cloned()
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "Project is not subscribed".into(),
+        })?;
+    let available = crate::agents::inspect_agent_sources(&state.app_data_dir)
+        .await
+        .map(|sources| {
+            sources
+                .into_iter()
+                .flat_map(|source| source.agents)
+                .filter(|package| package.installable)
+                .map(|package| package.reference)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut projection = subscription.clone();
+    if include_seen_latest {
+        projection.last_seen_batch = None;
+    }
+    let recommendations =
+        derive_project_recommendations(baseline, &projection, &document.catalog_feed, &available);
+    Ok((subscription, recommendations))
+}
+
+#[tauri::command]
+pub async fn project_recommendations_list(
+    state: State<'_, AppState>,
+    project_path: String,
+) -> Result<Vec<ProjectRecommendation>, AppError> {
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    let (subscription, recommendations) =
+        current_recommendations(&state, &project_path, false).await?;
+    let surfaced_cursor = recommendations
+        .iter()
+        .filter(|recommendation| recommendation.lifecycle == RecommendationLifecycle::New)
+        .map(|recommendation| recommendation.batch_at.as_str())
+        .max()
+        .map(str::to_owned);
+    if let Some(cursor) = surfaced_cursor {
+        control_center_database(&state)
+            .await?
+            .mutate(
+                corpus::control_center_spec(),
+                crate::types::ControlCenterDocument::default(),
+                move |document| {
+                    let current = document
+                        .project_subscriptions
+                        .iter_mut()
+                        .find(|item| item.project_path == subscription.project_path)
+                        .ok_or_else(|| AppError::InvalidArgument {
+                            message: "Project subscription changed during evaluation".into(),
+                        })?;
+                    current.last_seen_batch = Some(cursor);
+                    Ok(())
+                },
+            )
+            .await?;
+    }
+    Ok(recommendations)
+}
+
+#[tauri::command]
+pub async fn project_recommendation_dismiss(
+    state: State<'_, AppState>,
+    project_path: String,
+    recommendation_id: String,
+) -> Result<(), AppError> {
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    let (_, recommendations) = current_recommendations(&state, &project_path, true).await?;
+    if !recommendations
+        .iter()
+        .any(|recommendation| recommendation.id == recommendation_id)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Recommendation is not current for this project subscription".into(),
+        });
+    }
+    control_center_database(&state)
+        .await?
+        .mutate(
+            corpus::control_center_spec(),
+            crate::types::ControlCenterDocument::default(),
+            move |document| {
+                let subscription = document
+                    .project_subscriptions
+                    .iter_mut()
+                    .find(|subscription| subscription.project_path == project_path)
+                    .ok_or_else(|| AppError::InvalidArgument {
+                        message: "Project is not subscribed".into(),
+                    })?;
+                if !subscription
+                    .dismissed_recommendation_ids
+                    .contains(&recommendation_id)
+                {
+                    subscription
+                        .dismissed_recommendation_ids
+                        .push(recommendation_id);
+                    subscription.dismissed_recommendation_ids.sort();
+                }
+                Ok(())
+            },
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn project_recommendation_open(
+    state: State<'_, AppState>,
+    project_path: String,
+    recommendation_id: String,
+) -> Result<ProjectRecommendation, AppError> {
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    let (_, recommendations) = current_recommendations(&state, &project_path, true).await?;
+    let recommendation = recommendations
+        .into_iter()
+        .find(|recommendation| recommendation.id == recommendation_id)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "Recommendation is no longer available".into(),
+        })?;
+    if recommendation.lifecycle != RecommendationLifecycle::New {
+        return Err(AppError::InvalidArgument {
+            message: if recommendation.lifecycle == RecommendationLifecycle::Blocked {
+                "Recommendation exact references no longer resolve"
+            } else {
+                "Only a new recommendation can enter deployment review"
+            }
+            .into(),
+        });
+    }
+    Ok(recommendation)
 }
 
 // ---------- Project instruction snippets ----------
@@ -7231,6 +8120,7 @@ pub async fn loadout_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CatalogSnapshotItem;
 
     #[tokio::test]
     async fn passive_ledger_read_rejects_rows_that_require_migration_without_rewrite() {
@@ -7564,7 +8454,7 @@ mod tests {
                 WorkspacePackAgent {
                     reference: AgentReference {
                         source_id: "source-a".into(),
-                        relative_path: "reviewer.md".into(),
+                        relative_path: "engineering/reviewer.md".into(),
                     },
                     tool: "codex".into(),
                 },
@@ -7580,6 +8470,264 @@ mod tests {
             instructions: vec!["AGENTS.md conventions".into()],
             mcp_servers: vec!["memory".into()],
         }
+    }
+
+    #[test]
+    fn project_readiness_uses_locked_precedence_and_empty_categories() {
+        let baseline = ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Team baseline".into(),
+            agents: vec![AgentReference {
+                source_id: "source-a".into(),
+                relative_path: "reviewer.md".into(),
+            }],
+            skills: Vec::new(),
+            instructions: vec![BaselineRequirement {
+                id: "Follow the repository conventions".into(),
+                known: false,
+            }],
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        };
+        let report = build_readiness_report(
+            "/registered/project",
+            Some(&baseline),
+            ReadinessEvidence {
+                agents: Ok(BTreeMap::from([(
+                    baseline.agents[0].clone(),
+                    ReadinessRowState::Ready,
+                )])),
+                ..ReadinessEvidence::ready()
+            },
+        );
+        assert_eq!(report.overall, ProjectReadinessOverall::NeedsAttention);
+        assert_eq!(report.categories[0].state, ReadinessCategoryState::Ready);
+        assert_eq!(
+            report.categories[1].state,
+            ReadinessCategoryState::NotRequired
+        );
+        assert_eq!(
+            report.categories[2].rows[0].state,
+            ReadinessRowState::Unverifiable
+        );
+
+        let unavailable = build_readiness_report(
+            "/registered/project",
+            Some(&baseline),
+            ReadinessEvidence {
+                agents: Err("Agent inspection failed".into()),
+                ..ReadinessEvidence::ready()
+            },
+        );
+        assert_eq!(unavailable.overall, ProjectReadinessOverall::Unavailable);
+        assert_eq!(
+            unavailable.categories[0].rows[0].state,
+            ReadinessRowState::Unavailable
+        );
+
+        let unconfigured =
+            build_readiness_report("/registered/project", None, ReadinessEvidence::ready());
+        assert_eq!(unconfigured.overall, ProjectReadinessOverall::NotConfigured);
+        assert!(unconfigured
+            .categories
+            .iter()
+            .all(|category| category.state == ReadinessCategoryState::NotRequired));
+
+        let needs_attention = build_readiness_report(
+            "/registered/project",
+            Some(&baseline),
+            ReadinessEvidence::ready(),
+        );
+        assert_eq!(
+            needs_attention.categories[0].rows[0].state,
+            ReadinessRowState::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn team_baseline_requires_one_exact_current_source_reference_per_slug() {
+        let exact = built_in_result(&[("reviewer", "review/reviewer.md")]);
+        let resolved =
+            resolve_team_references(vec!["reviewer".into()], std::slice::from_ref(&exact)).unwrap();
+        assert_eq!(resolved[0].relative_path, "review/reviewer.md");
+        assert!(
+            resolve_team_references(vec!["reviewer".into()], &[exact.clone(), exact],).is_err()
+        );
+        assert!(resolve_team_references(vec!["missing".into()], &[]).is_err());
+    }
+
+    #[test]
+    fn workspace_pack_baseline_carries_exact_refs_and_keeps_requirements_opaque() {
+        let pack = normalize_workspace_pack(workspace_pack_fixture()).unwrap();
+        let baseline = baseline_from_workspace_pack("/registered/project".into(), pack);
+        assert_eq!(baseline.agents[0].source_id, "source-a");
+        assert_eq!(baseline.skills[0].source_id, "skills");
+        assert!(baseline.instructions.iter().all(|item| !item.known));
+        assert!(baseline.mcp_servers.iter().all(|item| !item.known));
+        let report = build_readiness_report(
+            "/registered/project",
+            Some(&baseline),
+            ReadinessEvidence::ready(),
+        );
+        assert!(report.categories[2]
+            .rows
+            .iter()
+            .all(|row| row.state == ReadinessRowState::Unverifiable));
+        assert!(report.categories[3]
+            .rows
+            .iter()
+            .all(|row| row.state == ReadinessRowState::Unverifiable));
+    }
+
+    #[test]
+    fn project_subscription_is_explicit_opt_in_and_requires_a_baseline() {
+        let mut document = crate::types::ControlCenterDocument::default();
+        assert!(
+            set_project_subscription(&mut document, "/registered/project".into(), true,).is_err()
+        );
+        document.project_baselines.push(ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Review".into(),
+            agents: Vec::new(),
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        });
+        set_project_subscription(&mut document, "/registered/project".into(), true).unwrap();
+        assert_eq!(document.project_subscriptions.len(), 1);
+        assert!(document.project_subscriptions[0].last_seen_batch.is_none());
+        set_project_subscription(&mut document, "/registered/project".into(), false).unwrap();
+        assert!(document.project_subscriptions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_baseline_and_opt_in_round_trip_in_versioned_control_center_sqlite() {
+        let app = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        let baseline = ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Review".into(),
+            agents: vec![AgentReference {
+                source_id: "source-a".into(),
+                relative_path: "reviewer.md".into(),
+            }],
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        };
+        database
+            .mutate(
+                corpus::control_center_spec(),
+                crate::types::ControlCenterDocument::default(),
+                move |document| {
+                    document.project_baselines.push(baseline);
+                    set_project_subscription(document, "/registered/project".into(), true)
+                },
+            )
+            .await
+            .unwrap();
+        drop(database);
+
+        let reopened = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        let document = corpus::load_control_center(&reopened).await.unwrap();
+        assert_eq!(
+            document.project_baselines[0].agents[0].source_id,
+            "source-a"
+        );
+        assert_eq!(
+            document.project_subscriptions[0].project_path,
+            "/registered/project"
+        );
+    }
+
+    #[test]
+    fn subscription_recommendations_obey_cursor_dismissal_supersession_and_blocking() {
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let baseline = ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Reviewers".into(),
+            agents: vec![reference.clone()],
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        };
+        let batches = vec![
+            CatalogFeedBatch {
+                at: "2026-08-17T01:00:00Z".into(),
+                changes: vec![CatalogChange::Updated {
+                    before: CatalogSnapshotItem {
+                        category: "engineering".into(),
+                        relative_path: "engineering/reviewer.md".into(),
+                        source_hash: "a".repeat(64),
+                        body_hash: "b".repeat(64),
+                    },
+                    after: CatalogSnapshotItem {
+                        category: "engineering".into(),
+                        relative_path: "engineering/reviewer.md".into(),
+                        source_hash: "c".repeat(64),
+                        body_hash: "d".repeat(64),
+                    },
+                }],
+            },
+            CatalogFeedBatch {
+                at: "2026-08-17T02:00:00Z".into(),
+                changes: vec![CatalogChange::Removed {
+                    item: CatalogSnapshotItem {
+                        category: "engineering".into(),
+                        relative_path: "engineering/reviewer.md".into(),
+                        source_hash: "c".repeat(64),
+                        body_hash: "d".repeat(64),
+                    },
+                }],
+            },
+        ];
+        let mut subscription = ProjectSubscription {
+            project_path: baseline.project_path.clone(),
+            last_seen_batch: None,
+            dismissed_recommendation_ids: Vec::new(),
+        };
+        let recommendations = derive_project_recommendations(
+            &baseline,
+            &subscription,
+            &batches,
+            &BTreeSet::from([reference.clone()]),
+        );
+        assert_eq!(recommendations.len(), 2);
+        assert_eq!(
+            recommendations[0].lifecycle,
+            RecommendationLifecycle::Superseded
+        );
+        assert_eq!(recommendations[1].lifecycle, RecommendationLifecycle::New);
+        assert_eq!(
+            derive_project_recommendations(&baseline, &subscription, &batches, &BTreeSet::new(),)
+                [1]
+            .lifecycle,
+            RecommendationLifecycle::Blocked
+        );
+        subscription
+            .dismissed_recommendation_ids
+            .push(recommendations[1].id.clone());
+        assert_eq!(
+            derive_project_recommendations(&baseline, &subscription, &batches, &BTreeSet::new(),)
+                [1]
+            .lifecycle,
+            RecommendationLifecycle::Dismissed
+        );
+        subscription.last_seen_batch = Some("2026-08-17T02:00:00Z".into());
+        assert!(derive_project_recommendations(
+            &baseline,
+            &subscription,
+            &batches,
+            &BTreeSet::from([reference]),
+        )
+        .iter()
+        .all(|recommendation| recommendation.lifecycle != RecommendationLifecycle::New));
     }
 
     #[test]

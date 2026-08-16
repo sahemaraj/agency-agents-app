@@ -29,7 +29,7 @@
 
 pub(crate) mod parse;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,7 +42,7 @@ use crate::types::{
     Agent, CatalogCandidate, CatalogChange, CatalogDetection, CatalogFeedBatch, CatalogFeedState,
     CatalogPendingRefresh, CatalogPendingSourceTransition, CatalogSnapshotItem,
     CatalogSnapshotProvenance, CatalogSource, CatalogStatus, CatalogUpdateCheck, Category,
-    ControlCenterDocument, CorpusEntry, CorpusMeta,
+    ControlCenterDocument, CorpusEntry, CorpusMeta, ProjectReadinessBaseline,
 };
 use crate::util::fs::atomic_write;
 
@@ -447,6 +447,13 @@ pub(crate) const CONTROL_CENTER_MAX_FEED_BATCHES: usize = 100;
 pub(crate) const CONTROL_CENTER_MAX_FEED_ITEMS: usize = 2_000;
 const CONTROL_CENTER_MAX_TEXT_CHARS: usize = 256;
 const CONTROL_CENTER_MAX_PATH_CHARS: usize = 512;
+const CONTROL_CENTER_MAX_PROJECT_BASELINES: usize = 64;
+const CONTROL_CENTER_MAX_PROJECT_AGENTS: usize = 256;
+const CONTROL_CENTER_MAX_PROJECT_SKILLS: usize = 256;
+const CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS: usize = 32;
+const CONTROL_CENTER_MAX_PROJECT_TOOLS: usize = 32;
+const CONTROL_CENTER_MAX_SUBSCRIPTIONS: usize = 128;
+const CONTROL_CENTER_MAX_DISMISSED_RECOMMENDATIONS: usize = 256;
 const CATALOG_SOURCE_TRANSITION_UNAVAILABLE: &str =
     "Catalog source change is incomplete. Retry the source selection.";
 const CATALOG_SOURCE_TRANSITION_MISMATCH: &str =
@@ -562,6 +569,84 @@ fn valid_timestamp(value: &str) -> bool {
     valid_text(value) && chrono::DateTime::parse_from_rfc3339(value).is_ok()
 }
 
+fn valid_project_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.chars().any(char::is_control)
+        && value.chars().count() <= CONTROL_CENTER_MAX_PATH_CHARS
+        && path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
+}
+
+fn validate_project_baseline(baseline: &ProjectReadinessBaseline) -> Result<(), AppError> {
+    if !valid_project_path(&baseline.project_path)
+        || !valid_text(&baseline.label)
+        || baseline.agents.len() > CONTROL_CENTER_MAX_PROJECT_AGENTS
+        || baseline.skills.len() > CONTROL_CENTER_MAX_PROJECT_SKILLS
+        || baseline.instructions.len() > CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS
+        || baseline.mcp_servers.len() > CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS
+        || baseline.tools.len() > CONTROL_CENTER_MAX_PROJECT_TOOLS
+    {
+        return Err(AppError::InvalidArgument {
+            message: "control-center project baseline exceeds its limits".into(),
+        });
+    }
+    let mut agent_keys = BTreeSet::new();
+    for reference in &baseline.agents {
+        crate::library::validate_reference(&reference.source_id, &reference.relative_path)?;
+        if reference.relative_path.chars().count() > CONTROL_CENTER_MAX_PATH_CHARS
+            || !agent_keys.insert((&reference.source_id, &reference.relative_path))
+        {
+            return Err(AppError::InvalidArgument {
+                message: "control-center project baseline has duplicate Agent references".into(),
+            });
+        }
+    }
+    let mut skill_keys = BTreeSet::new();
+    for reference in &baseline.skills {
+        crate::library::validate_reference(&reference.source_id, &reference.relative_path)?;
+        if reference.relative_path.chars().count() > CONTROL_CENTER_MAX_PATH_CHARS
+            || !skill_keys.insert((&reference.source_id, &reference.relative_path))
+        {
+            return Err(AppError::InvalidArgument {
+                message: "control-center project baseline has duplicate Skill references".into(),
+            });
+        }
+    }
+    for requirement in baseline.instructions.iter().chain(&baseline.mcp_servers) {
+        if !valid_text(&requirement.id) {
+            return Err(AppError::InvalidArgument {
+                message: "control-center project requirement is invalid".into(),
+            });
+        }
+    }
+    if baseline.instructions.iter().any(|requirement| {
+        requirement.known
+            && !matches!(
+                requirement.id.as_str(),
+                "agents" | "claude" | "gemini" | "copilot"
+            )
+    }) || baseline
+        .mcp_servers
+        .iter()
+        .any(|requirement| requirement.known && requirement.id != "agency-agents")
+        || baseline
+            .tools
+            .iter()
+            .any(|tool| !valid_text(tool) || crate::registry::get(tool).is_none())
+    {
+        return Err(AppError::InvalidArgument {
+            message: "control-center project tool is invalid".into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppError> {
     if document.active_catalog_snapshot.len() > CONTROL_CENTER_MAX_SNAPSHOT_ITEMS
         || document.catalog_feed.len() > CONTROL_CENTER_MAX_FEED_BATCHES
@@ -571,10 +656,54 @@ fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppEr
             .map(|batch| batch.changes.len())
             .sum::<usize>()
             > CONTROL_CENTER_MAX_FEED_ITEMS
+        || document.project_baselines.len() > CONTROL_CENTER_MAX_PROJECT_BASELINES
+        || document.project_subscriptions.len() > CONTROL_CENTER_MAX_SUBSCRIPTIONS
     {
         return Err(AppError::InvalidArgument {
             message: "control-center catalog state exceeds its item limits".into(),
         });
+    }
+
+    let mut baseline_projects = BTreeSet::new();
+    for baseline in &document.project_baselines {
+        validate_project_baseline(baseline)?;
+        if !baseline_projects.insert(baseline.project_path.as_str()) {
+            return Err(AppError::InvalidArgument {
+                message: "control-center project baselines are not unique".into(),
+            });
+        }
+    }
+    let mut subscription_projects = BTreeSet::new();
+    let last_success = document
+        .catalog_last_success_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+    for subscription in &document.project_subscriptions {
+        if !valid_project_path(&subscription.project_path)
+            || !baseline_projects.contains(subscription.project_path.as_str())
+            || !subscription_projects.insert(subscription.project_path.as_str())
+            || subscription
+                .last_seen_batch
+                .as_deref()
+                .is_some_and(|value| !valid_timestamp(value))
+            || subscription
+                .last_seen_batch
+                .as_deref()
+                .is_some_and(|value| {
+                    let cursor = chrono::DateTime::parse_from_rfc3339(value).ok();
+                    cursor.is_none() || last_success.is_none() || cursor > last_success
+                })
+            || subscription.dismissed_recommendation_ids.len()
+                > CONTROL_CENTER_MAX_DISMISSED_RECOMMENDATIONS
+            || subscription
+                .dismissed_recommendation_ids
+                .iter()
+                .any(|id| !valid_hash(id))
+        {
+            return Err(AppError::InvalidArgument {
+                message: "control-center project subscription is invalid".into(),
+            });
+        }
     }
 
     for item in &document.active_catalog_snapshot {
@@ -697,7 +826,7 @@ fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppEr
     Ok(())
 }
 
-fn control_center_spec() -> crate::state_db::DocumentSpec<ControlCenterDocument> {
+pub(crate) fn control_center_spec() -> crate::state_db::DocumentSpec<ControlCenterDocument> {
     crate::state_db::DocumentSpec::new(
         "control_center",
         1,
@@ -806,7 +935,7 @@ fn diff_catalog_snapshots(
     changes
 }
 
-async fn load_control_center(
+pub(crate) async fn load_control_center(
     database: &crate::state_db::StateDatabase,
 ) -> Result<ControlCenterDocument, AppError> {
     Ok(database
@@ -961,6 +1090,10 @@ async fn write_catalog_baseline(
                 if clear_history {
                     document.catalog_feed.clear();
                     document.catalog_last_success_at = None;
+                    for subscription in &mut document.project_subscriptions {
+                        subscription.last_seen_batch = None;
+                        subscription.dismissed_recommendation_ids.clear();
+                    }
                 }
                 document.catalog_stale = false;
                 document.catalog_error = None;
@@ -1127,6 +1260,10 @@ async fn finish_catalog_source_selection(
                         });
                         document.catalog_feed.clear();
                         document.catalog_last_success_at = None;
+                        for subscription in &mut document.project_subscriptions {
+                            subscription.last_seen_batch = None;
+                            subscription.dismissed_recommendation_ids.clear();
+                        }
                         document.catalog_pending_source_transition = None;
                         document.catalog_stale = false;
                         document.catalog_error = None;
@@ -2853,8 +2990,9 @@ mod tests {
     use super::*;
     use crate::commands::settings::{Settings, SettingsLoadState};
     use crate::types::{
-        CatalogChange, CatalogFeedBatch, CatalogPendingRefresh, CatalogSnapshotItem,
-        ControlCenterDocument,
+        AgentReference, BaselineRequirement, CatalogChange, CatalogFeedBatch,
+        CatalogPendingRefresh, CatalogSnapshotItem, ControlCenterDocument,
+        ProjectReadinessBaseline, ProjectSubscription,
     };
 
     fn test_app_state(app_data_dir: &Path, paranoid_mode: bool) -> AppState {
@@ -2908,6 +3046,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn control_center_validator_enforces_exact_document_and_field_caps() {
         assert!(validate_control_center(&ControlCenterDocument::default()).is_ok());
 
@@ -2962,6 +3101,64 @@ mod tests {
             };
             assert!(validate_control_center(&document).is_err());
         }
+    }
+
+    #[test]
+    fn control_center_validator_enforces_project_readiness_caps_and_identity_shape() {
+        let baseline = ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Review".into(),
+            agents: vec![AgentReference {
+                source_id: "source-a".into(),
+                relative_path: "reviewer.md".into(),
+            }],
+            skills: Vec::new(),
+            instructions: vec![BaselineRequirement {
+                id: "opaque requirement".into(),
+                known: false,
+            }],
+            mcp_servers: Vec::new(),
+            tools: vec!["codex".into()],
+        };
+        let valid = ControlCenterDocument {
+            catalog_last_success_at: Some("2026-08-17T00:00:00Z".into()),
+            project_baselines: vec![baseline.clone()],
+            project_subscriptions: vec![ProjectSubscription {
+                project_path: baseline.project_path.clone(),
+                last_seen_batch: Some("2026-08-17T00:00:00Z".into()),
+                dismissed_recommendation_ids: vec!["a".repeat(64)],
+            }],
+            ..ControlCenterDocument::default()
+        };
+        assert!(validate_control_center(&valid).is_ok());
+
+        let mut arbitrary_identity = valid.clone();
+        arbitrary_identity.project_baselines[0].project_path = "project nickname".into();
+        assert!(validate_control_center(&arbitrary_identity).is_err());
+
+        let mut future_cursor = valid.clone();
+        future_cursor.project_subscriptions[0].last_seen_batch =
+            Some("2026-08-17T01:00:00Z".into());
+        assert!(validate_control_center(&future_cursor).is_err());
+
+        let mut too_many_agents = valid.clone();
+        too_many_agents.project_baselines[0].agents = (0..=CONTROL_CENTER_MAX_PROJECT_AGENTS)
+            .map(|index| AgentReference {
+                source_id: "source-a".into(),
+                relative_path: format!("agent-{index}.md"),
+            })
+            .collect();
+        assert!(validate_control_center(&too_many_agents).is_err());
+
+        let mut too_many_requirements = valid;
+        too_many_requirements.project_baselines[0].instructions = (0
+            ..=CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS)
+            .map(|index| BaselineRequirement {
+                id: format!("requirement-{index}"),
+                known: false,
+            })
+            .collect();
+        assert!(validate_control_center(&too_many_requirements).is_err());
     }
 
     #[test]

@@ -756,6 +756,26 @@ describe("frontend test harness", () => {
     expect(teamsSource).not.toContain("install.importLoadout(");
   });
 
+  it("keeps project readiness opt-in, evidence, announcements, and exact-reference review in existing surfaces", () => {
+    for (const marker of [
+      /projects\.readiness\(projectPath\)/,
+      /projects\.recommendations\(projectPath\)/,
+      /Import Workspace Pack baseline/,
+      /type="checkbox" checked=\{readiness\.subscribed\}/,
+      /role="status" aria-live="polite" aria-atomic="true"/,
+      /agentReferences=\{recommendationPlan\.agentReferences\}/,
+      /disabled=\{recommendation\.lifecycle !== "new"\}/,
+    ]) expect(projectsSource).toMatch(marker);
+    for (const marker of [
+      /projects\.saveTeamBaseline\(baselineProject, openedTeam\.label, openedTeam\.agents\)/,
+      /projects\.subscribe\(baselineProject, true\)/,
+      /Save and subscribe/,
+      /role="status" aria-live="polite" aria-atomic="true"/,
+    ]) expect(teamsSource).toMatch(marker);
+    expect(projectsSource).not.toContain("autoApply");
+    expect(teamsSource).not.toContain("autoApply");
+  });
+
   it("keeps a completed receipt in memory when journal persistence fails", () => {
     vi.useFakeTimers();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -3618,7 +3638,7 @@ describe("frontend test harness", () => {
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(49);
+      .toHaveLength(54);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([

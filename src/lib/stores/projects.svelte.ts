@@ -14,12 +14,25 @@ import { invoke } from "@tauri-apps/api/core";
 import { i18n } from "$lib/stores/i18n.svelte";
 import { install } from "$lib/stores/install.svelte";
 import { activity, safeActivityDetail } from "$lib/stores/activity.svelte";
+import {
+  projectBaselineImportPack,
+  projectBaselineSaveTeam,
+  projectReadinessGet,
+  projectRecommendationDismiss,
+  projectRecommendationOpen,
+  projectRecommendationsList,
+  projectSubscriptionSet,
+} from "$lib/api";
 import type {
   ProjectInfo,
   ProjectInstructionApplyResponse,
   ProjectInstructionOperation,
   ProjectInstructionPlan,
   ProjectInstructionTarget,
+  ProjectReadinessBaseline,
+  ProjectReadinessReport,
+  ProjectRecommendation,
+  WorkspacePack,
 } from "$lib/types";
 
 const STORAGE_KEY = "agency-agents:projects:v1";
@@ -66,6 +79,34 @@ class ProjectsStore {
 
   inspectInstructions(projectPath: string): Promise<ProjectInstructionTarget[]> {
     return invoke<ProjectInstructionTarget[]>("project_instructions_inspect", { projectPath });
+  }
+
+  saveTeamBaseline(projectPath: string, label: string, slugs: string[]): Promise<ProjectReadinessBaseline> {
+    return projectBaselineSaveTeam(projectPath, label, slugs);
+  }
+
+  importPackBaseline(projectPath: string, pack: WorkspacePack): Promise<ProjectReadinessBaseline> {
+    return projectBaselineImportPack(projectPath, pack);
+  }
+
+  readiness(projectPath: string): Promise<ProjectReadinessReport> {
+    return projectReadinessGet(projectPath);
+  }
+
+  subscribe(projectPath: string, enabled: boolean): Promise<boolean> {
+    return projectSubscriptionSet(projectPath, enabled);
+  }
+
+  recommendations(projectPath: string): Promise<ProjectRecommendation[]> {
+    return projectRecommendationsList(projectPath);
+  }
+
+  dismissRecommendation(projectPath: string, recommendationId: string): Promise<void> {
+    return projectRecommendationDismiss(projectPath, recommendationId);
+  }
+
+  openRecommendation(projectPath: string, recommendationId: string): Promise<ProjectRecommendation> {
+    return projectRecommendationOpen(projectPath, recommendationId);
   }
 
   planInstruction(

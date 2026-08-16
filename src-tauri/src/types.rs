@@ -292,7 +292,7 @@ pub struct SkillFolderAssignment {
     pub folder_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillReference {
     pub source_id: String,
@@ -813,6 +813,120 @@ pub(crate) struct ControlCenterDocument {
     pub(crate) catalog_last_success_at: Option<String>,
     pub(crate) catalog_stale: bool,
     pub(crate) catalog_error: Option<String>,
+    pub(crate) project_baselines: Vec<ProjectReadinessBaseline>,
+    pub(crate) project_subscriptions: Vec<ProjectSubscription>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineRequirement {
+    pub id: String,
+    pub known: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectReadinessBaseline {
+    pub project_path: String,
+    pub label: String,
+    pub agents: Vec<AgentReference>,
+    pub skills: Vec<SkillReference>,
+    pub instructions: Vec<BaselineRequirement>,
+    pub mcp_servers: Vec<BaselineRequirement>,
+    pub tools: Vec<Tool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSubscription {
+    pub project_path: String,
+    pub last_seen_batch: Option<String>,
+    pub dismissed_recommendation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReadinessRowState {
+    Ready,
+    NeedsAttention,
+    Unavailable,
+    Unverifiable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReadinessCategoryState {
+    NotRequired,
+    Ready,
+    NeedsAttention,
+    Unavailable,
+    Unverifiable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectReadinessOverall {
+    NotConfigured,
+    Ready,
+    NeedsAttention,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReadinessCategoryKind {
+    AgentRoster,
+    Skills,
+    Instructions,
+    Mcp,
+    Tools,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessRow {
+    pub id: String,
+    pub label: String,
+    pub state: ReadinessRowState,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessCategoryReport {
+    pub category: ReadinessCategoryKind,
+    pub state: ReadinessCategoryState,
+    pub rows: Vec<ReadinessRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectReadinessReport {
+    pub project_path: String,
+    pub overall: ProjectReadinessOverall,
+    pub baseline: Option<ProjectReadinessBaseline>,
+    pub subscribed: bool,
+    pub categories: Vec<ReadinessCategoryReport>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecommendationLifecycle {
+    New,
+    Superseded,
+    Dismissed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRecommendation {
+    pub id: String,
+    pub project_path: String,
+    pub batch_at: String,
+    pub lifecycle: RecommendationLifecycle,
+    pub summary: String,
+    pub agent_references: Vec<AgentReference>,
 }
 
 /// Bounded UI projection; the potentially 10,000-item snapshot never crosses

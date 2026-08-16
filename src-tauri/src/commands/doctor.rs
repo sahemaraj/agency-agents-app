@@ -676,7 +676,7 @@ fn redact_token(token: &str, home: Option<&Path>) -> String {
     safe
 }
 
-fn sanitize_field(value: &str, home: Option<&Path>) -> String {
+pub(crate) fn sanitize_field(value: &str, home: Option<&Path>) -> String {
     let filtered: String = value
         .chars()
         .filter(|character| !character.is_control() || character.is_whitespace())

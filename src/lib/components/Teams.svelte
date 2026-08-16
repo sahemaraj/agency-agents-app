@@ -70,10 +70,33 @@
   onMount(() => {
     corpus.ensureLoaded();
     teams.hydrate();
+    void projects.refresh();
   });
 
   let tab = $state<"current" | "presets">("current");
   let busy = $state(false);
+  let baselineProject = $state("");
+  let baselineBusy = $state(false);
+  let baselineAnnouncement = $state("");
+
+  async function applyTeamBaseline(subscribe: boolean): Promise<void> {
+    if (!openedTeam || !baselineProject || baselineBusy) return;
+    baselineBusy = true;
+    baselineAnnouncement = "Resolving exact Team references…";
+    try {
+      await projects.saveTeamBaseline(baselineProject, openedTeam.label, openedTeam.agents);
+      if (subscribe) await projects.subscribe(baselineProject, true);
+      baselineAnnouncement = subscribe
+        ? "Team baseline saved and catalog recommendations enabled."
+        : "Team baseline saved.";
+      toast.success("Project readiness updated", baselineAnnouncement);
+    } catch (error) {
+      baselineAnnouncement = isAppError(error) ? appErrorMessage(error) : String(error);
+      toast.error("Could not save Team baseline", baselineAnnouncement);
+    } finally {
+      baselineBusy = false;
+    }
+  }
 
   // ── "Your team" = what WE installed (foreign isn't part of it until tracked). ──
   const managed = $derived(install.installed.filter((i) => i.state !== "foreign"));
@@ -445,6 +468,12 @@
         <span class="td-count">{i18n.count(st.count, "common.agent.one", "common.agent.many")}{#if st.deployed > 0} · {i18n.t("common.detectedCount", { count: st.deployed })}{/if}</span>
         <Button variant="primary" onclick={() => deploy(i18n.t("teams.deployTeamTitle", { team: team.label }), team.agents)}>{i18n.t("teams.deploy")}</Button>
       </div>
+      <div class="team-baseline" aria-busy={baselineBusy}>
+        <label><span>Apply readiness baseline to project</span><select bind:value={baselineProject}><option value="">Choose a registered project</option>{#each projects.list as project (project.path)}<option value={project.path}>{project.label}</option>{/each}</select></label>
+        <Button size="sm" disabled={!baselineProject || baselineBusy} loading={baselineBusy} onclick={() => void applyTeamBaseline(false)}>Save baseline</Button>
+        <Button size="sm" variant="primary" disabled={!baselineProject || baselineBusy} loading={baselineBusy} onclick={() => void applyTeamBaseline(true)}>Save and subscribe</Button>
+        <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{baselineAnnouncement}</div>
+      </div>
 
       <h3 class="td-sec">{i18n.t("teams.tryThese")}</h3>
       <div class="td-examples">
@@ -589,6 +618,9 @@
     flex: none; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
     padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border);
   }
+  .team-baseline { display: flex; flex-wrap: wrap; align-items: end; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); }
+  .team-baseline label { flex: 1; min-width: 14rem; display: grid; gap: var(--space-1); color: var(--color-text-secondary); font-size: var(--text-caption); }
+  .team-baseline select { min-height: 32px; padding: 0 var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-raised); color: var(--color-text-primary); }
   .lo-sub { flex: none; padding: var(--space-2) var(--space-4) 0; color: var(--color-text-secondary); font-size: var(--text-body-sm); }
   .lo-actions { display: flex; gap: var(--space-2); }
 

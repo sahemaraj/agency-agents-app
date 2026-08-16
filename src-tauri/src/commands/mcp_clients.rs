@@ -1218,8 +1218,9 @@ async fn collect_codex_inventory_at(
     }
 }
 
-#[tauri::command]
-pub async fn mcp_inventory(state: State<'_, AppState>) -> Result<McpInventoryReport, AppError> {
+pub(crate) async fn mcp_inventory_for_state(
+    state: &AppState,
+) -> Result<McpInventoryReport, AppError> {
     let trusted_tools = crate::skills::mcp::agency_agents_tool_names();
     let app_exe = env::current_exe().map_err(AppError::from)?;
     let claude_expected = expected_inventory_registration(&app_exe, McpClient::Claude);
@@ -1284,6 +1285,11 @@ pub async fn mcp_inventory(state: State<'_, AppState>) -> Result<McpInventoryRep
         }],
         issues,
     })
+}
+
+#[tauri::command]
+pub async fn mcp_inventory(state: State<'_, AppState>) -> Result<McpInventoryReport, AppError> {
+    mcp_inventory_for_state(&state).await
 }
 
 #[tauri::command]

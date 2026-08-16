@@ -70,6 +70,10 @@ import type {
   OllamaMutationPlan,
   OllamaMutationResult,
   OllamaStatus,
+  ProjectReadinessBaseline,
+  ProjectReadinessReport,
+  ProjectRecommendation,
+  WorkspacePack,
 } from "./types";
 
 export const doctorReport = () => invoke<DoctorReport>("doctor_report");
@@ -110,6 +114,24 @@ export const taskRecommendations = (task: string, limit = 10) =>
 export const catalogFeedList = () => invoke<CatalogFeedState>("catalog_feed_list");
 export const catalogSourceTransitionRecover = () =>
   invoke<boolean>("catalog_source_transition_recover");
+
+export const projectBaselineSaveTeam = (
+  projectPath: string,
+  label: string,
+  slugs: string[],
+) => invoke<ProjectReadinessBaseline>("project_baseline_save_team", { projectPath, label, slugs });
+export const projectBaselineImportPack = (projectPath: string, pack: WorkspacePack) =>
+  invoke<ProjectReadinessBaseline>("project_baseline_import_pack", { projectPath, pack });
+export const projectReadinessGet = (projectPath: string) =>
+  invoke<ProjectReadinessReport>("project_readiness_get", { projectPath });
+export const projectSubscriptionSet = (projectPath: string, enabled: boolean) =>
+  invoke<boolean>("project_subscription_set", { projectPath, enabled });
+export const projectRecommendationsList = (projectPath: string) =>
+  invoke<ProjectRecommendation[]>("project_recommendations_list", { projectPath });
+export const projectRecommendationDismiss = (projectPath: string, recommendationId: string) =>
+  invoke<void>("project_recommendation_dismiss", { projectPath, recommendationId });
+export const projectRecommendationOpen = (projectPath: string, recommendationId: string) =>
+  invoke<ProjectRecommendation>("project_recommendation_open", { projectPath, recommendationId });
 
 // ============================================================
 // Agent sources, drafts, and personal library

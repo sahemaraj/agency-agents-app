@@ -1338,6 +1338,58 @@ export interface WorkspacePackApplyResponse {
   result: WorkspacePackApplyResult | null;
 }
 
+export interface BaselineRequirement {
+  id: string;
+  known: boolean;
+}
+
+export interface ProjectReadinessBaseline {
+  projectPath: string;
+  label: string;
+  agents: AgentReference[];
+  skills: SkillReference[];
+  instructions: BaselineRequirement[];
+  mcpServers: BaselineRequirement[];
+  tools: Tool[];
+}
+
+export type ReadinessRowState = "ready" | "needsAttention" | "unavailable" | "unverifiable";
+export type ReadinessCategoryState = "notRequired" | ReadinessRowState;
+export type ProjectReadinessOverall = "notConfigured" | "ready" | "needsAttention" | "unavailable";
+export type ReadinessCategoryKind = "agentRoster" | "skills" | "instructions" | "mcp" | "tools";
+
+export interface ReadinessRow {
+  id: string;
+  label: string;
+  state: ReadinessRowState;
+  evidence: string;
+}
+
+export interface ReadinessCategoryReport {
+  category: ReadinessCategoryKind;
+  state: ReadinessCategoryState;
+  rows: ReadinessRow[];
+}
+
+export interface ProjectReadinessReport {
+  projectPath: string;
+  overall: ProjectReadinessOverall;
+  baseline: ProjectReadinessBaseline | null;
+  subscribed: boolean;
+  categories: ReadinessCategoryReport[];
+}
+
+export type RecommendationLifecycle = "new" | "superseded" | "dismissed" | "blocked";
+
+export interface ProjectRecommendation {
+  id: string;
+  projectPath: string;
+  batchAt: string;
+  lifecycle: RecommendationLifecycle;
+  summary: string;
+  agentReferences: AgentReference[];
+}
+
 export interface AgentVersionSnapshot {
   id: string;
   createdAt: string;
