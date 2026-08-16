@@ -67,6 +67,7 @@
   async function run(fn: () => Promise<unknown>, ok: string) {
     try {
       await fn();
+      await loadFeed();
       toast.success(ok);
     } catch (e) {
       toast.error(i18n.t("catalog.actionFailed"), isAppError(e) ? appErrorMessage(e) : String(e));
@@ -122,6 +123,14 @@
       case "userClone":
         return i18n.t(catalog.source.manage ? "catalog.source.userManaged" : "catalog.source.userReadOnly");
     }
+  });
+  const feedAnnouncement = $derived.by(() => {
+    if (feedLoading) return i18n.t("common.loading");
+    if (feed?.stale || feedError) {
+      return feed?.error ?? feedError ?? i18n.optional("catalog.refreshFailed", "Catalog refresh failed");
+    }
+    if (feed) return i18n.optional("catalog.changeFeedLoaded", "Catalog changes loaded");
+    return "";
   });
 
   function shortDate(iso: string | null): string {
@@ -208,7 +217,8 @@
     {/if}
   </div>
 
-  <div class="feed" aria-live="polite">
+  <div class="feed">
+    <p class="sr-only" role="status" aria-live="polite" aria-atomic="true">{feedAnnouncement}</p>
     <div class="feed-head">
       <h3>{i18n.optional("catalog.changeFeed", "Catalog changes")}</h3>
       <span class="hint">

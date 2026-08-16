@@ -37,7 +37,7 @@ import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type DoctorReport, type ExpertResolved, type ExpertRun, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type WorkspacePackPlan } from "$lib/types";
+import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type CatalogFeedState, type CatalogStatus, type DoctorReport, type ExpertResolved, type ExpertRun, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type WorkspacePackPlan } from "$lib/types";
 
 const notificationMocks = vi.hoisted(() => ({
   isPermissionGranted: vi.fn(async () => true),
@@ -116,6 +116,30 @@ const installRecord = (slug: string, dest: string): InstallRecord => ({
   disabledPath: null, sourceSnapshotHash: "snapshot", capabilities: [], publisherKey: null,
   publisherVerified: false, installedAt: "2026-08-14T01:00:00Z", corpusVersion: "test",
 });
+const catalogStatusFixture: CatalogStatus = {
+  source: { kind: "bundled" }, root: null, isGit: false, branch: null, commit: null,
+  lastCommitSubject: null, lastCommitDate: null, dirtyCount: 0, remoteUrl: null,
+  repoSlug: null, version: "test", fetchedAt: "2026-08-17T00:00:00Z", agentCount: 1,
+};
+const catalogFeedFixture = (
+  path = "engineering/reviewer.md",
+  stale = false,
+  error: string | null = null,
+): CatalogFeedState => ({
+  lastSuccessAt: "2026-08-17T00:00:00Z",
+  stale,
+  error,
+  batches: [{
+    at: "2026-08-17T00:00:00Z",
+    changes: [{
+      kind: "added",
+      item: {
+        category: "engineering", relativePath: path,
+        sourceHash: "a".repeat(64), bodyHash: "b".repeat(64),
+      },
+    }],
+  }],
+});
 const staleControlPackage: AgentPackageResult = {
   reference: { sourceId: "built-in", relativePath: "reviewer.md" }, agent: staleControlAgent,
   sourceHash: "source", frontmatterHash: "frontmatter", bodyHash: "body", version: null,
@@ -174,6 +198,13 @@ beforeEach(async () => {
     ["skill_folders_list", "agent_library_list"].includes(command) ? emptyFolderState() as never : [] as never);
   catalog.busy = false;
   catalog.error = null;
+  catalog.source = { kind: "bundled" };
+  catalog.configured = true;
+  catalog.status = null;
+  catalog.updateCheck = null;
+  catalog.detection = null;
+  catalog.checking = false;
+  catalog.scanning = false;
   corpus.agents = [];
   corpus.categories = [];
   corpus.loading = false;
@@ -1026,6 +1057,154 @@ describe("frontend test harness", () => {
         ? settings.error
         : experts.error;
     expect(actual).toBe(expected);
+  });
+
+  it("loads the catalog feed on initial render", async () => {
+    let resolveFeed!: (feed: CatalogFeedState) => void;
+    const feedResponse = new Promise<CatalogFeedState>((resolve) => { resolveFeed = resolve; });
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "catalog_source_get") return { kind: "bundled" } as never;
+      if (command === "catalog_configured") return true as never;
+      if (command === "catalog_status") return catalogStatusFixture as never;
+      if (command === "catalog_detect") return { gitAvailable: false, scanned: false, candidates: [] } as never;
+      if (command === "github_status") return { signedIn: false, username: null, scopes: [] } as never;
+      if (command === "catalog_feed_list") return feedResponse as never;
+      return [] as never;
+    });
+    const { default: SettingsSectionCatalog } = await import("$lib/components/SettingsSectionCatalog.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionCatalog, { target });
+    try {
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "catalog_feed_list")).toBe(true));
+      expect(target.querySelector(".feed")?.textContent).toContain("Loading");
+      resolveFeed({ lastSuccessAt: null, stale: false, error: null, batches: [] });
+      await vi.waitFor(() => expect(target.querySelector(".feed")?.textContent).toContain("No successful catalog refreshes yet"));
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("renders catalog feed history outside one concise live status", async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "catalog_source_get") return { kind: "bundled" } as never;
+      if (command === "catalog_configured") return true as never;
+      if (command === "catalog_status") return catalogStatusFixture as never;
+      if (command === "catalog_detect") return { gitAvailable: false, scanned: false, candidates: [] } as never;
+      if (command === "github_status") return { signedIn: false, username: null, scopes: [] } as never;
+      if (command === "catalog_feed_list") return catalogFeedFixture() as never;
+      return [] as never;
+    });
+    const { default: SettingsSectionCatalog } = await import("$lib/components/SettingsSectionCatalog.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionCatalog, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain("engineering/reviewer.md"));
+      expect(target.querySelectorAll('.feed [role="status"][aria-live="polite"]')).toHaveLength(1);
+      expect(target.querySelector(".batches")?.closest('[aria-live="polite"]')).toBeNull();
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("retains prior catalog batches and timestamp when refresh fails", async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "catalog_source_get") return { kind: "bundled" } as never;
+      if (command === "catalog_configured") return true as never;
+      if (command === "catalog_status") return catalogStatusFixture as never;
+      if (command === "catalog_detect") return { gitAvailable: false, scanned: false, candidates: [] } as never;
+      if (command === "github_status") return { signedIn: false, username: null, scopes: [] } as never;
+      if (command === "catalog_feed_list") return catalogFeedFixture() as never;
+      if (command === "catalog_pull") throw { code: "network", url: "https://example.test", message: "offline" };
+      return [] as never;
+    });
+    const { default: SettingsSectionCatalog } = await import("$lib/components/SettingsSectionCatalog.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionCatalog, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain("engineering/reviewer.md"));
+      const timestamp = target.querySelector(".feed-head .hint")?.textContent;
+      target.querySelector<HTMLButtonElement>("button.primary")!.click();
+      await vi.waitFor(() => expect(target.querySelector(".feed-error")?.textContent).toContain("Network error: offline"));
+      expect(target.textContent).toContain("engineering/reviewer.md");
+      expect(target.querySelector(".feed-head .hint")?.textContent).toBe(timestamp);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("reloads catalog feed state after Retry succeeds", async () => {
+    let feedCalls = 0;
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "catalog_source_get") return { kind: "bundled" } as never;
+      if (command === "catalog_configured") return true as never;
+      if (command === "catalog_status") return catalogStatusFixture as never;
+      if (command === "catalog_detect") return { gitAvailable: false, scanned: false, candidates: [] } as never;
+      if (command === "github_status") return { signedIn: false, username: null, scopes: [] } as never;
+      if (command === "catalog_feed_list") {
+        feedCalls += 1;
+        return (feedCalls === 1
+          ? catalogFeedFixture("engineering/old.md", true, "Previous refresh failed")
+          : catalogFeedFixture("engineering/recovered.md")) as never;
+      }
+      if (command === "catalog_pull") return { version: "test", commit: null, fetchedAt: "2026-08-17T00:01:00Z", count: 1 } as never;
+      if (command === "corpus_list" || command === "corpus_categories") return [] as never;
+      return [] as never;
+    });
+    const { default: SettingsSectionCatalog } = await import("$lib/components/SettingsSectionCatalog.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionCatalog, { target });
+    try {
+      await vi.waitFor(() => expect(target.querySelector(".feed-error")?.textContent).toContain("Previous refresh failed"));
+      target.querySelector<HTMLButtonElement>(".feed-error button")!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("engineering/recovered.md"));
+      expect(target.querySelector(".feed-error")).toBeNull();
+      expect(feedCalls).toBe(2);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("reloads and clears stale catalog feed state after a source switch", async () => {
+    let feedCalls = 0;
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "catalog_source_get") return { kind: "bundled" } as never;
+      if (command === "catalog_configured") return true as never;
+      if (command === "catalog_status") return catalogStatusFixture as never;
+      if (command === "catalog_detect") return { gitAvailable: false, scanned: false, candidates: [] } as never;
+      if (command === "github_status") return { signedIn: false, username: null, scopes: [] } as never;
+      if (command === "catalog_feed_list") {
+        feedCalls += 1;
+        return (feedCalls === 1
+          ? catalogFeedFixture("engineering/old-source.md", true, "Old source failed")
+          : { lastSuccessAt: null, stale: false, error: null, batches: [] }) as never;
+      }
+      if (command === "catalog_source_set") return { version: "test", commit: null, fetchedAt: "2026-08-17T00:01:00Z", count: 0 } as never;
+      if (command === "corpus_list" || command === "corpus_categories") return [] as never;
+      return [] as never;
+    });
+    const { default: SettingsSectionCatalog } = await import("$lib/components/SettingsSectionCatalog.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionCatalog, { target });
+    try {
+      await vi.waitFor(() => expect(target.querySelector(".feed-error")?.textContent).toContain("Old source failed"));
+      target.querySelectorAll<HTMLButtonElement>("button.card")[1]!.click();
+      await vi.waitFor(() => expect(feedCalls).toBe(2));
+      expect(target.querySelector(".feed-error")).toBeNull();
+      expect(target.textContent).not.toContain("engineering/old-source.md");
+      expect(target.querySelector(".feed")?.textContent).toContain("No successful catalog refreshes yet");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
   });
 
   it("renders semantic catalog action failures in the existing toast", async () => {

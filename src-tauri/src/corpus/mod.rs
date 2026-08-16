@@ -40,8 +40,8 @@ use crate::error::AppError;
 use crate::github::extract_github_repo;
 use crate::types::{
     Agent, CatalogCandidate, CatalogChange, CatalogDetection, CatalogFeedBatch, CatalogFeedState,
-    CatalogSnapshotItem, CatalogSnapshotProvenance, CatalogSource, CatalogStatus,
-    CatalogUpdateCheck, Category, ControlCenterDocument, CorpusEntry, CorpusMeta,
+    CatalogPendingRefresh, CatalogSnapshotItem, CatalogSnapshotProvenance, CatalogSource,
+    CatalogStatus, CatalogUpdateCheck, Category, ControlCenterDocument, CorpusEntry, CorpusMeta,
 };
 use crate::util::fs::atomic_write;
 
@@ -601,6 +601,25 @@ fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppEr
             });
         }
     }
+    if let Some(pending) = &document.catalog_pending_refresh {
+        let Some(provenance) = &document.active_catalog_provenance else {
+            return Err(AppError::InvalidArgument {
+                message: "control-center pending catalog refresh has no baseline".into(),
+            });
+        };
+        if !valid_hash(&pending.source_key)
+            || !valid_hash(&pending.baseline_revision)
+            || !matches!(pending.command.as_str(), "corpus_refresh" | "catalog_pull")
+            || !valid_timestamp(&pending.started_at)
+            || pending.source_key != provenance.source_key
+            || pending.baseline_revision != provenance.revision
+            || !document.catalog_stale
+        {
+            return Err(AppError::InvalidArgument {
+                message: "control-center pending catalog refresh is invalid".into(),
+            });
+        }
+    }
 
     let mut previous_at: Option<chrono::DateTime<chrono::FixedOffset>> = None;
     for batch in &document.catalog_feed {
@@ -783,11 +802,19 @@ async fn persist_catalog_refresh(
             control_center_spec(),
             ControlCenterDocument::default(),
             move |document| {
-                if document
-                    .active_catalog_provenance
-                    .as_ref()
-                    .map(|provenance| provenance.source_key.as_str())
-                    != Some(source_key.as_str())
+                let Some(provenance) = document.active_catalog_provenance.as_ref() else {
+                    return Err(AppError::InvalidArgument {
+                        message: "catalog refresh has no durable baseline".into(),
+                    });
+                };
+                let Some(pending) = document.catalog_pending_refresh.as_ref() else {
+                    return Err(AppError::InvalidArgument {
+                        message: "catalog refresh was not durably prepared".into(),
+                    });
+                };
+                if provenance.source_key != source_key
+                    || pending.source_key != source_key
+                    || pending.baseline_revision != provenance.revision
                 {
                     return Err(AppError::InvalidArgument {
                         message: "catalog source changed before its refresh was committed".into(),
@@ -819,7 +846,56 @@ async fn persist_catalog_refresh(
                     revision: catalog_snapshot_revision(&document.active_catalog_snapshot),
                 });
                 document.catalog_last_success_at = Some(at);
+                document.catalog_pending_refresh = None;
                 document.catalog_stale = false;
+                document.catalog_error = None;
+                Ok(())
+            },
+        )
+        .await
+}
+
+async fn begin_catalog_refresh(
+    database: &crate::state_db::StateDatabase,
+    source_key: String,
+    entrypoint: CatalogRefreshEntrypoint,
+    started_at: String,
+) -> Result<(), AppError> {
+    database
+        .mutate(
+            control_center_spec(),
+            ControlCenterDocument::default(),
+            move |document| {
+                let provenance = document.active_catalog_provenance.as_ref().ok_or_else(|| {
+                    AppError::InvalidArgument {
+                        message: "catalog refresh has no durable baseline".into(),
+                    }
+                })?;
+                if provenance.source_key != source_key {
+                    return Err(AppError::InvalidArgument {
+                        message: "catalog source changed before refresh preparation".into(),
+                    });
+                }
+                match document.catalog_pending_refresh.as_ref() {
+                    Some(pending)
+                        if pending.source_key != source_key
+                            || pending.baseline_revision != provenance.revision =>
+                    {
+                        return Err(AppError::InvalidArgument {
+                            message: "pending catalog refresh belongs to another baseline".into(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        document.catalog_pending_refresh = Some(CatalogPendingRefresh {
+                            source_key,
+                            baseline_revision: provenance.revision.clone(),
+                            command: entrypoint.feature().into(),
+                            started_at,
+                        });
+                    }
+                }
+                document.catalog_stale = true;
                 document.catalog_error = None;
                 Ok(())
             },
@@ -832,6 +908,15 @@ async fn persist_catalog_baseline(
     source_key: String,
     snapshot: Vec<CatalogSnapshotItem>,
 ) -> Result<(), AppError> {
+    write_catalog_baseline(database, source_key, snapshot, true).await
+}
+
+async fn write_catalog_baseline(
+    database: &crate::state_db::StateDatabase,
+    source_key: String,
+    snapshot: Vec<CatalogSnapshotItem>,
+    clear_history: bool,
+) -> Result<(), AppError> {
     database
         .mutate(
             control_center_spec(),
@@ -842,6 +927,11 @@ async fn persist_catalog_baseline(
                     source_key,
                     revision: catalog_snapshot_revision(&document.active_catalog_snapshot),
                 });
+                document.catalog_pending_refresh = None;
+                if clear_history {
+                    document.catalog_feed.clear();
+                    document.catalog_last_success_at = None;
+                }
                 document.catalog_stale = false;
                 document.catalog_error = None;
                 Ok(())
@@ -857,13 +947,16 @@ async fn ensure_catalog_baseline(
 ) -> Result<(), AppError> {
     let document = load_control_center(database).await?;
     let revision = catalog_snapshot_revision(&snapshot);
-    let needs_baseline = match document.active_catalog_provenance.as_ref() {
-        None => true,
-        Some(provenance) if provenance.source_key != source_key => true,
-        Some(provenance) => provenance.revision != revision && !document.catalog_stale,
+    let (needs_baseline, clear_history) = match document.active_catalog_provenance.as_ref() {
+        None => (true, true),
+        Some(provenance) if provenance.source_key != source_key => (true, true),
+        Some(provenance) => (
+            provenance.revision != revision && document.catalog_pending_refresh.is_none(),
+            false,
+        ),
     };
     if needs_baseline {
-        persist_catalog_baseline(database, source_key, snapshot).await?;
+        write_catalog_baseline(database, source_key, snapshot, clear_history).await?;
     }
     Ok(())
 }
@@ -1919,32 +2012,7 @@ pub async fn corpus_refresh(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CorpusMeta, AppError> {
-    state.require_network("corpus_refresh").await?;
-
-    // Single-flight: a second click fast-fails rather than queuing a
-    // duplicate download.
-    let _flight = match state.corpus_refresh_in_flight.try_lock() {
-        Ok(g) => g,
-        Err(_) => {
-            return Err(AppError::InvalidArgument {
-                message: "corpus refresh already in progress".into(),
-            });
-        }
-    };
-
-    let adir = app_data_dir(&app)?;
-    refresh(&adir).await?;
-
-    // Rebuild the in-memory copy from the freshly-written working tree and
-    // swap the memoized Arc so subsequent reads see the new corpus.
-    let bdir = baseline_dir(&app)?;
-    let fresh = Arc::new(resolve_active(&adir, &bdir).await);
-    let meta = fresh.meta();
-    {
-        let mut cached = state.corpus_cache.lock().await;
-        *cached = Some(fresh);
-    }
-    Ok(meta)
+    refresh_catalog_authority(&app, &state, CatalogRefreshEntrypoint::CorpusRefresh).await
 }
 
 /// `catalog_source_get()` — the persisted [`CatalogSource`] (default Bundled).
@@ -2039,6 +2107,15 @@ async fn build_source_checked(
     app_data_dir: &Path,
     source: &CatalogSource,
 ) -> Result<Corpus, AppError> {
+    let corpus = read_source_checked(app_data_dir, source).await?;
+    persist(app_data_dir, &corpus).await?;
+    Ok(corpus)
+}
+
+async fn read_source_checked(
+    app_data_dir: &Path,
+    source: &CatalogSource,
+) -> Result<Corpus, AppError> {
     let dir = catalog_root(app_data_dir, source);
     let categories = discover_categories(&dir);
     let version = load_stored_meta(app_data_dir)
@@ -2047,7 +2124,6 @@ async fn build_source_checked(
         .unwrap_or_else(|| BASELINE_VERSION.to_string());
     let mut corpus = build_from_dir(&dir, &version, &categories).await?;
     corpus.division_meta = load_division_meta(&dir);
-    persist(app_data_dir, &corpus).await?;
     Ok(corpus)
 }
 
@@ -2096,7 +2172,30 @@ pub async fn catalog_pull(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CorpusMeta, AppError> {
-    state.require_network("catalog_pull").await?;
+    refresh_catalog_authority(&app, &state, CatalogRefreshEntrypoint::CatalogPull).await
+}
+
+#[derive(Clone, Copy)]
+enum CatalogRefreshEntrypoint {
+    CorpusRefresh,
+    CatalogPull,
+}
+
+impl CatalogRefreshEntrypoint {
+    fn feature(self) -> &'static str {
+        match self {
+            Self::CorpusRefresh => "corpus_refresh",
+            Self::CatalogPull => "catalog_pull",
+        }
+    }
+}
+
+async fn refresh_catalog_authority(
+    app: &AppHandle,
+    state: &AppState,
+    entrypoint: CatalogRefreshEntrypoint,
+) -> Result<CorpusMeta, AppError> {
+    state.require_network(entrypoint.feature()).await?;
     let _flight =
         state
             .corpus_refresh_in_flight
@@ -2104,7 +2203,7 @@ pub async fn catalog_pull(
             .map_err(|_| AppError::InvalidArgument {
                 message: "catalog refresh already in progress".into(),
             })?;
-    let adir = app_data_dir(&app)?;
+    let adir = app_data_dir(app)?;
     let database =
         state
             .completed_state_database()
@@ -2113,10 +2212,10 @@ pub async fn catalog_pull(
                 message: "SQLite migration must complete before refreshing the catalog".into(),
             })?;
     // Establish a durable same-source baseline before any catalog bytes
-    // change. A stale same-source revision is retained so a failed post-pull
-    // commit can replay its diff on the next successful refresh.
+    // change. An existing pending marker retains its baseline so a crashed
+    // post-pull commit replays the diff on the next successful refresh.
     let source = load_catalog_source(&adir).await;
-    let before = match build_source_checked(&adir, &source).await {
+    let before = match read_source_checked(&adir, &source).await {
         Ok(corpus) => corpus,
         Err(error) => {
             let _ = mark_catalog_feed_stale(&database, &error.to_string()).await;
@@ -2127,6 +2226,17 @@ pub async fn catalog_pull(
         &database,
         catalog_source_key(&source),
         before.catalog_snapshot(),
+    )
+    .await
+    {
+        let _ = mark_catalog_feed_stale(&database, &error.to_string()).await;
+        return Err(error);
+    }
+    if let Err(error) = begin_catalog_refresh(
+        &database,
+        catalog_source_key(&source),
+        entrypoint,
+        chrono::Utc::now().to_rfc3339(),
     )
     .await
     {
@@ -2424,7 +2534,8 @@ pub async fn corpus_categories(
 mod tests {
     use super::*;
     use crate::types::{
-        CatalogChange, CatalogFeedBatch, CatalogSnapshotItem, ControlCenterDocument,
+        CatalogChange, CatalogFeedBatch, CatalogPendingRefresh, CatalogSnapshotItem,
+        ControlCenterDocument,
     };
 
     fn write_agent(dir: &Path, category: &str, slug: &str, name: &str, body: &str) {
@@ -2441,6 +2552,22 @@ mod tests {
             source_hash: format!("{:064x}", hash as u32),
             body_hash: format!("{:064x}", hash as u32 + 1),
         }
+    }
+
+    async fn commit_catalog_refresh(
+        database: &crate::state_db::StateDatabase,
+        source_key: String,
+        snapshot: Vec<CatalogSnapshotItem>,
+        at: &str,
+    ) -> Result<(), AppError> {
+        begin_catalog_refresh(
+            database,
+            source_key.clone(),
+            CatalogRefreshEntrypoint::CatalogPull,
+            at.into(),
+        )
+        .await?;
+        persist_catalog_refresh(database, source_key, snapshot, at.into()).await
     }
 
     #[test]
@@ -2556,16 +2683,24 @@ mod tests {
         persist_catalog_baseline(&database, source_key.clone(), old.clone())
             .await
             .unwrap();
-        persist_catalog_refresh(
+        commit_catalog_refresh(
             &database,
             source_key.clone(),
             old.clone(),
-            "2026-08-17T00:00:00Z".into(),
+            "2026-08-17T00:00:00Z",
         )
         .await
         .unwrap();
 
         let invalid = vec![snapshot_item(&"x".repeat(257), "x/invalid.md", 'b')];
+        begin_catalog_refresh(
+            &database,
+            source_key.clone(),
+            CatalogRefreshEntrypoint::CatalogPull,
+            "2026-08-17T00:01:00Z".into(),
+        )
+        .await
+        .unwrap();
         assert!(persist_catalog_refresh(
             &database,
             source_key.clone(),
@@ -2605,6 +2740,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_crash_after_catalog_mutation_replays_from_the_retained_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = root.path().join("catalog");
+        write_agent(&catalog, "engineering", "old", "Agent", "same body");
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let source_key = "a".repeat(64);
+        let old = build_from_dir(&catalog, "test", &discover_categories(&catalog))
+            .await
+            .unwrap()
+            .catalog_snapshot();
+        persist_catalog_baseline(&database, source_key.clone(), old.clone())
+            .await
+            .unwrap();
+
+        begin_catalog_refresh(
+            &database,
+            source_key.clone(),
+            CatalogRefreshEntrypoint::CatalogPull,
+            "2026-08-17T00:00:00Z".into(),
+        )
+        .await
+        .unwrap();
+        std::fs::rename(
+            catalog.join("engineering/old.md"),
+            catalog.join("engineering/new.md"),
+        )
+        .unwrap();
+        let mutated = build_from_dir(&catalog, "test", &discover_categories(&catalog))
+            .await
+            .unwrap()
+            .catalog_snapshot();
+        // Simulate process death before the feed transaction by reopening
+        // durable state after the real source-tree rename.
+        let reopened = crate::state_db::StateDatabase::existing(root.path()).unwrap();
+        ensure_catalog_baseline(&reopened, source_key.clone(), mutated.clone())
+            .await
+            .unwrap();
+        let pending = load_control_center(&reopened).await.unwrap();
+        assert_eq!(pending.active_catalog_snapshot, old);
+        assert!(pending.catalog_pending_refresh.is_some());
+
+        persist_catalog_refresh(
+            &reopened,
+            source_key,
+            mutated,
+            "2026-08-17T00:01:00Z".into(),
+        )
+        .await
+        .unwrap();
+        let recovered = load_control_center(&reopened).await.unwrap();
+        assert!(recovered.catalog_pending_refresh.is_none());
+        assert!(matches!(
+            recovered.catalog_feed[0].changes.as_slice(),
+            [CatalogChange::Renamed { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_refresh_marker_is_bounded_and_bound_to_the_retained_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let source_key = "a".repeat(64);
+        persist_catalog_baseline(&database, source_key.clone(), Vec::new())
+            .await
+            .unwrap();
+
+        let result = database
+            .mutate(
+                control_center_spec(),
+                ControlCenterDocument::default(),
+                move |document| {
+                    document.catalog_pending_refresh = Some(CatalogPendingRefresh {
+                        source_key,
+                        baseline_revision: "b".repeat(64),
+                        command: "catalog_pull".into(),
+                        started_at: "x".repeat(257),
+                    });
+                    Ok(())
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AppError::InvalidArgument { .. })));
+    }
+
+    #[tokio::test]
+    async fn every_registered_catalog_refresh_entrypoint_is_durably_attributed() {
+        for (entrypoint, expected) in [
+            (CatalogRefreshEntrypoint::CorpusRefresh, "corpus_refresh"),
+            (CatalogRefreshEntrypoint::CatalogPull, "catalog_pull"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+            database
+                .set_migration_state(crate::types::StorageMigrationState::Complete)
+                .await
+                .unwrap();
+            let source_key = "a".repeat(64);
+            persist_catalog_baseline(&database, source_key.clone(), Vec::new())
+                .await
+                .unwrap();
+
+            begin_catalog_refresh(
+                &database,
+                source_key,
+                entrypoint,
+                "2026-08-17T00:00:00Z".into(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                load_control_center(&database)
+                    .await
+                    .unwrap()
+                    .catalog_pending_refresh
+                    .unwrap()
+                    .command,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn first_pull_baselines_existing_catalog_without_an_all_added_batch() {
         let root = tempfile::tempdir().unwrap();
         let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
@@ -2621,14 +2888,9 @@ mod tests {
         ensure_catalog_baseline(&database, "a".repeat(64), existing)
             .await
             .unwrap();
-        persist_catalog_refresh(
-            &database,
-            "a".repeat(64),
-            refreshed,
-            "2026-08-17T00:00:00Z".into(),
-        )
-        .await
-        .unwrap();
+        commit_catalog_refresh(&database, "a".repeat(64), refreshed, "2026-08-17T00:00:00Z")
+            .await
+            .unwrap();
 
         let document = load_control_center(&database).await.unwrap();
         assert!(matches!(
@@ -2651,17 +2913,23 @@ mod tests {
         ensure_catalog_baseline(&database, "a".repeat(64), first)
             .await
             .unwrap();
-        persist_catalog_baseline(&database, "b".repeat(64), second.clone())
-            .await
-            .unwrap();
-        persist_catalog_refresh(
+        commit_catalog_refresh(
             &database,
-            "b".repeat(64),
-            second,
-            "2026-08-17T00:00:00Z".into(),
+            "a".repeat(64),
+            vec![snapshot_item("engineering", "engineering/changed.md", 'c')],
+            "2026-08-17T00:00:00Z",
         )
         .await
         .unwrap();
+        persist_catalog_baseline(&database, "b".repeat(64), second.clone())
+            .await
+            .unwrap();
+        let switched = load_control_center(&database).await.unwrap();
+        assert!(switched.catalog_feed.is_empty());
+        assert_eq!(switched.catalog_last_success_at, None);
+        commit_catalog_refresh(&database, "b".repeat(64), second, "2026-08-17T00:01:00Z")
+            .await
+            .unwrap();
 
         let document = load_control_center(&database).await.unwrap();
         assert_eq!(document.catalog_feed.len(), 1);
@@ -2682,14 +2950,9 @@ mod tests {
         ensure_catalog_baseline(&database, "a".repeat(64), first)
             .await
             .unwrap();
-        persist_catalog_refresh(
-            &database,
-            "a".repeat(64),
-            second,
-            "2026-08-17T00:00:00Z".into(),
-        )
-        .await
-        .unwrap();
+        commit_catalog_refresh(&database, "a".repeat(64), second, "2026-08-17T00:00:00Z")
+            .await
+            .unwrap();
 
         let document = load_control_center(&database).await.unwrap();
         assert!(matches!(
@@ -2714,11 +2977,11 @@ mod tests {
         )
         .await
         .unwrap();
-        persist_catalog_refresh(
+        commit_catalog_refresh(
             &database,
             source_key,
             vec![snapshot_item("engineering", "engineering/agent.md", 'a')],
-            "2026-08-17T00:00:00Z".into(),
+            "2026-08-17T00:00:00Z",
         )
         .await
         .unwrap();

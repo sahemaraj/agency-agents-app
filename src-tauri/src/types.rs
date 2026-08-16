@@ -783,6 +783,15 @@ pub(crate) struct CatalogSnapshotProvenance {
     pub(crate) revision: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CatalogPendingRefresh {
+    pub(crate) source_key: String,
+    pub(crate) baseline_revision: String,
+    pub(crate) command: String,
+    pub(crate) started_at: String,
+}
+
 /// The single forward-compatible control-center document. Later capabilities
 /// extend this document; Task 1 stores only active-catalog feed truth.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -790,6 +799,7 @@ pub(crate) struct CatalogSnapshotProvenance {
 pub(crate) struct ControlCenterDocument {
     pub(crate) active_catalog_snapshot: Vec<CatalogSnapshotItem>,
     pub(crate) active_catalog_provenance: Option<CatalogSnapshotProvenance>,
+    pub(crate) catalog_pending_refresh: Option<CatalogPendingRefresh>,
     pub(crate) catalog_feed: Vec<CatalogFeedBatch>,
     pub(crate) catalog_last_success_at: Option<String>,
     pub(crate) catalog_stale: bool,
