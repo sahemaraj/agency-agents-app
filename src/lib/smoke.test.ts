@@ -11,6 +11,7 @@ import SettingsSectionMcp from "$lib/components/SettingsSectionMcp.svelte";
 import agentsWorkspaceSource from "$lib/components/AgentsWorkspace.svelte?raw";
 import skillsWorkspaceSource from "$lib/components/SkillsWorkspace.svelte?raw";
 import installModalSource from "$lib/components/InstallModal.svelte?raw";
+import ollamaDeployModalSource from "$lib/components/OllamaDeployModal.svelte?raw";
 import deployBrowserSource from "$lib/components/DeployBrowser.svelte?raw";
 import dashboardSource from "$lib/components/AgencyDashboard.svelte?raw";
 import toolsViewSource from "$lib/components/ToolsView.svelte?raw";
@@ -885,6 +886,27 @@ describe("frontend test harness", () => {
       expect(source).toContain("ui.openActivityReceipt(receiptId)");
     }
     expect(installModalSource).toContain("install.applyCollection(pendingCollection, plan)");
+  });
+
+  it("guards the reviewed local Ollama lifecycle from Agent detail", () => {
+    const detailSource = rel01Sources["./components/AgentDetailTabs.svelte"];
+    expect(detailSource).toContain("onLocalModel");
+    expect(agentsWorkspaceSource).toContain("<OllamaDeployModal");
+    expect(agentsWorkspaceSource).toContain("onLocalModel={() => (ollamaOpen = true)}");
+
+    expect(ollamaDeployModalSource).toContain("ollamaStatus()");
+    expect(ollamaDeployModalSource).toContain("ollamaPlan(pkg.reference, operation, baseModel)");
+    expect(ollamaDeployModalSource).toContain("ollamaApply(pkg.reference, plan.operation, plan.baseModel, plan.revision)");
+    expect(ollamaDeployModalSource).toContain('"This device"');
+    expect(ollamaDeployModalSource).toContain("plan.promptPreview");
+    expect(ollamaDeployModalSource).toContain("plan.blockers");
+    expect(ollamaDeployModalSource).toContain("plan.warnings");
+    expect(ollamaDeployModalSource).toContain("statusError");
+    expect(ollamaDeployModalSource).toContain("activity.log");
+    expect(ollamaDeployModalSource).toContain("safeActivityDetail");
+    expect(ollamaDeployModalSource).toContain("ui.openActivityReceipt(receiptId)");
+    expect(ollamaDeployModalSource).not.toContain("detail: plan.promptPreview");
+    expect(ollamaDeployModalSource).not.toContain("destination: plan.promptPreview");
   });
 
   it("renders semantic AppErrors in both Agent source alerts", async () => {

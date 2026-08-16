@@ -19,6 +19,7 @@
     catalogDeployment?: boolean;
     onCategory: (slug: string) => void;
     onInstall: () => void;
+    onLocalModel?: () => void;
     onEdit?: () => void;
     onDuplicate?: () => void;
     onDiff: (target: { slug: string; tool: Tool; projectPath: string | null; name: string }) => void;
@@ -32,6 +33,7 @@
     catalogDeployment = false,
     onCategory,
     onInstall,
+    onLocalModel,
     onEdit,
     onDuplicate,
     onDiff,
@@ -129,6 +131,9 @@
           {#snippet icon()}<DownloadIcon size={14} />{/snippet}
           {i18n.t(pkg ? "agents.manageInstallations" : "agents.installAgent")}
         </Button>
+        {#if pkg?.installable && onLocalModel}
+          <Button size="sm" onclick={onLocalModel}>{i18n.optional("agents.localModel", "Local model")}</Button>
+        {/if}
         {#if pkg && onEdit}<Button size="sm" onclick={onEdit}>{i18n.t("agents.editAsDraft")}</Button>{/if}
         {#if pkg && onDuplicate}<Button size="sm" onclick={onDuplicate}>{i18n.t("agents.duplicateDraft")}</Button>{/if}
       {/snippet}

@@ -1192,6 +1192,61 @@ export interface AgentMutationPlan {
   rollbackAvailable: boolean;
 }
 
+export interface OllamaModel {
+  name: string;
+  digest: string;
+  size: number;
+}
+
+export type OllamaDeploymentState = "current" | "outdated" | "modified" | "missing" | "sourceUnavailable";
+
+export interface OllamaDeploymentRecord {
+  reference: AgentReference;
+  agentName: string;
+  agentSlug: string;
+  targetName: string;
+  baseModel: string;
+  baseDigest: string;
+  sourceHash: string;
+  promptHash: string;
+  deployedAt: string;
+}
+
+export interface OllamaDeployment {
+  record: OllamaDeploymentRecord;
+  state: OllamaDeploymentState;
+}
+
+export interface OllamaStatus {
+  models: OllamaModel[];
+  deployments: OllamaDeployment[];
+}
+
+export interface OllamaMutationPlan {
+  revision: string;
+  operation: "create" | "update" | "remove";
+  reference: AgentReference;
+  agentName: string;
+  agentSlug: string;
+  targetName: string;
+  baseModel: string | null;
+  baseDigest: string | null;
+  sourceHash: string;
+  promptHash: string;
+  promptPreview: string | null;
+  state: OllamaDeploymentState | null;
+  scope: "device";
+  warnings: string[];
+  blockers: string[];
+  rollbackAvailable: boolean;
+}
+
+export interface OllamaMutationResult {
+  operation: "create" | "update" | "remove";
+  targetName: string;
+  deployment: OllamaDeploymentRecord | null;
+}
+
 export type WorkspacePackScope = "user" | "project";
 
 export interface WorkspacePack {

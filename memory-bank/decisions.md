@@ -272,3 +272,19 @@ transactions, excessive migration risk, and unnecessary dependency/operational c
 files never auto-merge after completion; newer schemas fail closed; document normalization, FTS,
 cloud synchronization, and SQLCipher remain deferred until measured needs justify them.
 **Reference**: `tasks/2026-08/260806_sqlite-control-plane.md`.
+
+### 2026-08-16: Local model runtimes are a separate, fixed-loopback deployment class
+
+**Status**: Approved. **Context**: file-tool Agent installs own rendered filesystem destinations,
+while Ollama owns model manifests and exposes no Agent directory. Treating Ollama as another `Tool`
+would spread path and scope exceptions across the existing lifecycle. **Decision**: keep local model
+deployment in a narrow runtime-specific module and validated state document while reusing exact Agent
+references, hashes, revision-bound plans, Activity receipts, and the shared mutation lock. Only the
+fixed default loopback API and already-installed bases are allowed; prompt JSON remains data, MCP has
+no mutation authority, and update/removal preserve the prior model with Ollama copy before mutation.
+**Alternatives**: generated Modelfiles, shelling out to the CLI, remote/configurable hosts, or adding
+Ollama to the file-tool registry (rejected for prompt delimiter ambiguity, command surface expansion,
+remote authority, and incompatible ownership semantics). **Consequences**: exact prompt deployment is
+recoverable and auditable without changing file-tool behavior; LM Studio, downloads, inference,
+daemon management, parameter tuning, and remote hosts remain out of scope. **Reference**:
+`tasks/2026-08/260816_phase18-ollama-system-prompt-deployment.md`.

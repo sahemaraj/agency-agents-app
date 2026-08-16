@@ -16,4 +16,4 @@
 - `tasks/2026-07/` — Skills library inspection, transactional installation, managed lifecycle,
   project/application integration, and the MCP Skills Platform.
 - `tasks/2026-08/` — Expert MCP Release 1, Agent–Skills feature parity, Skill-to-Agent creation,
-  revision-bound Skill publication, SQLite control plane, and v2.0 Phases 6–17.
+  revision-bound Skill publication, SQLite control plane, and v2.0 Phases 6–18.

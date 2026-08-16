@@ -108,6 +108,12 @@ pub(crate) const PERSISTENCE_INVENTORY: &[PersistenceDocument] = &[
         "agent_library",
     ),
     PersistenceDocument::json("installs", "state/installs.json", 16_777_216, "installs"),
+    PersistenceDocument::json(
+        "ollama_deployments",
+        "state/ollama-deployments.json",
+        4_194_304,
+        "ollama_deployments",
+    ),
     PersistenceDocument::json("projects", "state/projects.json", 65_536, "projects"),
     PersistenceDocument::json("experts", "state/experts.json", 4_194_304, "experts"),
     PersistenceDocument::json(
@@ -613,6 +619,7 @@ fn migration_import_specs() -> Vec<crate::state_db::ImportSpec> {
         crate::agents::drafts::import_spec(),
         crate::agents::organize::import_spec(),
         crate::install::installs_import_spec(),
+        crate::ollama::import_spec(),
         crate::install::projects_import_spec(),
         crate::experts::experts_import_spec(),
         crate::experts::activation_requests_import_spec(),
@@ -1381,6 +1388,7 @@ agent_sources|state/agent-sources.json|1|1048576|json|agent_sources\n\
 agent_drafts|state/agent-drafts.json|1|8388608|json|agent_drafts\n\
 agent_library|state/agent-library.json|1|1048576|json|agent_library\n\
 installs|state/installs.json|1|16777216|json|installs\n\
+ollama_deployments|state/ollama-deployments.json|1|4194304|json|ollama_deployments\n\
 projects|state/projects.json|1|65536|json|projects\n\
 experts|state/experts.json|1|4194304|json|experts\n\
 expert_activation_requests|state/expert-activation-requests.json|1|524288|json|expert_activation_requests\n\
