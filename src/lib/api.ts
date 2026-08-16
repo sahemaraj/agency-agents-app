@@ -66,9 +66,30 @@ import type {
   StorageMigrationStatus,
   TaskRecommendation,
   DoctorReport,
+  OllamaMutationPlan,
+  OllamaMutationResult,
+  OllamaStatus,
 } from "./types";
 
 export const doctorReport = () => invoke<DoctorReport>("doctor_report");
+
+export const ollamaStatus = () => invoke<OllamaStatus>("ollama_status");
+export const ollamaPlan = (
+  reference: AgentReference,
+  operation: OllamaMutationPlan["operation"],
+  baseModel: string | null,
+) => invoke<OllamaMutationPlan>("ollama_plan", { reference, operation, baseModel });
+export const ollamaApply = (
+  reference: AgentReference,
+  operation: OllamaMutationPlan["operation"],
+  baseModel: string | null,
+  planRevision: string,
+) => invoke<OllamaMutationResult>("ollama_apply", {
+  reference,
+  operation,
+  baseModel,
+  planRevision,
+});
 
 export const storageMigrationStatus = () =>
   invoke<StorageMigrationStatus>("storage_migration_status");

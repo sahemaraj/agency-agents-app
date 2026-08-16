@@ -13,6 +13,7 @@ mod experts;
 mod github;
 mod install;
 mod library;
+mod ollama;
 mod registry;
 mod render;
 mod skills;
@@ -275,6 +276,9 @@ pub fn run() {
             agents::organize::agent_usage_record,
             agents::organize::agent_approval_approve,
             agents::organize::agent_approval_reject,
+            ollama::ollama_status,
+            ollama::ollama_plan,
+            ollama::ollama_apply,
             skills::skill_sources_list,
             skills::skill_sources_inspect,
             skills::skill_trust_grant,

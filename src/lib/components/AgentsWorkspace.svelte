@@ -29,6 +29,7 @@
   import DiffModal from "./DiffModal.svelte";
   import DivisionsLanding from "./DivisionsLanding.svelte";
   import InstallModal from "./InstallModal.svelte";
+  import OllamaDeployModal from "./OllamaDeployModal.svelte";
   import StarterPrompt from "./StarterPrompt.svelte";
   import AgentLibrarySidebar from "./AgentLibrarySidebar.svelte";
   import AgentSourceManager from "./AgentSourceManager.svelte";
@@ -337,6 +338,7 @@
   let diffTarget = $state<{ slug: string; tool: Tool; projectPath: string | null; name: string } | null>(null);
   // ── Install modal (the shared destinations × tools grid) for the open agent ──
   let installOpen = $state(false);
+  let ollamaOpen = $state(false);
 
   // ── Bulk select (lifted from the old Library, now over the unified list) ──
   let selectMode = $state(false);
@@ -668,6 +670,7 @@
           catalogDeployment={!libraryPackage}
           onCategory={(slug) => ui.openDivision(slug)}
           onInstall={() => (installOpen = true)}
+          onLocalModel={() => (ollamaOpen = true)}
           onEdit={panelPackage ? editLibraryAgent : undefined}
           onDuplicate={panelPackage ? () => agentLibrary.duplicateDraft(panelPackage!.reference) : undefined}
           onDiff={(target) => (diffTarget = target)}
@@ -702,6 +705,10 @@
     agentPackage={panelPackage ?? undefined}
     onClose={() => (installOpen = false)}
   />
+{/if}
+
+{#if ollamaOpen && panelPackage && panelAgent}
+  <OllamaDeployModal pkg={panelPackage} agent={panelAgent} onClose={() => (ollamaOpen = false)} />
 {/if}
 
 {#if bulkInstallOpen && selected.size > 0}
