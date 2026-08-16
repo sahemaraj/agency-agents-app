@@ -57,6 +57,18 @@ export function isInstalled(pkg: SkillPackageResult, installed: InstalledSkill[]
   return installed.some((record) => sameSkill(record, pkg) && record.state !== "missing");
 }
 
+function isCleanupCandidate(
+  pkg: SkillPackageResult,
+  installed: InstalledSkill[],
+  folderState: SkillFolderState,
+): boolean {
+  return installed.some((record) =>
+    sameSkill(record, pkg) && record.tracked && record.state !== "missing"
+  ) && !folderState.usage.some((usage) =>
+    sameSkill(usage.skill, pkg) && (usage.fetches > 0 || usage.installs > 0)
+  );
+}
+
 export function requiresTrust(pkg: SkillPackageResult): boolean {
   return pkg.errors.some((error) => error.code === "trustRequired");
 }
@@ -106,9 +118,7 @@ export function filterPackages(options: FilterOptions): PackageView[] {
     if (libraryFilter === "favorites" && !folderState.favorites.some((favorite) => sameSkill(favorite, pkg))) return false;
     if (libraryFilter === "recommendations" && (isInstalled(pkg, installed) || pkg.qualityScore < 60)) return false;
     if (libraryFilter === "duplicates" && packageConflicts(pkg, packages).length === 0) return false;
-    if (libraryFilter === "cleanup" && (!isInstalled(pkg, installed) || folderState.usage.some((usage) =>
-      sameSkill(usage.skill, pkg) && (usage.fetches > 0 || usage.installs > 0)
-    ))) return false;
+    if (libraryFilter === "cleanup" && !isCleanupCandidate(pkg, installed, folderState)) return false;
     if (libraryFilter === "recent" && !folderState.recent.some((recent) => sameSkill(recent.skill, pkg))) return false;
     if (libraryFilter.startsWith("collection:")) {
       const collection = folderState.collections.find((item) =>
@@ -239,10 +249,6 @@ export function libraryMetrics(
       !isInstalled(pkg, installed) && pkg.qualityScore >= 60
     ).length,
     duplicates: packages.filter(({ pkg }) => packageConflicts(pkg, packages).length > 0).length,
-    cleanup: packages.filter(({ pkg }) =>
-      isInstalled(pkg, installed) && !folderState.usage.some((usage) =>
-        sameSkill(usage.skill, pkg) && (usage.fetches > 0 || usage.installs > 0)
-      )
-    ).length,
+    cleanup: packages.filter(({ pkg }) => isCleanupCandidate(pkg, installed, folderState)).length,
   };
 }

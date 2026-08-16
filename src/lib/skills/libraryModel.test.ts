@@ -190,4 +190,31 @@ describe("Skills library model", () => {
       cleanup: 0,
     });
   });
+
+  it("suggests cleanup only for tracked installs without usage", () => {
+    const cleanupInstalled: InstalledSkill[] = [
+      { ...installed[0], tracked: false },
+      {
+        ...installed[0],
+        sourceId: "github",
+        relativePath: "beta",
+        name: "Beta",
+        path: "/installed/beta",
+      },
+    ];
+    const unusedState = { ...folderState, usage: [] };
+    const base = {
+      packages,
+      installed: cleanupInstalled,
+      folderState: unusedState,
+      query: "",
+      statusFilter: "all" as const,
+      sourceFilter: "all",
+      sortOrder: "name" as const,
+    };
+
+    expect(filterPackages({ ...base, libraryFilter: "cleanup" }).map(({ pkg }) => pkg.name))
+      .toEqual(["Beta"]);
+    expect(libraryMetrics(packages, cleanupInstalled, unusedState).cleanup).toBe(1);
+  });
 });

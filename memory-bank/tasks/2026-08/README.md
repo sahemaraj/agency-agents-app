@@ -115,3 +115,11 @@ Added five-run-gated local Expert performance summaries for exact versioned qual
 ### 2026-08-16: Phase 18 Local Ollama System-Prompt Deployment
 
 Added explicit revision-bound create, update, remove, reconciliation, rollback, and prompt-free receipts for app-owned local Ollama models derived from exact installable Agent prompts and already-installed bases. Fixed-loopback, no-pull, no-inference, no-daemon, no-remote-host, and no-MCP-authority boundaries are enforced. OpenSpec, frontend, backend, Rust quality, Svelte, build, dependency, live Ollama, security, and diff gates passed. See [260816_phase18-ollama-system-prompt-deployment.md](./260816_phase18-ollama-system-prompt-deployment.md).
+
+### 2026-08-16: Skill Review and Cleanup Classification
+
+Removed hidden runtime-mirror packages from Skill discovery and limited Cleanup suggestions to
+app-tracked unused installs. Live MCP reduced Needs review from 672 to 202 genuine items and
+Cleanup to 0 without trusting, deleting, or modifying any Skill package. Frontend, backend,
+Svelte, build, Clippy, format, and diff gates passed. See
+[260816_skill-review-cleanup.md](./260816_skill-review-cleanup.md).

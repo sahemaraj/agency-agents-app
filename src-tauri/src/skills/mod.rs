@@ -1234,6 +1234,14 @@ fn discover_source_blocking(source: SkillSource) -> Result<SkillSourceResult, Ap
                 ));
                 continue;
             }
+            if metadata.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
             if metadata.is_dir() {
                 directories.push_back(path);
             } else if metadata.is_file()
@@ -5763,6 +5771,29 @@ mod tests {
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].relative_path, ".");
         assert!(result.packages[0].installable, "{:?}", result.packages[0]);
+    }
+
+    #[tokio::test]
+    async fn discovery_skips_hidden_runtime_skill_mirrors() {
+        let source = tempdir().expect("source");
+        write_skill(source.path(), "visible", "visible", "Visible skill");
+        write_skill(
+            source.path(),
+            ".cursor/skills/visible",
+            "visible",
+            "Runtime mirror",
+        );
+        let registered = SkillSource {
+            id: "source-id".into(),
+            kind: SkillSourceKind::Local {
+                root: source.path().to_string_lossy().into_owned(),
+            },
+        };
+
+        let result = discover_source(registered).await.expect("discover source");
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].relative_path, "visible");
     }
 
     #[cfg(unix)]
