@@ -108,6 +108,8 @@ export const taskRecommendations = (task: string, limit = 10) =>
   invoke<TaskRecommendation[]>("task_recommendations", { task, limit });
 
 export const catalogFeedList = () => invoke<CatalogFeedState>("catalog_feed_list");
+export const catalogSourceTransitionRecover = () =>
+  invoke<boolean>("catalog_source_transition_recover");
 
 // ============================================================
 // Agent sources, drafts, and personal library

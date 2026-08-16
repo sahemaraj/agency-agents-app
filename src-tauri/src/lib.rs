@@ -213,6 +213,7 @@ pub fn run() {
             corpus::catalog_detect,
             corpus::catalog_provision_managed,
             corpus::catalog_pull,
+            corpus::catalog_source_transition_recover,
             corpus::catalog_feed_list,
             corpus::catalog_status,
             corpus::catalog_check_updates,

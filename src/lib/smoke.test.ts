@@ -1118,6 +1118,7 @@ describe("frontend test harness", () => {
       if (command === "catalog_detect") return { gitAvailable: false, scanned: false, candidates: [] } as never;
       if (command === "github_status") return { signedIn: false, username: null, scopes: [] } as never;
       if (command === "catalog_feed_list") return catalogFeedFixture() as never;
+      if (command === "catalog_source_transition_recover") return false as never;
       if (command === "catalog_pull") throw { code: "network", url: "https://example.test", message: "offline" };
       return [] as never;
     });
@@ -1138,8 +1139,9 @@ describe("frontend test harness", () => {
     }
   });
 
-  it("reloads catalog feed state after Retry succeeds", async () => {
+  it("runs local recovery before the normal writable Retry pull", async () => {
     let feedCalls = 0;
+    const retryCommands: string[] = [];
     vi.mocked(invoke).mockImplementation(async (command: string) => {
       if (command === "catalog_source_get") return { kind: "bundled" } as never;
       if (command === "catalog_configured") return true as never;
@@ -1152,6 +1154,11 @@ describe("frontend test harness", () => {
           ? catalogFeedFixture("engineering/old.md", true, "Previous refresh failed")
           : catalogFeedFixture("engineering/recovered.md")) as never;
       }
+      if (command === "catalog_source_transition_recover") {
+        retryCommands.push(command);
+        return false as never;
+      }
+      if (command === "catalog_pull") retryCommands.push(command);
       if (command === "catalog_pull") return { version: "test", commit: null, fetchedAt: "2026-08-17T00:01:00Z", count: 1 } as never;
       if (command === "corpus_list" || command === "corpus_categories") return [] as never;
       return [] as never;
@@ -1166,6 +1173,85 @@ describe("frontend test harness", () => {
       await vi.waitFor(() => expect(target.textContent).toContain("engineering/recovered.md"));
       expect(target.querySelector(".feed-error")).toBeNull();
       expect(feedCalls).toBe(2);
+      expect(retryCommands).toEqual(["catalog_source_transition_recover", "catalog_pull"]);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("keeps read-only Retry enabled and stops after local transition recovery", async () => {
+    let feedCalls = 0;
+    const retryCommands: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "catalog_source_get") return { kind: "userClone", path: "/read-only", manage: false } as never;
+      if (command === "catalog_configured") return true as never;
+      if (command === "catalog_status") return { ...catalogStatusFixture, source: { kind: "userClone", path: "/read-only", manage: false } } as never;
+      if (command === "catalog_detect") return { gitAvailable: false, scanned: false, candidates: [] } as never;
+      if (command === "github_status") return { signedIn: false, username: null, scopes: [] } as never;
+      if (command === "catalog_feed_list") {
+        feedCalls += 1;
+        return (feedCalls === 1
+          ? catalogFeedFixture("engineering/hidden.md", true, "Catalog source change is incomplete")
+          : { lastSuccessAt: null, stale: false, error: null, batches: [] }) as never;
+      }
+      if (command === "catalog_source_transition_recover") {
+        retryCommands.push(command);
+        return true as never;
+      }
+      if (command === "catalog_pull") retryCommands.push(command);
+      return [] as never;
+    });
+    const { default: SettingsSectionCatalog } = await import("$lib/components/SettingsSectionCatalog.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionCatalog, { target });
+    try {
+      await vi.waitFor(() => expect(target.querySelector(".feed-error")?.textContent).toContain("Catalog source change is incomplete"));
+      const retry = target.querySelector<HTMLButtonElement>(".feed-error button")!;
+      expect(retry.disabled).toBe(false);
+      retry.click();
+      await vi.waitFor(() => expect(target.querySelector(".feed-error")).toBeNull());
+      expect(feedCalls).toBe(2);
+      expect(retryCommands).toEqual(["catalog_source_transition_recover"]);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("reloads honest stale state without network when read-only Retry has no transition", async () => {
+    let feedCalls = 0;
+    const retryCommands: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "catalog_source_get") return { kind: "userClone", path: "/read-only", manage: false } as never;
+      if (command === "catalog_configured") return true as never;
+      if (command === "catalog_status") return { ...catalogStatusFixture, source: { kind: "userClone", path: "/read-only", manage: false } } as never;
+      if (command === "catalog_detect") return { gitAvailable: false, scanned: false, candidates: [] } as never;
+      if (command === "github_status") return { signedIn: false, username: null, scopes: [] } as never;
+      if (command === "catalog_feed_list") {
+        feedCalls += 1;
+        return catalogFeedFixture("engineering/retained.md", true, "Read-only catalog remains stale") as never;
+      }
+      if (command === "catalog_source_transition_recover") {
+        retryCommands.push(command);
+        return false as never;
+      }
+      if (command === "catalog_pull") retryCommands.push(command);
+      return [] as never;
+    });
+    const { default: SettingsSectionCatalog } = await import("$lib/components/SettingsSectionCatalog.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionCatalog, { target });
+    try {
+      await vi.waitFor(() => expect(target.querySelector(".feed-error")?.textContent).toContain("Read-only catalog remains stale"));
+      const retry = target.querySelector<HTMLButtonElement>(".feed-error button")!;
+      expect(retry.disabled).toBe(false);
+      retry.click();
+      await vi.waitFor(() => expect(feedCalls).toBe(2));
+      expect(retryCommands).toEqual(["catalog_source_transition_recover"]);
+      expect(target.querySelector(".feed-error")?.textContent).toContain("Read-only catalog remains stale");
     } finally {
       unmount(component);
       target.remove();
@@ -1214,6 +1300,7 @@ describe("frontend test harness", () => {
       if (command === "catalog_configured") return true as never;
       if (command === "catalog_status") return { isGit: false, repoSlug: null } as never;
       if (command === "catalog_detect") return { candidates: [] } as never;
+      if (command === "catalog_source_transition_recover") return false as never;
       if (command === "catalog_pull") throw { code: "http_status", url: "https://example.test/catalog", status: 503 };
       return [] as never;
     });

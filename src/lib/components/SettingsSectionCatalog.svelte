@@ -22,7 +22,7 @@
   import ExternalLink from "@lucide/svelte/icons/external-link";
 
   import { catalog } from "$lib/stores/catalog.svelte";
-  import { catalogFeedList } from "$lib/api";
+  import { catalogFeedList, catalogSourceTransitionRecover } from "$lib/api";
   import { github, type RepoStatsOutcome } from "$lib/stores/github.svelte";
   import { toast } from "$lib/stores/toast.svelte";
   import { safeOpenUrl } from "$lib/util/url";
@@ -89,11 +89,12 @@
 
   async function refreshCatalog() {
     try {
-      await catalog.pull();
+      const recovered = await catalogSourceTransitionRecover();
+      if (!recovered && !isReadOnly) await catalog.pull();
       await loadFeed();
-      toast.success(i18n.t("catalog.updated"));
+      if (recovered || !isReadOnly) toast.success(i18n.t("catalog.updated"));
     } catch (e) {
-      const message = catalog.error ?? catalogFeedError(e);
+      const message = catalogFeedError(e);
       feedError = message;
       if (feed) feed = { ...feed, stale: true, error: message };
       toast.error(i18n.t("catalog.actionFailed"), message);
@@ -230,7 +231,7 @@
     {:else if feed?.stale || feedError}
       <div class="feed-error">
         <p class="err">{feed?.error ?? feedError ?? i18n.optional("catalog.refreshFailed", "Catalog refresh failed")}</p>
-        <button class="ghost" disabled={catalog.busy || isReadOnly} onclick={refreshCatalog}>
+        <button class="ghost" disabled={catalog.busy} onclick={refreshCatalog}>
           <RefreshCw size={14} />{i18n.optional("common.retry", "Retry")}
         </button>
       </div>

@@ -2403,6 +2403,45 @@ pub async fn catalog_pull(
     refresh_catalog_authority(&app, &state, CatalogRefreshEntrypoint::CatalogPull).await
 }
 
+async fn catalog_source_transition_recover_state(state: &AppState) -> Result<bool, AppError> {
+    let _flight =
+        state
+            .corpus_refresh_in_flight
+            .try_lock()
+            .map_err(|_| AppError::InvalidArgument {
+                message: "catalog change already in progress".into(),
+            })?;
+    let database =
+        state
+            .completed_state_database()
+            .await?
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "SQLite migration must complete before recovering catalog source".into(),
+            })?;
+    if load_control_center(&database)
+        .await?
+        .catalog_pending_source_transition
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let source = load_catalog_source(&state.app_data_dir).await;
+    let (corpus, _) =
+        recover_catalog_source_for_refresh(&state.app_data_dir, &database, &source).await?;
+    *state.corpus_cache.lock().await = Some(Arc::new(corpus));
+    Ok(true)
+}
+
+/// Resolve a pending source transition using local bytes only. `false` is an
+/// explicit no-op outcome; callers may then choose whether network refresh is
+/// permitted for the active source.
+#[tauri::command]
+pub async fn catalog_source_transition_recover(
+    state: State<'_, AppState>,
+) -> Result<bool, AppError> {
+    catalog_source_transition_recover_state(&state).await
+}
+
 #[derive(Clone, Copy)]
 enum CatalogRefreshEntrypoint {
     CorpusRefresh,
@@ -2812,10 +2851,29 @@ pub async fn corpus_categories(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::settings::{Settings, SettingsLoadState};
     use crate::types::{
         CatalogChange, CatalogFeedBatch, CatalogPendingRefresh, CatalogSnapshotItem,
         ControlCenterDocument,
     };
+
+    fn test_app_state(app_data_dir: &Path, paranoid_mode: bool) -> AppState {
+        AppState {
+            app_data_dir: app_data_dir.to_path_buf(),
+            corpus_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            corpus_refresh_in_flight: Arc::new(tokio::sync::Mutex::new(())),
+            skill_sources_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            skill_installs_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            skill_folders_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings: Arc::new(tokio::sync::RwLock::new(SettingsLoadState::Loaded(
+                Settings {
+                    paranoid_mode,
+                    ..Settings::default()
+                },
+            ))),
+            updater_state: crate::commands::updater::empty_state(),
+        }
+    }
 
     fn write_agent(dir: &Path, category: &str, slug: &str, name: &str, body: &str) {
         let cat = dir.join(category);
@@ -3501,7 +3559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_after_crash_before_source_commit_restores_old_feed_then_continues_pull() {
+    async fn local_retry_recovers_old_side_even_when_network_is_blocked() {
         let root = tempfile::tempdir().unwrap();
         let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
         database
@@ -3547,12 +3605,13 @@ mod tests {
         .await
         .unwrap();
 
-        let active = load_catalog_source(root.path()).await;
-        let (_, recovery) = recover_catalog_source_for_refresh(root.path(), &database, &active)
+        let state = test_app_state(root.path(), true);
+        assert!(state.require_network("catalog_pull").await.is_err());
+        let recovered = catalog_source_transition_recover_state(&state)
             .await
             .unwrap();
 
-        assert_eq!(recovery, CatalogRefreshRecovery::Continue);
+        assert!(recovered);
         let restored = load_control_center(&database).await.unwrap();
         assert!(restored.catalog_pending_source_transition.is_none());
         assert_eq!(
@@ -3567,7 +3626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_after_crash_after_source_commit_finishes_target_without_second_pull() {
+    async fn local_retry_rebuilds_target_side_even_when_network_is_blocked() {
         let root = tempfile::tempdir().unwrap();
         let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
         database
@@ -3613,14 +3672,19 @@ mod tests {
         .unwrap();
         save_catalog_source(root.path(), &source_b).await.unwrap();
 
-        let active = load_catalog_source(root.path()).await;
-        let (corpus, recovery) =
-            recover_catalog_source_for_refresh(root.path(), &database, &active)
-                .await
-                .unwrap();
+        let state = test_app_state(root.path(), true);
+        assert!(state.require_network("catalog_pull").await.is_err());
+        let recovered = catalog_source_transition_recover_state(&state)
+            .await
+            .unwrap();
 
-        assert_eq!(recovery, CatalogRefreshRecovery::Complete);
-        assert!(corpus.get("new").is_some());
+        assert!(recovered);
+        assert!(state
+            .corpus_cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|corpus| corpus.get("new").is_some()));
         assert!(
             index_path(root.path()).is_file(),
             "target rebuild persisted its index"
@@ -3660,7 +3724,9 @@ mod tests {
             path: catalog_c.to_string_lossy().into_owned(),
         };
 
-        let error = recover_catalog_source_for_refresh(root.path(), &database, &source_c)
+        save_catalog_source(root.path(), &source_c).await.unwrap();
+        let state = test_app_state(root.path(), true);
+        let error = catalog_source_transition_recover_state(&state)
             .await
             .unwrap_err();
 
@@ -3676,6 +3742,24 @@ mod tests {
             .unwrap();
         assert!(projected.stale);
         assert!(projected.batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_retry_without_a_pending_transition_is_an_explicit_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let state = test_app_state(root.path(), true);
+
+        let recovered = catalog_source_transition_recover_state(&state)
+            .await
+            .unwrap();
+
+        assert!(!recovered);
+        assert!(state.corpus_cache.lock().await.is_none());
     }
 
     #[tokio::test]
