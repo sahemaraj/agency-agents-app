@@ -141,6 +141,8 @@ export const projectRecommendationDismiss = (projectPath: string, recommendation
   invoke<void>("project_recommendation_dismiss", { projectPath, recommendationId });
 export const projectRecommendationOpen = (projectPath: string, recommendationId: string) =>
   invoke<ProjectRecommendation>("project_recommendation_open", { projectPath, recommendationId });
+export const projectRecommendationFinalize = (projectPath: string, recommendationId: string) =>
+  invoke<ProjectReadinessBaseline>("project_recommendation_finalize", { projectPath, recommendationId });
 
 // ============================================================
 // Agent sources, drafts, and personal library

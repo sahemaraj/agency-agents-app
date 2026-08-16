@@ -3773,7 +3773,7 @@ describe("frontend test harness", () => {
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(56);
+      .toHaveLength(57);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -4045,6 +4045,138 @@ describe("frontend test harness", () => {
       await vi.waitFor(() => expect(target.textContent).toContain("Review catalog recommendation"));
       await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) =>
         command === "agent_install_plan")).toBe(true));
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("finalizes a reviewed rename only after InstallModal applies its exact target", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/project";
+    const initialRecommendation = renamedProjectRecommendation(projectPath);
+    const recommendation: ProjectRecommendation = {
+      ...initialRecommendation,
+      targets: [
+        ...initialRecommendation.targets,
+        { ...initialRecommendation.targets[0], tool: "codex" },
+      ],
+    };
+    const projectRows = [{ path: projectPath, label: "project", installedCount: 0 }];
+    const nextReference = recommendation.agentReferences[0];
+    const newPackage: AgentPackageResult = {
+      ...staleControlPackage,
+      reference: nextReference,
+      agent: { ...staleControlAgent, slug: "new-reviewer", name: "New Reviewer" },
+    };
+    const planFor = (tool: string): AgentMutationPlan => ({
+      revision: "rename-install",
+      operation: "install",
+      tool,
+      scope: "project",
+      projectPath,
+      agents: [{
+        reference: nextReference,
+        name: "New Reviewer",
+        sourceHash: "source",
+        dependency: false,
+        destination: `/tmp/project/.agents/${tool}/new-reviewer.md`,
+        renderedFileCount: 1,
+        capabilities: [],
+      }],
+      warnings: [], blockers: [], rollbackAvailable: true,
+    });
+    const installedTools = new Set<string>();
+    let finalized = false;
+    install.tools = [
+      staleControlTool,
+      { ...staleControlTool, tool: "codex", label: "Codex" },
+    ];
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    corpus.agents = [staleControlAgent];
+    corpus.categories = [{ slug: "engineering", label: "Engineering", color: "#2563eb", icon: "Code", count: 1 }];
+    const target = document.createElement("div");
+    document.body.append(target);
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile") return [...installedTools].map((tool) => ({
+        ...staleControlRow,
+        slug: "new-reviewer",
+        name: "New Reviewer",
+        sourceId: nextReference.sourceId,
+        relativePath: nextReference.relativePath,
+        tool,
+        projectPath,
+        dest: `/tmp/project/.agents/${tool}/new-reviewer.md`,
+        scope: "project",
+        state: "current",
+        tracked: true,
+      })) as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "tools_list") return install.tools as never;
+      if (command === "project_instructions_inspect") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath) as never;
+      if (command === "project_recommendations_list") return (finalized ? [] : [recommendation]) as never;
+      if (command === "project_recommendations_acknowledge") return true as never;
+      if (command === "project_recommendation_open") return recommendation as never;
+      if (command === "agent_sources_inspect") return [{
+        source: { id: "built-in", label: "Built in", enabled: true, kind: { kind: "builtIn" } },
+        agents: [newPackage], errors: [], revision: "fresh",
+      }] as never;
+      if (command === "agent_drafts_list") return [] as never;
+      if (command === "agent_library_list") return emptyFolderState() as never;
+      if (command === "agent_install_plan") return planFor((args as { tool: string }).tool) as never;
+      if (command === "agent_install_with_dependencies") {
+        expect(invokeMock.mock.calls.some(([name]) => name === "project_recommendation_finalize")).toBe(false);
+        const tool = (args as { tool: string }).tool;
+        const plan = planFor(tool);
+        installedTools.add(tool);
+        return [{
+          ...installRecord("new-reviewer", plan.agents[0].destination),
+          sourceId: nextReference.sourceId,
+          relativePath: nextReference.relativePath,
+          tool,
+          projectPath,
+          scope: "project",
+        }] as never;
+      }
+      if (command === "project_recommendation_finalize") {
+        expect([...installedTools].sort()).toEqual(["claudeCode", "codex"]);
+        expect(args).toEqual({ projectPath, recommendationId: recommendation.id });
+        finalized = true;
+        return {
+          ...readinessFixture(projectPath).baseline,
+          agentRequirements: [{ reference: nextReference, tool: "claudeCode" }],
+          agents: [nextReference],
+        } as never;
+      }
+      return [] as never;
+    });
+    const component = mount(Projects, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain(recommendation.summary));
+      const open = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Open review")!;
+      open.focus();
+      open.click();
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) => command === "agent_install_plan")).toBe(true));
+      const apply = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Apply plan")!;
+      apply.click();
+
+      await vi.waitFor(() => expect(invokeMock.mock.calls.filter(([command]) =>
+        command === "agent_install_plan")).toHaveLength(2));
+      expect(invokeMock.mock.calls.some(([command]) => command === "project_recommendation_finalize")).toBe(false);
+      const secondApply = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Apply plan")!;
+      secondApply.click();
+
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) =>
+        command === "project_recommendation_finalize")).toBe(true));
+      await vi.waitFor(() => expect(target.textContent).toContain("No catalog recommendations."));
+      expect((document.activeElement as HTMLButtonElement).textContent?.trim()).toBe("Retry");
     } finally {
       unmount(component);
       target.remove();

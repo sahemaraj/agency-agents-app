@@ -158,6 +158,7 @@
   let recommendationTargetIndex = $state(0);
   let recommendationTrigger: HTMLButtonElement | undefined = $state();
   let recommendationTriggerId = $state("");
+  let readinessRoot: HTMLElement | undefined = $state();
   let instructionManager: HTMLElement | undefined = $state();
   let readinessGeneration = 0;
   const newRecommendationCount = $derived(
@@ -331,26 +332,57 @@
     if (generation === readinessGeneration && selected?.path === projectPath) await refreshReadiness();
   }
 
-  async function closeRecommendation(): Promise<void> {
-    recommendationPlan = null;
-    recommendationPackage = null;
+  async function restoreRecommendationFocus(): Promise<void> {
     await tick();
     const trigger = [...(projectsRoot?.querySelectorAll<HTMLButtonElement>("button[data-recommendation-id]") ?? [])]
       .find((button) => button.dataset.recommendationId === recommendationTriggerId)
-      ?? recommendationTrigger;
+      ?? (recommendationTrigger?.isConnected
+        ? recommendationTrigger
+        : readinessRoot?.querySelector<HTMLButtonElement>(".readiness-heading button"));
     trigger?.focus({ preventScroll: true });
   }
 
-  function recommendationApplied(): void {
+  async function closeRecommendation(): Promise<void> {
+    recommendationPlan = null;
+    recommendationPackage = null;
+    await restoreRecommendationFocus();
+  }
+
+  async function recommendationApplied(): Promise<void> {
     if (!recommendationPlan) return;
     const targets = recommendationPlan.targets.filter((target) => target.operation !== "informational");
     if (recommendationTargetIndex + 1 < targets.length) {
       recommendationTargetIndex += 1;
       return;
     }
+    const completed = recommendationPlan;
+    const projectPath = completed.projectPath;
+    const generation = readinessGeneration;
+    let completionError: string | null = null;
+    readinessBusy = true;
+    try {
+      if (completed.changeKind === "renamed") {
+        await projects.finalizeRecommendation(projectPath, completed.id);
+      }
+    } catch (error) {
+      completionError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      if (generation === readinessGeneration) readinessBusy = false;
+    }
     recommendationPlan = null;
     recommendationPackage = null;
-    void refreshReadiness();
+    if (generation === readinessGeneration && selected?.path === projectPath) {
+      await refreshReadiness();
+      if (completionError) {
+        readinessError = completionError;
+        readinessAnnouncement = `Recommendation completion could not be finalized. ${completionError}`;
+      } else {
+        readinessAnnouncement = completed.changeKind === "renamed"
+          ? "Rename baseline finalized. Readiness refreshed."
+          : "Recommendation applied. Readiness refreshed.";
+      }
+    }
+    await restoreRecommendationFocus();
   }
 
   function readinessRepairLabel(
@@ -648,7 +680,7 @@
       <button class="btn danger-ic" disabled={!mutationTruthFresh} title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: rosterFor(selected.path).length, skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
     </header>
 
-    <section class="readiness" aria-labelledby="project-readiness-heading" aria-busy={readinessBusy}>
+    <section bind:this={readinessRoot} class="readiness" aria-labelledby="project-readiness-heading" aria-busy={readinessBusy}>
       <div class="readiness-heading">
         <div>
           <h3 id="project-readiness-heading">Readiness</h3>
@@ -817,19 +849,21 @@
 
 {#if recommendationPlan && recommendationPackage}
   {@const recommendationTarget = recommendationPlan.targets.filter((target) => target.operation !== "informational")[recommendationTargetIndex]}
-  <InstallModal
-    title="Review catalog recommendation"
-    agentPackage={recommendationPackage}
-    reviewIntent={{
-      operation: recommendationTarget.operation as "install" | "update",
-      reference: recommendationTarget.reference,
-      tool: recommendationTarget.tool,
-      projectPath: recommendationTarget.projectPath,
-    }}
-    allowedTools={[recommendationTarget.tool]}
-    onClose={closeRecommendation}
-    onApplied={recommendationApplied}
-  />
+  {#key `${recommendationPlan.id}:${recommendationTargetIndex}`}
+    <InstallModal
+      title="Review catalog recommendation"
+      agentPackage={recommendationPackage}
+      reviewIntent={{
+        operation: recommendationTarget.operation as "install" | "update",
+        reference: recommendationTarget.reference,
+        tool: recommendationTarget.tool,
+        projectPath: recommendationTarget.projectPath,
+      }}
+      allowedTools={[recommendationTarget.tool]}
+      onClose={closeRecommendation}
+      onApplied={() => void recommendationApplied()}
+    />
+  {/key}
 {/if}
 
 {#if confirm}

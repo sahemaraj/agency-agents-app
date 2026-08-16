@@ -19,6 +19,7 @@ import {
   projectBaselineSaveTeam,
   projectReadinessGet,
   projectRecommendationDismiss,
+  projectRecommendationFinalize,
   projectRecommendationOpen,
   projectRecommendationsAcknowledge,
   projectRecommendationsList,
@@ -121,6 +122,10 @@ class ProjectsStore {
 
   openRecommendation(projectPath: string, recommendationId: string): Promise<ProjectRecommendation> {
     return projectRecommendationOpen(projectPath, recommendationId);
+  }
+
+  finalizeRecommendation(projectPath: string, recommendationId: string): Promise<ProjectReadinessBaseline> {
+    return projectRecommendationFinalize(projectPath, recommendationId);
   }
 
   planInstruction(

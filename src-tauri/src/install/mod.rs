@@ -3969,6 +3969,12 @@ pub(crate) async fn mcp_reconcile_agent_installs(
 ) -> Result<Vec<InstalledAgent>, AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    reconcile_agent_installs_locked(state).await
+}
+
+async fn reconcile_agent_installs_locked(
+    state: &AppState,
+) -> Result<Vec<InstalledAgent>, AppError> {
     let ledger = load_ledger_for_state(state).await?;
     let agent_sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
     let mut installed = Vec::with_capacity(ledger.len());
@@ -5653,11 +5659,52 @@ fn catalog_change_for_reference(
     }
 }
 
-fn derive_project_recommendations(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecommendationInstallState {
+    Current,
+    Outdated,
+    Unsafe,
+}
+
+fn recommendation_install_state(
+    installed: Option<&[InstalledAgent]>,
+    project_path: &str,
+    reference: &AgentReference,
+    tool: &str,
+) -> RecommendationInstallState {
+    let Some(installed) = installed else {
+        return RecommendationInstallState::Unsafe;
+    };
+    let matches = installed
+        .iter()
+        .filter(|row| {
+            row.tracked
+                && row.project_path.as_deref() == Some(project_path)
+                && row.source_id == reference.source_id
+                && row.relative_path == reference.relative_path
+                && row.tool == tool
+        })
+        .collect::<Vec<_>>();
+    let [row] = matches.as_slice() else {
+        return RecommendationInstallState::Unsafe;
+    };
+    match row.state {
+        InstallState::Current => RecommendationInstallState::Current,
+        InstallState::Outdated => RecommendationInstallState::Outdated,
+        InstallState::Modified
+        | InstallState::Missing
+        | InstallState::Foreign
+        | InstallState::Disabled
+        | InstallState::SourceUnavailable => RecommendationInstallState::Unsafe,
+    }
+}
+
+fn derive_project_recommendations_with_installs(
     baseline: &ProjectReadinessBaseline,
     subscription: &ProjectSubscription,
     batches: &[CatalogFeedBatch],
     available: &BTreeMap<AgentReference, usize>,
+    installed: Option<&[InstalledAgent]>,
 ) -> Vec<ProjectRecommendation> {
     let mut recommendations = Vec::new();
     let required = baseline
@@ -5708,17 +5755,45 @@ fn derive_project_recommendations(
                     RecommendationOperation::Install,
                 ),
             };
-            let targets = exact_agent_requirements(baseline)
+            let requirements = exact_agent_requirements(baseline)
                 .into_iter()
                 .filter(|requirement| requirement.reference == baseline_reference)
                 .filter(|requirement| requirement.tool != LEGACY_UNREVIEWED_TARGET)
-                .map(|requirement| ProjectRecommendationTarget {
-                    reference: action_reference.clone(),
-                    tool: requirement.tool,
-                    project_path: baseline.project_path.clone(),
-                    operation,
+                .collect::<Vec<_>>();
+            let mut unsafe_updated_target = false;
+            let targets = requirements
+                .iter()
+                .filter_map(|requirement| {
+                    if change_kind == RecommendationChangeKind::Updated {
+                        match recommendation_install_state(
+                            installed,
+                            &baseline.project_path,
+                            &action_reference,
+                            &requirement.tool,
+                        ) {
+                            RecommendationInstallState::Current => return None,
+                            RecommendationInstallState::Outdated => {}
+                            RecommendationInstallState::Unsafe => {
+                                unsafe_updated_target = true;
+                                return None;
+                            }
+                        }
+                    }
+                    Some(ProjectRecommendationTarget {
+                        reference: action_reference.clone(),
+                        tool: requirement.tool.clone(),
+                        project_path: baseline.project_path.clone(),
+                        operation,
+                    })
                 })
                 .collect::<Vec<_>>();
+            if change_kind == RecommendationChangeKind::Updated
+                && !requirements.is_empty()
+                && targets.is_empty()
+                && !unsafe_updated_target
+            {
+                continue;
+            }
             let id = render::sha256_hex(
                 &serde_json::to_vec(&(
                     baseline.project_path.as_str(),
@@ -5734,6 +5809,7 @@ fn derive_project_recommendations(
                 RecommendationLifecycle::Superseded
             } else if matches!(change_kind, RecommendationChangeKind::Removed)
                 || targets.is_empty()
+                || unsafe_updated_target
                 || available.get(&action_reference) != Some(&1)
             {
                 RecommendationLifecycle::Blocked
@@ -5770,6 +5846,16 @@ fn derive_project_recommendations(
             .then_with(|| left.id.cmp(&right.id))
     });
     recommendations
+}
+
+#[cfg(test)]
+fn derive_project_recommendations(
+    baseline: &ProjectReadinessBaseline,
+    subscription: &ProjectSubscription,
+    batches: &[CatalogFeedBatch],
+    available: &BTreeMap<AgentReference, usize>,
+) -> Vec<ProjectRecommendation> {
+    derive_project_recommendations_with_installs(baseline, subscription, batches, available, None)
 }
 
 fn set_project_subscription(
@@ -5844,7 +5930,24 @@ async fn current_recommendations(
         .ok_or_else(|| AppError::InvalidArgument {
             message: "Project is not subscribed".into(),
         })?;
-    let available = crate::agents::inspect_agent_sources(&state.app_data_dir)
+    let available = available_agent_reference_counts(state).await;
+    let mut projection = subscription.clone();
+    if include_seen_latest {
+        projection.last_seen_batch = None;
+    }
+    let installed = mcp_reconcile_agent_installs(state).await.ok();
+    let recommendations = derive_project_recommendations_with_installs(
+        baseline,
+        &projection,
+        &document.catalog_feed,
+        &available,
+        installed.as_deref(),
+    );
+    Ok((subscription, recommendations))
+}
+
+async fn available_agent_reference_counts(state: &AppState) -> BTreeMap<AgentReference, usize> {
+    crate::agents::inspect_agent_sources(&state.app_data_dir)
         .await
         .map(|sources| {
             let mut counts = BTreeMap::new();
@@ -5858,14 +5961,7 @@ async fn current_recommendations(
             }
             counts
         })
-        .unwrap_or_default();
-    let mut projection = subscription.clone();
-    if include_seen_latest {
-        projection.last_seen_batch = None;
-    }
-    let recommendations =
-        derive_project_recommendations(baseline, &projection, &document.catalog_feed, &available);
-    Ok((subscription, recommendations))
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -6068,6 +6164,7 @@ pub async fn project_recommendation_open(
     project_path: String,
     recommendation_id: String,
 ) -> Result<ProjectRecommendation, AppError> {
+    let _project_lock = lock_project_registry(&state.app_data_dir)?;
     let project_path = exact_registered_project(&state, &project_path).await?;
     let (_, recommendations) = current_recommendations(&state, &project_path, true).await?;
     let recommendation = recommendations
@@ -6116,6 +6213,148 @@ pub async fn project_recommendation_open(
         }
     }
     Ok(recommendation)
+}
+
+fn finalize_rename_recommendation_in_document(
+    document: &mut crate::types::ControlCenterDocument,
+    project_path: &str,
+    recommendation_id: &str,
+    available: &BTreeMap<AgentReference, usize>,
+    installed: &[InstalledAgent],
+) -> Result<ProjectReadinessBaseline, AppError> {
+    let mut next = document.clone();
+    let baseline_index = next
+        .project_baselines
+        .iter()
+        .position(|baseline| baseline.project_path == project_path)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "Project has no readiness baseline".into(),
+        })?;
+    let baseline_snapshot = next.project_baselines[baseline_index].clone();
+    let mut subscription = next
+        .project_subscriptions
+        .iter()
+        .find(|subscription| subscription.project_path == project_path)
+        .cloned()
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "Project is not subscribed".into(),
+        })?;
+    subscription.last_seen_batch = None;
+    let recommendation = derive_project_recommendations_with_installs(
+        &baseline_snapshot,
+        &subscription,
+        &next.catalog_feed,
+        available,
+        Some(installed),
+    )
+    .into_iter()
+    .find(|recommendation| recommendation.id == recommendation_id)
+    .ok_or_else(|| AppError::InvalidArgument {
+        message: "Rename recommendation is stale".into(),
+    })?;
+    if recommendation.lifecycle != RecommendationLifecycle::New
+        || recommendation.change_kind != RecommendationChangeKind::Renamed
+        || recommendation.agent_references.len() != 1
+        || recommendation.targets.is_empty()
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Recommendation is not a current actionable rename".into(),
+        });
+    }
+    let new_reference = recommendation.agent_references[0].clone();
+    let required_tools = recommendation
+        .targets
+        .iter()
+        .map(|target| target.tool.clone())
+        .collect::<BTreeSet<_>>();
+    let mut effective_requirements = exact_agent_requirements(&baseline_snapshot);
+    let matching_requirements = effective_requirements
+        .iter()
+        .filter(|requirement| requirement.reference == recommendation.baseline_reference)
+        .collect::<Vec<_>>();
+    if matching_requirements.len() != required_tools.len()
+        || matching_requirements
+            .iter()
+            .any(|requirement| !required_tools.contains(&requirement.tool))
+        || recommendation.targets.iter().any(|target| {
+            target.project_path != project_path
+                || target.reference != new_reference
+                || target.operation != RecommendationOperation::Install
+                || recommendation_install_state(
+                    Some(installed),
+                    project_path,
+                    &target.reference,
+                    &target.tool,
+                ) != RecommendationInstallState::Current
+        })
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Every exact renamed Agent target must be current before finalizing".into(),
+        });
+    }
+
+    let baseline = &mut next.project_baselines[baseline_index];
+    for requirement in &mut effective_requirements {
+        if requirement.reference == recommendation.baseline_reference
+            && required_tools.contains(&requirement.tool)
+        {
+            requirement.reference = new_reference.clone();
+        }
+    }
+    baseline.agent_requirements = effective_requirements;
+    for reference in &mut baseline.agents {
+        if *reference == recommendation.baseline_reference {
+            *reference = new_reference.clone();
+        }
+    }
+    let mut seen_agents = BTreeSet::new();
+    baseline
+        .agents
+        .retain(|reference| seen_agents.insert(reference.clone()));
+    let returned = baseline.clone();
+    corpus::validate_control_center(&next)?;
+    *document = next;
+    Ok(returned)
+}
+
+#[tauri::command]
+pub async fn project_recommendation_finalize(
+    state: State<'_, AppState>,
+    project_path: String,
+    recommendation_id: String,
+) -> Result<ProjectReadinessBaseline, AppError> {
+    if recommendation_id.len() != 64
+        || !recommendation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Recommendation id is invalid".into(),
+        });
+    }
+    let _project_lock = lock_project_registry(&state.app_data_dir)?;
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    let _install_guard = state.skill_installs_write_lock.lock().await;
+    let _install_file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    let available = available_agent_reference_counts(&state).await;
+    let installed = reconcile_agent_installs_locked(&state).await?;
+    let finalized_project = project_path.clone();
+    control_center_database(&state)
+        .await?
+        .mutate(
+            corpus::control_center_spec(),
+            crate::types::ControlCenterDocument::default(),
+            move |document| {
+                finalize_rename_recommendation_in_document(
+                    document,
+                    &finalized_project,
+                    &recommendation_id,
+                    &available,
+                    &installed,
+                )
+            },
+        )
+        .await
 }
 
 // ---------- Project instruction snippets ----------
@@ -8877,6 +9116,132 @@ mod tests {
         }
     }
 
+    fn recommendation_install(
+        reference: &AgentReference,
+        tool: &str,
+        state: InstallState,
+    ) -> InstalledAgent {
+        InstalledAgent {
+            slug: reference
+                .relative_path
+                .trim_end_matches(".md")
+                .rsplit('/')
+                .next()
+                .unwrap_or("agent")
+                .into(),
+            name: reference.relative_path.clone(),
+            source_id: reference.source_id.clone(),
+            relative_path: reference.relative_path.clone(),
+            tool: tool.into(),
+            scope: crate::types::Scope::Project,
+            project_path: Some("/registered/project".into()),
+            dest: format!("/registered/project/.agents/{tool}.md"),
+            state,
+            update_kind: None,
+            tracked: true,
+        }
+    }
+
+    fn recommendation_baseline(
+        reference: &AgentReference,
+        tools: &[&str],
+    ) -> ProjectReadinessBaseline {
+        ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Reviewers".into(),
+            agent_requirements: tools
+                .iter()
+                .map(|tool| BaselineAgentRequirement {
+                    reference: reference.clone(),
+                    tool: (*tool).into(),
+                })
+                .collect(),
+            skill_requirements: Vec::new(),
+            agents: vec![reference.clone()],
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: tools.iter().map(|tool| (*tool).into()).collect(),
+        }
+    }
+
+    fn recommendation_subscription() -> ProjectSubscription {
+        ProjectSubscription {
+            project_path: "/registered/project".into(),
+            last_seen_batch: None,
+            dismissed_recommendation_ids: Vec::new(),
+        }
+    }
+
+    fn updated_batch(reference: &AgentReference) -> Vec<CatalogFeedBatch> {
+        vec![CatalogFeedBatch {
+            at: "2026-08-17T01:00:00Z".into(),
+            changes: vec![CatalogChange::Updated {
+                before: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: reference.relative_path.clone(),
+                    source_hash: "a".repeat(64),
+                    body_hash: "b".repeat(64),
+                },
+                after: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: reference.relative_path.clone(),
+                    source_hash: "c".repeat(64),
+                    body_hash: "d".repeat(64),
+                },
+            }],
+        }]
+    }
+
+    fn renamed_batch(old: &AgentReference, new: &AgentReference) -> Vec<CatalogFeedBatch> {
+        vec![CatalogFeedBatch {
+            at: "2026-08-17T01:00:00Z".into(),
+            changes: vec![CatalogChange::Renamed {
+                before: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: old.relative_path.clone(),
+                    source_hash: "a".repeat(64),
+                    body_hash: "b".repeat(64),
+                },
+                after: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: new.relative_path.clone(),
+                    source_hash: "a".repeat(64),
+                    body_hash: "b".repeat(64),
+                },
+            }],
+        }]
+    }
+
+    fn rename_document(
+        old: &AgentReference,
+        new: &AgentReference,
+        tools: &[&str],
+    ) -> (crate::types::ControlCenterDocument, String) {
+        let baseline = recommendation_baseline(old, tools);
+        let subscription = recommendation_subscription();
+        let catalog_feed = renamed_batch(old, new);
+        let recommendation_id = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &catalog_feed,
+            &BTreeMap::from([(new.clone(), 1)]),
+            Some(&[]),
+        )[0]
+        .id
+        .clone();
+        (
+            crate::types::ControlCenterDocument {
+                project_baselines: vec![baseline],
+                project_subscriptions: vec![subscription],
+                catalog_last_success_at: Some("2026-08-17T01:00:00Z".into()),
+                catalog_feed,
+                ..Default::default()
+            },
+            recommendation_id,
+        )
+    }
+
     #[test]
     fn project_readiness_uses_locked_precedence_and_empty_categories() {
         let agent_requirement = BaselineAgentRequirement {
@@ -9487,10 +9852,10 @@ mod tests {
             RecommendationChangeKind::Updated
         );
         assert_eq!(
-            recommendations[0].targets[0].operation,
-            RecommendationOperation::Update
+            recommendations[0].lifecycle,
+            RecommendationLifecycle::Blocked
         );
-        assert_eq!(recommendations[0].targets[0].tool, "codex");
+        assert!(recommendations[0].targets.is_empty());
         assert_eq!(
             corpus::load_control_center(&database).await.unwrap(),
             before
@@ -9604,6 +9969,121 @@ mod tests {
     }
 
     #[test]
+    fn updated_recommendation_targets_only_the_remaining_outdated_tool() {
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&reference, &["claudeCode", "codex"]);
+        let installed = vec![
+            recommendation_install(&reference, "claudeCode", InstallState::Current),
+            recommendation_install(&reference, "codex", InstallState::Outdated),
+        ];
+        let recommendations = derive_project_recommendations_with_installs(
+            &baseline,
+            &recommendation_subscription(),
+            &updated_batch(&reference),
+            &BTreeMap::from([(reference.clone(), 1)]),
+            Some(&installed),
+        );
+
+        assert_eq!(recommendations.len(), 1);
+        assert_eq!(recommendations[0].lifecycle, RecommendationLifecycle::New);
+        assert_eq!(recommendations[0].targets.len(), 1);
+        assert_eq!(recommendations[0].targets[0].tool, "codex");
+        assert_eq!(
+            recommendations[0].targets[0].operation,
+            RecommendationOperation::Update
+        );
+    }
+
+    #[test]
+    fn updated_recommendation_with_all_targets_current_has_no_action() {
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&reference, &["claudeCode", "codex"]);
+        let installed = vec![
+            recommendation_install(&reference, "claudeCode", InstallState::Current),
+            recommendation_install(&reference, "codex", InstallState::Current),
+        ];
+
+        assert!(derive_project_recommendations_with_installs(
+            &baseline,
+            &recommendation_subscription(),
+            &updated_batch(&reference),
+            &BTreeMap::from([(reference.clone(), 1)]),
+            Some(&installed),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn updated_recommendation_blocks_current_plus_modified_without_partial_action() {
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&reference, &["claudeCode", "codex"]);
+        let installed = vec![
+            recommendation_install(&reference, "claudeCode", InstallState::Current),
+            recommendation_install(&reference, "codex", InstallState::Modified),
+        ];
+        let recommendations = derive_project_recommendations_with_installs(
+            &baseline,
+            &recommendation_subscription(),
+            &updated_batch(&reference),
+            &BTreeMap::from([(reference.clone(), 1)]),
+            Some(&installed),
+        );
+
+        assert_eq!(recommendations.len(), 1);
+        assert_eq!(
+            recommendations[0].lifecycle,
+            RecommendationLifecycle::Blocked
+        );
+        assert!(recommendations[0].targets.is_empty());
+    }
+
+    #[test]
+    fn updated_recommendation_revalidation_rejects_a_race_to_current() {
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&reference, &["codex"]);
+        let before = vec![recommendation_install(
+            &reference,
+            "codex",
+            InstallState::Outdated,
+        )];
+        let opened = derive_project_recommendations_with_installs(
+            &baseline,
+            &recommendation_subscription(),
+            &updated_batch(&reference),
+            &BTreeMap::from([(reference.clone(), 1)]),
+            Some(&before),
+        );
+        let recommendation_id = opened[0].id.clone();
+        let after = vec![recommendation_install(
+            &reference,
+            "codex",
+            InstallState::Current,
+        )];
+
+        assert!(!derive_project_recommendations_with_installs(
+            &baseline,
+            &recommendation_subscription(),
+            &updated_batch(&reference),
+            &BTreeMap::from([(reference, 1)]),
+            Some(&after),
+        )
+        .iter()
+        .any(|recommendation| recommendation.id == recommendation_id));
+    }
+
+    #[test]
     fn rename_recommendation_tracks_old_identity_and_hands_off_exact_new_reference() {
         let old = AgentReference {
             source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
@@ -9680,6 +10160,142 @@ mod tests {
     }
 
     #[test]
+    fn rename_finalize_replaces_every_matching_requirement_after_all_targets_are_current() {
+        let old = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/old-reviewer.md".into(),
+        };
+        let new = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/new-reviewer.md".into(),
+        };
+        let (mut document, recommendation_id) =
+            rename_document(&old, &new, &["claudeCode", "codex"]);
+        let installed = vec![
+            recommendation_install(&new, "claudeCode", InstallState::Current),
+            recommendation_install(&new, "codex", InstallState::Current),
+        ];
+
+        let baseline = finalize_rename_recommendation_in_document(
+            &mut document,
+            "/registered/project",
+            &recommendation_id,
+            &BTreeMap::from([(new.clone(), 1)]),
+            &installed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            baseline
+                .agent_requirements
+                .iter()
+                .map(|requirement| (&requirement.reference, requirement.tool.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(&new, "claudeCode"), (&new, "codex")]
+        );
+        assert_eq!(baseline.agents, vec![new]);
+        assert_eq!(baseline.tools, vec!["claudeCode", "codex"]);
+    }
+
+    #[test]
+    fn rename_finalize_rejects_partial_installs_without_mutating_the_baseline() {
+        let old = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/old-reviewer.md".into(),
+        };
+        let new = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/new-reviewer.md".into(),
+        };
+        let (mut document, recommendation_id) =
+            rename_document(&old, &new, &["claudeCode", "codex"]);
+        let before = document.clone();
+        let installed = vec![
+            recommendation_install(&new, "claudeCode", InstallState::Current),
+            recommendation_install(&new, "codex", InstallState::Missing),
+        ];
+
+        assert!(finalize_rename_recommendation_in_document(
+            &mut document,
+            "/registered/project",
+            &recommendation_id,
+            &BTreeMap::from([(new, 1)]),
+            &installed,
+        )
+        .is_err());
+        assert_eq!(document, before);
+    }
+
+    #[test]
+    fn rename_finalize_rejects_a_stale_recommendation_id_without_mutation() {
+        let old = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/old-reviewer.md".into(),
+        };
+        let new = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/new-reviewer.md".into(),
+        };
+        let (mut document, recommendation_id) = rename_document(&old, &new, &["codex"]);
+        document.project_baselines[0].agent_requirements[0].reference = new.clone();
+        document.project_baselines[0].agents[0] = new.clone();
+        let before = document.clone();
+        let installed = vec![recommendation_install(&new, "codex", InstallState::Current)];
+
+        assert!(finalize_rename_recommendation_in_document(
+            &mut document,
+            "/registered/project",
+            &recommendation_id,
+            &BTreeMap::from([(new, 1)]),
+            &installed,
+        )
+        .is_err());
+        assert_eq!(document, before);
+    }
+
+    #[test]
+    fn rename_finalize_preserves_a_concurrent_unrelated_baseline_change() {
+        let old = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/old-reviewer.md".into(),
+        };
+        let new = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/new-reviewer.md".into(),
+        };
+        let other = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/writer.md".into(),
+        };
+        let (mut document, recommendation_id) = rename_document(&old, &new, &["codex"]);
+        document.project_baselines[0]
+            .agent_requirements
+            .push(BaselineAgentRequirement {
+                reference: other.clone(),
+                tool: "claudeCode".into(),
+            });
+        document.project_baselines[0].agents.push(other.clone());
+        document.project_baselines[0]
+            .tools
+            .push("claudeCode".into());
+        let installed = vec![recommendation_install(&new, "codex", InstallState::Current)];
+
+        let baseline = finalize_rename_recommendation_in_document(
+            &mut document,
+            "/registered/project",
+            &recommendation_id,
+            &BTreeMap::from([(new.clone(), 1), (other.clone(), 1)]),
+            &installed,
+        )
+        .unwrap();
+
+        assert_eq!(baseline.agent_requirements[0].reference, new);
+        assert_eq!(baseline.agent_requirements[1].reference, other.clone());
+        assert_eq!(baseline.agents[1], other);
+        assert_eq!(baseline.tools, vec!["codex", "claudeCode"]);
+    }
+
+    #[test]
     fn only_a_later_change_for_the_same_logical_baseline_supersedes() {
         let first = AgentReference {
             source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
@@ -9726,8 +10342,13 @@ mod tests {
             dismissed_recommendation_ids: Vec::new(),
         };
         let available = BTreeMap::from([(first.clone(), 1)]);
+        let installed = vec![recommendation_install(
+            &first,
+            "codex",
+            InstallState::Outdated,
+        )];
 
-        let unrelated_later = derive_project_recommendations(
+        let unrelated_later = derive_project_recommendations_with_installs(
             &baseline,
             &subscription,
             &[
@@ -9735,11 +10356,12 @@ mod tests {
                 change(&unrelated, "2026-08-17T02:00:00Z", 'c'),
             ],
             &available,
+            Some(&installed),
         );
         assert_eq!(unrelated_later.len(), 1);
         assert_eq!(unrelated_later[0].lifecycle, RecommendationLifecycle::New);
 
-        let same_later = derive_project_recommendations(
+        let same_later = derive_project_recommendations_with_installs(
             &baseline,
             &subscription,
             &[
@@ -9747,6 +10369,7 @@ mod tests {
                 change(&first, "2026-08-17T02:00:00Z", 'c'),
             ],
             &available,
+            Some(&installed),
         );
         assert_eq!(same_later.len(), 2);
         assert_eq!(same_later[0].lifecycle, RecommendationLifecycle::Superseded);
