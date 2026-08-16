@@ -366,6 +366,7 @@ pub fn run() {
             install::project_readiness_get,
             install::project_subscription_set,
             install::project_recommendations_list,
+            install::project_recommendations_acknowledge,
             install::project_recommendation_dismiss,
             install::project_recommendation_open,
             install::project_instructions_inspect,

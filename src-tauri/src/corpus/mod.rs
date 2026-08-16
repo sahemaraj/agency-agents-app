@@ -3150,7 +3150,16 @@ mod tests {
             .collect();
         assert!(validate_control_center(&too_many_agents).is_err());
 
-        let mut too_many_requirements = valid;
+        let mut too_many_skills = valid.clone();
+        too_many_skills.project_baselines[0].skills = (0..=CONTROL_CENTER_MAX_PROJECT_SKILLS)
+            .map(|index| crate::types::SkillReference {
+                source_id: "skills".into(),
+                relative_path: format!("skill-{index}"),
+            })
+            .collect();
+        assert!(validate_control_center(&too_many_skills).is_err());
+
+        let mut too_many_requirements = valid.clone();
         too_many_requirements.project_baselines[0].instructions = (0
             ..=CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS)
             .map(|index| BaselineRequirement {
@@ -3159,6 +3168,88 @@ mod tests {
             })
             .collect();
         assert!(validate_control_center(&too_many_requirements).is_err());
+
+        let mut too_many_mcp = valid.clone();
+        too_many_mcp.project_baselines[0].mcp_servers = (0
+            ..=CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS)
+            .map(|index| BaselineRequirement {
+                id: format!("opaque-mcp-{index}"),
+                known: false,
+            })
+            .collect();
+        assert!(validate_control_center(&too_many_mcp).is_err());
+
+        let mut too_many_tools = valid.clone();
+        too_many_tools.project_baselines[0].tools =
+            vec!["codex".into(); CONTROL_CENTER_MAX_PROJECT_TOOLS + 1];
+        assert!(validate_control_center(&too_many_tools).is_err());
+
+        let mut too_many_projects = valid.clone();
+        too_many_projects.project_baselines = (0..=CONTROL_CENTER_MAX_PROJECT_BASELINES)
+            .map(|index| ProjectReadinessBaseline {
+                project_path: format!("/registered/project-{index}"),
+                label: format!("Project {index}"),
+                agents: Vec::new(),
+                skills: Vec::new(),
+                instructions: Vec::new(),
+                mcp_servers: Vec::new(),
+                tools: Vec::new(),
+            })
+            .collect();
+        assert!(validate_control_center(&too_many_projects).is_err());
+
+        let mut too_many_subscriptions = valid.clone();
+        too_many_subscriptions.project_subscriptions = (0..=CONTROL_CENTER_MAX_SUBSCRIPTIONS)
+            .map(|index| ProjectSubscription {
+                project_path: format!("/registered/project-{index}"),
+                last_seen_batch: None,
+                dismissed_recommendation_ids: Vec::new(),
+            })
+            .collect();
+        assert!(validate_control_center(&too_many_subscriptions).is_err());
+
+        let mut too_many_dismissals = valid.clone();
+        too_many_dismissals.project_subscriptions[0].dismissed_recommendation_ids = (0
+            ..=CONTROL_CENTER_MAX_DISMISSED_RECOMMENDATIONS)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        assert!(validate_control_center(&too_many_dismissals).is_err());
+
+        for invalid in [
+            {
+                let mut document = valid.clone();
+                document.project_baselines[0].label = "x".repeat(CONTROL_CENTER_MAX_TEXT_CHARS + 1);
+                document
+            },
+            {
+                let mut document = valid.clone();
+                document.project_baselines[0].project_path =
+                    format!("/{}", "x".repeat(CONTROL_CENTER_MAX_PATH_CHARS));
+                document
+            },
+            {
+                let mut document = valid.clone();
+                document.project_baselines[0].agents[0].relative_path =
+                    format!("{}.md", "x".repeat(CONTROL_CENTER_MAX_PATH_CHARS));
+                document
+            },
+            {
+                let mut document = valid.clone();
+                document.project_baselines[0].skills = vec![crate::types::SkillReference {
+                    source_id: "skills".into(),
+                    relative_path: "x".repeat(CONTROL_CENTER_MAX_PATH_CHARS + 1),
+                }];
+                document
+            },
+            {
+                let mut document = valid.clone();
+                document.project_baselines[0].instructions[0].id =
+                    "x".repeat(CONTROL_CENTER_MAX_TEXT_CHARS + 1);
+                document
+            },
+        ] {
+            assert!(validate_control_center(&invalid).is_err());
+        }
     }
 
     #[test]

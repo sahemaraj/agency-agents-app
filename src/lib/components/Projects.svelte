@@ -39,7 +39,7 @@
   import { toast } from "$lib/stores/toast.svelte";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import { appErrorMessage, isAppError, type InstalledAgent, type ProjectReadinessReport, type ProjectRecommendation } from "$lib/types";
+  import { appErrorMessage, isAppError, type InstalledAgent, type ProjectReadinessBaseline, type ProjectReadinessReport, type ProjectRecommendation } from "$lib/types";
   import type { ProjectInstructionApplyResult, ProjectInstructionOperation, ProjectInstructionPlan, ProjectInstructionSnippet, ProjectInstructionTarget } from "$lib/types";
   import { diffLines, diffStat, type DiffRow } from "$lib/util/diff";
 
@@ -153,6 +153,7 @@
   let readinessError = $state<string | null>(null);
   let readinessAnnouncement = $state("");
   let recommendationPlan = $state<ProjectRecommendation | null>(null);
+  let instructionManager: HTMLElement | undefined = $state();
   let readinessGeneration = 0;
   const newRecommendationCount = $derived(
     recommendations.filter((recommendation) => recommendation.lifecycle === "new").length,
@@ -177,7 +178,27 @@
       if (generation !== readinessGeneration) return;
       readiness = report;
       recommendations = nextRecommendations;
-      readinessAnnouncement = `Readiness ${report.overall}. ${nextRecommendations.filter((item) => item.lifecycle === "new").length} new recommendations.`;
+      const surfaced = nextRecommendations.filter((item) => item.lifecycle === "new");
+      readinessAnnouncement = `Readiness ${report.overall}. ${surfaced.length} new recommendations.`;
+      await tick();
+      if (generation !== readinessGeneration) return;
+      if (surfaced.length > 0) {
+        const cursor = surfaced.reduce((latest, item) =>
+          Date.parse(item.batchAt) > Date.parse(latest) ? item.batchAt : latest,
+        surfaced[0].batchAt);
+        try {
+          await projects.acknowledgeRecommendations(
+            projectPath,
+            cursor,
+            surfaced.map((item) => item.id),
+          );
+        } catch (error) {
+          if (generation === readinessGeneration) {
+            readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
+            readinessAnnouncement = `Recommendations are visible but could not be acknowledged. ${readinessError}`;
+          }
+        }
+      }
     } catch (error) {
       if (generation === readinessGeneration) {
         readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
@@ -253,6 +274,52 @@
     await projects.dismissRecommendation(selected.path, recommendation.id);
     readinessAnnouncement = "Recommendation dismissed.";
     await refreshReadiness();
+  }
+
+  function readinessRepairLabel(
+    category: ProjectReadinessReport["categories"][number]["category"],
+    label: string,
+  ): string {
+    return ({
+      agentRoster: `Review Agent readiness: ${label}`,
+      skills: `Review Skill readiness: ${label}`,
+      instructions: `Review project instructions: ${label}`,
+      mcp: `Open MCP settings for ${label}`,
+      tools: `Open Tools for ${label}`,
+    })[category];
+  }
+
+  async function repairReadiness(
+    category: ProjectReadinessReport["categories"][number]["category"],
+    row: ProjectReadinessReport["categories"][number]["rows"][number],
+  ): Promise<void> {
+    if (!readiness?.baseline) return;
+    if (category === "agentRoster") {
+      const reference = readiness.baseline.agents.find(
+        (item) => `${item.sourceId}:${item.relativePath}` === row.id,
+      );
+      if (reference) ui.openAgentReference(reference);
+      return;
+    }
+    if (category === "skills") {
+      const reference = readiness.baseline.skills.find(
+        (item) => `${item.sourceId}:${item.relativePath}` === row.id,
+      );
+      if (reference) ui.openSkill(reference);
+      return;
+    }
+    if (category === "instructions") {
+      readinessAnnouncement = `Project instruction configuration focused for ${row.label}.`;
+      await tick();
+      instructionManager?.scrollIntoView?.({ block: "nearest" });
+      instructionManager?.focus({ preventScroll: true });
+      return;
+    }
+    if (category === "mcp") {
+      ui.openSettings("mcp");
+      return;
+    }
+    ui.openTools(row.id as ProjectReadinessBaseline["tools"][number]);
   }
 
   // ── Project instructions: inspect → compose/remove → review → approve. ──
@@ -506,8 +573,8 @@
           <h3 id="project-readiness-heading">Readiness</h3>
           <p>{readiness?.baseline?.label ?? "No baseline configured"}{#if readiness} · {readiness.overall}{/if}</p>
         </div>
-        <button class="btn" disabled={readinessBusy} onclick={() => void refreshReadiness()}>Retry</button>
-        <button class="btn" disabled={readinessBusy} onclick={() => void importReadinessPack()}>Import Workspace Pack baseline</button>
+        <Button size="sm" disabled={readinessBusy} onclick={() => void refreshReadiness()}>Retry</Button>
+        <Button size="sm" disabled={readinessBusy} onclick={() => void importReadinessPack()}>Import Workspace Pack baseline</Button>
         {#if readiness?.baseline}
           <label class="readiness-opt-in"><input type="checkbox" checked={readiness.subscribed} disabled={readinessBusy} onchange={(event) => void setReadinessSubscription(event.currentTarget.checked)} /> Catalog recommendations</label>
         {/if}
@@ -520,7 +587,7 @@
             <section class="readiness-category">
               <h4>{readinessCategoryLabel(category.category)} <span>{category.state}</span></h4>
               {#if category.rows.length}
-                <ul>{#each category.rows as row (row.id)}<li><strong>{row.label}</strong><span>{row.state} · {row.evidence}</span></li>{/each}</ul>
+                <ul>{#each category.rows as row (row.id)}<li><strong>{row.label}</strong><span>{row.state} · {row.evidence}</span>{#if row.state !== "ready"}<Button variant="link" size="sm" ariaLabel={readinessRepairLabel(category.category, row.label)} onclick={() => void repairReadiness(category.category, row)}>Review</Button>{/if}</li>{/each}</ul>
               {:else}<p>Not required</p>{/if}
             </section>
           {/each}
@@ -546,7 +613,7 @@
       {/if}
     </section>
 
-    <section class="instruction-manager" aria-labelledby="project-instructions-heading" aria-busy={instructionLoading}>
+    <section class="instruction-manager" bind:this={instructionManager} tabindex="-1" aria-labelledby="project-instructions-heading" aria-busy={instructionLoading}>
       <div class="instruction-heading">
         <div>
           <h3 id="project-instructions-heading">Project instructions</h3>

@@ -128,6 +128,11 @@ export const projectSubscriptionSet = (projectPath: string, enabled: boolean) =>
   invoke<boolean>("project_subscription_set", { projectPath, enabled });
 export const projectRecommendationsList = (projectPath: string) =>
   invoke<ProjectRecommendation[]>("project_recommendations_list", { projectPath });
+export const projectRecommendationsAcknowledge = (
+  projectPath: string,
+  batchAt: string,
+  recommendationIds: string[],
+) => invoke<boolean>("project_recommendations_acknowledge", { projectPath, batchAt, recommendationIds });
 export const projectRecommendationDismiss = (projectPath: string, recommendationId: string) =>
   invoke<void>("project_recommendation_dismiss", { projectPath, recommendationId });
 export const projectRecommendationOpen = (projectPath: string, recommendationId: string) =>

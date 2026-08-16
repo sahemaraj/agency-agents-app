@@ -926,6 +926,7 @@ pub struct ProjectRecommendation {
     pub batch_at: String,
     pub lifecycle: RecommendationLifecycle,
     pub summary: String,
+    pub baseline_reference: AgentReference,
     pub agent_references: Vec<AgentReference>,
 }
 

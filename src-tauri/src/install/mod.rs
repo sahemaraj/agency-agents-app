@@ -5445,14 +5445,43 @@ pub async fn project_readiness_get(
     Ok(report)
 }
 
-fn catalog_change_reference(change: &CatalogChange) -> AgentReference {
-    let item = match change {
-        CatalogChange::Added { item } | CatalogChange::Removed { item } => item,
-        CatalogChange::Updated { after, .. } | CatalogChange::Renamed { after, .. } => after,
-    };
+fn catalog_item_reference(item: &crate::types::CatalogSnapshotItem) -> AgentReference {
     AgentReference {
         source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
         relative_path: item.relative_path.clone(),
+    }
+}
+
+fn catalog_change_for_reference(
+    current: &AgentReference,
+    change: &CatalogChange,
+) -> Option<(AgentReference, String)> {
+    match change {
+        CatalogChange::Added { item } if catalog_item_reference(item) == *current => Some((
+            current.clone(),
+            "Required Agent was added in a successful catalog refresh".into(),
+        )),
+        CatalogChange::Updated { before, after } if catalog_item_reference(before) == *current => {
+            Some((
+                catalog_item_reference(after),
+                "Required Agent was updated in a successful catalog refresh".into(),
+            ))
+        }
+        CatalogChange::Removed { item } if catalog_item_reference(item) == *current => Some((
+            current.clone(),
+            "Required Agent was removed in a successful catalog refresh".into(),
+        )),
+        CatalogChange::Renamed { before, after } if catalog_item_reference(before) == *current => {
+            let next = catalog_item_reference(after);
+            Some((
+                next.clone(),
+                format!(
+                    "Required Agent was renamed: {} → {}",
+                    current.relative_path, next.relative_path
+                ),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -5460,27 +5489,44 @@ fn derive_project_recommendations(
     baseline: &ProjectReadinessBaseline,
     subscription: &ProjectSubscription,
     batches: &[CatalogFeedBatch],
-    available: &BTreeSet<AgentReference>,
+    available: &BTreeMap<AgentReference, usize>,
 ) -> Vec<ProjectRecommendation> {
-    let required = baseline.agents.iter().cloned().collect::<BTreeSet<_>>();
-    let latest_batch = batches.last().map(|batch| batch.at.as_str());
     let mut recommendations = Vec::new();
-    for batch in batches {
-        for change in &batch.changes {
-            let reference = catalog_change_reference(change);
-            if !required.contains(&reference) {
-                continue;
+    let required = baseline.agents.iter().cloned().collect::<BTreeSet<_>>();
+    for baseline_reference in required {
+        let mut current_reference = baseline_reference.clone();
+        let mut relevant = Vec::new();
+        for batch in batches {
+            for change in &batch.changes {
+                let Some((action_reference, summary)) =
+                    catalog_change_for_reference(&current_reference, change)
+                else {
+                    continue;
+                };
+                relevant.push((batch, change, action_reference.clone(), summary));
+                if matches!(change, CatalogChange::Renamed { .. }) {
+                    current_reference = action_reference;
+                }
             }
+        }
+        let latest_relevant = relevant.len().checked_sub(1);
+        for (index, (batch, change, action_reference, summary)) in relevant.into_iter().enumerate()
+        {
             let id = render::sha256_hex(
-                &serde_json::to_vec(&(baseline.project_path.as_str(), batch.at.as_str(), change))
-                    .expect("catalog recommendation identity is serializable"),
+                &serde_json::to_vec(&(
+                    baseline.project_path.as_str(),
+                    &baseline_reference,
+                    batch.at.as_str(),
+                    change,
+                ))
+                .expect("catalog recommendation identity is serializable"),
             );
             let lifecycle = if subscription.dismissed_recommendation_ids.contains(&id) {
                 RecommendationLifecycle::Dismissed
-            } else if !available.contains(&reference) {
-                RecommendationLifecycle::Blocked
-            } else if latest_batch != Some(batch.at.as_str()) {
+            } else if Some(index) != latest_relevant {
                 RecommendationLifecycle::Superseded
+            } else if available.get(&action_reference) != Some(&1) {
+                RecommendationLifecycle::Blocked
             } else if subscription
                 .last_seen_batch
                 .as_deref()
@@ -5493,24 +5539,24 @@ fn derive_project_recommendations(
             } else {
                 continue;
             };
-            let change_label = match change {
-                CatalogChange::Added { .. } => "added",
-                CatalogChange::Updated { .. } => "updated",
-                CatalogChange::Removed { .. } => "removed",
-                CatalogChange::Renamed { .. } => "renamed",
-            };
             recommendations.push(ProjectRecommendation {
                 id,
                 project_path: baseline.project_path.clone(),
                 batch_at: batch.at.clone(),
                 lifecycle,
-                summary: format!(
-                    "Required Agent was {change_label} in a successful catalog refresh"
-                ),
-                agent_references: vec![reference],
+                summary,
+                baseline_reference: baseline_reference.clone(),
+                agent_references: vec![action_reference],
             });
         }
     }
+    recommendations.sort_by(|left, right| {
+        chrono::DateTime::parse_from_rfc3339(&left.batch_at)
+            .ok()
+            .cmp(&chrono::DateTime::parse_from_rfc3339(&right.batch_at).ok())
+            .then_with(|| left.baseline_reference.cmp(&right.baseline_reference))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     recommendations
 }
 
@@ -5588,12 +5634,16 @@ async fn current_recommendations(
     let available = crate::agents::inspect_agent_sources(&state.app_data_dir)
         .await
         .map(|sources| {
-            sources
+            let mut counts = BTreeMap::new();
+            for reference in sources
                 .into_iter()
                 .flat_map(|source| source.agents)
                 .filter(|package| package.installable)
                 .map(|package| package.reference)
-                .collect::<BTreeSet<_>>()
+            {
+                *counts.entry(reference).or_insert(0) += 1;
+            }
+            counts
         })
         .unwrap_or_default();
     let mut projection = subscription.clone();
@@ -5611,35 +5661,127 @@ pub async fn project_recommendations_list(
     project_path: String,
 ) -> Result<Vec<ProjectRecommendation>, AppError> {
     let project_path = exact_registered_project(&state, &project_path).await?;
+    list_project_recommendations_for_state(&state, &project_path).await
+}
+
+async fn list_project_recommendations_for_state(
+    state: &AppState,
+    project_path: &str,
+) -> Result<Vec<ProjectRecommendation>, AppError> {
+    let (_, recommendations) = current_recommendations(state, project_path, false).await?;
+    Ok(recommendations)
+}
+
+fn advance_project_recommendation_cursor(
+    document: &mut crate::types::ControlCenterDocument,
+    project_path: &str,
+    expected_cursor: Option<&str>,
+    surfaced_cursor: &str,
+) -> Result<(), AppError> {
+    let surfaced_at = chrono::DateTime::parse_from_rfc3339(surfaced_cursor).map_err(|_| {
+        AppError::InvalidArgument {
+            message: "Recommendation cursor is invalid".into(),
+        }
+    })?;
+    if document
+        .catalog_last_success_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|last_success| surfaced_at > last_success)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Recommendation cursor is newer than the durable catalog feed".into(),
+        });
+    }
+    let subscription = document
+        .project_subscriptions
+        .iter_mut()
+        .find(|subscription| subscription.project_path == project_path)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "Project is not subscribed".into(),
+        })?;
+    if subscription.last_seen_batch.as_deref() != expected_cursor {
+        return Err(AppError::InvalidArgument {
+            message: "Recommendation acknowledgement is stale".into(),
+        });
+    }
+    if subscription
+        .last_seen_batch
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|cursor| surfaced_at <= cursor)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Recommendation cursor must advance".into(),
+        });
+    }
+    subscription.last_seen_batch = Some(surfaced_cursor.into());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn project_recommendations_acknowledge(
+    state: State<'_, AppState>,
+    project_path: String,
+    batch_at: String,
+    recommendation_ids: Vec<String>,
+) -> Result<bool, AppError> {
+    const MAX_SURFACED_RECOMMENDATIONS: usize = 256;
+    let project_path = exact_registered_project(&state, &project_path).await?;
+    if recommendation_ids.is_empty()
+        || recommendation_ids.len() > MAX_SURFACED_RECOMMENDATIONS
+        || recommendation_ids
+            .iter()
+            .any(|id| id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Surfaced recommendation receipt is invalid".into(),
+        });
+    }
     let (subscription, recommendations) =
         current_recommendations(&state, &project_path, false).await?;
+    let mut expected_ids = recommendations
+        .iter()
+        .filter(|recommendation| recommendation.lifecycle == RecommendationLifecycle::New)
+        .map(|recommendation| recommendation.id.clone())
+        .collect::<Vec<_>>();
     let surfaced_cursor = recommendations
         .iter()
         .filter(|recommendation| recommendation.lifecycle == RecommendationLifecycle::New)
-        .map(|recommendation| recommendation.batch_at.as_str())
-        .max()
-        .map(str::to_owned);
-    if let Some(cursor) = surfaced_cursor {
-        control_center_database(&state)
-            .await?
-            .mutate(
-                corpus::control_center_spec(),
-                crate::types::ControlCenterDocument::default(),
-                move |document| {
-                    let current = document
-                        .project_subscriptions
-                        .iter_mut()
-                        .find(|item| item.project_path == subscription.project_path)
-                        .ok_or_else(|| AppError::InvalidArgument {
-                            message: "Project subscription changed during evaluation".into(),
-                        })?;
-                    current.last_seen_batch = Some(cursor);
-                    Ok(())
-                },
-            )
-            .await?;
+        .max_by_key(|recommendation| {
+            chrono::DateTime::parse_from_rfc3339(&recommendation.batch_at).ok()
+        })
+        .map(|recommendation| recommendation.batch_at.as_str());
+    let mut supplied_ids = recommendation_ids;
+    expected_ids.sort();
+    supplied_ids.sort();
+    let supplied_count = supplied_ids.len();
+    supplied_ids.dedup();
+    if supplied_ids.len() != supplied_count
+        || supplied_ids != expected_ids
+        || surfaced_cursor != Some(batch_at.as_str())
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Recommendation receipt does not match the current surfaced set".into(),
+        });
     }
-    Ok(recommendations)
+    let expected_cursor = subscription.last_seen_batch;
+    control_center_database(&state)
+        .await?
+        .mutate(
+            corpus::control_center_spec(),
+            crate::types::ControlCenterDocument::default(),
+            move |document| {
+                advance_project_recommendation_cursor(
+                    document,
+                    &project_path,
+                    expected_cursor.as_deref(),
+                    &batch_at,
+                )
+            },
+        )
+        .await?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -8542,6 +8684,64 @@ mod tests {
             needs_attention.categories[0].rows[0].state,
             ReadinessRowState::NeedsAttention
         );
+
+        let ready_baseline = ProjectReadinessBaseline {
+            instructions: Vec::new(),
+            ..baseline.clone()
+        };
+        let ready = build_readiness_report(
+            "/registered/project",
+            Some(&ready_baseline),
+            ReadinessEvidence {
+                agents: Ok(BTreeMap::from([(
+                    ready_baseline.agents[0].clone(),
+                    ReadinessRowState::Ready,
+                )])),
+                ..ReadinessEvidence::ready()
+            },
+        );
+        assert_eq!(ready.overall, ProjectReadinessOverall::Ready);
+
+        let independently_unavailable = build_readiness_report(
+            "/registered/project",
+            Some(&ready_baseline),
+            ReadinessEvidence {
+                skills: Err("Skill inspection failed".into()),
+                agents: Ok(BTreeMap::from([(
+                    ready_baseline.agents[0].clone(),
+                    ReadinessRowState::Ready,
+                )])),
+                ..ReadinessEvidence::ready()
+            },
+        );
+        assert_eq!(
+            independently_unavailable.overall,
+            ProjectReadinessOverall::Ready
+        );
+
+        let required_skill = ProjectReadinessBaseline {
+            skills: vec![SkillReference {
+                source_id: "skills".into(),
+                relative_path: "audit".into(),
+            }],
+            ..ready_baseline
+        };
+        let independently_unavailable = build_readiness_report(
+            "/registered/project",
+            Some(&required_skill),
+            ReadinessEvidence {
+                skills: Err("Skill inspection failed".into()),
+                agents: Ok(BTreeMap::from([(
+                    required_skill.agents[0].clone(),
+                    ReadinessRowState::Ready,
+                )])),
+                ..ReadinessEvidence::ready()
+            },
+        );
+        assert_eq!(
+            independently_unavailable.overall,
+            ProjectReadinessOverall::Unavailable
+        );
     }
 
     #[test]
@@ -8642,6 +8842,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn project_recommendation_listing_is_cursor_and_destination_write_free() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let marker = project.path().join("user-owned.txt");
+        std::fs::write(&marker, "unchanged").unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let database = control_center_database(&state).await.unwrap();
+        let persisted_path = project_path.clone();
+        database
+            .mutate(
+                corpus::control_center_spec(),
+                crate::types::ControlCenterDocument::default(),
+                move |document| {
+                    document.catalog_last_success_at = Some("2026-08-17T01:00:00Z".into());
+                    document.catalog_feed = vec![CatalogFeedBatch {
+                        at: "2026-08-17T01:00:00Z".into(),
+                        changes: vec![CatalogChange::Updated {
+                            before: CatalogSnapshotItem {
+                                category: "engineering".into(),
+                                relative_path: reference.relative_path.clone(),
+                                source_hash: "a".repeat(64),
+                                body_hash: "b".repeat(64),
+                            },
+                            after: CatalogSnapshotItem {
+                                category: "engineering".into(),
+                                relative_path: reference.relative_path.clone(),
+                                source_hash: "c".repeat(64),
+                                body_hash: "d".repeat(64),
+                            },
+                        }],
+                    }];
+                    document.project_baselines = vec![ProjectReadinessBaseline {
+                        project_path: persisted_path.clone(),
+                        label: "Reviewers".into(),
+                        agents: vec![reference],
+                        skills: Vec::new(),
+                        instructions: Vec::new(),
+                        mcp_servers: Vec::new(),
+                        tools: Vec::new(),
+                    }];
+                    document.project_subscriptions = vec![ProjectSubscription {
+                        project_path: persisted_path,
+                        last_seen_batch: None,
+                        dismissed_recommendation_ids: Vec::new(),
+                    }];
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let before = corpus::load_control_center(&database).await.unwrap();
+
+        let recommendations = list_project_recommendations_for_state(&state, &project_path)
+            .await
+            .unwrap();
+
+        assert_eq!(recommendations.len(), 1);
+        assert_eq!(
+            corpus::load_control_center(&database).await.unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "unchanged");
+        assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn subscription_recommendations_obey_cursor_dismissal_supersession_and_blocking() {
         let reference = AgentReference {
@@ -8696,7 +8970,7 @@ mod tests {
             &baseline,
             &subscription,
             &batches,
-            &BTreeSet::from([reference.clone()]),
+            &BTreeMap::from([(reference.clone(), 1)]),
         );
         assert_eq!(recommendations.len(), 2);
         assert_eq!(
@@ -8705,7 +8979,7 @@ mod tests {
         );
         assert_eq!(recommendations[1].lifecycle, RecommendationLifecycle::New);
         assert_eq!(
-            derive_project_recommendations(&baseline, &subscription, &batches, &BTreeSet::new(),)
+            derive_project_recommendations(&baseline, &subscription, &batches, &BTreeMap::new(),)
                 [1]
             .lifecycle,
             RecommendationLifecycle::Blocked
@@ -8714,7 +8988,7 @@ mod tests {
             .dismissed_recommendation_ids
             .push(recommendations[1].id.clone());
         assert_eq!(
-            derive_project_recommendations(&baseline, &subscription, &batches, &BTreeSet::new(),)
+            derive_project_recommendations(&baseline, &subscription, &batches, &BTreeMap::new(),)
                 [1]
             .lifecycle,
             RecommendationLifecycle::Dismissed
@@ -8724,10 +8998,181 @@ mod tests {
             &baseline,
             &subscription,
             &batches,
-            &BTreeSet::from([reference]),
+            &BTreeMap::from([(reference, 1)]),
         )
         .iter()
         .all(|recommendation| recommendation.lifecycle != RecommendationLifecycle::New));
+    }
+
+    #[test]
+    fn rename_recommendation_tracks_old_identity_and_hands_off_exact_new_reference() {
+        let old = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/old-reviewer.md".into(),
+        };
+        let new = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/new-reviewer.md".into(),
+        };
+        let baseline = ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Reviewers".into(),
+            agents: vec![old.clone()],
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        };
+        let batches = vec![CatalogFeedBatch {
+            at: "2026-08-17T01:00:00Z".into(),
+            changes: vec![CatalogChange::Renamed {
+                before: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: old.relative_path.clone(),
+                    source_hash: "a".repeat(64),
+                    body_hash: "b".repeat(64),
+                },
+                after: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: new.relative_path.clone(),
+                    source_hash: "a".repeat(64),
+                    body_hash: "b".repeat(64),
+                },
+            }],
+        }];
+        let subscription = ProjectSubscription {
+            project_path: baseline.project_path.clone(),
+            last_seen_batch: None,
+            dismissed_recommendation_ids: Vec::new(),
+        };
+
+        let ready = derive_project_recommendations(
+            &baseline,
+            &subscription,
+            &batches,
+            &BTreeMap::from([(new.clone(), 1)]),
+        );
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].baseline_reference, old);
+        assert_eq!(ready[0].agent_references, vec![new.clone()]);
+        assert!(ready[0].summary.contains("old-reviewer.md"));
+        assert!(ready[0].summary.contains("new-reviewer.md"));
+        assert_eq!(ready[0].lifecycle, RecommendationLifecycle::New);
+
+        let ambiguous = derive_project_recommendations(
+            &baseline,
+            &subscription,
+            &batches,
+            &BTreeMap::from([(new, 2)]),
+        );
+        assert_eq!(ambiguous[0].lifecycle, RecommendationLifecycle::Blocked);
+    }
+
+    #[test]
+    fn only_a_later_change_for_the_same_logical_baseline_supersedes() {
+        let first = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/first.md".into(),
+        };
+        let unrelated = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/unrelated.md".into(),
+        };
+        let baseline = ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Reviewers".into(),
+            agents: vec![first.clone()],
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        };
+        let change = |reference: &AgentReference, at: &str, hash: char| CatalogFeedBatch {
+            at: at.into(),
+            changes: vec![CatalogChange::Updated {
+                before: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: reference.relative_path.clone(),
+                    source_hash: format!("{:064x}", hash as u32),
+                    body_hash: "b".repeat(64),
+                },
+                after: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: reference.relative_path.clone(),
+                    source_hash: format!("{:064x}", hash as u32 + 1),
+                    body_hash: "c".repeat(64),
+                },
+            }],
+        };
+        let subscription = ProjectSubscription {
+            project_path: baseline.project_path.clone(),
+            last_seen_batch: None,
+            dismissed_recommendation_ids: Vec::new(),
+        };
+        let available = BTreeMap::from([(first.clone(), 1)]);
+
+        let unrelated_later = derive_project_recommendations(
+            &baseline,
+            &subscription,
+            &[
+                change(&first, "2026-08-17T01:00:00Z", 'a'),
+                change(&unrelated, "2026-08-17T02:00:00Z", 'c'),
+            ],
+            &available,
+        );
+        assert_eq!(unrelated_later.len(), 1);
+        assert_eq!(unrelated_later[0].lifecycle, RecommendationLifecycle::New);
+
+        let same_later = derive_project_recommendations(
+            &baseline,
+            &subscription,
+            &[
+                change(&first, "2026-08-17T01:00:00Z", 'a'),
+                change(&first, "2026-08-17T02:00:00Z", 'c'),
+            ],
+            &available,
+        );
+        assert_eq!(same_later.len(), 2);
+        assert_eq!(same_later[0].lifecycle, RecommendationLifecycle::Superseded);
+        assert_eq!(same_later[1].lifecycle, RecommendationLifecycle::New);
+    }
+
+    #[test]
+    fn recommendation_acknowledgement_is_ordered_and_rejects_stale_cursor() {
+        let mut document = crate::types::ControlCenterDocument {
+            catalog_last_success_at: Some("2026-08-17T03:00:00Z".into()),
+            project_subscriptions: vec![ProjectSubscription {
+                project_path: "/registered/project".into(),
+                last_seen_batch: Some("2026-08-17T01:00:00Z".into()),
+                dismissed_recommendation_ids: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        advance_project_recommendation_cursor(
+            &mut document,
+            "/registered/project",
+            Some("2026-08-17T01:00:00Z"),
+            "2026-08-17T02:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            document.project_subscriptions[0].last_seen_batch.as_deref(),
+            Some("2026-08-17T02:00:00Z")
+        );
+        assert!(advance_project_recommendation_cursor(
+            &mut document,
+            "/registered/project",
+            Some("2026-08-17T01:00:00Z"),
+            "2026-08-17T03:00:00Z",
+        )
+        .is_err());
+        assert!(advance_project_recommendation_cursor(
+            &mut document,
+            "/registered/project",
+            Some("2026-08-17T02:00:00Z"),
+            "2026-08-17T01:00:00Z",
+        )
+        .is_err());
     }
 
     #[test]

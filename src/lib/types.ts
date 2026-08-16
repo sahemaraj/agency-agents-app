@@ -1387,6 +1387,7 @@ export interface ProjectRecommendation {
   batchAt: string;
   lifecycle: RecommendationLifecycle;
   summary: string;
+  baselineReference: AgentReference;
   agentReferences: AgentReference[];
 }
 

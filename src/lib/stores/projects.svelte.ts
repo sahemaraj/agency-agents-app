@@ -20,6 +20,7 @@ import {
   projectReadinessGet,
   projectRecommendationDismiss,
   projectRecommendationOpen,
+  projectRecommendationsAcknowledge,
   projectRecommendationsList,
   projectSubscriptionSet,
 } from "$lib/api";
@@ -99,6 +100,14 @@ class ProjectsStore {
 
   recommendations(projectPath: string): Promise<ProjectRecommendation[]> {
     return projectRecommendationsList(projectPath);
+  }
+
+  acknowledgeRecommendations(
+    projectPath: string,
+    batchAt: string,
+    recommendationIds: string[],
+  ): Promise<boolean> {
+    return projectRecommendationsAcknowledge(projectPath, batchAt, recommendationIds);
   }
 
   dismissRecommendation(projectPath: string, recommendationId: string): Promise<void> {

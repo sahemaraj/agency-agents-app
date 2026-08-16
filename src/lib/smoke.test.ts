@@ -26,6 +26,7 @@ import {
   selectMcpAuditEntries,
 } from "$lib/stores/activity.svelte";
 import type { JournalEntry } from "$lib/stores/activity.svelte";
+import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
 import { catalog } from "$lib/stores/catalog.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
 import { experts, summarizeExpertPerformance } from "$lib/stores/experts.svelte";
@@ -37,7 +38,7 @@ import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type CatalogFeedState, type CatalogStatus, type DoctorReport, type ExpertResolved, type ExpertRun, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type WorkspacePackPlan } from "$lib/types";
+import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type CatalogFeedState, type CatalogStatus, type DoctorReport, type ExpertResolved, type ExpertRun, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type ProjectReadinessReport, type ProjectRecommendation, type WorkspacePackPlan } from "$lib/types";
 
 const notificationMocks = vi.hoisted(() => ({
   isPermissionGranted: vi.fn(async () => true),
@@ -140,6 +141,36 @@ const catalogFeedFixture = (
     }],
   }],
 });
+const readinessFixture = (projectPath = "/tmp/project", subscribed = true): ProjectReadinessReport => ({
+  projectPath,
+  overall: "needsAttention",
+  subscribed,
+  baseline: {
+    projectPath,
+    label: "Review baseline",
+    agents: [{ sourceId: "built-in", relativePath: "engineering/old-reviewer.md" }],
+    skills: [{ sourceId: "skills", relativePath: "audit" }],
+    instructions: [{ id: "agents", known: true }],
+    mcpServers: [{ id: "agency-agents", known: true }],
+    tools: ["claudeCode"],
+  },
+  categories: [
+    { category: "agentRoster", state: "needsAttention", rows: [{ id: "built-in:engineering/old-reviewer.md", label: "Old reviewer", state: "needsAttention", evidence: "Drifted" }] },
+    { category: "skills", state: "needsAttention", rows: [{ id: "skills:audit", label: "Audit", state: "needsAttention", evidence: "Missing" }] },
+    { category: "instructions", state: "needsAttention", rows: [{ id: "agents", label: "AGENTS.md", state: "needsAttention", evidence: "Missing" }] },
+    { category: "mcp", state: "unavailable", rows: [{ id: "agency-agents", label: "agency-agents", state: "unavailable", evidence: "Inspection failed" }] },
+    { category: "tools", state: "needsAttention", rows: [{ id: "claudeCode", label: "Claude Code", state: "needsAttention", evidence: "Not detected" }] },
+  ],
+});
+const renamedProjectRecommendation = (projectPath = "/tmp/project"): ProjectRecommendation => ({
+  id: "a".repeat(64),
+  projectPath,
+  batchAt: "2026-08-17T01:00:00Z",
+  lifecycle: "new",
+  summary: "Required Agent was renamed: engineering/old-reviewer.md → engineering/new-reviewer.md",
+  baselineReference: { sourceId: "built-in", relativePath: "engineering/old-reviewer.md" },
+  agentReferences: [{ sourceId: "built-in", relativePath: "engineering/new-reviewer.md" }],
+});
 const staleControlPackage: AgentPackageResult = {
   reference: { sourceId: "built-in", relativePath: "reviewer.md" }, agent: staleControlAgent,
   sourceHash: "source", frontmatterHash: "frontmatter", bodyHash: "body", version: null,
@@ -205,6 +236,7 @@ beforeEach(async () => {
   catalog.detection = null;
   catalog.checking = false;
   catalog.scanning = false;
+  agentLibrary.results = [];
   corpus.agents = [];
   corpus.categories = [];
   corpus.loading = false;
@@ -3638,7 +3670,7 @@ describe("frontend test harness", () => {
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(54);
+      .toHaveLength(55);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -3780,6 +3812,178 @@ describe("frontend test harness", () => {
       expect(source).not.toContain("flex: 1 1 240px");
       expect(source).not.toMatch(/\.reconcile-warning[^}]*overflow-x:\s*(auto|scroll|hidden)/s);
       expect(source).not.toMatch(/\.reconcile-message[^}]*text-overflow:\s*ellipsis/s);
+    }
+  });
+
+  it("acknowledges recommendations only after the current generation is rendered", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectRows = [
+      { path: "/tmp/project-one", label: "project-one", installedCount: 0 },
+      { path: "/tmp/project-two", label: "project-two", installedCount: 0 },
+    ];
+    let resolveFirst!: (value: ProjectRecommendation[]) => void;
+    const firstRecommendations = new Promise<ProjectRecommendation[]>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      const projectPath = (args as { projectPath?: string } | undefined)?.projectPath;
+      if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_instructions_inspect") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath) as never;
+      if (command === "project_recommendations_list") {
+        return (projectPath === "/tmp/project-one" ? firstRecommendations : []) as never;
+      }
+      if (command === "project_recommendations_acknowledge") {
+        throw new Error("discarded generation must not acknowledge");
+      }
+      return [] as never;
+    });
+    corpus.agents = [staleControlAgent];
+    corpus.categories = [{ slug: "engineering", label: "Engineering", color: "#2563eb", icon: "Code", count: 1 }];
+    projects.list = projectRows;
+    ui.projectsSelected = "/tmp/project-one";
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Projects, { target });
+    try {
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command, args]) =>
+        command === "project_recommendations_list"
+        && (args as { projectPath?: string }).projectPath === "/tmp/project-one")).toBe(true));
+      ui.selectProject("/tmp/project-two");
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command, args]) =>
+        command === "project_recommendations_list"
+        && (args as { projectPath?: string }).projectPath === "/tmp/project-two")).toBe(true));
+      resolveFirst([renamedProjectRecommendation("/tmp/project-one")]);
+      await tick();
+      await Promise.resolve();
+      expect(invokeMock.mock.calls.some(([command]) => command === "project_recommendations_acknowledge")).toBe(false);
+      expect(target.textContent).not.toContain("old-reviewer.md → engineering/new-reviewer.md");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("renders rename recommendations before acknowledging and hands the exact new ref to review", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/project";
+    const recommendation = renamedProjectRecommendation(projectPath);
+    const projectRows = [{ path: projectPath, label: "project", installedCount: 0 }];
+    const newPackage: AgentPackageResult = {
+      ...staleControlPackage,
+      reference: recommendation.agentReferences[0],
+      agent: { ...staleControlAgent, slug: "new-reviewer", name: "New Reviewer" },
+    };
+    agentLibrary.results = [{
+      source: { id: "built-in", label: "Built in", enabled: true, kind: { kind: "builtIn" } },
+      agents: [newPackage], errors: [], revision: "test",
+    }];
+    install.tools = [staleControlTool];
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    corpus.agents = [staleControlAgent];
+    corpus.categories = [{ slug: "engineering", label: "Engineering", color: "#2563eb", icon: "Code", count: 1 }];
+    const target = document.createElement("div");
+    document.body.append(target);
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "tools_list") return [staleControlTool] as never;
+      if (command === "project_instructions_inspect") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath) as never;
+      if (command === "project_recommendations_list") return [recommendation] as never;
+      if (command === "project_recommendations_acknowledge") {
+        expect(target.textContent).toContain(recommendation.summary);
+        expect(args).toEqual({
+          projectPath,
+          batchAt: recommendation.batchAt,
+          recommendationIds: [recommendation.id],
+        });
+        return true as never;
+      }
+      if (command === "project_recommendation_open") return recommendation as never;
+      if (command === "agent_batch_install_plan") {
+        expect(args).toMatchObject({ references: recommendation.agentReferences });
+        throw new Error("review boundary reached");
+      }
+      return [] as never;
+    });
+    const component = mount(Projects, { target });
+    try {
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) =>
+        command === "project_recommendations_acknowledge")).toBe(true));
+      const open = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Open review")!;
+      open.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Review catalog recommendation"));
+      await vi.waitFor(() => expect(target.querySelector<HTMLButtonElement>(".grid .toggle:not(:disabled)")).toBeTruthy());
+      const exactCell = target.querySelector<HTMLButtonElement>(".grid .toggle:not(:disabled)")!;
+      exactCell.click();
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) =>
+        command === "agent_batch_install_plan")).toBe(true));
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("offers accessible category-specific repair links that reuse existing flows", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/project";
+    const projectRows = [{ path: projectPath, label: "project", installedCount: 0 }];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_instructions_inspect") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath, false) as never;
+      return [] as never;
+    });
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    corpus.agents = [staleControlAgent];
+    corpus.categories = [{ slug: "engineering", label: "Engineering", color: "#2563eb", icon: "Code", count: 1 }];
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Projects, { target });
+    const button = (label: string) => [...target.querySelectorAll<HTMLButtonElement>("button")]
+      .find((candidate) => candidate.getAttribute("aria-label") === label)!;
+    try {
+      await vi.waitFor(() => expect(button("Review Agent readiness: Old reviewer")).toBeTruthy());
+      const retry = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((candidate) => candidate.textContent?.trim() === "Retry")!;
+      expect(retry).toBeTruthy();
+      expect(retry.disabled).toBe(false);
+      expect(button("Review Skill readiness: Audit")).toBeTruthy();
+      expect(button("Review project instructions: AGENTS.md")).toBeTruthy();
+      expect(button("Open MCP settings for agency-agents")).toBeTruthy();
+      expect(button("Open Tools for Claude Code")).toBeTruthy();
+
+      button("Review project instructions: AGENTS.md").click();
+      await vi.waitFor(() => expect(document.activeElement?.classList.contains("instruction-manager")).toBe(true));
+
+      button("Open MCP settings for agency-agents").click();
+      expect(ui.settingsOpen).toBe(true);
+      expect(ui.settingsInitialSection).toBe("mcp");
+      ui.closeSettings();
+
+      button("Review Agent readiness: Old reviewer").click();
+      expect(ui.agentsReference).toEqual(readinessFixture().baseline?.agents[0]);
+      ui.selectProject(projectPath);
+      await vi.waitFor(() => expect(button("Review Skill readiness: Audit")).toBeTruthy());
+      button("Review Skill readiness: Audit").click();
+      expect(ui.skillsSelected).toEqual(readinessFixture().baseline?.skills[0]);
+
+      ui.selectProject(projectPath);
+      await vi.waitFor(() => expect(button("Open Tools for Claude Code")).toBeTruthy());
+      button("Open Tools for Claude Code").click();
+      expect(ui.toolsSelected).toBe("claudeCode");
+      expect(ui.section).toBe("tools");
+    } finally {
+      unmount(component);
+      target.remove();
     }
   });
 
