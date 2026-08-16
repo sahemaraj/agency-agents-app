@@ -293,6 +293,123 @@ impl StateDatabase {
             .transpose()
     }
 
+    /// Atomically extends the registry of an already-completed installation.
+    /// This is intentionally separate from legacy import: adding a new durable
+    /// document must not rerun migration or relax the complete-inventory check.
+    pub(crate) async fn register_completed_document<T>(
+        &self,
+        document: PersistenceDocument,
+        spec: DocumentSpec<T>,
+        default: T,
+    ) -> Result<(), AppError>
+    where
+        T: DeserializeOwned + Serialize + Send + 'static,
+    {
+        let database = self.clone();
+        run_blocking(move || database.register_completed_document_blocking(document, spec, default))
+            .await
+    }
+
+    pub(crate) fn register_completed_document_blocking<T>(
+        &self,
+        document: PersistenceDocument,
+        spec: DocumentSpec<T>,
+        default: T,
+    ) -> Result<(), AppError>
+    where
+        T: DeserializeOwned + Serialize,
+    {
+        if document.name != spec.name
+            || document.version != spec.version
+            || document.max_bytes != spec.max_bytes
+            || document.parser != "json"
+        {
+            return Err(AppError::InvalidArgument {
+                message: "completed document registration does not match its specification".into(),
+            });
+        }
+        safe_relative_path(document.relative_path)?;
+        (spec.validate)(&default)?;
+        let default_payload = serde_json::to_string(&default).map_err(|_| AppError::Internal {
+            message: format!("serialize {} registration state", spec.name),
+        })?;
+        if default_payload.len() as u64 > spec.max_bytes {
+            return Err(AppError::InvalidArgument {
+                message: format!("{} exceeds its {}-byte limit", spec.name, spec.max_bytes),
+            });
+        }
+
+        let mut connection = open_connection(&self.path)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if migration_state(&transaction)? != StorageMigrationState::Complete {
+            return Err(AppError::InvalidArgument {
+                message: "new durable documents can be registered only after SQLite migration"
+                    .into(),
+            });
+        }
+
+        let existing = transaction
+            .query_row(
+                "SELECT document_version, payload FROM state_documents WHERE name = ?1",
+                [spec.name],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        if let Some((version, payload)) = existing {
+            let _: T = decode(&spec, version, payload)?;
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO state_documents \
+                     (name, document_version, revision, payload, updated_at) \
+                     VALUES (?1, ?2, 1, ?3, ?4)",
+                    params![
+                        spec.name,
+                        spec.version,
+                        default_payload,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+
+        let registered_path = transaction
+            .query_row(
+                "SELECT relative_path FROM legacy_imports WHERE name = ?1",
+                [document.name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        match registered_path {
+            Some(path) if path != document.relative_path => {
+                return Err(AppError::StorageCorrupt {
+                    message: format!("{} legacy fingerprint path is invalid", document.name),
+                });
+            }
+            Some(_) => {}
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO legacy_imports \
+                         (name, relative_path, was_present, size_bytes, sha256, imported_at) \
+                         VALUES (?1, ?2, 0, 0, ?3, ?4)",
+                        params![
+                            document.name,
+                            document.relative_path,
+                            hex::encode(Sha256::digest([])),
+                            chrono::Utc::now().to_rfc3339()
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
     pub(crate) async fn mutate<T, R>(
         &self,
         spec: DocumentSpec<T>,
@@ -1541,6 +1658,78 @@ mod tests {
             ["durable"]
         );
         assert_eq!(database.visible_revision().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_database_registers_a_new_document_without_rerunning_migration() {
+        const EXPANDED_INVENTORY: &[PersistenceDocument] = &[
+            SYNTHETIC_INVENTORY[0],
+            SYNTHETIC_INVENTORY[1],
+            PersistenceDocument {
+                name: "three",
+                relative_path: "state/three.json",
+                version: 1,
+                max_bytes: 1024,
+                parser: "json",
+                validator: "test",
+            },
+        ];
+        let root = tempfile::tempdir().unwrap();
+        let database = StateDatabase::open(root.path()).unwrap();
+        database
+            .import_legacy(
+                root.path(),
+                SYNTHETIC_INVENTORY,
+                &[import_spec("one"), import_spec("two")],
+            )
+            .await
+            .unwrap();
+        let revision = database.visible_revision().await.unwrap();
+
+        database
+            .register_completed_document(
+                EXPANDED_INVENTORY[2],
+                DocumentSpec::new("three", 1, 1024, validate),
+                TestDocument::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database.migration_state().await.unwrap(),
+            StorageMigrationState::Complete
+        );
+        assert_eq!(
+            database
+                .read(DocumentSpec::new("three", 1, 1024, validate))
+                .await
+                .unwrap(),
+            Some(TestDocument::default())
+        );
+        assert_eq!(database.visible_revision().await.unwrap(), revision);
+        assert!(database
+            .legacy_conflicts(root.path(), EXPANDED_INVENTORY)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let backup = root.path().join("registered.sqlite3");
+        database.backup_to(&backup).await.unwrap();
+        let backup = Connection::open(backup).unwrap();
+        let registrations: i64 = backup
+            .query_row(
+                "SELECT count(*) FROM legacy_imports WHERE name = 'three'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registrations, 1);
+        assert_eq!(
+            backup
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
     }
 
     #[test]

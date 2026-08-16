@@ -268,7 +268,10 @@ impl AppState {
             return Ok(None);
         };
         match database.migration_state().await? {
-            crate::types::StorageMigrationState::Complete => Ok(Some(database)),
+            crate::types::StorageMigrationState::Complete => {
+                crate::corpus::register_control_center_document(&database).await?;
+                Ok(Some(database))
+            }
             crate::types::StorageMigrationState::Legacy
             | crate::types::StorageMigrationState::InProgress
             | crate::types::StorageMigrationState::Corrupt => Ok(None),
@@ -298,6 +301,12 @@ impl AppState {
         let storage_lease = crate::state_db::StorageLease::shared(&app_data_dir)?;
         #[cfg(not(test))]
         let state_database = crate::state_db::StateDatabase::open(&app_data_dir)?;
+        #[cfg(not(test))]
+        if state_database.migration_state_blocking()?
+            == crate::types::StorageMigrationState::Complete
+        {
+            crate::corpus::register_control_center_document_blocking(&state_database)?;
+        }
 
         // Load settings synchronously at startup. The loader handles
         // file-absent (FirstLaunch → defaults), file-corrupt (Corrupt →
@@ -1113,6 +1122,7 @@ pub(crate) async fn migration_status(
             Vec::new(),
         ),
         crate::types::StorageMigrationState::Complete => {
+            crate::corpus::register_control_center_document(&database).await?;
             let pending = database.pending_filesystem_operations().await?;
             let recovery_errors = pending
                 .iter()
@@ -1296,6 +1306,47 @@ mod tests {
             .query_row("SELECT count(*) FROM state_documents", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, PERSISTENCE_INVENTORY.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn completed_installation_backfills_control_center_before_status_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        let mut previous_inventory = PERSISTENCE_INVENTORY.to_vec();
+        let removed = previous_inventory.remove(2);
+        assert_eq!(removed.name, "control_center");
+        let mut previous_specs = migration_import_specs();
+        previous_specs.remove(2);
+        database
+            .import_legacy(root.path(), &previous_inventory, &previous_specs)
+            .await
+            .unwrap();
+        let state = AppState {
+            app_data_dir: root.path().to_path_buf(),
+            corpus_cache: Arc::new(Mutex::new(None)),
+            corpus_refresh_in_flight: Arc::new(Mutex::new(())),
+            skill_sources_write_lock: Arc::new(Mutex::new(())),
+            skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
+            settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
+            updater_state: crate::commands::updater::empty_state(),
+        };
+
+        let status = migration_status(&state).await.unwrap();
+
+        assert_eq!(status.state, crate::types::StorageMigrationState::Complete);
+        assert!(status.legacy_conflicts.is_empty());
+        let connection =
+            rusqlite::Connection::open(root.path().join("state/agency-agents.sqlite3")).unwrap();
+        for table in ["state_documents", "legacy_imports"] {
+            let query = format!("SELECT count(*) FROM {table} WHERE name = 'control_center'");
+            assert_eq!(
+                connection
+                    .query_row(&query, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
