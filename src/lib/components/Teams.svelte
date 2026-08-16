@@ -79,23 +79,45 @@
   let baselineBusy = $state(false);
   let baselineAnnouncement = $state("");
   let baselineGeneration = 0;
-  const baselineRequirements = $derived.by(() => {
-    if (!openedTeam || !baselineProject) return [];
-    const seen = new Set<string>();
-    return install.installed.flatMap((row) => {
-      const key = `${row.sourceId}:${row.relativePath}:${row.tool}`;
-      if (row.projectPath !== baselineProject || !openedTeam!.agents.includes(row.slug)
-        || !row.sourceId || !row.relativePath || row.state === "missing" || seen.has(key)) return [];
-      seen.add(key);
-      return [{
-        reference: { sourceId: row.sourceId, relativePath: row.relativePath },
-        tool: row.tool,
-      }];
-    });
+  const baselineResolution = $derived.by(() => {
+    const requirements: Array<{ reference: { sourceId: string; relativePath: string }; tool: string }> = [];
+    const unresolved: string[] = [];
+    if (!openedTeam || !baselineProject) return { requirements, unresolved };
+    for (const slug of new Set(openedTeam.agents)) {
+      const candidates = install.installed
+        .filter((row) => row.slug === slug
+          && row.projectPath === baselineProject
+          && row.tracked
+          && row.sourceId
+          && row.relativePath
+          && !["missing", "foreign", "sourceUnavailable"].includes(row.state))
+        .map((row) => ({
+          reference: { sourceId: row.sourceId, relativePath: row.relativePath },
+          tool: row.tool,
+        }));
+      const exact = [...new Map(candidates.map((item) => [
+        `${item.reference.sourceId}:${item.reference.relativePath}:${item.tool}`,
+        item,
+      ])).values()];
+      if (exact.length === 1) requirements.push(exact[0]);
+      else unresolved.push(corpus.agents.find((agent) => agent.slug === slug)?.name ?? slug);
+    }
+    return { requirements, unresolved };
   });
+  const baselineRequirements = $derived(baselineResolution.requirements);
+  const baselineBlockingMessage = $derived(
+    baselineProject && baselineResolution.unresolved.length > 0
+      ? `${baselineResolution.unresolved.length} Team ${baselineResolution.unresolved.length === 1 ? "member" : "members"} cannot be saved: ${baselineResolution.unresolved.join(", ")}. Deploy each member to exactly one target in this project before saving.`
+      : "",
+  );
+  const baselineReady = $derived(Boolean(baselineProject) && !baselineBlockingMessage && baselineRequirements.length > 0);
 
   async function applyTeamBaseline(subscribe: boolean): Promise<void> {
-    if (!openedTeam || !baselineProject || baselineBusy || baselineRequirements.length === 0) return;
+    if (!openedTeam || !baselineProject || baselineBusy) return;
+    if (!baselineReady) {
+      baselineAnnouncement = baselineBlockingMessage || "Every Team member needs one reviewed deployment target before saving.";
+      return;
+    }
     const projectPath = baselineProject;
     const teamKey = openedTeam.key;
     const teamLabel = openedTeam.label;
@@ -509,8 +531,9 @@
       </div>
       <div class="team-baseline" aria-busy={baselineBusy}>
         <label><span>Apply readiness baseline to project</span><select bind:value={baselineProject} disabled={baselineBusy}><option value="">Choose a registered project</option>{#each projects.list as project (project.path)}<option value={project.path}>{project.label}</option>{/each}</select></label>
-        <Button size="sm" disabled={!baselineProject || baselineBusy || baselineRequirements.length === 0} loading={baselineBusy} onclick={() => void applyTeamBaseline(false)}>Save {baselineRequirements.length} reviewed targets</Button>
-        <Button size="sm" variant="primary" disabled={!baselineProject || baselineBusy || baselineRequirements.length === 0} loading={baselineBusy} onclick={() => void applyTeamBaseline(true)}>Save targets and subscribe</Button>
+        <Button size="sm" disabled={!baselineReady || baselineBusy} loading={baselineBusy} onclick={() => void applyTeamBaseline(false)}>Save {baselineRequirements.length} reviewed targets</Button>
+        <Button size="sm" variant="primary" disabled={!baselineReady || baselineBusy} loading={baselineBusy} onclick={() => void applyTeamBaseline(true)}>Save targets and subscribe</Button>
+        {#if baselineBlockingMessage}<p class="baseline-error" role="alert">{baselineBlockingMessage}</p>{/if}
         <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{baselineAnnouncement}</div>
       </div>
 
@@ -660,6 +683,7 @@
   .team-baseline { display: flex; flex-wrap: wrap; align-items: end; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); }
   .team-baseline label { flex: 1; min-width: 14rem; display: grid; gap: var(--space-1); color: var(--color-text-secondary); font-size: var(--text-caption); }
   .team-baseline select { min-height: 32px; padding: 0 var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-raised); color: var(--color-text-primary); }
+  .baseline-error { flex-basis: 100%; margin: 0; color: var(--color-danger); font-size: var(--text-caption); }
   .lo-sub { flex: none; padding: var(--space-2) var(--space-4) 0; color: var(--color-text-secondary); font-size: var(--text-body-sm); }
   .lo-actions { display: flex; gap: var(--space-2); }
 

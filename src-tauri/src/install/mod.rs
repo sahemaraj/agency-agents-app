@@ -5262,6 +5262,7 @@ fn baseline_from_workspace_pack(
         .agents
         .iter()
         .map(|item| item.tool.clone())
+        .chain(pack.skills.iter().map(|item| item.runtime.clone()))
         .collect::<Vec<_>>();
     agents.sort();
     agents.dedup();
@@ -9060,6 +9061,44 @@ mod tests {
             .rows
             .iter()
             .all(|row| row.state == ReadinessRowState::Unverifiable));
+    }
+
+    #[test]
+    fn skill_only_workspace_pack_requires_its_runtime_tool() {
+        let mut pack = workspace_pack_fixture();
+        pack.agents.clear();
+        pack.skills[0].runtime = "claudeCode".into();
+        let baseline = baseline_from_workspace_pack(
+            "/registered/project".into(),
+            normalize_workspace_pack(pack).unwrap(),
+        );
+
+        assert_eq!(baseline.tools, vec!["claudeCode"]);
+        let missing_tool = build_readiness_report(
+            "/registered/project",
+            Some(&baseline),
+            ReadinessEvidence::ready(),
+        );
+        assert_eq!(
+            missing_tool.categories[4].rows[0].state,
+            ReadinessRowState::NeedsAttention
+        );
+
+        let detected_tool = build_readiness_report(
+            "/registered/project",
+            Some(&baseline),
+            ReadinessEvidence {
+                tools: Ok(BTreeMap::from([(
+                    "claudeCode".into(),
+                    ReadinessRowState::Ready,
+                )])),
+                ..ReadinessEvidence::ready()
+            },
+        );
+        assert_eq!(
+            detected_tool.categories[4].rows[0].state,
+            ReadinessRowState::Ready
+        );
     }
 
     #[test]

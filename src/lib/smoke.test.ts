@@ -845,6 +845,72 @@ describe("frontend test harness", () => {
     expect(teamsSource).not.toContain("autoApply");
   });
 
+  it("blocks a partial Team baseline without saving or subscribing", async () => {
+    const { default: Teams } = await import("$lib/components/Teams.svelte");
+    const projectPath = "/tmp/project";
+    const reviewer = { ...staleControlAgent };
+    const writer = { ...staleControlAgent, slug: "writer", name: "Writer" };
+    const deployedReviewer: InstalledAgent = {
+      ...staleControlRow,
+      slug: reviewer.slug,
+      name: reviewer.name,
+      sourceId: "built-in",
+      relativePath: "engineering/reviewer.md",
+      projectPath,
+      scope: "project",
+      state: "current",
+      tracked: true,
+    };
+    const projectRows = [{ path: projectPath, label: "Project", installedCount: 1 }];
+    teams.saved = [{
+      id: "partial",
+      name: "Partial Team",
+      agents: [reviewer.slug, writer.slug],
+      createdAt: "2026-08-17T00:00:00Z",
+    }];
+    corpus.agents = [reviewer, writer];
+    corpus.categories = [{ slug: "engineering", label: "Engineering", color: "#2563eb", icon: "Code", count: 2 }];
+    install.installed = [deployedReviewer];
+    install.reconciled = true;
+    projects.list = projectRows;
+    ui.teamsSelected = "saved:partial";
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "installs_reconcile") return [deployedReviewer] as never;
+      if (command === "tools_list") return [staleControlTool] as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_baseline_save_team") return readinessFixture(projectPath).baseline as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Teams, { target });
+    try {
+      const presetsTab = [...target.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+        .find((button) => button.textContent?.includes("Team presets"))!;
+      presetsTab.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Partial Team"));
+      const project = target.querySelector<HTMLSelectElement>(".team-baseline select")!;
+      project.value = projectPath;
+      project.dispatchEvent(new Event("change", { bubbles: true }));
+      await tick();
+
+      const error = target.querySelector<HTMLElement>('.team-baseline [role="alert"]');
+      expect(error?.textContent).toContain("1 Team member");
+      expect(error?.textContent).toContain("Writer");
+      const subscribe = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("Save targets and subscribe"))!;
+      expect(subscribe.disabled).toBe(true);
+      subscribe.click();
+      await tick();
+      expect(invokeMock.mock.calls.some(([command]) => command === "project_baseline_save_team")).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
   it("keeps a completed receipt in memory when journal persistence fails", () => {
     vi.useFakeTimers();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
