@@ -452,7 +452,9 @@ const CONTROL_CENTER_MAX_PROJECT_AGENTS: usize = 256;
 const CONTROL_CENTER_MAX_PROJECT_SKILLS: usize = 256;
 const CONTROL_CENTER_MAX_PROJECT_REQUIREMENTS: usize = 32;
 const CONTROL_CENTER_MAX_PROJECT_TOOLS: usize = 32;
-const CONTROL_CENTER_MAX_SUBSCRIPTIONS: usize = 128;
+// A subscription has project identity only and the validator enforces one per
+// baseline project, so the honest document maximum is the baseline maximum.
+const CONTROL_CENTER_MAX_SUBSCRIPTIONS: usize = CONTROL_CENTER_MAX_PROJECT_BASELINES;
 const CONTROL_CENTER_MAX_DISMISSED_RECOMMENDATIONS: usize = 256;
 const CATALOG_SOURCE_TRANSITION_UNAVAILABLE: &str =
     "Catalog source change is incomplete. Retry the source selection.";
@@ -648,6 +650,16 @@ fn validate_project_baseline(baseline: &ProjectReadinessBaseline) -> Result<(), 
 }
 
 fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppError> {
+    if document.project_baselines.len() > CONTROL_CENTER_MAX_PROJECT_BASELINES {
+        return Err(AppError::InvalidArgument {
+            message: "control-center exceeds its project baseline limit".into(),
+        });
+    }
+    if document.project_subscriptions.len() > CONTROL_CENTER_MAX_SUBSCRIPTIONS {
+        return Err(AppError::InvalidArgument {
+            message: "control-center exceeds its project subscription limit".into(),
+        });
+    }
     if document.active_catalog_snapshot.len() > CONTROL_CENTER_MAX_SNAPSHOT_ITEMS
         || document.catalog_feed.len() > CONTROL_CENTER_MAX_FEED_BATCHES
         || document
@@ -656,8 +668,6 @@ fn validate_control_center(document: &ControlCenterDocument) -> Result<(), AppEr
             .map(|batch| batch.changes.len())
             .sum::<usize>()
             > CONTROL_CENTER_MAX_FEED_ITEMS
-        || document.project_baselines.len() > CONTROL_CENTER_MAX_PROJECT_BASELINES
-        || document.project_subscriptions.len() > CONTROL_CENTER_MAX_SUBSCRIPTIONS
     {
         return Err(AppError::InvalidArgument {
             message: "control-center catalog state exceeds its item limits".into(),
@@ -3184,30 +3194,6 @@ mod tests {
             vec!["codex".into(); CONTROL_CENTER_MAX_PROJECT_TOOLS + 1];
         assert!(validate_control_center(&too_many_tools).is_err());
 
-        let mut too_many_projects = valid.clone();
-        too_many_projects.project_baselines = (0..=CONTROL_CENTER_MAX_PROJECT_BASELINES)
-            .map(|index| ProjectReadinessBaseline {
-                project_path: format!("/registered/project-{index}"),
-                label: format!("Project {index}"),
-                agents: Vec::new(),
-                skills: Vec::new(),
-                instructions: Vec::new(),
-                mcp_servers: Vec::new(),
-                tools: Vec::new(),
-            })
-            .collect();
-        assert!(validate_control_center(&too_many_projects).is_err());
-
-        let mut too_many_subscriptions = valid.clone();
-        too_many_subscriptions.project_subscriptions = (0..=CONTROL_CENTER_MAX_SUBSCRIPTIONS)
-            .map(|index| ProjectSubscription {
-                project_path: format!("/registered/project-{index}"),
-                last_seen_batch: None,
-                dismissed_recommendation_ids: Vec::new(),
-            })
-            .collect();
-        assert!(validate_control_center(&too_many_subscriptions).is_err());
-
         let mut too_many_dismissals = valid.clone();
         too_many_dismissals.project_subscriptions[0].dismissed_recommendation_ids = (0
             ..=CONTROL_CENTER_MAX_DISMISSED_RECOMMENDATIONS)
@@ -3250,6 +3236,83 @@ mod tests {
         ] {
             assert!(validate_control_center(&invalid).is_err());
         }
+    }
+
+    fn empty_project_baseline(index: usize) -> ProjectReadinessBaseline {
+        ProjectReadinessBaseline {
+            project_path: format!("/registered/project-{index}"),
+            label: format!("Project {index}"),
+            agents: Vec::new(),
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn project_baseline_cap_fixture_fails_only_the_exact_65th_baseline_limit() {
+        let mut document = ControlCenterDocument {
+            project_baselines: (0..=CONTROL_CENTER_MAX_PROJECT_BASELINES)
+                .map(empty_project_baseline)
+                .collect(),
+            ..ControlCenterDocument::default()
+        };
+        assert!(matches!(
+            validate_control_center(&document),
+            Err(AppError::InvalidArgument { message })
+                if message == "control-center exceeds its project baseline limit"
+        ));
+
+        document.project_baselines.pop();
+        assert_eq!(
+            document.project_baselines.len(),
+            CONTROL_CENTER_MAX_PROJECT_BASELINES
+        );
+        assert!(validate_control_center(&document).is_ok());
+    }
+
+    #[test]
+    fn project_subscription_capacity_is_the_64_unique_baseline_capacity() {
+        assert_eq!(
+            CONTROL_CENTER_MAX_SUBSCRIPTIONS,
+            CONTROL_CENTER_MAX_PROJECT_BASELINES
+        );
+        let baselines = (0..CONTROL_CENTER_MAX_PROJECT_BASELINES)
+            .map(empty_project_baseline)
+            .collect::<Vec<_>>();
+        let subscriptions = baselines
+            .iter()
+            .map(|baseline| ProjectSubscription {
+                project_path: baseline.project_path.clone(),
+                last_seen_batch: None,
+                dismissed_recommendation_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut document = ControlCenterDocument {
+            project_baselines: baselines,
+            project_subscriptions: subscriptions,
+            ..ControlCenterDocument::default()
+        };
+        assert!(validate_control_center(&document).is_ok());
+
+        // There is no 65th unique subscription identity in the existing DTO:
+        // project_path is the identity and every subscription must reference
+        // one of the 64 unique baselines. The duplicate below therefore tests
+        // the explicit early bound; removing it restores a fully valid maximum.
+        document.project_subscriptions.push(ProjectSubscription {
+            project_path: document.project_baselines[0].project_path.clone(),
+            last_seen_batch: None,
+            dismissed_recommendation_ids: Vec::new(),
+        });
+        assert!(matches!(
+            validate_control_center(&document),
+            Err(AppError::InvalidArgument { message })
+                if message == "control-center exceeds its project subscription limit"
+        ));
+
+        document.project_subscriptions.pop();
+        assert!(validate_control_center(&document).is_ok());
     }
 
     #[test]
