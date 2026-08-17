@@ -65,6 +65,57 @@ export interface McpClientPolicy {
   agentDestructiveAccess: boolean;
 }
 
+export type SecurityPosture = "strict" | "localDevelopment" | "custom";
+export type SecurityPosturePreset = Exclude<SecurityPosture, "custom">;
+
+export function classifySecurityPosture(settings: Settings): SecurityPosture {
+  const skillsOff = !settings.mcpSourceAccess
+    && !settings.mcpInstallAccess
+    && !settings.mcpDestructiveAccess;
+  const agentsOff = !settings.mcpAgentSourceAccess
+    && !settings.mcpAgentInstallAccess
+    && !settings.mcpAgentDestructiveAccess;
+  const skillsOn = settings.mcpSourceAccess
+    && settings.mcpInstallAccess
+    && settings.mcpDestructiveAccess;
+  const agentsOn = settings.mcpAgentSourceAccess
+    && settings.mcpAgentInstallAccess
+    && settings.mcpAgentDestructiveAccess;
+  const noOverrides = Object.keys(settings.mcpClientPolicies).length === 0;
+  if (settings.paranoidMode
+    && !settings.githubEnabled
+    && !settings.updateAutoCheck
+    && !settings.driftNotifications
+    && skillsOff
+    && agentsOff
+    && noOverrides) return "strict";
+  if (!settings.paranoidMode && skillsOn && agentsOn && noOverrides) {
+    return "localDevelopment";
+  }
+  return "custom";
+}
+
+export function previewSecurityPosture(
+  current: Settings,
+  preset: SecurityPosturePreset,
+): Settings {
+  const enabled = preset === "localDevelopment";
+  return {
+    ...current,
+    paranoidMode: !enabled,
+    githubEnabled: enabled ? current.githubEnabled : false,
+    updateAutoCheck: enabled ? current.updateAutoCheck : false,
+    driftNotifications: enabled ? current.driftNotifications : false,
+    mcpSourceAccess: enabled,
+    mcpInstallAccess: enabled,
+    mcpDestructiveAccess: enabled,
+    mcpAgentSourceAccess: enabled,
+    mcpAgentInstallAccess: enabled,
+    mcpAgentDestructiveAccess: enabled,
+    mcpClientPolicies: {},
+  };
+}
+
 export type GeneralSettingsPatch = Partial<
   Pick<
     Settings,

@@ -19,7 +19,7 @@
   } from "$lib/api";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { settings } from "$lib/stores/settings.svelte";
-  import { appErrorMessage, isAppError, type McpClient, type McpClientStatus, type McpInventoryReport, type McpInventoryServer } from "$lib/types";
+  import { appErrorMessage, classifySecurityPosture, isAppError, previewSecurityPosture, type McpClient, type McpClientStatus, type McpInventoryReport, type McpInventoryServer, type SecurityPosturePreset, type Settings } from "$lib/types";
 
   let statuses: McpClientStatus[] = $state([]);
   let inventory: McpInventoryReport = $state({ servers: [], trustedTemplates: [], issues: [] });
@@ -28,6 +28,41 @@
   let announcement = $state("");
   let copied: McpClient | null = $state(null);
   let policySaving = $state(false);
+  let selectedPreset: SecurityPosturePreset = $state("strict");
+  let presetAnnouncement = $state("");
+  let currentPosture = $derived(classifySecurityPosture(settings.effective));
+  let presetPreview = $derived(previewSecurityPosture(settings.effective, selectedPreset));
+
+  const postureLabels = {
+    strict: "Strict",
+    localDevelopment: "Local Development",
+    custom: "Custom",
+  } as const;
+
+  function onOff(value: boolean): string {
+    return value ? "On" : "Off";
+  }
+
+  function clientPolicySummary(
+    source: Settings,
+    client: McpClient,
+    kind: "skills" | "agents",
+  ): string {
+    const policy = source.mcpClientPolicies[client];
+    if (!policy) return "Inherit";
+    const values = kind === "skills"
+      ? [policy.sourceAccess, policy.installAccess, policy.destructiveAccess]
+      : [policy.agentSourceAccess, policy.agentInstallAccess, policy.agentDestructiveAccess];
+    return values.map(onOff).join(" / ");
+  }
+
+  async function applyPreset() {
+    error = "";
+    presetAnnouncement = "";
+    await settings.applySecurityPosture(selectedPreset);
+    if (settings.error) error = settings.error;
+    else presetAnnouncement = `${postureLabels[selectedPreset]} security posture applied`;
+  }
 
   function clientId(status: McpClientStatus): McpClient {
     return status.client;
@@ -330,6 +365,54 @@
     {/each}
   </section>
 
+  <section class="preset" aria-labelledby="security-posture-title" aria-busy={settings.loading}>
+    <div>
+      <h3 id="security-posture-title">Security posture</h3>
+      <p>Apply the complete network and MCP mutation policy as one atomic change.</p>
+      <p data-security-posture-current>Current: <strong>{postureLabels[currentPosture]}</strong></p>
+    </div>
+    <div class="preset-options" aria-label="Security posture preset">
+      {#each ["strict", "localDevelopment"] as preset (preset)}
+        <button
+          type="button"
+          data-security-posture={preset}
+          aria-pressed={selectedPreset === preset}
+          disabled={settings.loading}
+          onclick={() => selectedPreset = preset as SecurityPosturePreset}
+        >{postureLabels[preset as SecurityPosturePreset]}</button>
+      {/each}
+    </div>
+    <table class="preset-preview" data-security-posture-preview>
+      <thead><tr><th scope="col">Setting</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
+      <tbody>
+        {#each [
+          ["Offline mode", settings.effective.paranoidMode, presetPreview.paranoidMode],
+          ["GitHub access", settings.effective.githubEnabled, presetPreview.githubEnabled],
+          ["Automatic update checks", settings.effective.updateAutoCheck, presetPreview.updateAutoCheck],
+          ["Drift notifications", settings.effective.driftNotifications, presetPreview.driftNotifications],
+          ["Skill source mutations", settings.effective.mcpSourceAccess, presetPreview.mcpSourceAccess],
+          ["Skill install mutations", settings.effective.mcpInstallAccess, presetPreview.mcpInstallAccess],
+          ["Skill destructive mutations", settings.effective.mcpDestructiveAccess, presetPreview.mcpDestructiveAccess],
+          ["Agent source mutations", settings.effective.mcpAgentSourceAccess, presetPreview.mcpAgentSourceAccess],
+          ["Agent install mutations", settings.effective.mcpAgentInstallAccess, presetPreview.mcpAgentInstallAccess],
+          ["Agent destructive mutations", settings.effective.mcpAgentDestructiveAccess, presetPreview.mcpAgentDestructiveAccess],
+        ] as row (row[0] as string)}
+          <tr><th scope="row">{row[0]}</th><td>{onOff(row[1] as boolean)}</td><td>{onOff(row[2] as boolean)}</td></tr>
+        {/each}
+        <tr><th scope="row">Client overrides</th><td>{Object.keys(settings.effective.mcpClientPolicies).length} configured</td><td>None</td></tr>
+        <tr><th scope="row">Claude Skill override</th><td>{clientPolicySummary(settings.effective, "claude", "skills")}</td><td>{clientPolicySummary(presetPreview, "claude", "skills")}</td></tr>
+        <tr><th scope="row">Claude Agent override</th><td>{clientPolicySummary(settings.effective, "claude", "agents")}</td><td>{clientPolicySummary(presetPreview, "claude", "agents")}</td></tr>
+        <tr><th scope="row">Codex Skill override</th><td>{clientPolicySummary(settings.effective, "codex", "skills")}</td><td>{clientPolicySummary(presetPreview, "codex", "skills")}</td></tr>
+        <tr><th scope="row">Codex Agent override</th><td>{clientPolicySummary(settings.effective, "codex", "agents")}</td><td>{clientPolicySummary(presetPreview, "codex", "agents")}</td></tr>
+        <tr><th scope="row">Project allowlist</th><td>{settings.effective.mcpProjectAllowlist.length} retained</td><td>{presetPreview.mcpProjectAllowlist.length} retained</td></tr>
+      </tbody>
+    </table>
+    <button type="button" class="primary" data-security-posture-apply disabled={settings.loading} onclick={applyPreset}>
+      Apply {postureLabels[selectedPreset]}
+    </button>
+    <span class="sr-only" aria-live="polite" data-security-posture-announcement>{presetAnnouncement}</span>
+  </section>
+
   <div class="policy" aria-busy={policySaving || settings.loading}>
     <div>
       <h3>{i18n.t("settings.mcp.policy.title")}</h3>
@@ -387,8 +470,15 @@
   p { margin: 0; color: var(--color-text-muted); font-size: var(--text-body-sm); }
   .cards { display: grid; gap: var(--space-3); }
   .card { padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); display: grid; gap: var(--space-3); }
-  .policy, .inventory { padding-top: var(--space-4); border-top: 1px solid var(--color-border); display: grid; gap: var(--space-3); }
-  .policy h3, .inventory h3 { margin: 0 0 var(--space-1); font-size: var(--text-body); }
+  .policy, .inventory, .preset { padding-top: var(--space-4); border-top: 1px solid var(--color-border); display: grid; gap: var(--space-3); }
+  .policy h3, .inventory h3, .preset h3 { margin: 0 0 var(--space-1); font-size: var(--text-body); }
+  .preset-options { display: flex; gap: var(--space-2); }
+  .preset-options button[aria-pressed="true"] { border-color: var(--color-accent); color: var(--color-accent); }
+  .preset-preview { width: 100%; border-collapse: separate; border-spacing: 0; border: 1px solid var(--color-border); border-radius: var(--radius-sm); overflow: hidden; font-size: var(--text-caption); }
+  .preset-preview th, .preset-preview td { padding: var(--space-2) var(--space-3); text-align: left; font-weight: 400; }
+  .preset-preview thead th { background: var(--color-surface-sunken); font-weight: 600; }
+  .preset-preview tbody th { width: 55%; }
+  .preset-preview tbody tr > * { border-top: 1px solid var(--color-border); }
   .inventory-cards { display: grid; gap: var(--space-2); }
   .inventory-card, .template { padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); display: grid; gap: var(--space-2); }
   dl, dl div { margin: 0; display: grid; gap: var(--space-1); }

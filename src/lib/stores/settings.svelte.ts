@@ -17,9 +17,10 @@ import {
   isAppError,
   SETTINGS_DEFAULTS,
   type GeneralSettingsPatch,
+  type SecurityPosturePreset,
   type Settings,
 } from "$lib/types";
-import { settingsGet, settingsReset, settingsSet } from "$lib/api";
+import { securityPostureApply, settingsGet, settingsReset, settingsSet } from "$lib/api";
 
 class SettingsStore {
   /** Authoritative current settings, or `null` until first load. */
@@ -112,6 +113,19 @@ class SettingsStore {
       } else {
         this.error = String(e);
       }
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async applySecurityPosture(preset: SecurityPosturePreset): Promise<void> {
+    this.loading = true;
+    this.error = null;
+    try {
+      this.data = await securityPostureApply(preset);
+      this.corruptOnDisk = false;
+    } catch (e) {
+      this.error = isAppError(e) ? appErrorMessage(e) : String(e);
     } finally {
       this.loading = false;
     }

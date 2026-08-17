@@ -170,6 +170,20 @@ pub struct McpClientPolicy {
     pub agent_destructive_access: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityPosture {
+    Strict,
+    LocalDevelopment,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SecurityPosturePreset {
+    Strict,
+    LocalDevelopment,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GeneralSettingsPatch {
@@ -255,6 +269,51 @@ impl Settings {
     pub const SKIPPED_UPDATE_VERSIONS_CAP: usize = 10;
     pub const MCP_PROJECT_ALLOWLIST_CAP: usize = 64;
     pub const MCP_PROJECT_PATH_CHARS_CAP: usize = 4096;
+
+    fn security_posture(&self) -> SecurityPosture {
+        let no_mutations = !self.mcp_source_access
+            && !self.mcp_install_access
+            && !self.mcp_destructive_access
+            && !self.mcp_agent_source_access
+            && !self.mcp_agent_install_access
+            && !self.mcp_agent_destructive_access;
+        let all_mutations = self.mcp_source_access
+            && self.mcp_install_access
+            && self.mcp_destructive_access
+            && self.mcp_agent_source_access
+            && self.mcp_agent_install_access
+            && self.mcp_agent_destructive_access;
+        if self.paranoid_mode
+            && !self.github_enabled
+            && !self.update_auto_check
+            && !self.drift_notifications
+            && no_mutations
+            && self.mcp_client_policies.is_empty()
+        {
+            SecurityPosture::Strict
+        } else if !self.paranoid_mode && all_mutations && self.mcp_client_policies.is_empty() {
+            SecurityPosture::LocalDevelopment
+        } else {
+            SecurityPosture::Custom
+        }
+    }
+
+    fn apply_security_posture(&mut self, preset: SecurityPosturePreset) {
+        let enabled = matches!(preset, SecurityPosturePreset::LocalDevelopment);
+        self.paranoid_mode = !enabled;
+        if !enabled {
+            self.github_enabled = false;
+            self.update_auto_check = false;
+            self.drift_notifications = false;
+        }
+        self.mcp_source_access = enabled;
+        self.mcp_install_access = enabled;
+        self.mcp_destructive_access = enabled;
+        self.mcp_agent_source_access = enabled;
+        self.mcp_agent_install_access = enabled;
+        self.mcp_agent_destructive_access = enabled;
+        self.mcp_client_policies.clear();
+    }
 
     /// Apply the numeric clamps declared in the field docs. Idempotent;
     /// safe to call on already-clamped values.
@@ -763,6 +822,38 @@ pub(crate) async fn mcp_agent_policy_set_inner(
     Ok(saved)
 }
 
+pub(crate) async fn security_posture_apply_inner(
+    state: &AppState,
+    preset: SecurityPosturePreset,
+) -> Result<Settings, AppError> {
+    let mut cache = state.settings.write().await;
+    if let SettingsLoadState::Corrupt { message } = &*cache {
+        return Err(AppError::Internal {
+            message: format!("settings file is unreadable: {message}"),
+        });
+    }
+    let mut latest = match load_async(&state.app_data_dir).await {
+        SettingsLoadState::Loaded(latest) => latest,
+        SettingsLoadState::FirstLaunch => Settings::default(),
+        SettingsLoadState::Corrupt { message } => {
+            return Err(AppError::Internal {
+                message: format!("settings file is unreadable: {message}"),
+            });
+        }
+    };
+    latest.apply_security_posture(preset);
+    let saved = persist(&state.app_data_dir, latest).await?;
+    debug_assert_eq!(
+        saved.security_posture(),
+        match preset {
+            SecurityPosturePreset::Strict => SecurityPosture::Strict,
+            SecurityPosturePreset::LocalDevelopment => SecurityPosture::LocalDevelopment,
+        }
+    );
+    *cache = SettingsLoadState::Loaded(saved.clone());
+    Ok(saved)
+}
+
 /// Read the current settings.
 ///
 /// Always returns the *currently-loaded* state — does not re-read from
@@ -821,6 +912,14 @@ pub async fn mcp_agent_policy_set(
     state: State<'_, AppState>,
 ) -> Result<Settings, AppError> {
     mcp_agent_policy_set_inner(&state, source_access, install_access, destructive_access).await
+}
+
+#[tauri::command]
+pub async fn security_posture_apply(
+    preset: SecurityPosturePreset,
+    state: State<'_, AppState>,
+) -> Result<Settings, AppError> {
+    security_posture_apply_inner(&state, preset).await
 }
 
 #[tauri::command]
@@ -912,6 +1011,224 @@ pub fn app_version<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app_state(app_data_dir: &Path, settings: SettingsLoadState) -> AppState {
+        AppState {
+            app_data_dir: app_data_dir.to_path_buf(),
+            corpus_cache: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            corpus_refresh_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            skill_sources_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            skill_installs_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            skill_folders_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            settings: std::sync::Arc::new(tokio::sync::RwLock::new(settings)),
+            updater_state: crate::commands::updater::empty_state(),
+        }
+    }
+
+    #[test]
+    fn security_posture_classification_is_exact() {
+        let mut settings = Settings::default();
+        settings.apply_security_posture(SecurityPosturePreset::Strict);
+        assert_eq!(settings.security_posture(), SecurityPosture::Strict);
+
+        let mut network_opt_ins = settings.clone();
+        network_opt_ins.github_enabled = true;
+        assert_eq!(network_opt_ins.security_posture(), SecurityPosture::Custom);
+
+        settings.apply_security_posture(SecurityPosturePreset::LocalDevelopment);
+        assert_eq!(
+            settings.security_posture(),
+            SecurityPosture::LocalDevelopment
+        );
+
+        settings.mcp_agent_install_access = false;
+        assert_eq!(settings.security_posture(), SecurityPosture::Custom);
+    }
+
+    #[test]
+    fn strict_clears_every_override_and_network_mutation_path() {
+        let mut settings = Settings {
+            paranoid_mode: false,
+            github_enabled: true,
+            update_auto_check: true,
+            drift_notifications: true,
+            catalog_stale_banner_days: 31,
+            ai_features_enabled: false,
+            tool_paths: HashMap::from([("codex".into(), "/custom".into())]),
+            mcp_source_access: true,
+            mcp_install_access: true,
+            mcp_destructive_access: true,
+            mcp_agent_source_access: true,
+            mcp_agent_install_access: true,
+            mcp_agent_destructive_access: true,
+            mcp_project_allowlist: vec!["/retained/project".into()],
+            mcp_client_policies: HashMap::from([(
+                "claude".into(),
+                McpClientPolicy {
+                    source_access: true,
+                    install_access: true,
+                    destructive_access: true,
+                    agent_source_access: true,
+                    agent_install_access: true,
+                    agent_destructive_access: true,
+                },
+            )]),
+            ..Settings::default()
+        };
+
+        settings.apply_security_posture(SecurityPosturePreset::Strict);
+
+        assert!(settings.paranoid_mode);
+        assert!(!settings.github_enabled);
+        assert!(!settings.update_auto_check);
+        assert!(!settings.drift_notifications);
+        assert!(!settings.mcp_source_access);
+        assert!(!settings.mcp_install_access);
+        assert!(!settings.mcp_destructive_access);
+        assert!(!settings.mcp_agent_source_access);
+        assert!(!settings.mcp_agent_install_access);
+        assert!(!settings.mcp_agent_destructive_access);
+        assert!(settings.mcp_client_policies.is_empty());
+        assert_eq!(settings.mcp_project_allowlist, ["/retained/project"]);
+        assert_eq!(settings.catalog_stale_banner_days, 31);
+        assert!(!settings.ai_features_enabled);
+        assert_eq!(settings.tool_paths["codex"], "/custom");
+    }
+
+    #[test]
+    fn local_development_preserves_network_consent_and_unrelated_settings() {
+        let mut settings = Settings {
+            paranoid_mode: true,
+            github_enabled: true,
+            update_auto_check: false,
+            drift_notifications: true,
+            catalog_stale_banner_days: 45,
+            ai_features_enabled: false,
+            mcp_project_allowlist: vec!["/retained/project".into()],
+            mcp_client_policies: HashMap::from([("codex".into(), McpClientPolicy::default())]),
+            ..Settings::default()
+        };
+
+        settings.apply_security_posture(SecurityPosturePreset::LocalDevelopment);
+
+        assert!(!settings.paranoid_mode);
+        assert!(settings.github_enabled);
+        assert!(!settings.update_auto_check);
+        assert!(settings.drift_notifications);
+        assert!(settings.mcp_source_access);
+        assert!(settings.mcp_install_access);
+        assert!(settings.mcp_destructive_access);
+        assert!(settings.mcp_agent_source_access);
+        assert!(settings.mcp_agent_install_access);
+        assert!(settings.mcp_agent_destructive_access);
+        assert!(settings.mcp_client_policies.is_empty());
+        assert_eq!(settings.mcp_project_allowlist, ["/retained/project"]);
+        assert_eq!(settings.catalog_stale_banner_days, 45);
+        assert!(!settings.ai_features_enabled);
+    }
+
+    #[tokio::test]
+    async fn posture_apply_rejects_corrupt_settings_without_changing_cache_or_disk() {
+        let app = tempfile::tempdir().expect("app data");
+        let corrupt = b"{bad json";
+        tokio::fs::write(settings_path(app.path()), corrupt)
+            .await
+            .expect("write corrupt settings");
+        let state = test_app_state(
+            app.path(),
+            SettingsLoadState::Corrupt {
+                message: "parse failure".into(),
+            },
+        );
+
+        assert!(
+            security_posture_apply_inner(&state, SecurityPosturePreset::Strict)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read(settings_path(app.path())).await.unwrap(),
+            corrupt
+        );
+        assert!(matches!(
+            &*state.settings.read().await,
+            SettingsLoadState::Corrupt { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn posture_apply_failure_leaves_disk_and_cache_unchanged() {
+        let app = tempfile::tempdir().expect("app data");
+        let original = Settings {
+            github_enabled: true,
+            ..Settings::default()
+        };
+        persist(app.path(), original.clone()).await.expect("seed");
+        tokio::fs::create_dir(settings_path(app.path()).with_extension("json.tmp"))
+            .await
+            .expect("block atomic temp creation");
+        let state = test_app_state(app.path(), SettingsLoadState::Loaded(original.clone()));
+        let before = tokio::fs::read(settings_path(app.path())).await.unwrap();
+
+        assert!(
+            security_posture_apply_inner(&state, SecurityPosturePreset::Strict)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            tokio::fs::read(settings_path(app.path())).await.unwrap(),
+            before
+        );
+        assert!(matches!(
+            &*state.settings.read().await,
+            SettingsLoadState::Loaded(settings) if settings == &original
+        ));
+    }
+
+    #[tokio::test]
+    async fn posture_apply_serializes_with_other_settings_writes() {
+        let app = tempfile::tempdir().expect("app data");
+        let original = Settings {
+            github_enabled: true,
+            update_auto_check: true,
+            drift_notifications: true,
+            mcp_project_allowlist: vec![app.path().to_string_lossy().into_owned()],
+            ..Settings::default()
+        };
+        let original = persist(app.path(), original).await.expect("seed");
+        let state = test_app_state(app.path(), SettingsLoadState::Loaded(original));
+
+        let (preset, unrelated) = tokio::join!(
+            security_posture_apply_inner(&state, SecurityPosturePreset::Strict),
+            settings_set_inner(
+                &state,
+                GeneralSettingsPatch {
+                    ai_features_enabled: Some(false),
+                    ..Default::default()
+                },
+            ),
+        );
+        preset.expect("apply preset");
+        unrelated.expect("save unrelated setting");
+
+        let SettingsLoadState::Loaded(saved) = load_async(app.path()).await else {
+            panic!("settings should remain readable")
+        };
+        assert_eq!(saved.security_posture(), SecurityPosture::Strict);
+        assert!(!saved.ai_features_enabled);
+        assert_eq!(
+            saved.mcp_project_allowlist,
+            [std::fs::canonicalize(app.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()]
+        );
+        assert!(matches!(
+            &*state.settings.read().await,
+            SettingsLoadState::Loaded(cached) if cached == &saved
+        ));
+    }
 
     /// File-absent → defaults apply (paranoid OFF).
     #[tokio::test]

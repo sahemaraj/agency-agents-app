@@ -21,6 +21,7 @@ import type {
   GeneralSettingsPatch,
   RepoStats,
   Settings,
+  SecurityPosturePreset,
   SkillDraft,
   SkillFolderState,
   SkillCollection,
@@ -522,6 +523,12 @@ export function mcpAgentClientPolicySet(
     installAccess,
     destructiveAccess,
   });
+}
+
+export function securityPostureApply(
+  preset: SecurityPosturePreset,
+): Promise<Settings> {
+  return invoke<Settings>("security_posture_apply", { preset });
 }
 
 /**

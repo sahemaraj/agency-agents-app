@@ -5256,18 +5256,18 @@ describe("frontend test harness", () => {
       ["./components/AgencyDashboard.svelte", [/async function updateCatalog[^]*?appErrorMessage/]],
       ["./components/Projects.svelte", [/async function reveal[^]*?appErrorMessage/, /async function forgetProject[^]*?appErrorMessage/, /async function uninstallAndRemove[^]*?appErrorMessage/, /async function refreshProjectInstructions[^]*?appErrorMessage/, /async function reviewInstruction[^]*?appErrorMessage/, /async function applyInstruction[^]*?appErrorMessage/]],
       ["./stores/catalog.svelte.ts", [/catalog_status[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_check_updates[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_detect[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /async setSource[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /async provisionManaged[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_pull[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
-      ["./stores/settings.svelte.ts", [/corruptOnDisk = true[^]*?this\.error = appErrorMessage/, /else if \(isAppError\(e\)\)[^]*?this\.error = appErrorMessage/, /async save[^]*?this\.error = appErrorMessage/, /async reset[^]*?this\.error = appErrorMessage/]],
+      ["./stores/settings.svelte.ts", [/corruptOnDisk = true[^]*?this\.error = appErrorMessage/, /else if \(isAppError\(e\)\)[^]*?this\.error = appErrorMessage/, /async save[^]*?this\.error = appErrorMessage/, /async reset[^]*?this\.error = appErrorMessage/, /async applySecurityPosture[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/experts.svelte.ts", [/expert_runs_list[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/activity.svelte.ts", [/safeActivityDetail[^]*?isAppError\(value\) \? appErrorMessage\(value\)/]],
     ]);
-    expect([...inventory.values()].flat()).toHaveLength(46);
+    expect([...inventory.values()].flat()).toHaveLength(47);
     for (const [path, markers] of inventory) {
       const source = rel01Sources[path];
       expect(source, path).toBeTruthy();
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(58);
+      .toHaveLength(59);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -6206,6 +6206,94 @@ describe("MCP inventory settings", () => {
     await Promise.resolve();
     await tick();
     expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "mcp_inventory")).toHaveLength(2);
+    unmount(component);
+    settings.data = null;
+  });
+});
+
+describe("security posture presets", () => {
+  it("classifies exact shapes, previews every policy field, and applies explicitly", async () => {
+    settings.data = {
+      ...SETTINGS_DEFAULTS,
+      githubEnabled: true,
+      updateAutoCheck: true,
+      driftNotifications: true,
+      mcpSourceAccess: true,
+      mcpClientPolicies: {
+        claude: {
+          sourceAccess: true,
+          installAccess: true,
+          destructiveAccess: true,
+          agentSourceAccess: true,
+          agentInstallAccess: true,
+          agentDestructiveAccess: true,
+        },
+      },
+      mcpProjectAllowlist: ["/projects/retained"],
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "mcp_clients_status") return [] as never;
+      if (command === "mcp_inventory") return { servers: [], trustedTemplates: [], issues: [] } as never;
+      if (command === "security_posture_apply") {
+        return {
+          ...settings.data,
+          paranoidMode: true,
+          githubEnabled: false,
+          updateAutoCheck: false,
+          driftNotifications: false,
+          mcpSourceAccess: false,
+          mcpInstallAccess: false,
+          mcpDestructiveAccess: false,
+          mcpAgentSourceAccess: false,
+          mcpAgentInstallAccess: false,
+          mcpAgentDestructiveAccess: false,
+          mcpClientPolicies: {},
+        } as never;
+      }
+      return [] as never;
+    });
+
+    const component = mount(SettingsSectionMcp, { target: document.body });
+    await Promise.resolve();
+    await tick();
+    await Promise.resolve();
+    await tick();
+
+    expect(document.querySelector("[data-security-posture-current]")?.textContent).toContain("Custom");
+    document.querySelector<HTMLButtonElement>('[data-security-posture="strict"]')?.click();
+    await tick();
+    const preview = document.querySelector("[data-security-posture-preview]")?.textContent ?? "";
+    for (const field of [
+      "Offline mode", "GitHub access", "Automatic update checks", "Drift notifications",
+      "Skill source mutations", "Skill install mutations", "Skill destructive mutations",
+      "Agent source mutations", "Agent install mutations", "Agent destructive mutations",
+      "Client overrides", "Claude Skill override", "Claude Agent override",
+      "Codex Skill override", "Codex Agent override", "Project allowlist",
+    ]) expect(preview).toContain(field);
+    expect(preview).toContain("1 retained");
+    const rows = Object.fromEntries(
+      [...document.querySelectorAll<HTMLTableRowElement>("[data-security-posture-preview] tbody tr")]
+        .map((row) => [...row.children].map((cell) => cell.textContent?.trim() ?? ""))
+        .map(([label, before, after]) => [label, [before, after]]),
+    );
+    expect(rows["Offline mode"]).toEqual(["Off", "On"]);
+    expect(rows["GitHub access"]).toEqual(["On", "Off"]);
+    expect(rows["Client overrides"]).toEqual(["1 configured", "None"]);
+    expect(rows["Claude Skill override"]).toEqual(["On / On / On", "Inherit"]);
+    expect(rows["Claude Agent override"]).toEqual(["On / On / On", "Inherit"]);
+    expect(rows["Codex Skill override"]).toEqual(["Inherit", "Inherit"]);
+    expect(rows["Codex Agent override"]).toEqual(["Inherit", "Inherit"]);
+    expect(rows["Project allowlist"]).toEqual(["1 retained", "1 retained"]);
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "security_posture_apply")).toBe(false);
+
+    document.querySelector<HTMLButtonElement>("[data-security-posture-apply]")?.click();
+    await Promise.resolve();
+    await tick();
+    await Promise.resolve();
+    await tick();
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("security_posture_apply", { preset: "strict" });
+    expect(document.querySelector("[data-security-posture-current]")?.textContent).toContain("Strict");
+    expect(document.querySelector('[data-security-posture-announcement]')?.textContent).toContain("Strict");
     unmount(component);
     settings.data = null;
   });
