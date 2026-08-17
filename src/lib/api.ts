@@ -75,6 +75,8 @@ import type {
   ProjectReadinessReport,
   ProjectRecommendation,
   ProjectInfo,
+  PlaybookCatalogEntry,
+  PlaybookDocument,
   InstalledAgent,
   ExpertActivationRequest,
   ExpertCreationRequest,
@@ -120,6 +122,9 @@ export const taskRecommendations = (task: string, limit = 10) =>
 export const catalogFeedList = () => invoke<CatalogFeedState>("catalog_feed_list");
 export const catalogSourceTransitionRecover = () =>
   invoke<boolean>("catalog_source_transition_recover");
+export const playbooksList = () => invoke<PlaybookCatalogEntry[]>("playbooks_list");
+export const playbookRead = (relativePath: string) =>
+  invoke<PlaybookDocument>("playbook_read", { relativePath });
 
 export const projectBaselineSaveTeam = (
   projectPath: string,

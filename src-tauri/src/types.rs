@@ -1000,6 +1000,32 @@ pub struct CatalogFeedState {
     pub batches: Vec<CatalogFeedBatch>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaybookKind {
+    Strategy,
+    Example,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookCatalogEntry {
+    pub relative_path: String,
+    pub title: String,
+    pub kind: PlaybookKind,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookDocument {
+    pub relative_path: String,
+    pub title: String,
+    pub kind: PlaybookKind,
+    pub size_bytes: u64,
+    pub content: String,
+}
+
 // ---------- Agent (parsed from the corpus) ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]

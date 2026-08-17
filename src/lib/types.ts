@@ -943,6 +943,19 @@ export interface Runbook {
   roster: RunbookGroup[];
 }
 
+export type PlaybookKind = "strategy" | "example";
+
+export interface PlaybookCatalogEntry {
+  relativePath: string;
+  title: string;
+  kind: PlaybookKind;
+  sizeBytes: number;
+}
+
+export interface PlaybookDocument extends PlaybookCatalogEntry {
+  content: string;
+}
+
 export type ExpertClient = "claudeCode" | "codex";
 
 export interface ExpertCheck {

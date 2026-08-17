@@ -8,6 +8,7 @@ import DivisionsLanding from "$lib/components/DivisionsLanding.svelte";
 import Sidebar from "$lib/components/Sidebar.svelte";
 import CommandPalette from "$lib/components/CommandPalette.svelte";
 import SettingsSectionMcp from "$lib/components/SettingsSectionMcp.svelte";
+import RunbooksView from "$lib/components/Runbooks.svelte";
 import agentsWorkspaceSource from "$lib/components/AgentsWorkspace.svelte?raw";
 import skillsWorkspaceSource from "$lib/components/SkillsWorkspace.svelte?raw";
 import installModalSource from "$lib/components/InstallModal.svelte?raw";
@@ -34,6 +35,7 @@ import { install } from "$lib/stores/install.svelte";
 import { i18n } from "$lib/stores/i18n.svelte";
 import { projects } from "$lib/stores/projects.svelte";
 import { settings } from "$lib/stores/settings.svelte";
+import { filterPlaybooks, runbooks } from "$lib/stores/runbooks.svelte";
 import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
@@ -289,6 +291,15 @@ beforeEach(async () => {
   install.reconcileAttempt = 0;
   install.reconcileTerminal = 0;
   projects.list = [];
+  runbooks.list = [];
+  runbooks.playbooks = [];
+  runbooks.selected = null;
+  runbooks.loaded = false;
+  runbooks.loading = false;
+  runbooks.runbooksError = null;
+  runbooks.error = null;
+  runbooks.reading = false;
+  runbooks.readError = null;
   settings.data = null;
   settings.error = null;
   settings.corruptOnDisk = false;
@@ -6052,6 +6063,78 @@ describe("frontend test harness", () => {
     ]) expect(projectsSource.match(marker) ?? [], String(marker)).toHaveLength(1);
     expect(projectsSource).not.toContain("window.fetch");
     expect(projectsSource).not.toContain("execute(");
+  });
+});
+
+describe("bounded playbook library", () => {
+  const entries = [
+    { relativePath: "strategy/zeta.md", title: "Zeta", kind: "strategy" as const, sizeBytes: 12 },
+    { relativePath: "examples/alpha.md", title: "Alpha workflow", kind: "example" as const, sizeBytes: 20 },
+  ];
+
+  it("filters locally in deterministic source-relative order", () => {
+    expect(filterPlaybooks(entries, "workflow").map((entry) => entry.relativePath))
+      .toEqual(["examples/alpha.md"]);
+    expect(filterPlaybooks(entries.toReversed(), "").map((entry) => entry.relativePath))
+      .toEqual(["examples/alpha.md", "strategy/zeta.md"]);
+  });
+
+  it("shows safe text, provenance, copy, empty/error retry, and accessible modes", async () => {
+    const copy = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText: copy } });
+    let listAttempts = 0;
+    vi.mocked(invoke).mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "playbooks_list") {
+        listAttempts += 1;
+        if (listAttempts === 1) throw { code: "io", message: "catalog unavailable" };
+        return entries as never;
+      }
+      if (command === "playbook_read") {
+        expect(args).toEqual({ relativePath: "examples/alpha.md" });
+        return {
+          ...entries[1],
+          content: "# Alpha workflow\n<script>never execute</script>",
+        } as never;
+      }
+      return [] as never;
+    });
+
+    const component = mount(RunbooksView, { target: document.body });
+    await Promise.resolve();
+    await tick();
+    await Promise.resolve();
+    await tick();
+
+    const modes = [...document.querySelectorAll<HTMLButtonElement>("[data-runbooks-mode]")];
+    expect(modes.map((button) => [button.textContent?.trim(), button.getAttribute("aria-pressed")]))
+      .toEqual([["Runbooks", "true"], ["Playbooks", "false"]]);
+    modes[1].click();
+    await tick();
+    expect(document.querySelector('[role="status"]')?.textContent).toContain("catalog unavailable");
+
+    document.querySelector<HTMLButtonElement>("[data-playbooks-retry]")?.click();
+    await Promise.resolve();
+    await tick();
+    expect(document.body.textContent).toContain("Alpha workflow");
+    expect(document.body.textContent).toContain("examples/alpha.md");
+
+    const search = document.querySelector<HTMLInputElement>("[data-playbooks-search]")!;
+    search.value = "alpha";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await tick();
+    expect(document.body.textContent).not.toContain("Zeta");
+
+    document.querySelector<HTMLButtonElement>('[data-playbook-path="examples/alpha.md"]')?.click();
+    await Promise.resolve();
+    await tick();
+    expect(document.querySelector("pre")?.textContent).toContain("<script>never execute</script>");
+    expect(document.querySelector("pre script")).toBeNull();
+
+    document.querySelector<HTMLButtonElement>("[data-playbook-copy]")?.click();
+    await Promise.resolve();
+    expect(copy).toHaveBeenCalledWith("# Alpha workflow\n<script>never execute</script>");
+    expect(document.querySelector('[aria-live="polite"]')).not.toBeNull();
+    unmount(component);
   });
 });
 

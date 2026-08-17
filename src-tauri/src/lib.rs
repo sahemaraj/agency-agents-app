@@ -218,6 +218,8 @@ pub fn run() {
             corpus::catalog_status,
             corpus::catalog_check_updates,
             corpus::runbooks_list,
+            corpus::playbooks_list,
+            corpus::playbook_read,
             experts::experts_list,
             experts::experts_get,
             experts::expert_save,

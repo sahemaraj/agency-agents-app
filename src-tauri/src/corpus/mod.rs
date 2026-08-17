@@ -29,7 +29,7 @@
 
 pub(crate) mod parse;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,7 +42,8 @@ use crate::types::{
     Agent, CatalogCandidate, CatalogChange, CatalogDetection, CatalogFeedBatch, CatalogFeedState,
     CatalogPendingRefresh, CatalogPendingSourceTransition, CatalogSnapshotItem,
     CatalogSnapshotProvenance, CatalogSource, CatalogStatus, CatalogUpdateCheck, Category,
-    ControlCenterDocument, CorpusEntry, CorpusMeta, ProjectReadinessBaseline,
+    ControlCenterDocument, CorpusEntry, CorpusMeta, PlaybookCatalogEntry, PlaybookDocument,
+    PlaybookKind, ProjectReadinessBaseline,
 };
 use crate::util::fs::atomic_write;
 
@@ -140,6 +141,10 @@ const MAX_TARBALL_BYTES: u64 = 32 * 1024 * 1024;
 /// Cap on a single decompressed agent `.md`. Personas run a few KiB;
 /// 1 MiB is absurdly generous and still bounds memory.
 pub(crate) const MAX_AGENT_BYTES: u64 = 1024 * 1024;
+
+const MAX_PLAYBOOK_BYTES: u64 = 256 * 1024;
+const MAX_PLAYBOOK_DOCUMENTS: usize = 256;
+const PLAYBOOK_ROOTS: [&str; 2] = ["strategy", "examples"];
 
 /// Version string recorded for the bundled baseline before any refresh
 /// has resolved a commit SHA.
@@ -2029,6 +2034,88 @@ fn categories_from_tarball(tar_gz: &[u8]) -> Option<Vec<String>> {
     None
 }
 
+fn archive_path_components(path: &Path) -> Result<Vec<String>, AppError> {
+    if path.is_absolute() {
+        return Err(AppError::InvalidArgument {
+            message: "catalog archive paths must be relative".into(),
+        });
+    }
+    path.components()
+        .map(|component| {
+            let std::path::Component::Normal(value) = component else {
+                return Err(AppError::InvalidArgument {
+                    message: "catalog archive paths must contain only normal components".into(),
+                });
+            };
+            value
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| AppError::InvalidArgument {
+                    message: "catalog archive paths must be valid UTF-8".into(),
+                })
+        })
+        .collect()
+}
+
+fn managed_playbook_target(root: &Path, relative_path: &str) -> Result<PathBuf, AppError> {
+    let canonical_root = validate_real_directory(root, "managed catalog root")?;
+    let mut directory = root.to_path_buf();
+    for component in Path::new(relative_path)
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+    {
+        let std::path::Component::Normal(component) = component else {
+            return Err(AppError::InvalidArgument {
+                message: "managed playbook paths must be normalized and relative".into(),
+            });
+        };
+        directory.push(component);
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && !crate::skills::metadata_is_reparse_point(&metadata) => {}
+            Ok(_) => {
+                return Err(AppError::InvalidArgument {
+                    message: "managed playbook paths cannot contain links or special entries"
+                        .into(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&directory).map_err(|error| AppError::Io {
+                    message: format!("create managed playbook directory: {error}"),
+                })?;
+            }
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect managed playbook directory: {error}"),
+                });
+            }
+        }
+        let canonical = std::fs::canonicalize(&directory).map_err(|error| AppError::Io {
+            message: format!("resolve managed playbook directory: {error}"),
+        })?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(AppError::InvalidArgument {
+                message: "managed playbook path resolved outside the catalog".into(),
+            });
+        }
+    }
+    let target = root.join(relative_path);
+    if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || crate::skills::metadata_is_reparse_point(&metadata)
+        {
+            return Err(AppError::InvalidArgument {
+                message: "managed playbook targets must be real files".into(),
+            });
+        }
+    }
+    Ok(target)
+}
+
 /// Gunzip + untar `tar_gz`, writing every `<category>/<slug>.md` whose category
 /// is in `categories` into `<dest>/<category>/`, plus `scripts/convert.sh` (so
 /// the working copy stays self-describing). The codeload tarball nests
@@ -2049,24 +2136,29 @@ fn extract_categories(tar_gz: &[u8], dest: &Path, categories: &[String]) -> Resu
 
     let is_category = |c: &str| categories.iter().any(|cat| cat == c);
     let mut written = 0u32;
+    let mut playbooks_written = 0usize;
     for entry in entries {
         let mut entry = entry.map_err(|e| AppError::Io {
             message: format!("tar entry: {e}"),
         })?;
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
         let path = entry.path().map_err(|e| AppError::Io {
             message: format!("tar entry path: {e}"),
         })?;
         // Strip the single top-level `agency-agents-main/` component.
-        let comps: Vec<String> = path
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(s) => s.to_str().map(|s| s.to_string()),
-                _ => None,
-            })
-            .collect();
+        let comps = archive_path_components(&path)?;
+        let relative = (comps.len() >= 3).then(|| comps[1..].join("/"));
+        let in_playbook_root = comps
+            .get(1)
+            .is_some_and(|value| PLAYBOOK_ROOTS.contains(&value.as_str()));
+        if !entry.header().entry_type().is_file() {
+            if in_playbook_root && !entry.header().entry_type().is_dir() {
+                return Err(AppError::InvalidArgument {
+                    message: "catalog playbooks cannot contain links or special archive entries"
+                        .into(),
+                });
+            }
+            continue;
+        }
 
         // Persist the tooling so subsequent launches re-derive categories.
         if comps.len() == 3 && comps[1] == "scripts" && comps[2] == "convert.sh" {
@@ -2076,6 +2168,45 @@ fn extract_categories(tar_gz: &[u8], dest: &Path, categories: &[String]) -> Resu
             if entry.read_to_end(&mut buf).is_ok() {
                 let _ = std::fs::write(scripts_dir.join("convert.sh"), &buf);
             }
+            continue;
+        }
+
+        let retain_runbook_manifest = relative.as_deref() == Some("strategy/runbooks.json");
+        let retain_playbook = relative
+            .as_deref()
+            .is_some_and(|value| validate_playbook_relative_path(value).is_ok());
+        if retain_runbook_manifest || retain_playbook {
+            if retain_playbook {
+                if playbooks_written >= MAX_PLAYBOOK_DOCUMENTS {
+                    return Err(AppError::InvalidArgument {
+                        message: format!(
+                            "catalog contains more than {MAX_PLAYBOOK_DOCUMENTS} playbook documents"
+                        ),
+                    });
+                }
+                playbooks_written += 1;
+            }
+            if entry.size() > MAX_PLAYBOOK_BYTES {
+                return Err(AppError::InvalidArgument {
+                    message: format!(
+                        "catalog playbook exceeds the {MAX_PLAYBOOK_BYTES}-byte limit"
+                    ),
+                });
+            }
+            let relative = relative.expect("retained paths have a relative path");
+            let target = managed_playbook_target(dest, &relative)?;
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).map_err(|e| AppError::Io {
+                message: format!("read managed catalog content: {e}"),
+            })?;
+            if retain_playbook && std::str::from_utf8(&buf).is_err() {
+                return Err(AppError::InvalidArgument {
+                    message: "catalog playbooks must be valid UTF-8".into(),
+                });
+            }
+            std::fs::write(target, buf).map_err(|e| AppError::Io {
+                message: format!("write managed catalog content: {e}"),
+            })?;
             continue;
         }
 
@@ -2984,6 +3115,199 @@ pub struct RunbookGroup {
     pub agents: Vec<String>,
 }
 
+fn validate_playbook_relative_path(value: &str) -> Result<String, AppError> {
+    let normalized = crate::library::normalize_relative_path(value)?;
+    let mut parts = normalized.split('/');
+    let root = parts.next().unwrap_or_default();
+    if !PLAYBOOK_ROOTS.contains(&root)
+        || parts.next().is_none()
+        || Path::new(&normalized)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("md")
+    {
+        return Err(AppError::InvalidArgument {
+            message: "playbooks must be source-relative Markdown under strategy/ or examples/"
+                .into(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn playbook_kind(relative_path: &str) -> PlaybookKind {
+    if relative_path.starts_with("strategy/") {
+        PlaybookKind::Strategy
+    } else {
+        PlaybookKind::Example
+    }
+}
+
+fn playbook_title(relative_path: &str, content: &str) -> String {
+    content
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("# ").map(str::trim).filter(|title| {
+                !title.is_empty() && title.chars().all(|character| !character.is_control())
+            })
+        })
+        .map(|title| title.chars().take(256).collect())
+        .or_else(|| {
+            Path::new(relative_path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| relative_path.to_owned())
+}
+
+fn validate_real_directory(path: &Path, label: &str) -> Result<PathBuf, AppError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| AppError::Io {
+        message: format!("inspect {label}: {error}"),
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: format!("{label} must be a real directory, not a link or reparse point"),
+        });
+    }
+    std::fs::canonicalize(path).map_err(|error| AppError::Io {
+        message: format!("resolve {label}: {error}"),
+    })
+}
+
+fn read_playbook(root: &Path, relative_path: &str) -> Result<PlaybookDocument, AppError> {
+    let relative_path = validate_playbook_relative_path(relative_path)?;
+    let canonical_root = validate_real_directory(root, "catalog root")?;
+    let mut candidate = root.to_path_buf();
+    for component in relative_path.split('/') {
+        candidate.push(component);
+        let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| AppError::Io {
+            message: format!("inspect playbook {relative_path}: {error}"),
+        })?;
+        if metadata.file_type().is_symlink() || crate::skills::metadata_is_reparse_point(&metadata)
+        {
+            return Err(AppError::InvalidArgument {
+                message: "playbook paths cannot contain links or reparse points".into(),
+            });
+        }
+    }
+    let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| AppError::Io {
+        message: format!("inspect playbook {relative_path}: {error}"),
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_PLAYBOOK_BYTES {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "playbook must be a regular file no larger than {MAX_PLAYBOOK_BYTES} bytes"
+            ),
+        });
+    }
+    let canonical = std::fs::canonicalize(&candidate).map_err(|error| AppError::Io {
+        message: format!("resolve playbook {relative_path}: {error}"),
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(AppError::InvalidArgument {
+            message: "playbook resolved outside the active catalog".into(),
+        });
+    }
+    let bytes = std::fs::read(&canonical).map_err(|error| AppError::Io {
+        message: format!("read playbook {relative_path}: {error}"),
+    })?;
+    if bytes.len() as u64 > MAX_PLAYBOOK_BYTES {
+        return Err(AppError::InvalidArgument {
+            message: format!("playbook exceeds the {MAX_PLAYBOOK_BYTES}-byte limit"),
+        });
+    }
+    let content = String::from_utf8(bytes).map_err(|_| AppError::InvalidArgument {
+        message: "playbooks must be valid UTF-8".into(),
+    })?;
+    Ok(PlaybookDocument {
+        title: playbook_title(&relative_path, &content),
+        kind: playbook_kind(&relative_path),
+        size_bytes: content.len() as u64,
+        relative_path,
+        content,
+    })
+}
+
+fn playbook_catalog(root: &Path) -> Result<Vec<PlaybookCatalogEntry>, AppError> {
+    validate_real_directory(root, "catalog root")?;
+    let mut documents = Vec::new();
+    for allowed_root in PLAYBOOK_ROOTS {
+        let directory = root.join(allowed_root);
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect {allowed_root} playbooks: {error}"),
+                });
+            }
+        };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || crate::skills::metadata_is_reparse_point(&metadata)
+        {
+            return Err(AppError::InvalidArgument {
+                message: format!("{allowed_root}/ must be a real directory"),
+            });
+        }
+        let mut directories = VecDeque::from([directory]);
+        while let Some(directory) = directories.pop_front() {
+            let mut entries = std::fs::read_dir(&directory)
+                .map_err(|error| AppError::Io {
+                    message: format!("read {allowed_root} playbooks: {error}"),
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Io {
+                    message: format!("read {allowed_root} playbook entry: {error}"),
+                })?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path).map_err(|error| AppError::Io {
+                    message: format!("inspect {allowed_root} playbook entry: {error}"),
+                })?;
+                if metadata.file_type().is_symlink()
+                    || crate::skills::metadata_is_reparse_point(&metadata)
+                    || (!metadata.is_dir() && !metadata.is_file())
+                {
+                    return Err(AppError::InvalidArgument {
+                        message: format!(
+                            "{allowed_root}/ contains a link, reparse point, or special entry"
+                        ),
+                    });
+                }
+                let relative_path = normalized_corpus_relative_path(root, &path)?;
+                if metadata.is_dir() {
+                    directories.push_back(path);
+                    continue;
+                }
+                if path.extension().and_then(|value| value.to_str()) != Some("md") {
+                    continue;
+                }
+                if documents.len() >= MAX_PLAYBOOK_DOCUMENTS {
+                    return Err(AppError::InvalidArgument {
+                        message: format!(
+                            "catalog contains more than {MAX_PLAYBOOK_DOCUMENTS} playbook documents"
+                        ),
+                    });
+                }
+                let document = read_playbook(root, &relative_path)?;
+                documents.push(PlaybookCatalogEntry {
+                    relative_path: document.relative_path,
+                    title: document.title,
+                    kind: document.kind,
+                    size_bytes: document.size_bytes,
+                });
+            }
+        }
+    }
+    documents.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(documents)
+}
+
 /// `runbooks_list()` — the NEXUS runbook manifest from the active catalog's
 /// `strategy/runbooks.json`. Empty when the catalog is the bundled snapshot or an
 /// unsynced/pre-#664 clone (no `strategy/` on disk) — the UI treats empty as
@@ -3002,6 +3326,33 @@ pub async fn runbooks_list(app: AppHandle) -> Result<Vec<Runbook>, AppError> {
         message: format!("parse strategy/runbooks.json: {e}"),
     })?;
     Ok(file.runbooks)
+}
+
+#[tauri::command]
+pub async fn playbooks_list(app: AppHandle) -> Result<Vec<PlaybookCatalogEntry>, AppError> {
+    let adir = app_data_dir(&app)?;
+    let source = load_catalog_source_checked(&adir).await?;
+    let root = catalog_root(&adir, &source);
+    tauri::async_runtime::spawn_blocking(move || playbook_catalog(&root))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("playbook catalog task failed: {error}"),
+        })?
+}
+
+#[tauri::command]
+pub async fn playbook_read(
+    app: AppHandle,
+    relative_path: String,
+) -> Result<PlaybookDocument, AppError> {
+    let adir = app_data_dir(&app)?;
+    let source = load_catalog_source_checked(&adir).await?;
+    let root = catalog_root(&adir, &source);
+    tauri::async_runtime::spawn_blocking(move || read_playbook(&root, &relative_path))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("playbook read task failed: {error}"),
+        })?
 }
 
 /// Heuristic: does `root` hold an agency-agents catalog? True if it has the
@@ -3085,6 +3436,22 @@ mod tests {
         std::fs::create_dir_all(&cat).unwrap();
         let content = format!("---\nname: {name}\ndescription: d\n---\n{body}\n");
         std::fs::write(cat.join(format!("{slug}.md")), content).unwrap();
+    }
+
+    fn test_catalog_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(gz);
+        for (path, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, path, *bytes)
+                .expect("append test tar entry");
+        }
+        let gz = archive.into_inner().expect("finish tar");
+        gz.finish().expect("finish gzip")
     }
 
     fn snapshot_item(category: &str, path: &str, hash: char) -> CatalogSnapshotItem {
@@ -4854,5 +5221,220 @@ echo done
         // An absent `runbooks` key (bundled / no strategy/) parses to empty, not an error.
         let empty: RunbooksFile = serde_json::from_str("{}").unwrap();
         assert!(empty.runbooks.is_empty());
+    }
+
+    #[test]
+    fn managed_tar_retains_only_supported_playbook_content() {
+        let tar = test_catalog_tar(&[
+            (
+                "agency-agents-main/engineering/reviewer.md",
+                b"---\nname: Reviewer\n---\nBody\n",
+            ),
+            (
+                "agency-agents-main/strategy/runbooks.json",
+                br#"{"runbooks":[]}"#,
+            ),
+            (
+                "agency-agents-main/strategy/QUICKSTART.md",
+                b"# Quickstart\n",
+            ),
+            (
+                "agency-agents-main/strategy/runbooks/scenario.md",
+                b"# Scenario\n",
+            ),
+            ("agency-agents-main/examples/README.md", b"# Examples\n"),
+            ("agency-agents-main/examples/workflow.md", b"# Workflow\n"),
+            ("agency-agents-main/examples/execute.sh", b"echo unsafe\n"),
+            ("agency-agents-main/docs/private.md", b"# Private\n"),
+        ]);
+        let dest = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            extract_categories(&tar, dest.path(), &["engineering".into()]).unwrap(),
+            1
+        );
+        for retained in [
+            "strategy/runbooks.json",
+            "strategy/QUICKSTART.md",
+            "strategy/runbooks/scenario.md",
+            "examples/README.md",
+            "examples/workflow.md",
+        ] {
+            assert!(dest.path().join(retained).is_file(), "retained {retained}");
+        }
+        assert!(!dest.path().join("examples/execute.sh").exists());
+        assert!(!dest.path().join("docs/private.md").exists());
+    }
+
+    #[test]
+    fn managed_tar_rejects_linked_playbook_entries() {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name("../../private.md").unwrap();
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "agency-agents-main/strategy/private.md",
+                std::io::empty(),
+            )
+            .unwrap();
+        let tar = archive.into_inner().unwrap().finish().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        assert!(extract_categories(&tar, dest.path(), &["engineering".into()]).is_err());
+        assert!(!dest.path().join("strategy/private.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_tar_rejects_linked_destination_paths() {
+        use std::os::unix::fs::symlink;
+
+        let tar = test_catalog_tar(&[("agency-agents-main/strategy/plan.md", b"# Plan\n")]);
+        let dest = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), dest.path().join("strategy")).unwrap();
+
+        assert!(extract_categories(&tar, dest.path(), &["engineering".into()]).is_err());
+        assert!(!outside.path().join("plan.md").exists());
+    }
+
+    #[test]
+    fn playbook_paths_are_fixed_root_relative_markdown_only() {
+        for valid in [
+            "strategy/QUICKSTART.md",
+            "strategy/runbooks/scenario.md",
+            "examples/workflow.md",
+        ] {
+            assert_eq!(validate_playbook_relative_path(valid).unwrap(), valid);
+        }
+        for invalid in [
+            "strategy",
+            "strategy/runbooks.json",
+            "strategy/../secrets.md",
+            "examples/../../secrets.md",
+            "/strategy/secret.md",
+            "docs/secret.md",
+            "examples\\secret.md",
+            "examples/secret.MD",
+        ] {
+            assert!(
+                validate_playbook_relative_path(invalid).is_err(),
+                "rejected {invalid}"
+            );
+        }
+        assert!(archive_path_components(Path::new("../strategy/secret.md")).is_err());
+        assert!(archive_path_components(Path::new("/strategy/secret.md")).is_err());
+        assert!(crate::skills::is_windows_reparse_point(0x400));
+    }
+
+    #[test]
+    fn playbook_catalog_is_bounded_utf8_and_deterministically_sorted() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("strategy/runbooks")).unwrap();
+        std::fs::create_dir_all(root.path().join("examples")).unwrap();
+        std::fs::write(root.path().join("strategy/zeta.md"), "# Zeta\nBody").unwrap();
+        std::fs::write(
+            root.path().join("strategy/runbooks/alpha.md"),
+            "# Alpha\nBody",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("examples/beta.md"), "No heading\nBody").unwrap();
+        std::fs::write(root.path().join("examples/ignored.txt"), "ignored").unwrap();
+
+        let catalog = playbook_catalog(root.path()).unwrap();
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|item| item.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "examples/beta.md",
+                "strategy/runbooks/alpha.md",
+                "strategy/zeta.md"
+            ]
+        );
+        assert_eq!(catalog[0].title, "beta");
+        assert_eq!(catalog[1].title, "Alpha");
+
+        std::fs::write(root.path().join("examples/invalid.md"), [0xff, 0xfe]).unwrap();
+        assert!(
+            playbook_catalog(root.path()).is_err(),
+            "invalid UTF-8 fails closed"
+        );
+        std::fs::remove_file(root.path().join("examples/invalid.md")).unwrap();
+
+        std::fs::write(
+            root.path().join("examples/oversized.md"),
+            vec![b'x'; MAX_PLAYBOOK_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(
+            playbook_catalog(root.path()).is_err(),
+            "oversized docs fail closed"
+        );
+    }
+
+    #[test]
+    fn playbook_catalog_enforces_document_count_cap() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("examples")).unwrap();
+        for index in 0..=MAX_PLAYBOOK_DOCUMENTS {
+            std::fs::write(
+                root.path().join(format!("examples/{index:04}.md")),
+                format!("# {index}\n"),
+            )
+            .unwrap();
+        }
+        assert!(playbook_catalog(root.path()).is_err());
+    }
+
+    #[test]
+    fn playbook_read_revalidates_exact_file_and_returns_source_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("strategy")).unwrap();
+        std::fs::write(
+            root.path().join("strategy/plan.md"),
+            "# Plan\n<script>never run</script>",
+        )
+        .unwrap();
+
+        let document = read_playbook(root.path(), "strategy/plan.md").unwrap();
+        assert_eq!(document.relative_path, "strategy/plan.md");
+        assert_eq!(document.title, "Plan");
+        assert_eq!(document.content, "# Plan\n<script>never run</script>");
+        assert!(read_playbook(root.path(), "../secret.md").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn playbook_catalog_and_read_reject_linked_roots_directories_and_files() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "# Secret").unwrap();
+
+        let linked_root_parent = tempfile::tempdir().unwrap();
+        symlink(outside.path(), linked_root_parent.path().join("catalog")).unwrap();
+        assert!(playbook_catalog(&linked_root_parent.path().join("catalog")).is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        symlink(outside.path(), root.path().join("strategy")).unwrap();
+        assert!(playbook_catalog(root.path()).is_err());
+        assert!(read_playbook(root.path(), "strategy/secret.md").is_err());
+
+        std::fs::remove_file(root.path().join("strategy")).unwrap();
+        std::fs::create_dir_all(root.path().join("strategy")).unwrap();
+        symlink(
+            outside.path().join("secret.md"),
+            root.path().join("strategy/secret.md"),
+        )
+        .unwrap();
+        assert!(playbook_catalog(root.path()).is_err());
+        assert!(read_playbook(root.path(), "strategy/secret.md").is_err());
     }
 }

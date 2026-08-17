@@ -19,14 +19,26 @@
   import RocketIcon from "@lucide/svelte/icons/rocket";
   import DownloadIcon from "@lucide/svelte/icons/download";
   import CopyIcon from "@lucide/svelte/icons/copy";
+  import SearchIcon from "@lucide/svelte/icons/search";
   import InstallModal from "./InstallModal.svelte";
   import EmptyState from "./EmptyState.svelte";
   import { corpus } from "$lib/stores/corpus.svelte";
-  import { runbooks } from "$lib/stores/runbooks.svelte";
+  import { filterPlaybooks, runbooks } from "$lib/stores/runbooks.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { toast } from "$lib/stores/toast.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import type { Agent, Runbook } from "$lib/types";
+  import { appErrorMessage, isAppError, type Agent, type Runbook } from "$lib/types";
+
+  let mode = $state<"runbooks" | "playbooks">("runbooks");
+  let playbookSearch = $state("");
+  let selectedPath = $state<string | null>(null);
+  let announcement = $state("");
+  const shownPlaybooks = $derived(filterPlaybooks(runbooks.playbooks, playbookSearch));
+
+  function setMode(next: "runbooks" | "playbooks") {
+    mode = next;
+    announcement = next === "runbooks" ? "Runbooks shown" : "Playbooks shown";
+  }
 
   onMount(() => {
     corpus.ensureLoaded();
@@ -98,6 +110,29 @@
       toast.error(i18n.t("common.copyFailed"), String(e));
     }
   }
+
+  async function openPlaybook(relativePath: string) {
+    selectedPath = relativePath;
+    await runbooks.read(relativePath);
+    announcement = runbooks.selected
+      ? `${runbooks.selected.title} loaded`
+      : `Could not load ${relativePath}`;
+  }
+
+  async function copyPlaybook() {
+    if (!runbooks.selected) return;
+    try {
+      await navigator.clipboard.writeText(runbooks.selected.content);
+      announcement = `${runbooks.selected.title} copied`;
+      toast.success("Playbook copied");
+    } catch (error) {
+      toast.error(i18n.t("common.copyFailed"), isAppError(error) ? appErrorMessage(error) : String(error));
+    }
+  }
+
+  function retrySelected() {
+    if (selectedPath) void openPlaybook(selectedPath);
+  }
 </script>
 
 <section class="rbv">
@@ -106,12 +141,23 @@
       <h1 class="rbv-title">{i18n.t("nav.runbooks")}</h1>
       <p class="rbv-sub">{i18n.t("runbooks.subtitle")}</p>
     </div>
+    <div class="mode-switch" aria-label="Runbooks content">
+      <button data-runbooks-mode aria-pressed={mode === "runbooks"} onclick={() => setMode("runbooks")}>Runbooks</button>
+      <button data-runbooks-mode aria-pressed={mode === "playbooks"} onclick={() => setMode("playbooks")}>Playbooks</button>
+    </div>
   </header>
+
+  <span class="sr-only" aria-live="polite">{announcement}</span>
 
   <div class="rbv-scroll">
     {#if !runbooks.loaded || runbooks.loading}
       <p class="rbv-status">{i18n.t("common.loading")}</p>
-    {:else if runbooks.list.length === 0}
+    {:else if mode === "runbooks" && runbooks.runbooksError}
+      <div class="error-state" role="status">
+        <p>{runbooks.runbooksError}</p>
+        <button class="btn" onclick={() => runbooks.retryRunbooks()}>Retry</button>
+      </div>
+    {:else if mode === "runbooks" && runbooks.list.length === 0}
       <EmptyState title={i18n.t("runbooks.needSyncTitle")}>
         {#snippet icon()}<RocketIcon size={44} />{/snippet}
         {i18n.t("runbooks.needSync")}
@@ -119,7 +165,7 @@
           <button class="link" onclick={() => ui.openSettings("catalog")}>{i18n.t("runbooks.openCatalog")}</button>
         {/snippet}
       </EmptyState>
-    {:else}
+    {:else if mode === "runbooks"}
       <ul class="rb-list">
         {#each runbooks.list as rb (rb.slug)}
           {@const c = counts(rb)}
@@ -173,6 +219,70 @@
           </li>
         {/each}
       </ul>
+    {:else if runbooks.error}
+      <div class="error-state" role="status">
+        <p>{runbooks.error}</p>
+        <button data-playbooks-retry class="btn" onclick={() => runbooks.retryPlaybooks()}>Retry</button>
+      </div>
+    {:else if runbooks.playbooks.length === 0}
+      <EmptyState title="No playbooks available">
+        {#snippet icon()}<RocketIcon size={44} />{/snippet}
+        Sync the catalog to browse strategy and workflow example documents.
+        {#snippet cta()}
+          <button class="link" onclick={() => ui.openSettings("catalog")}>{i18n.t("runbooks.openCatalog")}</button>
+        {/snippet}
+      </EmptyState>
+    {:else}
+      <div class="playbook-layout">
+        <div class="playbook-browser">
+          <label class="playbook-search">
+            <SearchIcon size={15} aria-hidden="true" />
+            <span class="sr-only">Search playbooks</span>
+            <input data-playbooks-search maxlength="200" placeholder="Search playbooks" bind:value={playbookSearch} />
+          </label>
+          <p class="playbook-count">{shownPlaybooks.length} of {runbooks.playbooks.length}</p>
+          {#if shownPlaybooks.length === 0}
+            <p class="rbv-status">No playbooks match this search.</p>
+          {:else}
+            <ul class="playbook-list">
+              {#each shownPlaybooks as playbook (playbook.relativePath)}
+                <li>
+                  <button
+                    data-playbook-path={playbook.relativePath}
+                    class:selected={selectedPath === playbook.relativePath}
+                    disabled={runbooks.reading}
+                    onclick={() => openPlaybook(playbook.relativePath)}
+                  >
+                    <span>{playbook.title}</span>
+                    <small>{playbook.relativePath}</small>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+        <article class="playbook-reader" aria-busy={runbooks.reading}>
+          {#if runbooks.reading}
+            <p class="rbv-status">Loading playbook…</p>
+          {:else if runbooks.readError}
+            <div class="error-state" role="status">
+              <p>{runbooks.readError}</p>
+              {#if selectedPath}<button class="btn" onclick={retrySelected}>Retry</button>{/if}
+            </div>
+          {:else if runbooks.selected}
+            <header class="playbook-reader-head">
+              <div>
+                <h2>{runbooks.selected.title}</h2>
+                <p>{runbooks.selected.relativePath} · {runbooks.selected.sizeBytes} bytes</p>
+              </div>
+              <button data-playbook-copy class="btn" onclick={copyPlaybook}><CopyIcon size={14} />Copy</button>
+            </header>
+            <pre>{runbooks.selected.content}</pre>
+          {:else}
+            <p class="rbv-status">Select a playbook to read its source text.</p>
+          {/if}
+        </article>
+      </div>
     {/if}
   </div>
 </section>
@@ -187,13 +297,37 @@
 
 <style>
   .rbv { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-  .rbv-head { flex: none; padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); }
+  .rbv-head { flex: none; padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
   .rbv-title { font-size: var(--text-h2); font-weight: var(--fw-semibold); color: var(--color-text-primary); }
   .rbv-sub { font-size: var(--text-body-sm); color: var(--color-text-secondary); margin-top: 1px; }
   .rbv-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-3); }
   .rbv-status { font-size: var(--text-body-sm); color: var(--color-text-muted); padding: var(--space-3); }
   .link { background: transparent; color: var(--color-brand); font-size: var(--text-body-sm); cursor: pointer; padding: 2px; }
   .link:hover { text-decoration: underline; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .mode-switch { display: inline-flex; padding: 2px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); }
+  .mode-switch button { padding: 5px 10px; border-radius: calc(var(--radius-md) - 2px); color: var(--color-text-secondary); font-size: var(--text-body-sm); cursor: pointer; }
+  .mode-switch button[aria-pressed="true"] { background: var(--color-surface-raised); color: var(--color-text-primary); box-shadow: var(--shadow-sm); }
+  .mode-switch button:focus-visible, .playbook-list button:focus-visible, .btn:focus-visible, .link:focus-visible { outline: 2px solid var(--color-brand); outline-offset: 2px; }
+  .error-state { display: flex; align-items: center; justify-content: center; gap: var(--space-3); padding: var(--space-5); color: var(--color-danger); }
+
+  .playbook-layout { display: grid; grid-template-columns: minmax(220px, 34%) minmax(0, 1fr); min-height: 100%; border: 1px solid var(--color-border); border-radius: var(--radius-lg); overflow: hidden; background: var(--color-surface-raised); }
+  .playbook-browser { min-width: 0; padding: var(--space-3); border-right: 1px solid var(--color-border); }
+  .playbook-search { display: flex; align-items: center; gap: var(--space-2); height: 34px; padding: 0 var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-text-muted); }
+  .playbook-search:focus-within { border-color: var(--color-brand); box-shadow: 0 0 0 1px var(--color-brand); }
+  .playbook-search input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--color-text-primary); }
+  .playbook-count { margin: var(--space-2) 0; color: var(--color-text-muted); font-size: var(--text-caption); }
+  .playbook-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+  .playbook-list button { width: 100%; padding: var(--space-2); border-radius: var(--radius-md); text-align: left; cursor: pointer; }
+  .playbook-list button:hover, .playbook-list button.selected { background: var(--color-surface-sunken); }
+  .playbook-list span, .playbook-list small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .playbook-list span { color: var(--color-text-primary); font-size: var(--text-body-sm); font-weight: var(--fw-medium); }
+  .playbook-list small { margin-top: 2px; color: var(--color-text-muted); font-family: var(--font-mono, ui-monospace, monospace); font-size: 10px; }
+  .playbook-reader { min-width: 0; padding: var(--space-3); }
+  .playbook-reader-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+  .playbook-reader-head h2 { color: var(--color-text-primary); font-size: var(--text-h3); }
+  .playbook-reader-head p { margin-top: 2px; color: var(--color-text-muted); font-family: var(--font-mono, ui-monospace, monospace); font-size: 10px; }
+  .playbook-reader pre { max-height: 60vh; margin: 0; padding: var(--space-3); overflow: auto; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); color: var(--color-text-primary); font-family: var(--font-mono, ui-monospace, monospace); font-size: var(--text-body-sm); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 
   .rb-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
   .rb-item { border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-surface-raised); overflow: hidden; }
