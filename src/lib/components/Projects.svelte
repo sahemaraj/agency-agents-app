@@ -311,6 +311,33 @@
     }
   }
 
+  async function finishRename(event: MouseEvent, recommendation: ProjectRecommendation): Promise<void> {
+    if (!selected || readinessBusy || !recommendation.finalizeOnly) return;
+    const projectPath = selected.path;
+    const generation = readinessGeneration;
+    recommendationTrigger = event.currentTarget as HTMLButtonElement;
+    recommendationTriggerId = recommendation.id;
+    readinessBusy = true;
+    readinessError = null;
+    try {
+      await projects.finalizeRecommendation(projectPath, recommendation.id);
+      if (generation !== readinessGeneration || selected?.path !== projectPath) return;
+      readinessAnnouncement = "Rename baseline finalized. Readiness refreshed.";
+    } catch (error) {
+      if (generation === readinessGeneration) {
+        readinessError = isAppError(error) ? appErrorMessage(error) : String(error);
+        readinessAnnouncement = `Recommendation completion could not be finalized. ${readinessError}`;
+      }
+      return;
+    } finally {
+      if (generation === readinessGeneration) readinessBusy = false;
+    }
+    if (generation === readinessGeneration && selected?.path === projectPath) {
+      await refreshReadiness();
+      await restoreRecommendationFocus();
+    }
+  }
+
   async function dismissRecommendation(recommendation: ProjectRecommendation): Promise<void> {
     if (!selected || readinessBusy) return;
     const projectPath = selected.path;
@@ -716,7 +743,11 @@
               {#each recommendations as recommendation (recommendation.id)}
                 <li>
                   <div><strong>{recommendation.lifecycle}</strong><span>{recommendation.summary}</span></div>
-                  <button class="btn" data-recommendation-id={recommendation.id} disabled={readinessBusy || recommendation.lifecycle !== "new" || recommendation.changeKind === "removed"} onclick={(event) => void openRecommendation(event, recommendation)}>Open review</button>
+                  {#if recommendation.finalizeOnly}
+                    <button class="btn" data-recommendation-id={recommendation.id} disabled={readinessBusy || !["new", "pending"].includes(recommendation.lifecycle)} onclick={(event) => void finishRename(event, recommendation)}>Finish rename</button>
+                  {:else}
+                    <button class="btn" data-recommendation-id={recommendation.id} disabled={readinessBusy || !["new", "pending"].includes(recommendation.lifecycle) || recommendation.changeKind === "removed"} onclick={(event) => void openRecommendation(event, recommendation)}>Open review</button>
+                  {/if}
                   {#if recommendation.lifecycle !== "dismissed"}<button class="btn" disabled={readinessBusy} onclick={() => void dismissRecommendation(recommendation)}>Dismiss</button>{/if}
                 </li>
               {/each}

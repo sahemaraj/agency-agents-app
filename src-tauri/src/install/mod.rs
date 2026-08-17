@@ -5663,6 +5663,7 @@ fn catalog_change_for_reference(
 enum RecommendationInstallState {
     Current,
     Outdated,
+    Absent,
     Unsafe,
 }
 
@@ -5685,8 +5686,10 @@ fn recommendation_install_state(
                 && row.tool == tool
         })
         .collect::<Vec<_>>();
-    let [row] = matches.as_slice() else {
-        return RecommendationInstallState::Unsafe;
+    let row = match matches.as_slice() {
+        [] => return RecommendationInstallState::Absent,
+        [row] => row,
+        _ => return RecommendationInstallState::Unsafe,
     };
     match row.state {
         InstallState::Current => RecommendationInstallState::Current,
@@ -5737,63 +5740,86 @@ fn derive_project_recommendations_with_installs(
         let latest_relevant = relevant.len().checked_sub(1);
         for (index, (batch, change, action_reference, summary)) in relevant.into_iter().enumerate()
         {
-            let (change_kind, operation) = match change {
-                CatalogChange::Added { .. } => (
-                    RecommendationChangeKind::Added,
-                    RecommendationOperation::Install,
-                ),
-                CatalogChange::Updated { .. } => (
-                    RecommendationChangeKind::Updated,
-                    RecommendationOperation::Update,
-                ),
-                CatalogChange::Removed { .. } => (
-                    RecommendationChangeKind::Removed,
-                    RecommendationOperation::Informational,
-                ),
-                CatalogChange::Renamed { .. } => (
-                    RecommendationChangeKind::Renamed,
-                    RecommendationOperation::Install,
-                ),
+            let change_kind = match change {
+                CatalogChange::Added { .. } => RecommendationChangeKind::Added,
+                CatalogChange::Updated { .. } => RecommendationChangeKind::Updated,
+                CatalogChange::Removed { .. } => RecommendationChangeKind::Removed,
+                CatalogChange::Renamed { .. } => RecommendationChangeKind::Renamed,
             };
             let requirements = exact_agent_requirements(baseline)
                 .into_iter()
                 .filter(|requirement| requirement.reference == baseline_reference)
                 .filter(|requirement| requirement.tool != LEGACY_UNREVIEWED_TARGET)
                 .collect::<Vec<_>>();
-            let mut unsafe_updated_target = false;
+            let mut unsafe_action_target = false;
+            let mut all_targets_current = !requirements.is_empty();
             let targets = requirements
                 .iter()
                 .filter_map(|requirement| {
-                    if change_kind == RecommendationChangeKind::Updated {
-                        match recommendation_install_state(
+                    let target_operation = match change_kind {
+                        RecommendationChangeKind::Updated => match recommendation_install_state(
                             installed,
                             &baseline.project_path,
                             &action_reference,
                             &requirement.tool,
                         ) {
                             RecommendationInstallState::Current => return None,
-                            RecommendationInstallState::Outdated => {}
-                            RecommendationInstallState::Unsafe => {
-                                unsafe_updated_target = true;
+                            RecommendationInstallState::Outdated => {
+                                all_targets_current = false;
+                                RecommendationOperation::Update
+                            }
+                            RecommendationInstallState::Absent
+                            | RecommendationInstallState::Unsafe => {
+                                all_targets_current = false;
+                                unsafe_action_target = true;
                                 return None;
                             }
+                        },
+                        RecommendationChangeKind::Added | RecommendationChangeKind::Renamed => {
+                            match recommendation_install_state(
+                                installed,
+                                &baseline.project_path,
+                                &action_reference,
+                                &requirement.tool,
+                            ) {
+                                RecommendationInstallState::Current => return None,
+                                RecommendationInstallState::Absent => {
+                                    all_targets_current = false;
+                                    RecommendationOperation::Install
+                                }
+                                RecommendationInstallState::Outdated => {
+                                    all_targets_current = false;
+                                    RecommendationOperation::Update
+                                }
+                                RecommendationInstallState::Unsafe => {
+                                    all_targets_current = false;
+                                    unsafe_action_target = true;
+                                    return None;
+                                }
+                            }
                         }
-                    }
+                        RecommendationChangeKind::Removed => {
+                            all_targets_current = false;
+                            RecommendationOperation::Informational
+                        }
+                    };
                     Some(ProjectRecommendationTarget {
                         reference: action_reference.clone(),
                         tool: requirement.tool.clone(),
                         project_path: baseline.project_path.clone(),
-                        operation,
+                        operation: target_operation,
                     })
                 })
                 .collect::<Vec<_>>();
-            if change_kind == RecommendationChangeKind::Updated
-                && !requirements.is_empty()
-                && targets.is_empty()
-                && !unsafe_updated_target
+            if matches!(
+                change_kind,
+                RecommendationChangeKind::Updated | RecommendationChangeKind::Added
+            ) && all_targets_current
             {
                 continue;
             }
+            let finalize_only =
+                change_kind == RecommendationChangeKind::Renamed && all_targets_current;
             let id = render::sha256_hex(
                 &serde_json::to_vec(&(
                     baseline.project_path.as_str(),
@@ -5803,16 +5829,19 @@ fn derive_project_recommendations_with_installs(
                 ))
                 .expect("catalog recommendation identity is serializable"),
             );
-            let lifecycle = if subscription.dismissed_recommendation_ids.contains(&id) {
-                RecommendationLifecycle::Dismissed
-            } else if Some(index) != latest_relevant {
+            if subscription.dismissed_recommendation_ids.contains(&id) {
+                continue;
+            }
+            let lifecycle = if Some(index) != latest_relevant {
                 RecommendationLifecycle::Superseded
             } else if matches!(change_kind, RecommendationChangeKind::Removed)
-                || targets.is_empty()
-                || unsafe_updated_target
+                || (targets.is_empty() && !finalize_only)
+                || unsafe_action_target
                 || available.get(&action_reference) != Some(&1)
             {
                 RecommendationLifecycle::Blocked
+            } else if subscription.pending_recommendation_ids.contains(&id) {
+                RecommendationLifecycle::Pending
             } else if subscription
                 .last_seen_batch
                 .as_deref()
@@ -5823,7 +5852,7 @@ fn derive_project_recommendations_with_installs(
             {
                 RecommendationLifecycle::New
             } else {
-                continue;
+                RecommendationLifecycle::Pending
             };
             recommendations.push(ProjectRecommendation {
                 id,
@@ -5835,6 +5864,7 @@ fn derive_project_recommendations_with_installs(
                 baseline_reference: baseline_reference.clone(),
                 agent_references: vec![action_reference],
                 targets,
+                finalize_only,
             });
         }
     }
@@ -5880,6 +5910,7 @@ fn set_project_subscription(
         document.project_subscriptions.push(ProjectSubscription {
             project_path,
             last_seen_batch: None,
+            pending_recommendation_ids: Vec::new(),
             dismissed_recommendation_ids: Vec::new(),
         });
         document
@@ -5969,6 +6000,7 @@ pub async fn project_recommendations_list(
     state: State<'_, AppState>,
     project_path: String,
 ) -> Result<Vec<ProjectRecommendation>, AppError> {
+    let _project_lock = lock_project_registry(&state.app_data_dir)?;
     let project_path = exact_registered_project(&state, &project_path).await?;
     list_project_recommendations_for_state(&state, &project_path).await
 }
@@ -5978,7 +6010,70 @@ async fn list_project_recommendations_for_state(
     project_path: &str,
 ) -> Result<Vec<ProjectRecommendation>, AppError> {
     let (_, recommendations) = current_recommendations(state, project_path, false).await?;
+    let represented_ids = recommendations
+        .iter()
+        .filter(|recommendation| {
+            !matches!(
+                recommendation.lifecycle,
+                RecommendationLifecycle::Superseded | RecommendationLifecycle::Dismissed
+            )
+        })
+        .map(|recommendation| recommendation.id.clone())
+        .collect::<BTreeSet<_>>();
+    let inferred_pending_ids = recommendations
+        .iter()
+        .filter(|recommendation| recommendation.lifecycle == RecommendationLifecycle::Pending)
+        .map(|recommendation| recommendation.id.clone())
+        .collect::<BTreeSet<_>>();
+    let retained_project = project_path.to_string();
+    control_center_database(state)
+        .await?
+        .mutate(
+            corpus::control_center_spec(),
+            crate::types::ControlCenterDocument::default(),
+            move |document| {
+                prune_project_pending_recommendations(
+                    document,
+                    &retained_project,
+                    &represented_ids,
+                    &inferred_pending_ids,
+                )
+            },
+        )
+        .await?;
     Ok(recommendations)
+}
+
+fn prune_project_pending_recommendations(
+    document: &mut crate::types::ControlCenterDocument,
+    project_path: &str,
+    represented_ids: &BTreeSet<String>,
+    inferred_pending_ids: &BTreeSet<String>,
+) -> Result<(), AppError> {
+    let subscription = document
+        .project_subscriptions
+        .iter_mut()
+        .find(|subscription| subscription.project_path == project_path)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "Project is not subscribed".into(),
+        })?;
+    subscription
+        .pending_recommendation_ids
+        .retain(|id| represented_ids.contains(id));
+    for id in inferred_pending_ids {
+        if !subscription.pending_recommendation_ids.contains(id) {
+            subscription.pending_recommendation_ids.push(id.clone());
+        }
+    }
+    subscription.pending_recommendation_ids.sort();
+    if subscription.pending_recommendation_ids.len()
+        > corpus::CONTROL_CENTER_MAX_PENDING_RECOMMENDATIONS
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Pending recommendations exceed the subscription limit".into(),
+        });
+    }
+    Ok(())
 }
 
 fn advance_project_recommendation_cursor(
@@ -5986,6 +6081,7 @@ fn advance_project_recommendation_cursor(
     project_path: &str,
     expected_cursor: Option<&str>,
     surfaced_cursor: &str,
+    mut pending_recommendation_ids: Vec<String>,
 ) -> Result<(), AppError> {
     let surfaced_at = chrono::DateTime::parse_from_rfc3339(surfaced_cursor).map_err(|_| {
         AppError::InvalidArgument {
@@ -6024,7 +6120,21 @@ fn advance_project_recommendation_cursor(
             message: "Recommendation cursor must advance".into(),
         });
     }
+    let pending_count = pending_recommendation_ids.len();
+    pending_recommendation_ids.sort();
+    pending_recommendation_ids.dedup();
+    if pending_recommendation_ids.len() != pending_count
+        || pending_recommendation_ids.len() > corpus::CONTROL_CENTER_MAX_PENDING_RECOMMENDATIONS
+        || pending_recommendation_ids
+            .iter()
+            .any(|id| id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Pending recommendation receipt is invalid".into(),
+        });
+    }
     subscription.last_seen_batch = Some(surfaced_cursor.into());
+    subscription.pending_recommendation_ids = pending_recommendation_ids;
     Ok(())
 }
 
@@ -6035,10 +6145,10 @@ pub async fn project_recommendations_acknowledge(
     batch_at: String,
     recommendation_ids: Vec<String>,
 ) -> Result<bool, AppError> {
-    const MAX_SURFACED_RECOMMENDATIONS: usize = 256;
+    let _project_lock = lock_project_registry(&state.app_data_dir)?;
     let project_path = exact_registered_project(&state, &project_path).await?;
     if recommendation_ids.is_empty()
-        || recommendation_ids.len() > MAX_SURFACED_RECOMMENDATIONS
+        || recommendation_ids.len() > corpus::CONTROL_CENTER_MAX_PENDING_RECOMMENDATIONS
         || recommendation_ids
             .iter()
             .any(|id| id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -6075,6 +6185,29 @@ pub async fn project_recommendations_acknowledge(
         });
     }
     let expected_cursor = subscription.last_seen_batch;
+    let represented_ids = recommendations
+        .iter()
+        .filter(|recommendation| {
+            !matches!(
+                recommendation.lifecycle,
+                RecommendationLifecycle::Superseded | RecommendationLifecycle::Dismissed
+            )
+        })
+        .map(|recommendation| recommendation.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut pending_ids = subscription
+        .pending_recommendation_ids
+        .into_iter()
+        .filter(|id| represented_ids.contains(id.as_str()))
+        .collect::<Vec<_>>();
+    pending_ids.extend(supplied_ids);
+    pending_ids.sort();
+    pending_ids.dedup();
+    if pending_ids.len() > corpus::CONTROL_CENTER_MAX_PENDING_RECOMMENDATIONS {
+        return Err(AppError::InvalidArgument {
+            message: "Pending recommendations exceed the subscription limit".into(),
+        });
+    }
     control_center_database(&state)
         .await?
         .mutate(
@@ -6086,6 +6219,7 @@ pub async fn project_recommendations_acknowledge(
                     &project_path,
                     expected_cursor.as_deref(),
                     &batch_at,
+                    pending_ids,
                 )
             },
         )
@@ -6099,6 +6233,7 @@ pub async fn project_recommendation_dismiss(
     project_path: String,
     recommendation_id: String,
 ) -> Result<(), AppError> {
+    let _project_lock = lock_project_registry(&state.app_data_dir)?;
     let project_path = exact_registered_project(&state, &project_path).await?;
     let (_, recommendations) = current_recommendations(&state, &project_path, true).await?;
     if !recommendations
@@ -6144,6 +6279,9 @@ fn dismiss_project_recommendation(
             message: "Project is not subscribed".into(),
         })?;
     subscription
+        .pending_recommendation_ids
+        .retain(|id| id != &recommendation_id && represented_ids.contains(id));
+    subscription
         .dismissed_recommendation_ids
         .retain(|id| represented_ids.contains(id));
     if !subscription
@@ -6173,14 +6311,22 @@ pub async fn project_recommendation_open(
         .ok_or_else(|| AppError::InvalidArgument {
             message: "Recommendation is no longer available".into(),
         })?;
-    if recommendation.lifecycle != RecommendationLifecycle::New {
+    if !matches!(
+        recommendation.lifecycle,
+        RecommendationLifecycle::New | RecommendationLifecycle::Pending
+    ) {
         return Err(AppError::InvalidArgument {
             message: if recommendation.lifecycle == RecommendationLifecycle::Blocked {
                 "Recommendation exact references no longer resolve"
             } else {
-                "Only a new recommendation can enter deployment review"
+                "Only an actionable recommendation can enter deployment review"
             }
             .into(),
+        });
+    }
+    if recommendation.finalize_only {
+        return Err(AppError::InvalidArgument {
+            message: "Rename recommendation is ready to finish without another install".into(),
         });
     }
     if recommendation.targets.iter().any(|target| {
@@ -6231,7 +6377,7 @@ fn finalize_rename_recommendation_in_document(
             message: "Project has no readiness baseline".into(),
         })?;
     let baseline_snapshot = next.project_baselines[baseline_index].clone();
-    let mut subscription = next
+    let subscription = next
         .project_subscriptions
         .iter()
         .find(|subscription| subscription.project_path == project_path)
@@ -6239,7 +6385,6 @@ fn finalize_rename_recommendation_in_document(
         .ok_or_else(|| AppError::InvalidArgument {
             message: "Project is not subscribed".into(),
         })?;
-    subscription.last_seen_batch = None;
     let recommendation = derive_project_recommendations_with_installs(
         &baseline_snapshot,
         &subscription,
@@ -6252,40 +6397,33 @@ fn finalize_rename_recommendation_in_document(
     .ok_or_else(|| AppError::InvalidArgument {
         message: "Rename recommendation is stale".into(),
     })?;
-    if recommendation.lifecycle != RecommendationLifecycle::New
-        || recommendation.change_kind != RecommendationChangeKind::Renamed
+    if !matches!(
+        recommendation.lifecycle,
+        RecommendationLifecycle::New | RecommendationLifecycle::Pending
+    ) || recommendation.change_kind != RecommendationChangeKind::Renamed
         || recommendation.agent_references.len() != 1
-        || recommendation.targets.is_empty()
+        || !recommendation.finalize_only
+        || !recommendation.targets.is_empty()
     {
         return Err(AppError::InvalidArgument {
             message: "Recommendation is not a current actionable rename".into(),
         });
     }
     let new_reference = recommendation.agent_references[0].clone();
-    let required_tools = recommendation
-        .targets
-        .iter()
-        .map(|target| target.tool.clone())
-        .collect::<BTreeSet<_>>();
     let mut effective_requirements = exact_agent_requirements(&baseline_snapshot);
     let matching_requirements = effective_requirements
         .iter()
         .filter(|requirement| requirement.reference == recommendation.baseline_reference)
         .collect::<Vec<_>>();
-    if matching_requirements.len() != required_tools.len()
-        || matching_requirements
-            .iter()
-            .any(|requirement| !required_tools.contains(&requirement.tool))
-        || recommendation.targets.iter().any(|target| {
-            target.project_path != project_path
-                || target.reference != new_reference
-                || target.operation != RecommendationOperation::Install
-                || recommendation_install_state(
-                    Some(installed),
-                    project_path,
-                    &target.reference,
-                    &target.tool,
-                ) != RecommendationInstallState::Current
+    let required_tools = matching_requirements
+        .iter()
+        .map(|requirement| requirement.tool.clone())
+        .collect::<BTreeSet<_>>();
+    if required_tools.is_empty()
+        || matching_requirements.len() != required_tools.len()
+        || required_tools.iter().any(|tool| {
+            recommendation_install_state(Some(installed), project_path, &new_reference, tool)
+                != RecommendationInstallState::Current
         })
     {
         return Err(AppError::InvalidArgument {
@@ -6312,6 +6450,12 @@ fn finalize_rename_recommendation_in_document(
         .agents
         .retain(|reference| seen_agents.insert(reference.clone()));
     let returned = baseline.clone();
+    next.project_subscriptions
+        .iter_mut()
+        .find(|subscription| subscription.project_path == project_path)
+        .expect("validated project subscription exists")
+        .pending_recommendation_ids
+        .retain(|id| id != recommendation_id);
     corpus::validate_control_center(&next)?;
     *document = next;
     Ok(returned)
@@ -9169,6 +9313,7 @@ mod tests {
         ProjectSubscription {
             project_path: "/registered/project".into(),
             last_seen_batch: None,
+            pending_recommendation_ids: Vec::new(),
             dismissed_recommendation_ids: Vec::new(),
         }
     }
@@ -9576,6 +9721,7 @@ mod tests {
             document.project_subscriptions.push(ProjectSubscription {
                 project_path,
                 last_seen_batch: None,
+                pending_recommendation_ids: Vec::new(),
                 dismissed_recommendation_ids: Vec::new(),
             });
         }
@@ -9689,6 +9835,7 @@ mod tests {
             project_subscriptions: vec![ProjectSubscription {
                 project_path: "/registered/project".into(),
                 last_seen_batch: None,
+                pending_recommendation_ids: vec!["current".into()],
                 dismissed_recommendation_ids: (0..256)
                     .map(|index| format!("stale-{index}"))
                     .collect(),
@@ -9706,6 +9853,35 @@ mod tests {
         assert_eq!(
             document.project_subscriptions[0].dismissed_recommendation_ids,
             vec!["current"]
+        );
+        assert!(document.project_subscriptions[0]
+            .pending_recommendation_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_prune_retains_only_latest_represented_recommendations() {
+        let mut document = crate::types::ControlCenterDocument {
+            project_subscriptions: vec![ProjectSubscription {
+                project_path: "/registered/project".into(),
+                last_seen_batch: Some("2026-08-17T02:00:00Z".into()),
+                pending_recommendation_ids: vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)],
+                dismissed_recommendation_ids: Vec::new(),
+            }],
+            ..Default::default()
+        };
+
+        prune_project_pending_recommendations(
+            &mut document,
+            "/registered/project",
+            &BTreeSet::from(["b".repeat(64)]),
+            &BTreeSet::from(["b".repeat(64)]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            document.project_subscriptions[0].pending_recommendation_ids,
+            vec!["b".repeat(64)]
         );
     }
 
@@ -9833,6 +10009,7 @@ mod tests {
                     document.project_subscriptions = vec![ProjectSubscription {
                         project_path: persisted_path,
                         last_seen_batch: None,
+                        pending_recommendation_ids: Vec::new(),
                         dismissed_recommendation_ids: Vec::new(),
                     }];
                     Ok(())
@@ -9917,6 +10094,7 @@ mod tests {
         let mut subscription = ProjectSubscription {
             project_path: baseline.project_path.clone(),
             last_seen_batch: None,
+            pending_recommendation_ids: Vec::new(),
             dismissed_recommendation_ids: Vec::new(),
         };
         let recommendations = derive_project_recommendations(
@@ -9951,12 +10129,14 @@ mod tests {
         subscription
             .dismissed_recommendation_ids
             .push(recommendations[1].id.clone());
-        assert_eq!(
-            derive_project_recommendations(&baseline, &subscription, &batches, &BTreeMap::new(),)
-                [1]
-            .lifecycle,
-            RecommendationLifecycle::Dismissed
-        );
+        assert!(derive_project_recommendations(
+            &baseline,
+            &subscription,
+            &batches,
+            &BTreeMap::new(),
+        )
+        .iter()
+        .all(|recommendation| recommendation.id != recommendations[1].id));
         subscription.last_seen_batch = Some("2026-08-17T02:00:00Z".into());
         assert!(derive_project_recommendations(
             &baseline,
@@ -9998,6 +10178,73 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_recommendation_remains_pending_after_its_cursor_advances() {
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&reference, &["codex"]);
+        let batches = updated_batch(&reference);
+        let available = BTreeMap::from([(reference.clone(), 1)]);
+        let installed = vec![recommendation_install(
+            &reference,
+            "codex",
+            InstallState::Outdated,
+        )];
+        let mut subscription = recommendation_subscription();
+        let id = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &available,
+            Some(&installed),
+        )[0]
+        .id
+        .clone();
+        subscription.last_seen_batch = Some(batches[0].at.clone());
+        subscription.pending_recommendation_ids.push(id.clone());
+
+        let pending = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &available,
+            Some(&installed),
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].lifecycle, RecommendationLifecycle::Pending);
+    }
+
+    #[test]
+    fn legacy_seen_actionable_recommendation_is_recovered_as_pending() {
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&reference, &["codex"]);
+        let batches = updated_batch(&reference);
+        let mut subscription = recommendation_subscription();
+        subscription.last_seen_batch = Some(batches[0].at.clone());
+        let installed = vec![recommendation_install(
+            &reference,
+            "codex",
+            InstallState::Outdated,
+        )];
+
+        let pending = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &BTreeMap::from([(reference, 1)]),
+            Some(&installed),
+        );
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].lifecycle, RecommendationLifecycle::Pending);
+    }
+
+    #[test]
     fn updated_recommendation_with_all_targets_current_has_no_action() {
         let reference = AgentReference {
             source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
@@ -10014,6 +10261,53 @@ mod tests {
             &recommendation_subscription(),
             &updated_batch(&reference),
             &BTreeMap::from([(reference.clone(), 1)]),
+            Some(&installed),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn pending_added_recommendation_clears_when_its_exact_target_is_current() {
+        let reference = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&reference, &["codex"]);
+        let batches = vec![CatalogFeedBatch {
+            at: "2026-08-17T01:00:00Z".into(),
+            changes: vec![CatalogChange::Added {
+                item: CatalogSnapshotItem {
+                    category: "engineering".into(),
+                    relative_path: reference.relative_path.clone(),
+                    source_hash: "a".repeat(64),
+                    body_hash: "b".repeat(64),
+                },
+            }],
+        }];
+        let available = BTreeMap::from([(reference.clone(), 1)]);
+        let mut subscription = recommendation_subscription();
+        let id = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &available,
+            Some(&[]),
+        )[0]
+        .id
+        .clone();
+        subscription.last_seen_batch = Some(batches[0].at.clone());
+        subscription.pending_recommendation_ids.push(id);
+        let installed = vec![recommendation_install(
+            &reference,
+            "codex",
+            InstallState::Current,
+        )];
+
+        assert!(derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &available,
             Some(&installed),
         )
         .is_empty());
@@ -10127,14 +10421,16 @@ mod tests {
         let subscription = ProjectSubscription {
             project_path: baseline.project_path.clone(),
             last_seen_batch: None,
+            pending_recommendation_ids: Vec::new(),
             dismissed_recommendation_ids: Vec::new(),
         };
 
-        let ready = derive_project_recommendations(
+        let ready = derive_project_recommendations_with_installs(
             &baseline,
             &subscription,
             &batches,
             &BTreeMap::from([(new.clone(), 1)]),
+            Some(&[]),
         );
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].baseline_reference, old);
@@ -10150,13 +10446,75 @@ mod tests {
         assert!(ready[0].summary.contains("new-reviewer.md"));
         assert_eq!(ready[0].lifecycle, RecommendationLifecycle::New);
 
-        let ambiguous = derive_project_recommendations(
+        let ambiguous = derive_project_recommendations_with_installs(
             &baseline,
             &subscription,
             &batches,
             &BTreeMap::from([(new, 2)]),
+            Some(&[]),
         );
         assert_eq!(ambiguous[0].lifecycle, RecommendationLifecycle::Blocked);
+    }
+
+    #[test]
+    fn pending_rename_rederives_remaining_targets_then_becomes_finalize_only() {
+        let old = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/old-reviewer.md".into(),
+        };
+        let new = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/new-reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&old, &["claudeCode", "codex"]);
+        let batches = renamed_batch(&old, &new);
+        let available = BTreeMap::from([(new.clone(), 1)]);
+        let mut subscription = recommendation_subscription();
+        let id = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &available,
+            Some(&[]),
+        )[0]
+        .id
+        .clone();
+        subscription.last_seen_batch = Some(batches[0].at.clone());
+        subscription.pending_recommendation_ids.push(id.clone());
+
+        let partial = vec![recommendation_install(
+            &new,
+            "claudeCode",
+            InstallState::Current,
+        )];
+        let remaining = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &available,
+            Some(&partial),
+        );
+        assert_eq!(remaining[0].lifecycle, RecommendationLifecycle::Pending);
+        assert_eq!(remaining[0].targets.len(), 1);
+        assert_eq!(remaining[0].targets[0].tool, "codex");
+        assert!(!remaining[0].finalize_only);
+
+        let complete = vec![
+            recommendation_install(&new, "claudeCode", InstallState::Current),
+            recommendation_install(&new, "codex", InstallState::Current),
+        ];
+        let finalize = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &available,
+            Some(&complete),
+        );
+        assert_eq!(finalize.len(), 1);
+        assert_eq!(finalize[0].id, id);
+        assert_eq!(finalize[0].lifecycle, RecommendationLifecycle::Pending);
+        assert!(finalize[0].targets.is_empty());
+        assert!(finalize[0].finalize_only);
     }
 
     #[test]
@@ -10171,6 +10529,9 @@ mod tests {
         };
         let (mut document, recommendation_id) =
             rename_document(&old, &new, &["claudeCode", "codex"]);
+        document.project_subscriptions[0]
+            .pending_recommendation_ids
+            .push(recommendation_id.clone());
         let installed = vec![
             recommendation_install(&new, "claudeCode", InstallState::Current),
             recommendation_install(&new, "codex", InstallState::Current),
@@ -10195,6 +10556,9 @@ mod tests {
         );
         assert_eq!(baseline.agents, vec![new]);
         assert_eq!(baseline.tools, vec!["claudeCode", "codex"]);
+        assert!(document.project_subscriptions[0]
+            .pending_recommendation_ids
+            .is_empty());
     }
 
     #[test]
@@ -10339,6 +10703,7 @@ mod tests {
         let subscription = ProjectSubscription {
             project_path: baseline.project_path.clone(),
             last_seen_batch: None,
+            pending_recommendation_ids: Vec::new(),
             dismissed_recommendation_ids: Vec::new(),
         };
         let available = BTreeMap::from([(first.clone(), 1)]);
@@ -10374,6 +10739,32 @@ mod tests {
         assert_eq!(same_later.len(), 2);
         assert_eq!(same_later[0].lifecycle, RecommendationLifecycle::Superseded);
         assert_eq!(same_later[1].lifecycle, RecommendationLifecycle::New);
+
+        let latest_id = same_later[1].id.clone();
+        let mut document = crate::types::ControlCenterDocument {
+            project_subscriptions: vec![ProjectSubscription {
+                project_path: baseline.project_path.clone(),
+                last_seen_batch: Some("2026-08-17T02:00:00Z".into()),
+                pending_recommendation_ids: same_later
+                    .iter()
+                    .map(|recommendation| recommendation.id.clone())
+                    .collect(),
+                dismissed_recommendation_ids: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let latest = BTreeSet::from([latest_id.clone()]);
+        prune_project_pending_recommendations(
+            &mut document,
+            &baseline.project_path,
+            &latest,
+            &latest,
+        )
+        .unwrap();
+        assert_eq!(
+            document.project_subscriptions[0].pending_recommendation_ids,
+            vec![latest_id]
+        );
     }
 
     #[test]
@@ -10383,6 +10774,7 @@ mod tests {
             project_subscriptions: vec![ProjectSubscription {
                 project_path: "/registered/project".into(),
                 last_seen_batch: Some("2026-08-17T01:00:00Z".into()),
+                pending_recommendation_ids: vec!["a".repeat(64)],
                 dismissed_recommendation_ids: Vec::new(),
             }],
             ..Default::default()
@@ -10392,17 +10784,23 @@ mod tests {
             "/registered/project",
             Some("2026-08-17T01:00:00Z"),
             "2026-08-17T02:00:00Z",
+            vec!["a".repeat(64), "b".repeat(64)],
         )
         .unwrap();
         assert_eq!(
             document.project_subscriptions[0].last_seen_batch.as_deref(),
             Some("2026-08-17T02:00:00Z")
         );
+        assert_eq!(
+            document.project_subscriptions[0].pending_recommendation_ids,
+            vec!["a".repeat(64), "b".repeat(64)]
+        );
         assert!(advance_project_recommendation_cursor(
             &mut document,
             "/registered/project",
             Some("2026-08-17T01:00:00Z"),
             "2026-08-17T03:00:00Z",
+            vec!["c".repeat(64)],
         )
         .is_err());
         assert!(advance_project_recommendation_cursor(
@@ -10410,6 +10808,7 @@ mod tests {
             "/registered/project",
             Some("2026-08-17T02:00:00Z"),
             "2026-08-17T01:00:00Z",
+            vec!["c".repeat(64)],
         )
         .is_err());
     }

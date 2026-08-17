@@ -867,6 +867,8 @@ pub struct ProjectReadinessBaseline {
 pub struct ProjectSubscription {
     pub project_path: String,
     pub last_seen_batch: Option<String>,
+    #[serde(default)]
+    pub pending_recommendation_ids: Vec<String>,
     pub dismissed_recommendation_ids: Vec<String>,
 }
 
@@ -939,6 +941,7 @@ pub struct ProjectReadinessReport {
 #[serde(rename_all = "camelCase")]
 pub enum RecommendationLifecycle {
     New,
+    Pending,
     Superseded,
     Dismissed,
     Blocked,
@@ -982,6 +985,7 @@ pub struct ProjectRecommendation {
     pub baseline_reference: AgentReference,
     pub agent_references: Vec<AgentReference>,
     pub targets: Vec<ProjectRecommendationTarget>,
+    pub finalize_only: bool,
 }
 
 /// Bounded UI projection; the potentially 10,000-item snapshot never crosses

@@ -455,6 +455,7 @@ const CONTROL_CENTER_MAX_PROJECT_TOOLS: usize = 32;
 // A subscription has project identity only and the validator enforces one per
 // baseline project, so the honest document maximum is the baseline maximum.
 const CONTROL_CENTER_MAX_SUBSCRIPTIONS: usize = CONTROL_CENTER_MAX_PROJECT_BASELINES;
+pub(crate) const CONTROL_CENTER_MAX_PENDING_RECOMMENDATIONS: usize = 256;
 const CONTROL_CENTER_MAX_DISMISSED_RECOMMENDATIONS: usize = 256;
 const CATALOG_SOURCE_TRANSITION_UNAVAILABLE: &str =
     "Catalog source change is incomplete. Retry the source selection.";
@@ -747,6 +748,18 @@ pub(crate) fn validate_control_center(document: &ControlCenterDocument) -> Resul
                 })
             || subscription.dismissed_recommendation_ids.len()
                 > CONTROL_CENTER_MAX_DISMISSED_RECOMMENDATIONS
+            || subscription.pending_recommendation_ids.len()
+                > CONTROL_CENTER_MAX_PENDING_RECOMMENDATIONS
+            || subscription
+                .pending_recommendation_ids
+                .iter()
+                .any(|id| !valid_hash(id))
+            || subscription
+                .pending_recommendation_ids
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != subscription.pending_recommendation_ids.len()
             || subscription
                 .dismissed_recommendation_ids
                 .iter()
@@ -1144,6 +1157,7 @@ async fn write_catalog_baseline(
                     document.catalog_last_success_at = None;
                     for subscription in &mut document.project_subscriptions {
                         subscription.last_seen_batch = None;
+                        subscription.pending_recommendation_ids.clear();
                         subscription.dismissed_recommendation_ids.clear();
                     }
                 }
@@ -1314,6 +1328,7 @@ async fn finish_catalog_source_selection(
                         document.catalog_last_success_at = None;
                         for subscription in &mut document.project_subscriptions {
                             subscription.last_seen_batch = None;
+                            subscription.pending_recommendation_ids.clear();
                             subscription.dismissed_recommendation_ids.clear();
                         }
                         document.catalog_pending_source_transition = None;
@@ -3180,6 +3195,7 @@ mod tests {
             project_subscriptions: vec![ProjectSubscription {
                 project_path: baseline.project_path.clone(),
                 last_seen_batch: Some("2026-08-17T00:00:00Z".into()),
+                pending_recommendation_ids: Vec::new(),
                 dismissed_recommendation_ids: vec!["a".repeat(64)],
             }],
             ..ControlCenterDocument::default()
@@ -3282,6 +3298,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_project_subscription_defaults_to_no_pending_recommendations() {
+        let subscription: ProjectSubscription = serde_json::from_value(serde_json::json!({
+            "projectPath": "/registered/project",
+            "lastSeenBatch": "2026-08-17T00:00:00Z",
+            "dismissedRecommendationIds": []
+        }))
+        .unwrap();
+
+        assert!(subscription.pending_recommendation_ids.is_empty());
+    }
+
+    #[test]
+    fn pending_recommendations_are_bounded_within_the_control_center_budget() {
+        let pending = (0..CONTROL_CENTER_MAX_PENDING_RECOMMENDATIONS)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>();
+        let mut document = ControlCenterDocument::default();
+        for index in 0..CONTROL_CENTER_MAX_SUBSCRIPTIONS {
+            let project_path = format!("/registered/project-{index}");
+            document.project_baselines.push(ProjectReadinessBaseline {
+                project_path: project_path.clone(),
+                label: format!("Project {index}"),
+                agent_requirements: Vec::new(),
+                skill_requirements: Vec::new(),
+                agents: Vec::new(),
+                skills: Vec::new(),
+                instructions: Vec::new(),
+                mcp_servers: Vec::new(),
+                tools: Vec::new(),
+            });
+            document.project_subscriptions.push(ProjectSubscription {
+                project_path,
+                last_seen_batch: None,
+                pending_recommendation_ids: pending.clone(),
+                dismissed_recommendation_ids: Vec::new(),
+            });
+        }
+
+        assert!(validate_control_center(&document).is_ok());
+        assert!(serde_json::to_vec(&document).unwrap().len() < CONTROL_CENTER_MAX_BYTES as usize);
+
+        document.project_subscriptions[0]
+            .pending_recommendation_ids
+            .push("f".repeat(64));
+        assert!(validate_control_center(&document).is_err());
+
+        document.project_subscriptions[0]
+            .pending_recommendation_ids
+            .pop();
+        document.project_subscriptions[0].pending_recommendation_ids[1] =
+            document.project_subscriptions[0].pending_recommendation_ids[0].clone();
+        assert!(validate_control_center(&document).is_err());
+    }
+
     fn empty_project_baseline(index: usize) -> ProjectReadinessBaseline {
         ProjectReadinessBaseline {
             project_path: format!("/registered/project-{index}"),
@@ -3332,6 +3403,7 @@ mod tests {
             .map(|baseline| ProjectSubscription {
                 project_path: baseline.project_path.clone(),
                 last_seen_batch: None,
+                pending_recommendation_ids: Vec::new(),
                 dismissed_recommendation_ids: Vec::new(),
             })
             .collect::<Vec<_>>();
@@ -3349,6 +3421,7 @@ mod tests {
         document.project_subscriptions.push(ProjectSubscription {
             project_path: document.project_baselines[0].project_path.clone(),
             last_seen_batch: None,
+            pending_recommendation_ids: Vec::new(),
             dismissed_recommendation_ids: Vec::new(),
         });
         assert!(matches!(

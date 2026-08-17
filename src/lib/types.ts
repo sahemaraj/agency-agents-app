@@ -1391,7 +1391,7 @@ export interface ProjectReadinessReport {
   categories: ReadinessCategoryReport[];
 }
 
-export type RecommendationLifecycle = "new" | "superseded" | "dismissed" | "blocked";
+export type RecommendationLifecycle = "new" | "pending" | "superseded" | "dismissed" | "blocked";
 
 export interface ProjectRecommendation {
   id: string;
@@ -1402,6 +1402,7 @@ export interface ProjectRecommendation {
   changeKind: "added" | "updated" | "removed" | "renamed";
   baselineReference: AgentReference;
   agentReferences: AgentReference[];
+  finalizeOnly: boolean;
   targets: Array<{
     reference: AgentReference;
     tool: Tool;

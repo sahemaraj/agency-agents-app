@@ -179,6 +179,7 @@ const renamedProjectRecommendation = (projectPath = "/tmp/project"): ProjectReco
   changeKind: "renamed",
   baselineReference: { sourceId: "built-in", relativePath: "engineering/old-reviewer.md" },
   agentReferences: [{ sourceId: "built-in", relativePath: "engineering/new-reviewer.md" }],
+  finalizeOnly: false,
   targets: [{
     reference: { sourceId: "built-in", relativePath: "engineering/new-reviewer.md" },
     tool: "claudeCode",
@@ -195,6 +196,7 @@ const updatedProjectRecommendation = (projectPath = "/tmp/project"): ProjectReco
   changeKind: "updated",
   baselineReference: { sourceId: "built-in", relativePath: "engineering/reviewer.md" },
   agentReferences: [{ sourceId: "built-in", relativePath: "engineering/reviewer.md" }],
+  finalizeOnly: false,
   targets: [{
     reference: { sourceId: "built-in", relativePath: "engineering/reviewer.md" },
     tool: "claudeCode",
@@ -3773,7 +3775,7 @@ describe("frontend test harness", () => {
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(57);
+      .toHaveLength(58);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -4088,6 +4090,15 @@ describe("frontend test harness", () => {
     });
     const installedTools = new Set<string>();
     let finalized = false;
+    const liveRecommendation = (): ProjectRecommendation => {
+      const targets = recommendation.targets.filter((target) => !installedTools.has(target.tool));
+      return {
+        ...recommendation,
+        lifecycle: installedTools.size > 0 ? "pending" : "new",
+        targets,
+        finalizeOnly: targets.length === 0,
+      };
+    };
     install.tools = [
       staleControlTool,
       { ...staleControlTool, tool: "codex", label: "Codex" },
@@ -4118,9 +4129,9 @@ describe("frontend test harness", () => {
       if (command === "tools_list") return install.tools as never;
       if (command === "project_instructions_inspect") return [] as never;
       if (command === "project_readiness_get") return readinessFixture(projectPath) as never;
-      if (command === "project_recommendations_list") return (finalized ? [] : [recommendation]) as never;
+      if (command === "project_recommendations_list") return (finalized ? [] : [liveRecommendation()]) as never;
       if (command === "project_recommendations_acknowledge") return true as never;
-      if (command === "project_recommendation_open") return recommendation as never;
+      if (command === "project_recommendation_open") return liveRecommendation() as never;
       if (command === "agent_sources_inspect") return [{
         source: { id: "built-in", label: "Built in", enabled: true, kind: { kind: "builtIn" } },
         agents: [newPackage], errors: [], revision: "fresh",
@@ -4155,6 +4166,9 @@ describe("frontend test harness", () => {
       return [] as never;
     });
     const component = mount(Projects, { target });
+    let firstMounted = true;
+    let resumed: ReturnType<typeof mount> | null = null;
+    let resumedTarget: HTMLDivElement | null = null;
     try {
       await vi.waitFor(() => expect(target.textContent).toContain(recommendation.summary));
       const open = [...target.querySelectorAll<HTMLButtonElement>("button")]
@@ -4169,17 +4183,140 @@ describe("frontend test harness", () => {
       await vi.waitFor(() => expect(invokeMock.mock.calls.filter(([command]) =>
         command === "agent_install_plan")).toHaveLength(2));
       expect(invokeMock.mock.calls.some(([command]) => command === "project_recommendation_finalize")).toBe(false);
-      const secondApply = [...target.querySelectorAll<HTMLButtonElement>("button")]
+      unmount(component);
+      firstMounted = false;
+      target.remove();
+
+      resumedTarget = document.createElement("div");
+      document.body.append(resumedTarget);
+      resumed = mount(Projects, { target: resumedTarget });
+      await vi.waitFor(() => expect(resumedTarget?.textContent).toContain(recommendation.summary));
+      const resumeOpen = [...resumedTarget.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Open review")!;
+      resumeOpen.click();
+      await vi.waitFor(() => expect(invokeMock.mock.calls.filter(([command]) =>
+        command === "agent_install_plan")).toHaveLength(3));
+      const secondApply = [...resumedTarget.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.trim() === "Apply plan")!;
       secondApply.click();
 
       await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) =>
         command === "project_recommendation_finalize")).toBe(true));
-      await vi.waitFor(() => expect(target.textContent).toContain("No catalog recommendations."));
+      await vi.waitFor(() => expect(resumedTarget?.textContent).toContain("No catalog recommendations."));
       expect((document.activeElement as HTMLButtonElement).textContent?.trim()).toBe("Retry");
     } finally {
-      unmount(component);
+      if (firstMounted) unmount(component);
+      if (resumed) unmount(resumed);
       target.remove();
+      resumedTarget?.remove();
+    }
+  });
+
+  it("keeps a failed finalize-only rename visible across remount and retries without reinstalling", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/project";
+    const recommendation: ProjectRecommendation = {
+      ...renamedProjectRecommendation(projectPath),
+      lifecycle: "pending",
+      targets: [],
+      finalizeOnly: true,
+    };
+    const projectRows = [{ path: projectPath, label: "project", installedCount: 2 }];
+    let finalizeAttempts = 0;
+    let finalized = false;
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_instructions_inspect") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath) as never;
+      if (command === "project_recommendations_list") return (finalized ? [] : [recommendation]) as never;
+      if (command === "project_recommendation_finalize") {
+        expect(args).toEqual({ projectPath, recommendationId: recommendation.id });
+        finalizeAttempts += 1;
+        if (finalizeAttempts === 1) throw new Error("finalize interrupted");
+        finalized = true;
+        return readinessFixture(projectPath).baseline as never;
+      }
+      return [] as never;
+    });
+
+    const firstTarget = document.createElement("div");
+    document.body.append(firstTarget);
+    const first = mount(Projects, { target: firstTarget });
+    await vi.waitFor(() => expect(firstTarget.textContent).toContain(recommendation.summary));
+    const firstFinish = [...firstTarget.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Finish rename")!;
+    firstFinish.click();
+    await vi.waitFor(() => expect(firstTarget.textContent).toContain("finalize interrupted"));
+    expect(firstTarget.textContent).toContain(recommendation.summary);
+    unmount(first);
+    firstTarget.remove();
+
+    const secondTarget = document.createElement("div");
+    document.body.append(secondTarget);
+    const second = mount(Projects, { target: secondTarget });
+    try {
+      await vi.waitFor(() => expect(secondTarget.textContent).toContain("Finish rename"));
+      const retry = [...secondTarget.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Finish rename")!;
+      retry.click();
+      await vi.waitFor(() => expect(secondTarget.textContent).toContain("No catalog recommendations."));
+      expect(finalizeAttempts).toBe(2);
+      expect(invokeMock.mock.calls.some(([command]) => command === "project_recommendation_open")).toBe(false);
+      expect(invokeMock.mock.calls.some(([command]) => command === "agent_install_plan")).toBe(false);
+    } finally {
+      unmount(second);
+      secondTarget.remove();
+    }
+  });
+
+  it("removes a pending recommendation after dismissal and keeps it gone on remount", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/project";
+    const recommendation: ProjectRecommendation = {
+      ...updatedProjectRecommendation(projectPath),
+      lifecycle: "pending",
+    };
+    const projectRows = [{ path: projectPath, label: "project", installedCount: 1 }];
+    let dismissed = false;
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    vi.mocked(invoke).mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_instructions_inspect") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath) as never;
+      if (command === "project_recommendations_list") return (dismissed ? [] : [recommendation]) as never;
+      if (command === "project_recommendation_dismiss") {
+        expect(args).toEqual({ projectPath, recommendationId: recommendation.id });
+        dismissed = true;
+      }
+      return [] as never;
+    });
+
+    const firstTarget = document.createElement("div");
+    document.body.append(firstTarget);
+    const first = mount(Projects, { target: firstTarget });
+    await vi.waitFor(() => expect(firstTarget.textContent).toContain(recommendation.summary));
+    const dismiss = [...firstTarget.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Dismiss")!;
+    dismiss.click();
+    await vi.waitFor(() => expect(firstTarget.textContent).toContain("No catalog recommendations."));
+    unmount(first);
+    firstTarget.remove();
+
+    const secondTarget = document.createElement("div");
+    document.body.append(secondTarget);
+    const second = mount(Projects, { target: secondTarget });
+    try {
+      await vi.waitFor(() => expect(secondTarget.textContent).toContain("No catalog recommendations."));
+      expect(secondTarget.textContent).not.toContain(recommendation.summary);
+    } finally {
+      unmount(second);
+      secondTarget.remove();
     }
   });
 
