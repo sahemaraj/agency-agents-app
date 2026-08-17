@@ -4520,7 +4520,12 @@ async fn commit_agent_adoptions(
         let (expected, active, disabled) = record_reconcile_hashes(state, &record).await?;
         let expected_active = expected.into_iter().map(Some).collect::<Vec<_>>();
         if active != expected_active || disabled.iter().any(Option::is_some) {
-            continue;
+            return Err(AppError::InvalidArgument {
+                message: format!(
+                    "Agent files changed during Agent adoption: {}:{}",
+                    record.source_id, record.relative_path
+                ),
+            });
         }
 
         let reference = AgentReference {
@@ -12572,6 +12577,47 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn adoption_commit_rejects_candidate_changed_after_scan_without_tracking_it() {
+        let app = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_root = std::fs::canonicalize(project.path()).unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        database
+            .mutate(installs_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let mut adopted = recovery_record(&project_root, render::sha256_hex(b"scanned"));
+        adopted.slug = "stale-adoption".into();
+        adopted.relative_path = "engineering/stale-adoption.md".into();
+        adopted.dest = project_root
+            .join(".codex/agents/stale-adoption.toml")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir_all(Path::new(&adopted.dest).parent().unwrap()).unwrap();
+        std::fs::write(&adopted.dest, b"scanned").unwrap();
+
+        // The passive scan already captured `adopted`; the candidate changes
+        // before the serialized commit acquires the lifecycle locks.
+        std::fs::write(&adopted.dest, b"changed after scan").unwrap();
+        let error = commit_agent_adoptions(&state, vec![adopted])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::InvalidArgument { message }
+                if message.contains("changed during Agent adoption")
+        ));
+        assert!(load_ledger_for_state(&state).await.unwrap().is_empty());
     }
 
     #[tokio::test]
