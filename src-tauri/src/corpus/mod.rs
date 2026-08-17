@@ -3508,11 +3508,13 @@ async fn pull_active(app_data_dir: &Path, source: &CatalogSource) -> Result<(), 
     }
     let root = catalog_root(app_data_dir, source);
     if has_git_dir(&root) {
+        validate_git_pull_source(source, &root)?;
         if !git_available().await {
             return Err(AppError::InvalidArgument {
                 message: "cannot update git checkout because the git binary is unavailable".into(),
             });
         }
+        validate_git_pull_source(source, &root)?;
         return run_git(&["-C", &root.to_string_lossy(), "pull", "--ff-only"], None)
             .await
             .map(|_| ());
@@ -3520,6 +3522,20 @@ async fn pull_active(app_data_dir: &Path, source: &CatalogSource) -> Result<(), 
     validate_snapshot_replacement_source(source, &root)?;
     // Tarball refresh writes into the active root (refresh() resolves it).
     refresh(app_data_dir).await.map(|_| ())
+}
+
+fn validate_git_pull_source(source: &CatalogSource, root: &Path) -> Result<(), AppError> {
+    if let CatalogSource::Managed { path } = source {
+        let configured = Path::new(path);
+        validate_managed_source_path(configured)?;
+        if configured != root {
+            return Err(AppError::InvalidArgument {
+                message: "managed catalog source and git target do not match".into(),
+            });
+        }
+        validate_managed_ownership_marker(root)?;
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -6478,6 +6494,44 @@ echo done
             std::fs::read(target.path().join(MANAGED_OWNERSHIP_MARKER)).unwrap(),
             MANAGED_OWNERSHIP_BYTES
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_active_revalidates_a_replaced_managed_root_before_git() {
+        use std::os::unix::fs::symlink;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let managed = parent.path().join(".agency-agents");
+        std::fs::create_dir_all(managed.join(".git")).unwrap();
+        std::fs::write(
+            managed.join(MANAGED_OWNERSHIP_MARKER),
+            MANAGED_OWNERSHIP_BYTES,
+        )
+        .unwrap();
+        std::fs::rename(&managed, parent.path().join("retained-managed")).unwrap();
+
+        let replacement = tempfile::tempdir().unwrap();
+        std::fs::create_dir(replacement.path().join(".git")).unwrap();
+        symlink(replacement.path(), &managed).unwrap();
+        let source = CatalogSource::Managed {
+            path: managed.to_string_lossy().into_owned(),
+        };
+
+        let error = with_test_managed_root(managed.clone(), async {
+            pull_active(app_data.path(), &source).await
+        })
+        .await
+        .expect_err("a replaced managed root must be rejected before git runs");
+
+        assert!(
+            error
+                .to_string()
+                .contains("managed catalog root must be a real directory"),
+            "{error}"
+        );
+        assert!(!replacement.path().join(".git/FETCH_HEAD").exists());
     }
 
     #[test]
