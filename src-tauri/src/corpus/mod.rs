@@ -1897,9 +1897,31 @@ async fn refresh(app_data_dir: &Path) -> Result<CorpusMeta, AppError> {
             message: "catalog source is a read-only user clone; enable manage-with-permission or switch source to refresh".into(),
         });
     }
+    let root = catalog_root(app_data_dir, &source);
+    validate_snapshot_replacement_source(&source, &root)?;
 
     let bytes = download_corpus_tarball().await?;
     refresh_from_tarball(app_data_dir, &source, &bytes).await
+}
+
+fn validate_snapshot_replacement_source(
+    source: &CatalogSource,
+    root: &Path,
+) -> Result<(), AppError> {
+    if matches!(source, CatalogSource::UserClone { .. }) {
+        return Err(AppError::InvalidArgument {
+            message: "a user clone can only be updated with git; snapshot replacement is disabled"
+                .into(),
+        });
+    }
+    if has_git_dir(root) {
+        return Err(AppError::InvalidArgument {
+            message:
+                "a git checkout can only be updated with git; snapshot replacement is disabled"
+                    .into(),
+        });
+    }
+    Ok(())
 }
 
 fn staged_catalog_path(live: &Path, label: &str) -> Result<PathBuf, AppError> {
@@ -1916,20 +1938,71 @@ fn staged_catalog_path(live: &Path, label: &str) -> Result<PathBuf, AppError> {
     Ok(parent.join(format!(".{name}.{label}-{}", uuid::Uuid::new_v4())))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CATALOG_ACTIVATION_RENAME_FAILURES: std::cell::RefCell<Option<(PathBuf, u8)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_catalog_activation_restore_failures(destination: &Path) {
+    CATALOG_ACTIVATION_RENAME_FAILURES.with(|injection| {
+        let mut injection = injection.borrow_mut();
+        assert!(
+            injection.is_none(),
+            "catalog rename injection is already armed"
+        );
+        *injection = Some((destination.to_path_buf(), 2));
+    });
+}
+
+fn rename_catalog_path(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    #[cfg(test)]
+    {
+        let injected = CATALOG_ACTIVATION_RENAME_FAILURES.with(|injection| {
+            let mut injection = injection.borrow_mut();
+            match injection.as_mut() {
+                Some((expected, remaining)) if expected == destination => {
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        *injection = None;
+                    }
+                    true
+                }
+                _ => false,
+            }
+        });
+        if injected {
+            return Err(std::io::Error::other(
+                "injected catalog activation rename failure",
+            ));
+        }
+    }
+    std::fs::rename(source, destination)
+}
+
 fn activate_staged_catalog(live: &Path, staged: &Path) -> Result<Option<PathBuf>, AppError> {
     let backup = if live.exists() {
         validate_real_directory(live, "managed catalog root")?;
         let backup = staged_catalog_path(live, "backup")?;
-        std::fs::rename(live, &backup).map_err(|error| AppError::Io {
+        rename_catalog_path(live, &backup).map_err(|error| AppError::Io {
             message: format!("backup managed catalog before refresh: {error}"),
         })?;
         Some(backup)
     } else {
         None
     };
-    if let Err(error) = std::fs::rename(staged, live) {
+    if let Err(error) = rename_catalog_path(staged, live) {
         if let Some(backup) = &backup {
-            let _ = std::fs::rename(backup, live);
+            if let Err(restore) = rename_catalog_path(backup, live) {
+                return Err(AppError::Internal {
+                    message: format!(
+                        "activate staged managed catalog failed: {error}; restore failed: {restore}; recovery retained at {} and {}",
+                        backup.display(),
+                        staged.display()
+                    ),
+                });
+            }
+            let _ = std::fs::remove_dir_all(staged);
         }
         return Err(AppError::Io {
             message: format!("activate staged managed catalog: {error}"),
@@ -1979,6 +2052,9 @@ async fn refresh_from_tarball(
     source: &CatalogSource,
     bytes: &[u8],
 ) -> Result<CorpusMeta, AppError> {
+    let dir = catalog_root(app_data_dir, source);
+    validate_snapshot_replacement_source(source, &dir)?;
+
     // Discover the live category set from the tarball's OWN tooling
     // (`scripts/convert.sh`) so a freshly-added upstream division is picked up
     // automatically. Falls back to the canonical default if absent.
@@ -1986,7 +2062,6 @@ async fn refresh_from_tarball(
 
     // Extract the category dirs (+ the tooling) into the active catalog root.
     // The tarball has a single top-level `agency-agents-main/` prefix we strip.
-    let dir = catalog_root(app_data_dir, source);
     let staged = staged_catalog_path(&dir, "staging")?;
     std::fs::create_dir(&staged).map_err(|error| AppError::Io {
         message: format!("create staged managed catalog: {error}"),
@@ -2023,10 +2098,7 @@ async fn refresh_from_tarball(
 
     let backup = match activate_staged_catalog(&dir, &staged) {
         Ok(backup) => backup,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&staged);
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
 
     // Persist a fresh meta (overwrite fetched_at/version this time —
@@ -2518,7 +2590,20 @@ async fn detect_catalogs(scan: bool) -> CatalogDetection {
 /// Ensure `~/.agency-agents` holds a catalog, cloning (git) or unpacking the
 /// snapshot (no git) as needed. Returns the managed root path. Idempotent: if
 /// it already looks like a catalog, this is a no-op (use pull to update).
-async fn provision_managed() -> Result<PathBuf, AppError> {
+async fn provision_managed_from_tarball(
+    app_data_dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    let source = CatalogSource::Managed {
+        path: path.to_string_lossy().into_owned(),
+    };
+    refresh_from_tarball(app_data_dir, &source, bytes)
+        .await
+        .map(|_| ())
+}
+
+async fn provision_managed(app_data_dir: &Path) -> Result<PathBuf, AppError> {
     let path = home_agency_dir().ok_or_else(|| AppError::Io {
         message: "cannot resolve home directory".into(),
     })?;
@@ -2537,20 +2622,10 @@ async fn provision_managed() -> Result<PathBuf, AppError> {
         // behind/ahead counts and diff stats in the Catalog status panel.
         run_git(&["clone", CATALOG_GIT_URL, &path.to_string_lossy()], None).await?;
     } else {
-        // No git (or a non-empty target): drop the snapshot tarball in place.
-        tokio::fs::create_dir_all(&path)
-            .await
-            .map_err(|e| AppError::Io {
-                message: format!("create {}: {e}", path.display()),
-            })?;
+        // No git (or a non-empty target): validate a complete snapshot in a
+        // sibling staging directory before replacing the managed root.
         let bytes = download_corpus_tarball().await?;
-        let categories = categories_from_tarball(&bytes).unwrap_or_else(bundled_division_slugs);
-        let written = extract_categories(&bytes, &path, &categories)?;
-        if written == 0 {
-            return Err(AppError::Internal {
-                message: "provision: snapshot tarball contained no agent files".into(),
-            });
-        }
+        provision_managed_from_tarball(app_data_dir, &path, &bytes).await?;
     }
     Ok(path)
 }
@@ -2565,13 +2640,19 @@ async fn pull_active(app_data_dir: &Path, source: &CatalogSource) -> Result<(), 
         });
     }
     let root = catalog_root(app_data_dir, source);
-    if has_git_dir(&root) && git_available().await {
-        run_git(&["-C", &root.to_string_lossy(), "pull", "--ff-only"], None).await?;
-        Ok(())
-    } else {
-        // Tarball refresh writes into the active root (refresh() resolves it).
-        refresh(app_data_dir).await.map(|_| ())
+    if has_git_dir(&root) {
+        if !git_available().await {
+            return Err(AppError::InvalidArgument {
+                message: "cannot update git checkout because the git binary is unavailable".into(),
+            });
+        }
+        return run_git(&["-C", &root.to_string_lossy(), "pull", "--ff-only"], None)
+            .await
+            .map(|_| ());
     }
+    validate_snapshot_replacement_source(source, &root)?;
+    // Tarball refresh writes into the active root (refresh() resolves it).
+    refresh(app_data_dir).await.map(|_| ())
 }
 
 // =====================================================================
@@ -2840,7 +2921,8 @@ pub async fn catalog_provision_managed(
             .ok_or_else(|| AppError::InvalidArgument {
                 message: "SQLite migration must complete before provisioning a catalog".into(),
             })?;
-    let path = provision_managed().await?;
+    let adir = app_data_dir(&app)?;
+    let path = provision_managed(&adir).await?;
     let source = CatalogSource::Managed {
         path: path.to_string_lossy().to_string(),
     };
@@ -5474,6 +5556,174 @@ echo done
         );
         assert!(!live.join("strategy/new.md").exists());
         assert!(!live.join("engineering/reviewer.md").exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_refresh_rejects_a_git_root_without_mutating_it() {
+        let app_data = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(managed.path().join(".git")).unwrap();
+        std::fs::write(
+            managed.path().join(".git/config"),
+            b"original git metadata\n",
+        )
+        .unwrap();
+        std::fs::write(managed.path().join("keep.txt"), b"original user content\n").unwrap();
+        let source = CatalogSource::Managed {
+            path: managed.path().to_string_lossy().into_owned(),
+        };
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nReplacement\n",
+        )]);
+
+        let error = refresh_from_tarball(app_data.path(), &source, &tar)
+            .await
+            .expect_err("a git checkout must never fall back to snapshot replacement");
+
+        assert!(error.to_string().contains("git checkout"));
+        assert_eq!(
+            std::fs::read(managed.path().join(".git/config")).unwrap(),
+            b"original git metadata\n"
+        );
+        assert_eq!(
+            std::fs::read(managed.path().join("keep.txt")).unwrap(),
+            b"original user content\n"
+        );
+        assert!(!managed.path().join("engineering/reviewer.md").exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_refresh_rejects_a_manageable_user_clone_without_mutating_it() {
+        let app_data = tempfile::tempdir().unwrap();
+        let user_clone = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_clone.path().join("keep.txt"),
+            b"original user content\n",
+        )
+        .unwrap();
+        let source = CatalogSource::UserClone {
+            path: user_clone.path().to_string_lossy().into_owned(),
+            manage: true,
+        };
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nReplacement\n",
+        )]);
+
+        let error = refresh_from_tarball(app_data.path(), &source, &tar)
+            .await
+            .expect_err("a user clone must never be snapshot-replaced");
+
+        assert!(error.to_string().contains("user clone"));
+        assert_eq!(
+            std::fs::read(user_clone.path().join("keep.txt")).unwrap(),
+            b"original user content\n"
+        );
+        assert!(!user_clone.path().join("engineering/reviewer.md").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_snapshot_provision_retries_without_selecting_a_partial_catalog() {
+        let app_data = tempfile::tempdir().unwrap();
+        let managed_parent = tempfile::tempdir().unwrap();
+        let managed = managed_parent.path().join(".agency-agents");
+        let oversized = vec![b'x'; MAX_PLAYBOOK_BYTES as usize + 1];
+        let invalid_tar = test_catalog_tar(&[
+            (
+                "agency-agents-main/engineering/reviewer.md",
+                b"---\nname: Reviewer\n---\nPartial\n",
+            ),
+            ("agency-agents-main/examples/oversized.md", &oversized),
+        ]);
+
+        provision_managed_from_tarball(app_data.path(), &managed, &invalid_tar)
+            .await
+            .expect_err("a late invalid entry must reject the complete provision");
+        assert!(!looks_like_catalog(&managed));
+        assert!(!managed.join("engineering/reviewer.md").exists());
+
+        let valid_tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nComplete\n",
+        )]);
+        provision_managed_from_tarball(app_data.path(), &managed, &valid_tar)
+            .await
+            .unwrap();
+
+        let source = CatalogSource::Managed {
+            path: managed.to_string_lossy().into_owned(),
+        };
+        let selected = build_source_checked(app_data.path(), &source)
+            .await
+            .unwrap();
+        assert!(looks_like_catalog(&managed));
+        assert_eq!(selected.count(), 1);
+        assert_eq!(selected.agents[0].body, "Complete\n");
+    }
+
+    #[tokio::test]
+    async fn failed_catalog_activation_and_restore_retains_both_recovery_trees() {
+        let app_data = tempfile::tempdir().unwrap();
+        let live = corpus_dir(app_data.path());
+        std::fs::create_dir_all(live.join("engineering")).unwrap();
+        std::fs::write(
+            live.join("engineering/original.md"),
+            b"---\nname: Original\n---\nOriginal\n",
+        )
+        .unwrap();
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nReplacement\n",
+        )]);
+        inject_catalog_activation_restore_failures(&live);
+
+        let error = refresh_from_tarball(app_data.path(), &CatalogSource::Bundled, &tar)
+            .await
+            .expect_err("activation and restoration failures must be explicit");
+
+        let message = error.to_string();
+        assert!(message.contains("activate staged managed catalog"));
+        assert!(message.contains("restore failed"));
+        assert!(message.contains("recovery retained"));
+        assert!(!live.exists());
+        let recovery_paths: Vec<PathBuf> = std::fs::read_dir(app_data.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(".corpus.backup-") || name.starts_with(".corpus.staging-")
+                    })
+            })
+            .collect();
+        assert_eq!(recovery_paths.len(), 2);
+        let backup = recovery_paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".corpus.backup-"))
+            })
+            .unwrap();
+        let staged = recovery_paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".corpus.staging-"))
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(backup.join("engineering/original.md")).unwrap(),
+            b"---\nname: Original\n---\nOriginal\n"
+        );
+        assert_eq!(
+            std::fs::read(staged.join("engineering/reviewer.md")).unwrap(),
+            b"---\nname: Reviewer\n---\nReplacement\n"
+        );
     }
 
     #[test]
