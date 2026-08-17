@@ -63,10 +63,11 @@
       projectPath: string;
     };
     historyIntent?: { reference: AgentReference; tool: Tool; projectPath: string | null };
+    onHistoryComplete?: () => void;
     onClose: () => void;
     onApplied?: (plan: AgentMutationPlan) => void;
   }
-  let { title, agentSlugs = [], agentPackage, agentReferences = [], allowedTools, collectionName, reviewIntent, historyIntent, onClose, onApplied }: Props = $props();
+  let { title, agentSlugs = [], agentPackage, agentReferences = [], allowedTools, collectionName, reviewIntent, historyIntent, onClose, onApplied, onHistoryComplete }: Props = $props();
   const installTruthFresh = $derived(install.reconciled && !install.reconciling && !install.reconcileError);
 
   onMount(() => {
@@ -286,7 +287,7 @@
     startedHistoryIntent = key;
     void showHistory(row).then(async () => {
       await tick();
-      document.querySelector<HTMLElement>(".history button")?.focus({ preventScroll: true });
+      document.querySelector<HTMLElement>(".snapshot button")?.focus({ preventScroll: true });
     });
   });
 
@@ -411,6 +412,7 @@
       toast.success(i18n.t("agents.rollbackSucceeded"));
       historyRow = null;
       rollbackConfirm = null;
+      if (historyIntent) onHistoryComplete?.();
     } catch (error) {
       actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {

@@ -69,6 +69,7 @@
     corpus.ensureLoaded();
     void (async () => {
       await projects.refresh();
+      projectInventoryReady = true;
       await skillSources.reconcileInstalls(projects.list.map((project) => project.path));
     })();
   });
@@ -160,6 +161,7 @@
   let recommendationTriggerId = $state("");
   let readinessRoot: HTMLElement | undefined = $state();
   let instructionManager: HTMLElement | undefined = $state();
+  let projectInventoryReady = $state(false);
   let readinessGeneration = 0;
   const newRecommendationCount = $derived(
     recommendations.filter((recommendation) => recommendation.lifecycle === "new").length,
@@ -167,14 +169,15 @@
 
   $effect(() => {
     const id = ui.projectRecommendationId;
-    if (!id || !recommendations.some((recommendation) => recommendation.id === id)) return;
+    if (!id || !projectInventoryReady || readinessBusy
+      || !recommendations.some((recommendation) => recommendation.id === id)) return;
     void tick().then(() => {
       const button = [...(projectsRoot?.querySelectorAll<HTMLButtonElement>("button[data-recommendation-id]") ?? [])]
         .find((candidate) => candidate.dataset.recommendationId === id);
       if (!button) return;
       ui.projectRecommendationId = null;
+      button.scrollIntoView?.({ block: "nearest" });
       button.focus({ preventScroll: true });
-      button.click();
     });
   });
 
@@ -347,7 +350,8 @@
     }
     if (generation === readinessGeneration && selected?.path === projectPath) {
       await refreshReadiness();
-      await restoreRecommendationFocus();
+      if (ui.reviewReturnId) ui.returnToActivityReview();
+      else await restoreRecommendationFocus();
     }
   }
 
@@ -385,7 +389,8 @@
   async function closeRecommendation(): Promise<void> {
     recommendationPlan = null;
     recommendationPackage = null;
-    await restoreRecommendationFocus();
+    if (ui.reviewReturnId) ui.returnToActivityReview();
+    else await restoreRecommendationFocus();
   }
 
   async function recommendationApplied(): Promise<void> {
@@ -422,7 +427,8 @@
           : "Recommendation applied. Readiness refreshed.";
       }
     }
-    await restoreRecommendationFocus();
+    if (ui.reviewReturnId) ui.returnToActivityReview();
+    else await restoreRecommendationFocus();
   }
 
   function readinessRepairLabel(

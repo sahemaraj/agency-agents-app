@@ -246,6 +246,19 @@
     });
   });
 
+  function closeLinkedSkillApproval(): void {
+    if (!ui.reviewReturnId) return;
+    ui.skillApprovalId = null;
+    ui.returnToActivityReview();
+  }
+
+  async function resolveLinkedSkillApproval(id: string, decision: "approve" | "reject"): Promise<void> {
+    const succeeded = decision === "approve"
+      ? await skillSources.approveRequest(id)
+      : await skillSources.rejectRequest(id);
+    if (succeeded) closeLinkedSkillApproval();
+  }
+
   $effect(() => {
     if (catalogLoaded && selectedKey !== null && !filtered.some(({ pkg }) => skillSources.packageKey(pkg) === selectedKey)) {
       selectedKey = null;
@@ -499,16 +512,29 @@
     const key = lifecycleKey(installed);
     if (startedRecovery === key) return;
     startedRecovery = key;
-    void tick().then(() => {
+    void tick().then(async () => {
       const details = [...document.querySelectorAll<HTMLDetailsElement>("details[data-skill-history]")]
         .find((candidate) => candidate.dataset.skillHistory === key);
       if (!details) return;
       details.open = true;
-      details.querySelector<HTMLElement>("summary")?.focus({ preventScroll: true });
-      void loadVersionHistory(installed);
+      await loadVersionHistory(installed);
+      await tick();
+      (details.querySelector<HTMLElement>("li button") ?? details.querySelector<HTMLElement>("summary"))
+        ?.focus({ preventScroll: true });
       ui.skillRecovery = null;
     });
   });
+
+  function toggleSkillHistory(event: Event, installed: InstalledSkill): void {
+    const details = event.currentTarget as HTMLDetailsElement;
+    const key = lifecycleKey(installed);
+    if (details.open) {
+      if (!versionHistory[key] && startedRecovery !== key) void loadVersionHistory(installed);
+    } else if (ui.recoveryReturnId && startedRecovery === key) {
+      startedRecovery = "";
+      ui.returnToSettingsRecovery();
+    }
+  }
 
   async function rollbackVersion(installed: InstalledSkill, snapshotPath: string): Promise<void> {
     if (!installTruthFresh) return;
@@ -520,7 +546,10 @@
     announcement = succeeded
       ? i18n.t("skills.rollbackSucceeded")
       : skillSources.addError ?? i18n.t("skills.rollbackFailed");
-    if (succeeded) await loadVersionHistory(installed);
+    if (succeeded) {
+      await loadVersionHistory(installed);
+      if (ui.recoveryReturnId) ui.returnToSettingsRecovery();
+    }
   }
 
   async function installCurrentCollection(): Promise<void> {
@@ -940,6 +969,7 @@
     </details>
     <details class="draft-inbox" bind:this={approvalInbox} ontoggle={(event) => {
       if (event.currentTarget.open) void skillSources.load();
+      else closeLinkedSkillApproval();
     }}>
       <summary>{i18n.t("skills.approvalInbox")} <span>{pendingDrafts.length + pendingApprovals.length}</span></summary>
       <div class="draft-popover" aria-label={i18n.t("skills.draftInboxAria")}>
@@ -953,8 +983,8 @@
                 <span>{approval.requestedBy} · {new Date(approval.submittedAt).toLocaleString()}</span>
               </div>
               <div class="draft-actions">
-                <Button size="sm" onclick={() => void skillSources.approveRequest(approval.id)}>{i18n.t("skills.approve")}</Button>
-                <Button size="sm" variant="danger" onclick={() => void skillSources.rejectRequest(approval.id)}>{i18n.t("skills.reject")}</Button>
+                <Button size="sm" onclick={() => void resolveLinkedSkillApproval(approval.id, "approve")}>{i18n.t("skills.approve")}</Button>
+                <Button size="sm" variant="danger" onclick={() => void resolveLinkedSkillApproval(approval.id, "reject")}>{i18n.t("skills.reject")}</Button>
               </div>
               {#if approval.result}<p class="draft-error">{approval.result}</p>{/if}
             </article>
@@ -1401,11 +1431,7 @@
                         <details
                           class="version-history"
                           data-skill-history={lifecycleKey(installed)}
-                          ontoggle={(event) => {
-                            if (event.currentTarget.open && !versionHistory[lifecycleKey(installed)]) {
-                              void loadVersionHistory(installed);
-                            }
-                          }}
+                          ontoggle={(event) => toggleSkillHistory(event, installed)}
                         >
                           <summary>{i18n.t("skills.versionHistory")}</summary>
                           {#if (versionHistory[lifecycleKey(installed)] ?? []).length === 0}

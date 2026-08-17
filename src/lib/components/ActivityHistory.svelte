@@ -46,7 +46,8 @@
   const approvalSources: ReviewSource[] = ["agent", "skill", "expert-change", "expert-run", "expert-activation"];
   const approvalTotal = $derived(approvalSources.reduce((count, source) =>
     count + (review[source].status === "ready" ? review[source].items.length : 0), 0));
-  const approvalsPartial = $derived(approvalSources.some((source) => review[source].status !== "ready"));
+  const reviewPartial = $derived([...approvalSources, "recommendation" as const]
+    .some((source) => review[source].status !== "ready"));
 
   onMount(() => {
     void activity.refreshMcpAudit();
@@ -58,6 +59,7 @@
 
   let root: HTMLElement | undefined = $state();
   let receiptAnnouncement = $state("");
+  let reviewAnnouncement = $state("");
 
   function setMode(next: "review" | "history") {
     mode = next;
@@ -112,23 +114,29 @@
       })));
   }
 
-  async function loadSource(source: ReviewSource) {
+  async function loadSource(source: ReviewSource): Promise<"ready" | "unavailable"> {
     review = { ...review, [source]: { ...review[source], status: "loading", error: "" } };
+    reviewAnnouncement = `${sourceLabel(source)} loading.`;
     try {
       const items = await readSource(source);
       review = { ...review, [source]: { status: "ready", items, error: "" } };
+      reviewAnnouncement = `${sourceLabel(source)} ready. ${items.length} pending.`;
+      return "ready";
     } catch (error) {
-      review = { ...review, [source]: { ...review[source], status: "unavailable", error: safeActivityDetail(error) } };
+      const detail = safeActivityDetail(error);
+      review = { ...review, [source]: { ...review[source], status: "unavailable", error: detail } };
+      reviewAnnouncement = `${sourceLabel(source)} unavailable. ${detail}`;
+      return "unavailable";
     }
   }
 
   async function retrySource(source: ReviewSource) {
-    await loadSource(source);
+    const status = await loadSource(source);
     await tick();
     const group = [...(root?.querySelectorAll<HTMLElement>("[data-review-group]") ?? [])]
       .find((candidate) => candidate.dataset.reviewGroup === source);
     group?.querySelector<HTMLElement>("button, h2")?.focus({ preventScroll: true });
-    receiptAnnouncement = `${sourceLabel(source)} refreshed.`;
+    if (status === "ready") reviewAnnouncement = `${sourceLabel(source)} refreshed.`;
   }
 
   function openReview(item: ReviewItem, triggerId: string) {
@@ -163,11 +171,17 @@
   $effect(() => {
     if (ui.section !== "activity" || !ui.reviewReturnId) return;
     const id = ui.reviewReturnId;
+    const allSettled = Object.values(review).every((state) => state.status !== "loading");
     void tick().then(() => {
       const trigger = [...(root?.querySelectorAll<HTMLButtonElement>("[data-review-trigger]") ?? [])]
         .find((candidate) => candidate.dataset.reviewTrigger === id);
-      if (!trigger) return;
-      trigger.focus({ preventScroll: true });
+      const source = id.slice(0, id.indexOf(":")) as ReviewSource;
+      const fallback = [...(root?.querySelectorAll<HTMLElement>("[data-review-group]") ?? [])]
+        .find((candidate) => candidate.dataset.reviewGroup === source)
+        ?.querySelector<HTMLElement>("h2");
+      const target = trigger ?? (allSettled ? fallback : null);
+      if (!target) return;
+      target.focus({ preventScroll: true });
       ui.consumeReviewReturn();
       receiptAnnouncement = "Returned to Review.";
     });
@@ -299,7 +313,7 @@
 </script>
 
 <section class="hist" bind:this={root}>
-  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{receiptAnnouncement} {modeAnnouncement}</div>
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{receiptAnnouncement || reviewAnnouncement} {modeAnnouncement}</div>
   <header class="panel-head" data-tauri-drag-region>
     <div class="modes" data-tauri-drag-region="false" aria-label="Activity mode">
       <button type="button" aria-pressed={mode === "review"} onclick={() => setMode("review")}>Review</button>
@@ -317,7 +331,7 @@
 
   <div class="list-wrap">
     {#if mode === "review"}
-      <div class="review-summary">{approvalTotal} pending{approvalsPartial ? " · partial" : ""}</div>
+      <div class="review-summary">{approvalTotal} pending{reviewPartial ? " · partial" : ""}</div>
       {#each approvalSources as source (source)}
         {@const state = review[source]}
         <section class="review-group" data-review-group={source} aria-busy={state.status === "loading"}>

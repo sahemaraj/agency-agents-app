@@ -120,6 +120,7 @@ class UiStore {
   expertReview: ExpertReviewLink | null = $state(null);
   projectRecommendationId: string | null = $state(null);
   /** Transient Recovery targets consumed by existing exact rollback controls. */
+  recoveryReturnId: string | null = $state(null);
   agentRecovery: AgentRecoveryLink | null = $state(null);
   skillRecovery: SkillRecoveryLink | null = $state(null);
   paletteOpen: boolean = $state(false);
@@ -258,14 +259,30 @@ class UiStore {
     return id;
   }
 
-  openAgentRecovery(link: AgentRecoveryLink) {
+  openAgentRecovery(link: AgentRecoveryLink, triggerId: string) {
+    this.recoveryReturnId = triggerId;
     this.agentRecovery = { ...link, reference: { ...link.reference } };
     this.openAgentReference(link.reference);
   }
 
-  openSkillRecovery(link: SkillRecoveryLink) {
+  openSkillRecovery(link: SkillRecoveryLink, triggerId: string) {
+    this.recoveryReturnId = triggerId;
     this.skillRecovery = { ...link, reference: { ...link.reference } };
     this.openSkill(link.reference);
+  }
+
+  returnToSettingsRecovery() {
+    if (!this.recoveryReturnId) return;
+    this.agentRecovery = null;
+    this.skillRecovery = null;
+    if (this.canBack) this.back();
+    this.openSettings("doctor");
+  }
+
+  consumeRecoveryReturn(): string | null {
+    const id = this.recoveryReturnId;
+    this.recoveryReturnId = null;
+    return id;
   }
 
   /** Open the Projects detail pane for a project path (null = back to the list).

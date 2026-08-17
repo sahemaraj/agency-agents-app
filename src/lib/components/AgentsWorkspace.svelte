@@ -355,6 +355,13 @@
     installOpen = true;
   });
 
+  function closeInstall(): void {
+    const returnToRecovery = !!ui.agentRecovery && !!ui.recoveryReturnId;
+    installOpen = false;
+    ui.agentRecovery = null;
+    if (returnToRecovery) ui.returnToSettingsRecovery();
+  }
+
   // ── Bulk select (lifted from the old Library, now over the unified list) ──
   let selectMode = $state(false);
   let selected = $state<Set<string>>(new Set());
@@ -719,7 +726,8 @@
     agentSlugs={panelPackage ? [] : [panelAgent.slug]}
     agentPackage={panelPackage ?? undefined}
     historyIntent={ui.agentRecovery ?? undefined}
-    onClose={() => { installOpen = false; ui.agentRecovery = null; }}
+    onClose={closeInstall}
+    onHistoryComplete={closeInstall}
   />
 {/if}
 

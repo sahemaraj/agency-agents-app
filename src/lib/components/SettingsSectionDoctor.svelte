@@ -7,8 +7,8 @@
     agentVersionHistory,
     doctorReport,
     projectsList,
-    skillBackupsList,
     skillInstallsReconcile,
+    skillVersionHistory,
     storageBackup,
     storageMigrationStatus,
   } from "$lib/api";
@@ -16,10 +16,12 @@
   import { safeActivityDetail } from "$lib/stores/activity.svelte";
   import { install } from "$lib/stores/install.svelte";
   import { ui } from "$lib/stores/ui.svelte";
-  import { appErrorMessage, isAppError, type AgentVersionSnapshot, type DoctorAction, type DoctorCategory, type DoctorClassification, type DoctorReport, type InstalledAgent, type InstalledSkill } from "$lib/types";
+  import { appErrorMessage, isAppError, type AgentVersionSnapshot, type DoctorAction, type DoctorCategory, type DoctorClassification, type DoctorReport, type InstalledAgent, type InstalledSkill, type SkillVersionSnapshot } from "$lib/types";
 
   type RecoveryStatus = "loading" | "ready" | "unavailable";
   type AgentRecoveryRow = { installed: InstalledAgent; snapshots: AgentVersionSnapshot[] };
+  type SkillRecoveryRow = { installed: InstalledSkill; snapshots: SkillVersionSnapshot[] };
+  const RECOVERY_INSTALL_LIMIT = 100;
 
   const CATEGORIES: DoctorCategory[] = ["core", "library", "installations", "tools", "integrations", "updates"];
   let report: DoctorReport | null = $state(null);
@@ -32,12 +34,13 @@
   let agentRecoveryRows = $state<AgentRecoveryRow[]>([]);
   let skillRecoveryStatus = $state<RecoveryStatus>("loading");
   let skillRecoveryError = $state("");
-  let skillRecoveryRows = $state<InstalledSkill[]>([]);
-  let skillBackups = $state<string[]>([]);
+  let skillRecoveryRows = $state<SkillRecoveryRow[]>([]);
+  const skillRollbackCount = $derived(skillRecoveryRows.reduce((count, row) => count + row.snapshots.length, 0));
   let storageRecoveryStatus = $state<RecoveryStatus>("loading");
   let storageRecoveryError = $state("");
   let backupPath = $state<string | null>(null);
   let backupBusy = $state(false);
+  let recoveryRoot: HTMLElement | undefined = $state();
 
   const label = (classification: DoctorClassification) => i18n.t(`settings.doctor.${classification}`);
   const categoryLabel = (category: DoctorCategory) => i18n.t(`settings.doctor.category.${category}`);
@@ -81,14 +84,17 @@
   async function loadAgentRecovery() {
     agentRecoveryStatus = "loading";
     agentRecoveryError = "";
+    recoveryAnnouncement = "Agent recovery loading.";
     try {
-      const installed = (await agentInstallsReconcile()).filter((item) => item.tracked && item.sourceId && item.relativePath);
-      agentRecoveryRows = await Promise.all(installed.map(async (item) => ({
+      const installed = (await agentInstallsReconcile())
+        .filter((item) => item.tracked && item.sourceId && item.relativePath)
+        .slice(0, RECOVERY_INSTALL_LIMIT);
+      agentRecoveryRows = (await Promise.all(installed.map(async (item) => ({
         installed: item,
         snapshots: await agentVersionHistory(
           { sourceId: item.sourceId, relativePath: item.relativePath }, item.tool, item.projectPath,
         ),
-      })));
+      })))).filter((row) => row.snapshots.length > 0);
       agentRecoveryStatus = "ready";
       recoveryAnnouncement = `Agent recovery ready. ${agentRecoveryRows.reduce((count, row) => count + row.snapshots.length, 0)} rollback points.`;
     } catch (error) {
@@ -101,14 +107,18 @@
   async function loadSkillRecovery() {
     skillRecoveryStatus = "loading";
     skillRecoveryError = "";
+    recoveryAnnouncement = "Skill recovery loading.";
     try {
       const registered = await projectsList();
-      [skillRecoveryRows, skillBackups] = await Promise.all([
-        skillInstallsReconcile(registered.map((project) => project.path)), skillBackupsList(),
-      ]);
-      skillRecoveryRows = skillRecoveryRows.filter((item) => item.tracked);
+      const installed = (await skillInstallsReconcile(registered.map((project) => project.path)))
+        .filter((item) => item.tracked)
+        .slice(0, RECOVERY_INSTALL_LIMIT);
+      skillRecoveryRows = (await Promise.all(installed.map(async (item) => ({
+        installed: item,
+        snapshots: await skillVersionHistory(item),
+      })))).filter((row) => row.snapshots.length > 0);
       skillRecoveryStatus = "ready";
-      recoveryAnnouncement = `Skill recovery ready. ${skillBackups.length} rollback points.`;
+      recoveryAnnouncement = `Skill recovery ready. ${skillRecoveryRows.reduce((count, row) => count + row.snapshots.length, 0)} rollback points.`;
     } catch (error) {
       skillRecoveryStatus = "unavailable";
       skillRecoveryError = recoveryError(error);
@@ -119,6 +129,7 @@
   async function loadStorageRecovery() {
     storageRecoveryStatus = "loading";
     storageRecoveryError = "";
+    recoveryAnnouncement = "Database backup recovery loading.";
     try {
       const status = await storageMigrationStatus();
       if (status.state !== "complete") throw new Error("SQLite migration must complete before verified backups are available.");
@@ -131,22 +142,30 @@
     }
   }
 
-  function openAgentRecovery(row: AgentRecoveryRow) {
+  function agentRecoveryTrigger(index: number): string {
+    return `agent-recovery-${index}`;
+  }
+
+  function skillRecoveryTrigger(index: number): string {
+    return `skill-recovery-${index}`;
+  }
+
+  function openAgentRecovery(row: AgentRecoveryRow, index: number) {
     ui.closeSettings();
     ui.openAgentRecovery({
       reference: { sourceId: row.installed.sourceId, relativePath: row.installed.relativePath },
       tool: row.installed.tool,
       projectPath: row.installed.projectPath,
-    });
+    }, agentRecoveryTrigger(index));
   }
 
-  function openSkillRecovery(installed: InstalledSkill) {
+  function openSkillRecovery(row: SkillRecoveryRow, index: number) {
     ui.closeSettings();
     ui.openSkillRecovery({
-      reference: { sourceId: installed.sourceId, relativePath: installed.relativePath },
-      runtime: installed.runtime,
-      projectPath: installed.projectPath,
-    });
+      reference: { sourceId: row.installed.sourceId, relativePath: row.installed.relativePath },
+      runtime: row.installed.runtime,
+      projectPath: row.installed.projectPath,
+    }, skillRecoveryTrigger(index));
   }
 
   async function createBackup() {
@@ -188,6 +207,12 @@
     else await loadStorageRecovery();
     await tick();
     document.querySelector<HTMLElement>(`[data-recovery-source="${source}"] h3`)?.focus({ preventScroll: true });
+    const ready = source === "agents"
+      ? agentRecoveryStatus === "ready"
+      : source === "skills"
+        ? skillRecoveryStatus === "ready"
+        : storageRecoveryStatus === "ready";
+    if (ready) recoveryAnnouncement = `${source === "agents" ? "Agent" : source === "skills" ? "Skill" : "Database backup"} recovery refreshed.`;
   }
 
   function runAction(action: DoctorAction) {
@@ -211,6 +236,19 @@
   onMount(() => {
     void refresh();
     void Promise.all([loadAgentRecovery(), loadSkillRecovery(), loadStorageRecovery()]);
+  });
+
+  $effect(() => {
+    const id = ui.recoveryReturnId;
+    if (!ui.settingsOpen || !id) return;
+    void tick().then(() => setTimeout(() => {
+      const trigger = [...(recoveryRoot?.querySelectorAll<HTMLButtonElement>("[data-recovery-trigger]") ?? [])]
+        .find((candidate) => candidate.dataset.recoveryTrigger === id);
+      if (!trigger) return;
+      trigger.focus({ preventScroll: true });
+      ui.consumeRecoveryReturn();
+      recoveryAnnouncement = "Returned to Recovery.";
+    }, 0));
   });
 </script>
 
@@ -271,7 +309,7 @@
     {/each}
   {/if}
 
-  <section class="recovery" aria-labelledby="recovery-title">
+  <section class="recovery" bind:this={recoveryRoot} aria-labelledby="recovery-title">
     <div><h2 id="recovery-title">Recovery</h2><p>Use the existing exact rollback controls and verified app-owned backups.</p></div>
     <p class="sr-only" role="status" aria-live="polite" aria-atomic="true">{recoveryAnnouncement}</p>
 
@@ -279,15 +317,15 @@
       <div class="recovery-head"><h3 tabindex="-1">Agent versions</h3><strong>{agentRecoveryStatus === "ready" ? `${agentRecoveryRows.reduce((count, row) => count + row.snapshots.length, 0)} rollback ${agentRecoveryRows.reduce((count, row) => count + row.snapshots.length, 0) === 1 ? "point" : "points"}` : agentRecoveryStatus === "loading" ? "Loading" : "Unavailable"}</strong></div>
       {#if agentRecoveryStatus === "unavailable"}<p role="alert" class="error">{agentRecoveryError}</p><button type="button" data-recovery-retry onclick={() => void retryRecovery("agents")}>Retry</button>
       {:else if agentRecoveryStatus === "ready"}
-        {#if agentRecoveryRows.length === 0}<p>No tracked Agent installs.</p>{:else}<ul>{#each agentRecoveryRows as row (`${row.installed.sourceId}:${row.installed.relativePath}:${row.installed.tool}:${row.installed.projectPath ?? ""}`)}<li><span>{row.installed.name} · {row.installed.tool} · {row.snapshots.length} snapshots</span><button type="button" data-agent-recovery onclick={() => openAgentRecovery(row)}>Open rollback</button></li>{/each}</ul>{/if}
+        {#if agentRecoveryRows.length === 0}<p>No Agent installs with version history.</p>{:else}<ul>{#each agentRecoveryRows as row, index (`${row.installed.sourceId}:${row.installed.relativePath}:${row.installed.tool}:${row.installed.projectPath ?? ""}`)}<li><span>{row.installed.name} · {row.installed.tool} · {row.snapshots.length} snapshots</span><button type="button" data-agent-recovery data-recovery-trigger={agentRecoveryTrigger(index)} onclick={() => openAgentRecovery(row, index)}>Open rollback</button></li>{/each}</ul>{/if}
       {/if}
     </article>
 
     <article data-recovery-source="skills" aria-busy={skillRecoveryStatus === "loading"}>
-      <div class="recovery-head"><h3 tabindex="-1">Skill backups</h3><strong>{skillRecoveryStatus === "ready" ? `${skillBackups.length} rollback ${skillBackups.length === 1 ? "point" : "points"}` : skillRecoveryStatus === "loading" ? "Loading" : "Unavailable"}</strong></div>
+      <div class="recovery-head"><h3 tabindex="-1">Skill versions</h3><strong>{skillRecoveryStatus === "ready" ? `${skillRollbackCount} rollback ${skillRollbackCount === 1 ? "point" : "points"}` : skillRecoveryStatus === "loading" ? "Loading" : "Unavailable"}</strong></div>
       {#if skillRecoveryStatus === "unavailable"}<p role="alert" class="error">{skillRecoveryError}</p><button type="button" data-recovery-retry onclick={() => void retryRecovery("skills")}>Retry</button>
       {:else if skillRecoveryStatus === "ready"}
-        {#if skillRecoveryRows.length === 0}<p>No tracked Skill installs.</p>{:else}<ul>{#each skillRecoveryRows as installed (`${installed.sourceId}:${installed.relativePath}:${installed.runtime}:${installed.projectPath ?? ""}`)}<li><span>{installed.name} · {installed.runtime}</span><button type="button" data-skill-recovery onclick={() => openSkillRecovery(installed)}>Open rollback</button></li>{/each}</ul>{/if}
+        {#if skillRecoveryRows.length === 0}<p>No Skill installs with version history.</p>{:else}<ul>{#each skillRecoveryRows as row, index (`${row.installed.sourceId}:${row.installed.relativePath}:${row.installed.runtime}:${row.installed.projectPath ?? ""}`)}<li><span>{row.installed.name} · {row.installed.runtime} · {row.snapshots.length} snapshots</span><button type="button" data-skill-recovery data-recovery-trigger={skillRecoveryTrigger(index)} onclick={() => openSkillRecovery(row, index)}>Open rollback</button></li>{/each}</ul>{/if}
       {/if}
     </article>
 

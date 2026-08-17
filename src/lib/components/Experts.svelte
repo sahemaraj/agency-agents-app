@@ -181,7 +181,7 @@
       id: `proposal-${request.id}`,
       version: 1,
       source: "custom",
-      ...structuredClone(request.proposal),
+      ...structuredClone($state.snapshot(request.proposal)),
     };
   }
 
