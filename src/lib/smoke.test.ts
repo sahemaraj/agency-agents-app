@@ -6127,6 +6127,9 @@ describe("bounded playbook library", () => {
     document.querySelector<HTMLButtonElement>('[data-playbook-path="examples/alpha.md"]')?.click();
     await Promise.resolve();
     await tick();
+    expect(document.querySelector('[data-playbook-path="examples/alpha.md"]')?.getAttribute("aria-current")).toBe("true");
+    expect(document.querySelector("pre")?.getAttribute("tabindex")).toBe("0");
+    expect(document.querySelector("pre")?.getAttribute("aria-label")).toBe("Alpha workflow source");
     expect(document.querySelector("pre")?.textContent).toContain("<script>never execute</script>");
     expect(document.querySelector("pre script")).toBeNull();
 

@@ -250,6 +250,7 @@
                   <button
                     data-playbook-path={playbook.relativePath}
                     class:selected={selectedPath === playbook.relativePath}
+                    aria-current={selectedPath === playbook.relativePath ? "true" : undefined}
                     disabled={runbooks.reading}
                     onclick={() => openPlaybook(playbook.relativePath)}
                   >
@@ -277,7 +278,8 @@
               </div>
               <button data-playbook-copy class="btn" onclick={copyPlaybook}><CopyIcon size={14} />Copy</button>
             </header>
-            <pre>{runbooks.selected.content}</pre>
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex (scrollable source region must be keyboard-focusable) -->
+            <pre role="region" tabindex="0" aria-label={`${runbooks.selected.title} source`}>{runbooks.selected.content}</pre>
           {:else}
             <p class="rbv-status">Select a playbook to read its source text.</p>
           {/if}

@@ -1899,51 +1899,170 @@ async fn refresh(app_data_dir: &Path) -> Result<CorpusMeta, AppError> {
     }
 
     let bytes = download_corpus_tarball().await?;
+    refresh_from_tarball(app_data_dir, &source, &bytes).await
+}
 
+fn staged_catalog_path(live: &Path, label: &str) -> Result<PathBuf, AppError> {
+    let parent = live.parent().ok_or_else(|| AppError::InvalidArgument {
+        message: "managed catalog root must have a parent directory".into(),
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| AppError::Io {
+        message: format!("create managed catalog parent: {error}"),
+    })?;
+    let name = live
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("catalog");
+    Ok(parent.join(format!(".{name}.{label}-{}", uuid::Uuid::new_v4())))
+}
+
+fn activate_staged_catalog(live: &Path, staged: &Path) -> Result<Option<PathBuf>, AppError> {
+    let backup = if live.exists() {
+        validate_real_directory(live, "managed catalog root")?;
+        let backup = staged_catalog_path(live, "backup")?;
+        std::fs::rename(live, &backup).map_err(|error| AppError::Io {
+            message: format!("backup managed catalog before refresh: {error}"),
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+    if let Err(error) = std::fs::rename(staged, live) {
+        if let Some(backup) = &backup {
+            let _ = std::fs::rename(backup, live);
+        }
+        return Err(AppError::Io {
+            message: format!("activate staged managed catalog: {error}"),
+        });
+    }
+    Ok(backup)
+}
+
+fn restore_catalog_snapshot(live: &Path, backup: Option<&Path>) -> Result<(), AppError> {
+    if live.exists() {
+        std::fs::remove_dir_all(live).map_err(|error| AppError::Io {
+            message: format!("remove failed managed catalog refresh: {error}"),
+        })?;
+    }
+    if let Some(backup) = backup {
+        std::fs::rename(backup, live).map_err(|error| AppError::Io {
+            message: format!("restore managed catalog after refresh failure: {error}"),
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_runbooks_manifest(root: &Path) -> Result<(), AppError> {
+    let path = root.join("strategy/runbooks.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("read staged runbooks manifest: {error}"),
+            });
+        }
+    };
+    if bytes.len() as u64 > MAX_PLAYBOOK_BYTES {
+        return Err(AppError::InvalidArgument {
+            message: "runbooks manifest exceeds the playbook byte limit".into(),
+        });
+    }
+    serde_json::from_slice::<RunbooksFile>(&bytes).map_err(|error| AppError::InvalidArgument {
+        message: format!("staged runbooks manifest is invalid: {error}"),
+    })?;
+    Ok(())
+}
+
+async fn refresh_from_tarball(
+    app_data_dir: &Path,
+    source: &CatalogSource,
+    bytes: &[u8],
+) -> Result<CorpusMeta, AppError> {
     // Discover the live category set from the tarball's OWN tooling
     // (`scripts/convert.sh`) so a freshly-added upstream division is picked up
     // automatically. Falls back to the canonical default if absent.
-    let categories = categories_from_tarball(&bytes).unwrap_or_else(bundled_division_slugs);
+    let categories = categories_from_tarball(bytes).unwrap_or_else(bundled_division_slugs);
 
     // Extract the category dirs (+ the tooling) into the active catalog root.
     // The tarball has a single top-level `agency-agents-main/` prefix we strip.
-    let dir = catalog_root(app_data_dir, &source);
-    let extracted = extract_categories(&bytes, &dir, &categories)?;
-    if extracted == 0 {
-        return Err(AppError::Internal {
-            message: "corpus tarball contained no agent files under known categories".into(),
-        });
-    }
+    let dir = catalog_root(app_data_dir, source);
+    let staged = staged_catalog_path(&dir, "staging")?;
+    std::fs::create_dir(&staged).map_err(|error| AppError::Io {
+        message: format!("create staged managed catalog: {error}"),
+    })?;
 
     // Re-index from the freshly-written working copy. Use a `main`-tagged
     // version marker; codeload does not expose the resolved commit SHA in
     // the tarball, so we record the ref name. A later phase can resolve
     // the exact SHA via the GitHub API if needed.
     let version = format!("github:main@{}", chrono::Utc::now().format("%Y-%m-%d"));
-    let mut corpus = build_from_dir(&dir, &version, &categories).await?;
+    let staged_result = async {
+        let extracted = extract_categories(bytes, &staged, &categories)?;
+        if extracted == 0 {
+            return Err(AppError::Internal {
+                message: "corpus tarball contained no agent files under known categories".into(),
+            });
+        }
+        let mut corpus = build_from_dir(&staged, &version, &categories).await?;
+        corpus.division_meta = load_division_meta(&staged);
+        playbook_catalog(&staged)?;
+        validate_runbooks_manifest(&staged)?;
+        Ok::<Corpus, AppError>(corpus)
+    }
+    .await;
+    let mut corpus = match staged_result {
+        Ok(corpus) => corpus,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
+    };
     let fetched_at = chrono::Utc::now().to_rfc3339();
     corpus.meta.fetched_at = fetched_at.clone();
+
+    let backup = match activate_staged_catalog(&dir, &staged) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
+    };
 
     // Persist a fresh meta (overwrite fetched_at/version this time —
     // unlike the baseline persist which preserves prior fetched_at).
     let sdir = state_dir(app_data_dir);
-    tokio::fs::create_dir_all(&sdir)
-        .await
-        .map_err(|e| AppError::Io {
-            message: format!("create state dir {}: {e}", sdir.display()),
+    let persist_result = async {
+        tokio::fs::create_dir_all(&sdir)
+            .await
+            .map_err(|e| AppError::Io {
+                message: format!("create state dir {}: {e}", sdir.display()),
+            })?;
+        let index_bytes = corpus.index_json()?;
+        atomic_write(&index_path(app_data_dir), &index_bytes).await?;
+        let stored = StoredMeta {
+            version: version.clone(),
+            commit: None,
+            fetched_at: fetched_at.clone(),
+            count: corpus.count(),
+        };
+        let meta_bytes = serde_json::to_vec_pretty(&stored).map_err(|e| AppError::Internal {
+            message: format!("serialize corpus-meta.json: {e}"),
         })?;
-    let index_bytes = corpus.index_json()?;
-    atomic_write(&index_path(app_data_dir), &index_bytes).await?;
-    let stored = StoredMeta {
-        version: version.clone(),
-        commit: None,
-        fetched_at: fetched_at.clone(),
-        count: corpus.count(),
-    };
-    let meta_bytes = serde_json::to_vec_pretty(&stored).map_err(|e| AppError::Internal {
-        message: format!("serialize corpus-meta.json: {e}"),
-    })?;
-    atomic_write(&meta_path(app_data_dir), &meta_bytes).await?;
+        atomic_write(&meta_path(app_data_dir), &meta_bytes).await
+    }
+    .await;
+    if let Err(error) = persist_result {
+        if let Err(rollback) = restore_catalog_snapshot(&dir, backup.as_deref()) {
+            return Err(AppError::Internal {
+                message: format!("catalog refresh failed: {error}; rollback failed: {rollback}"),
+            });
+        }
+        return Err(error);
+    }
+    if let Some(backup) = backup {
+        let _ = std::fs::remove_dir_all(backup);
+    }
 
     Ok(corpus.meta)
 }
@@ -5301,6 +5420,60 @@ echo done
 
         assert!(extract_categories(&tar, dest.path(), &["engineering".into()]).is_err());
         assert!(!outside.path().join("plan.md").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_refresh_replaces_the_complete_snapshot_and_removes_deleted_docs() {
+        let app_data = tempfile::tempdir().unwrap();
+        let live = corpus_dir(app_data.path());
+        std::fs::create_dir_all(live.join("strategy")).unwrap();
+        std::fs::write(live.join("strategy/deleted.md"), "# Deleted\n").unwrap();
+        let tar = test_catalog_tar(&[
+            (
+                "agency-agents-main/engineering/reviewer.md",
+                b"---\nname: Reviewer\n---\nBody\n",
+            ),
+            ("agency-agents-main/strategy/current.md", b"# Current\n"),
+        ]);
+
+        refresh_from_tarball(app_data.path(), &CatalogSource::Bundled, &tar)
+            .await
+            .unwrap();
+
+        assert!(!live.join("strategy/deleted.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(live.join("strategy/current.md")).unwrap(),
+            "# Current\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_managed_refresh_leaves_the_previous_snapshot_byte_identical() {
+        let app_data = tempfile::tempdir().unwrap();
+        let live = corpus_dir(app_data.path());
+        std::fs::create_dir_all(live.join("strategy")).unwrap();
+        std::fs::write(live.join("strategy/current.md"), "# Original\n").unwrap();
+        let oversized = vec![b'x'; MAX_PLAYBOOK_BYTES as usize + 1];
+        let tar = test_catalog_tar(&[
+            (
+                "agency-agents-main/engineering/reviewer.md",
+                b"---\nname: Reviewer\n---\nBody changed\n",
+            ),
+            ("agency-agents-main/strategy/new.md", b"# New\n"),
+            ("agency-agents-main/examples/oversized.md", &oversized),
+        ]);
+
+        assert!(
+            refresh_from_tarball(app_data.path(), &CatalogSource::Bundled, &tar)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(live.join("strategy/current.md")).unwrap(),
+            "# Original\n"
+        );
+        assert!(!live.join("strategy/new.md").exists());
+        assert!(!live.join("engineering/reviewer.md").exists());
     }
 
     #[test]
