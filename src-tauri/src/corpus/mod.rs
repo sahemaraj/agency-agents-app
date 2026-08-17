@@ -144,7 +144,14 @@ pub(crate) const MAX_AGENT_BYTES: u64 = 1024 * 1024;
 
 const MAX_PLAYBOOK_BYTES: u64 = 256 * 1024;
 const MAX_PLAYBOOK_DOCUMENTS: usize = 256;
+const MAX_PLAYBOOK_ENTRIES: usize = 1024;
+const MAX_PLAYBOOK_DEPTH: usize = 16;
 const PLAYBOOK_ROOTS: [&str; 2] = ["strategy", "examples"];
+const CATALOG_ACTIVATION_SCHEMA_VERSION: u32 = 1;
+const MAX_CATALOG_ACTIVATION_JOURNAL_BYTES: u64 = 32 * 1024;
+const MAX_CATALOG_ACTIVATION_ENTRIES: usize = 16_384;
+const MAX_CATALOG_ACTIVATION_DEPTH: usize = 32;
+const MAX_CATALOG_ACTIVATION_BYTES: u64 = MAX_TARBALL_BYTES * 8;
 
 /// Version string recorded for the bundled baseline before any refresh
 /// has resolved a commit SHA.
@@ -1528,6 +1535,11 @@ pub(crate) fn catalog_root(app_data_dir: &Path, source: &CatalogSource) -> PathB
 /// with `count == 0` so the UI degrades to "no agents" rather than
 /// failing to launch.
 pub async fn resolve_active(app_data_dir: &Path, baseline_dir: &Path) -> Corpus {
+    if let Err(error) = recover_catalog_activation(app_data_dir) {
+        tracing::error!("corpus: catalog activation recovery failed ({error})");
+        let categories = bundled_division_slugs();
+        return empty_corpus(BASELINE_VERSION, &categories);
+    }
     let source = load_catalog_source(app_data_dir).await;
     let dir = catalog_root(app_data_dir, &source);
 
@@ -1879,6 +1891,409 @@ async fn load_stored_meta(app_data_dir: &Path) -> Option<StoredMeta> {
     serde_json::from_slice(&bytes).ok()
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CATALOG_STATE_WRITE_FAILURE: std::cell::RefCell<Option<usize>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_catalog_state_write_failure_after(successful_writes: usize) {
+    CATALOG_STATE_WRITE_FAILURE.with(|injection| {
+        let mut injection = injection.borrow_mut();
+        assert!(
+            injection.is_none(),
+            "catalog state write injection is already armed"
+        );
+        *injection = Some(successful_writes);
+    });
+}
+
+async fn write_catalog_state(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    #[cfg(test)]
+    {
+        let injected = CATALOG_STATE_WRITE_FAILURE.with(|injection| {
+            let mut injection = injection.borrow_mut();
+            match injection.as_mut() {
+                Some(remaining) if *remaining == 0 => {
+                    *injection = None;
+                    true
+                }
+                Some(remaining) => {
+                    *remaining -= 1;
+                    false
+                }
+                None => false,
+            }
+        });
+        if injected {
+            return Err(AppError::Io {
+                message: "injected catalog state write failure".into(),
+            });
+        }
+    }
+    atomic_write(path, bytes).await
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum CatalogActivationArtifactKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum CatalogActivationPhase {
+    Prepared,
+    CatalogActivated,
+    IndexActivated,
+    MetaActivated,
+    Committed,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogActivationArtifact {
+    kind: CatalogActivationArtifactKind,
+    live: String,
+    staged: String,
+    backup: String,
+    previous_hash: Option<String>,
+    next_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogActivationRecord {
+    schema_version: u32,
+    phase: CatalogActivationPhase,
+    source: CatalogSource,
+    catalog: CatalogActivationArtifact,
+    index: CatalogActivationArtifact,
+    meta: CatalogActivationArtifact,
+}
+
+impl CatalogActivationRecord {
+    fn artifacts(&self) -> [&CatalogActivationArtifact; 3] {
+        [&self.catalog, &self.index, &self.meta]
+    }
+}
+
+fn catalog_activation_path(app_data_dir: &Path) -> PathBuf {
+    state_dir(app_data_dir).join("catalog-activation.json")
+}
+
+fn hash_part(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+fn hash_catalog_activation_file(path: &Path) -> Result<String, AppError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| AppError::Io {
+        message: format!(
+            "inspect catalog activation file {}: {error}",
+            path.display()
+        ),
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+        || metadata.len() > MAX_CATALOG_ACTIVATION_BYTES
+    {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "catalog activation file {} must be a bounded real file",
+                path.display()
+            ),
+        });
+    }
+    let bytes = std::fs::read(path).map_err(|error| AppError::Io {
+        message: format!("read catalog activation file {}: {error}", path.display()),
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn hash_catalog_activation_tree(root: &Path) -> Result<String, AppError> {
+    validate_real_directory(root, "catalog activation directory")?;
+    let mut digest = Sha256::new();
+    digest.update(b"catalog-activation-tree-v1");
+    let mut directories = VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut entries_seen = 0usize;
+    let mut bytes_seen = 0u64;
+    while let Some((directory, depth)) = directories.pop_front() {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&directory).map_err(|error| AppError::Io {
+            message: format!(
+                "read catalog activation tree {}: {error}",
+                directory.display()
+            ),
+        })? {
+            entries_seen += 1;
+            if entries_seen > MAX_CATALOG_ACTIVATION_ENTRIES {
+                return Err(AppError::InvalidArgument {
+                    message: format!(
+                        "catalog activation tree exceeds its {MAX_CATALOG_ACTIVATION_ENTRIES}-entry limit"
+                    ),
+                });
+            }
+            entries.push(entry.map_err(|error| AppError::Io {
+                message: format!("read catalog activation entry: {error}"),
+            })?);
+        }
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| AppError::Io {
+                message: format!(
+                    "inspect catalog activation entry {}: {error}",
+                    path.display()
+                ),
+            })?;
+            if metadata.file_type().is_symlink()
+                || crate::skills::metadata_is_reparse_point(&metadata)
+                || (!metadata.is_dir() && !metadata.is_file())
+            {
+                return Err(AppError::InvalidArgument {
+                    message: "catalog activation trees cannot contain links or special entries"
+                        .into(),
+                });
+            }
+            let relative = normalized_corpus_relative_path(root, &path)?;
+            if metadata.is_dir() {
+                digest.update(b"directory");
+                hash_part(&mut digest, relative.as_bytes());
+                if depth >= MAX_CATALOG_ACTIVATION_DEPTH {
+                    return Err(AppError::InvalidArgument {
+                        message: format!(
+                            "catalog activation tree exceeds its {MAX_CATALOG_ACTIVATION_DEPTH}-level depth limit"
+                        ),
+                    });
+                }
+                directories.push_back((path, depth + 1));
+            } else {
+                bytes_seen = bytes_seen.checked_add(metadata.len()).ok_or_else(|| {
+                    AppError::InvalidArgument {
+                        message: "catalog activation byte count overflowed".into(),
+                    }
+                })?;
+                if bytes_seen > MAX_CATALOG_ACTIVATION_BYTES {
+                    return Err(AppError::InvalidArgument {
+                        message: format!(
+                            "catalog activation tree exceeds its {MAX_CATALOG_ACTIVATION_BYTES}-byte limit"
+                        ),
+                    });
+                }
+                let bytes = std::fs::read(&path).map_err(|error| AppError::Io {
+                    message: format!("read catalog activation entry {}: {error}", path.display()),
+                })?;
+                digest.update(b"file");
+                hash_part(&mut digest, relative.as_bytes());
+                hash_part(&mut digest, &bytes);
+            }
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn catalog_activation_hash(
+    kind: CatalogActivationArtifactKind,
+    path: &Path,
+) -> Result<String, AppError> {
+    match kind {
+        CatalogActivationArtifactKind::Directory => hash_catalog_activation_tree(path),
+        CatalogActivationArtifactKind::File => hash_catalog_activation_file(path),
+    }
+}
+
+fn catalog_activation_hash_if_present(
+    kind: CatalogActivationArtifactKind,
+    path: &Path,
+) -> Result<Option<String>, AppError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => catalog_activation_hash(kind, path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::Io {
+            message: format!(
+                "inspect catalog activation path {}: {error}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+fn catalog_activation_path_string(path: &Path) -> Result<String, AppError> {
+    if !path.is_absolute() {
+        return Err(AppError::InvalidArgument {
+            message: "catalog activation paths must be absolute".into(),
+        });
+    }
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::InvalidArgument {
+            message: "catalog activation paths must be valid UTF-8".into(),
+        })
+}
+
+fn plan_catalog_activation_artifact(
+    kind: CatalogActivationArtifactKind,
+    live: &Path,
+    staged: &Path,
+) -> Result<CatalogActivationArtifact, AppError> {
+    let backup = staged_catalog_path(live, "backup")?;
+    Ok(CatalogActivationArtifact {
+        kind,
+        live: catalog_activation_path_string(live)?,
+        staged: catalog_activation_path_string(staged)?,
+        backup: catalog_activation_path_string(&backup)?,
+        previous_hash: catalog_activation_hash_if_present(kind, live)?,
+        next_hash: catalog_activation_hash(kind, staged)?,
+    })
+}
+
+fn valid_activation_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_catalog_activation_sibling(
+    live: &Path,
+    sibling: &Path,
+    label: &str,
+) -> Result<(), AppError> {
+    if sibling.parent() != live.parent() || sibling == live {
+        return Err(AppError::StorageCorrupt {
+            message: "catalog activation paths are not exact siblings".into(),
+        });
+    }
+    let live_name = live
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "catalog activation live path has no valid file name".into(),
+        })?;
+    let sibling_name = sibling
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "catalog activation sibling has no valid file name".into(),
+        })?;
+    let prefix = format!(".{live_name}.{label}-");
+    let suffix = sibling_name
+        .strip_prefix(&prefix)
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "catalog activation sibling name is invalid".into(),
+        })?;
+    uuid::Uuid::parse_str(suffix).map_err(|_| AppError::StorageCorrupt {
+        message: "catalog activation sibling identifier is invalid".into(),
+    })?;
+    Ok(())
+}
+
+fn validate_catalog_activation_record(
+    app_data_dir: &Path,
+    record: &CatalogActivationRecord,
+) -> Result<(), AppError> {
+    if record.schema_version != CATALOG_ACTIVATION_SCHEMA_VERSION
+        || matches!(record.source, CatalogSource::UserClone { .. })
+        || record.catalog.kind != CatalogActivationArtifactKind::Directory
+        || record.index.kind != CatalogActivationArtifactKind::File
+        || record.meta.kind != CatalogActivationArtifactKind::File
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "catalog activation record has an invalid schema or source".into(),
+        });
+    }
+    let expected_catalog = catalog_root(app_data_dir, &record.source);
+    let expected_index = index_path(app_data_dir);
+    let expected_meta = meta_path(app_data_dir);
+    for (artifact, expected_live) in [
+        (&record.catalog, expected_catalog.as_path()),
+        (&record.index, expected_index.as_path()),
+        (&record.meta, expected_meta.as_path()),
+    ] {
+        let live = Path::new(&artifact.live);
+        let staged = Path::new(&artifact.staged);
+        let backup = Path::new(&artifact.backup);
+        if live != expected_live
+            || !live.is_absolute()
+            || !valid_activation_hash(&artifact.next_hash)
+            || artifact
+                .previous_hash
+                .as_deref()
+                .is_some_and(|hash| !valid_activation_hash(hash))
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "catalog activation record has invalid paths or hashes".into(),
+            });
+        }
+        validate_catalog_activation_sibling(live, staged, "staging")?;
+        validate_catalog_activation_sibling(live, backup, "backup")?;
+    }
+    let paths = record
+        .artifacts()
+        .into_iter()
+        .flat_map(|artifact| [&artifact.live, &artifact.staged, &artifact.backup])
+        .collect::<BTreeSet<_>>();
+    if paths.len() != 9 {
+        return Err(AppError::StorageCorrupt {
+            message: "catalog activation record paths are not distinct".into(),
+        });
+    }
+    Ok(())
+}
+
+async fn save_catalog_activation_record(
+    app_data_dir: &Path,
+    record: &CatalogActivationRecord,
+) -> Result<(), AppError> {
+    validate_catalog_activation_record(app_data_dir, record)?;
+    let bytes = serde_json::to_vec_pretty(record).map_err(|error| AppError::Internal {
+        message: format!("serialize catalog activation record: {error}"),
+    })?;
+    if bytes.len() as u64 > MAX_CATALOG_ACTIVATION_JOURNAL_BYTES {
+        return Err(AppError::InvalidArgument {
+            message: "catalog activation record exceeds its byte limit".into(),
+        });
+    }
+    atomic_write(&catalog_activation_path(app_data_dir), &bytes).await
+}
+
+fn load_catalog_activation_record(
+    app_data_dir: &Path,
+) -> Result<Option<CatalogActivationRecord>, AppError> {
+    let path = catalog_activation_path(app_data_dir);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("inspect catalog activation record: {error}"),
+            });
+        }
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+        || metadata.len() > MAX_CATALOG_ACTIVATION_JOURNAL_BYTES
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "catalog activation record is not a bounded real file".into(),
+        });
+    }
+    let bytes = std::fs::read(&path).map_err(|error| AppError::Io {
+        message: format!("read catalog activation record: {error}"),
+    })?;
+    let record = serde_json::from_slice::<CatalogActivationRecord>(&bytes).map_err(|_| {
+        AppError::StorageCorrupt {
+            message: "catalog activation record is invalid".into(),
+        }
+    })?;
+    validate_catalog_activation_record(app_data_dir, &record)?;
+    Ok(Some(record))
+}
+
 // ---------- Refresh (live tarball) ----------
 
 /// Fetch the GitHub tarball, extract its category dirs over the working
@@ -1941,6 +2356,8 @@ fn staged_catalog_path(live: &Path, label: &str) -> Result<PathBuf, AppError> {
 #[cfg(test)]
 std::thread_local! {
     static CATALOG_ACTIVATION_RENAME_FAILURES: std::cell::RefCell<Option<(PathBuf, u8)>> = const { std::cell::RefCell::new(None) };
+    static CATALOG_CRASH_AFTER_BACKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CATALOG_CRASH_TRIGGERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1953,6 +2370,38 @@ fn inject_catalog_activation_restore_failures(destination: &Path) {
         );
         *injection = Some((destination.to_path_buf(), 2));
     });
+}
+
+#[cfg(test)]
+fn inject_catalog_crash_after_backup() {
+    CATALOG_CRASH_AFTER_BACKUP.with(|injection| {
+        assert!(
+            !injection.replace(true),
+            "catalog crash injection is already armed"
+        );
+    });
+}
+
+fn maybe_crash_after_catalog_backup() -> Result<(), AppError> {
+    #[cfg(test)]
+    {
+        if CATALOG_CRASH_AFTER_BACKUP.with(|injection| injection.replace(false)) {
+            CATALOG_CRASH_TRIGGERED.with(|triggered| triggered.set(true));
+            return Err(AppError::Internal {
+                message: "injected process crash after catalog backup".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn take_injected_catalog_crash() -> bool {
+    #[cfg(test)]
+    {
+        CATALOG_CRASH_TRIGGERED.with(|triggered| triggered.replace(false))
+    }
+    #[cfg(not(test))]
+    false
 }
 
 fn rename_catalog_path(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
@@ -1980,49 +2429,215 @@ fn rename_catalog_path(source: &Path, destination: &Path) -> Result<(), std::io:
     std::fs::rename(source, destination)
 }
 
-fn activate_staged_catalog(live: &Path, staged: &Path) -> Result<Option<PathBuf>, AppError> {
-    let backup = if live.exists() {
-        validate_real_directory(live, "managed catalog root")?;
-        let backup = staged_catalog_path(live, "backup")?;
-        rename_catalog_path(live, &backup).map_err(|error| AppError::Io {
-            message: format!("backup managed catalog before refresh: {error}"),
-        })?;
-        Some(backup)
-    } else {
-        None
-    };
-    if let Err(error) = rename_catalog_path(staged, live) {
-        if let Some(backup) = &backup {
-            if let Err(restore) = rename_catalog_path(backup, live) {
-                return Err(AppError::Internal {
-                    message: format!(
-                        "activate staged managed catalog failed: {error}; restore failed: {restore}; recovery retained at {} and {}",
-                        backup.display(),
-                        staged.display()
-                    ),
-                });
-            }
-            let _ = std::fs::remove_dir_all(staged);
-        }
-        return Err(AppError::Io {
-            message: format!("activate staged managed catalog: {error}"),
-        });
-    }
-    Ok(backup)
+fn catalog_activation_paths(artifact: &CatalogActivationArtifact) -> (&Path, &Path, &Path) {
+    (
+        Path::new(&artifact.live),
+        Path::new(&artifact.staged),
+        Path::new(&artifact.backup),
+    )
 }
 
-fn restore_catalog_snapshot(live: &Path, backup: Option<&Path>) -> Result<(), AppError> {
-    if live.exists() {
-        std::fs::remove_dir_all(live).map_err(|error| AppError::Io {
-            message: format!("remove failed managed catalog refresh: {error}"),
-        })?;
-    }
-    if let Some(backup) = backup {
-        std::fs::rename(backup, live).map_err(|error| AppError::Io {
-            message: format!("restore managed catalog after refresh failure: {error}"),
-        })?;
+fn validate_prepared_catalog_artifact(
+    artifact: &CatalogActivationArtifact,
+) -> Result<(), AppError> {
+    let (live, staged, backup) = catalog_activation_paths(artifact);
+    if catalog_activation_hash_if_present(artifact.kind, live)? != artifact.previous_hash
+        || catalog_activation_hash_if_present(artifact.kind, staged)?
+            != Some(artifact.next_hash.clone())
+        || catalog_activation_hash_if_present(artifact.kind, backup)?.is_some()
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "catalog activation inputs changed after validation".into(),
+        });
     }
     Ok(())
+}
+
+fn activate_catalog_artifact(
+    artifact: &CatalogActivationArtifact,
+    crash_after_backup: bool,
+) -> Result<(), AppError> {
+    validate_prepared_catalog_artifact(artifact)?;
+    let (live, staged, backup) = catalog_activation_paths(artifact);
+    if artifact.previous_hash.is_some() {
+        rename_catalog_path(live, backup).map_err(|error| AppError::Io {
+            message: format!(
+                "backup catalog activation target {}: {error}",
+                live.display()
+            ),
+        })?;
+        if crash_after_backup {
+            maybe_crash_after_catalog_backup()?;
+        }
+    }
+    rename_catalog_path(staged, live).map_err(|error| AppError::Io {
+        message: format!(
+            "activate staged managed catalog {}: {error}",
+            live.display()
+        ),
+    })?;
+    Ok(())
+}
+
+fn remove_catalog_activation_artifact(
+    kind: CatalogActivationArtifactKind,
+    path: &Path,
+    expected_hash: &str,
+) -> Result<(), AppError> {
+    let Some(actual_hash) = catalog_activation_hash_if_present(kind, path)? else {
+        return Ok(());
+    };
+    if actual_hash != expected_hash {
+        return Err(AppError::StorageCorrupt {
+            message: format!(
+                "catalog activation recovery refused changed path {}",
+                path.display()
+            ),
+        });
+    }
+    match kind {
+        CatalogActivationArtifactKind::Directory => std::fs::remove_dir_all(path),
+        CatalogActivationArtifactKind::File => std::fs::remove_file(path),
+    }
+    .map_err(|error| AppError::Io {
+        message: format!(
+            "remove catalog activation recovery path {}: {error}",
+            path.display()
+        ),
+    })
+}
+
+fn validate_catalog_artifact_for_rollback(
+    artifact: &CatalogActivationArtifact,
+) -> Result<(), AppError> {
+    let (live, staged, backup) = catalog_activation_paths(artifact);
+    let live_hash = catalog_activation_hash_if_present(artifact.kind, live)?;
+    let staged_hash = catalog_activation_hash_if_present(artifact.kind, staged)?;
+    let backup_hash = catalog_activation_hash_if_present(artifact.kind, backup)?;
+    if live_hash.as_deref().is_some_and(|hash| {
+        hash != artifact.next_hash && Some(hash) != artifact.previous_hash.as_deref()
+    }) || staged_hash
+        .as_deref()
+        .is_some_and(|hash| hash != artifact.next_hash)
+        || backup_hash.as_deref() != artifact.previous_hash.as_deref() && backup_hash.is_some()
+        || artifact.previous_hash.is_some()
+            && live_hash.as_deref() != artifact.previous_hash.as_deref()
+            && backup_hash.as_deref() != artifact.previous_hash.as_deref()
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "catalog activation recovery topology or hashes changed".into(),
+        });
+    }
+    Ok(())
+}
+
+fn rollback_catalog_artifact(artifact: &CatalogActivationArtifact) -> Result<(), AppError> {
+    let (live, staged, backup) = catalog_activation_paths(artifact);
+    if catalog_activation_hash_if_present(artifact.kind, live)?.as_deref()
+        == Some(artifact.next_hash.as_str())
+    {
+        remove_catalog_activation_artifact(artifact.kind, live, &artifact.next_hash)?;
+    }
+    if let Some(previous_hash) = &artifact.previous_hash {
+        if catalog_activation_hash_if_present(artifact.kind, live)?.as_deref()
+            == Some(previous_hash.as_str())
+        {
+            remove_catalog_activation_artifact(artifact.kind, backup, previous_hash)?;
+        } else {
+            rename_catalog_path(backup, live).map_err(|error| AppError::Internal {
+                message: format!(
+                    "restore failed for {}: {error}; recovery retained at {} and {}",
+                    live.display(),
+                    backup.display(),
+                    staged.display()
+                ),
+            })?;
+        }
+    }
+    remove_catalog_activation_artifact(artifact.kind, staged, &artifact.next_hash)
+}
+
+fn remove_catalog_activation_record(app_data_dir: &Path) -> Result<(), AppError> {
+    match std::fs::remove_file(catalog_activation_path(app_data_dir)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Io {
+            message: format!("remove catalog activation record: {error}"),
+        }),
+    }
+}
+
+fn rollback_catalog_activation(
+    app_data_dir: &Path,
+    record: &CatalogActivationRecord,
+) -> Result<(), AppError> {
+    for artifact in record.artifacts() {
+        validate_catalog_artifact_for_rollback(artifact)?;
+    }
+    for artifact in [&record.meta, &record.index, &record.catalog] {
+        rollback_catalog_artifact(artifact)?;
+    }
+    remove_catalog_activation_record(app_data_dir)
+}
+
+fn finalize_catalog_activation(
+    app_data_dir: &Path,
+    record: &CatalogActivationRecord,
+) -> Result<(), AppError> {
+    for artifact in record.artifacts() {
+        let (live, staged, backup) = catalog_activation_paths(artifact);
+        if catalog_activation_hash_if_present(artifact.kind, live)?.as_deref()
+            != Some(artifact.next_hash.as_str())
+            || catalog_activation_hash_if_present(artifact.kind, staged)?
+                .as_deref()
+                .is_some_and(|hash| hash != artifact.next_hash)
+            || catalog_activation_hash_if_present(artifact.kind, backup)?.as_deref()
+                != artifact.previous_hash.as_deref()
+                && catalog_activation_hash_if_present(artifact.kind, backup)?.is_some()
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "committed catalog activation artifacts changed".into(),
+            });
+        }
+    }
+    for artifact in record.artifacts() {
+        let (_, staged, backup) = catalog_activation_paths(artifact);
+        remove_catalog_activation_artifact(artifact.kind, staged, &artifact.next_hash)?;
+        if let Some(previous_hash) = &artifact.previous_hash {
+            remove_catalog_activation_artifact(artifact.kind, backup, previous_hash)?;
+        }
+    }
+    remove_catalog_activation_record(app_data_dir)
+}
+
+fn recover_catalog_activation(app_data_dir: &Path) -> Result<bool, AppError> {
+    let Some(record) = load_catalog_activation_record(app_data_dir)? else {
+        return Ok(false);
+    };
+    if record.phase == CatalogActivationPhase::Committed {
+        finalize_catalog_activation(app_data_dir, &record)?;
+    } else {
+        rollback_catalog_activation(app_data_dir, &record)?;
+    }
+    Ok(true)
+}
+
+async fn apply_catalog_activation(
+    app_data_dir: &Path,
+    record: &mut CatalogActivationRecord,
+) -> Result<(), AppError> {
+    activate_catalog_artifact(&record.catalog, true)?;
+    record.phase = CatalogActivationPhase::CatalogActivated;
+    save_catalog_activation_record(app_data_dir, record).await?;
+    activate_catalog_artifact(&record.index, false)?;
+    record.phase = CatalogActivationPhase::IndexActivated;
+    save_catalog_activation_record(app_data_dir, record).await?;
+    activate_catalog_artifact(&record.meta, false)?;
+    record.phase = CatalogActivationPhase::MetaActivated;
+    save_catalog_activation_record(app_data_dir, record).await?;
+    record.phase = CatalogActivationPhase::Committed;
+    save_catalog_activation_record(app_data_dir, record).await?;
+    finalize_catalog_activation(app_data_dir, record)
 }
 
 fn validate_runbooks_manifest(root: &Path) -> Result<(), AppError> {
@@ -2052,6 +2667,7 @@ async fn refresh_from_tarball(
     source: &CatalogSource,
     bytes: &[u8],
 ) -> Result<CorpusMeta, AppError> {
+    recover_catalog_activation(app_data_dir)?;
     let dir = catalog_root(app_data_dir, source);
     validate_snapshot_replacement_source(source, &dir)?;
 
@@ -2096,44 +2712,85 @@ async fn refresh_from_tarball(
     let fetched_at = chrono::Utc::now().to_rfc3339();
     corpus.meta.fetched_at = fetched_at.clone();
 
-    let backup = match activate_staged_catalog(&dir, &staged) {
-        Ok(backup) => backup,
-        Err(error) => return Err(error),
-    };
-
-    // Persist a fresh meta (overwrite fetched_at/version this time —
-    // unlike the baseline persist which preserves prior fetched_at).
     let sdir = state_dir(app_data_dir);
-    let persist_result = async {
-        tokio::fs::create_dir_all(&sdir)
-            .await
-            .map_err(|e| AppError::Io {
-                message: format!("create state dir {}: {e}", sdir.display()),
-            })?;
-        let index_bytes = corpus.index_json()?;
-        atomic_write(&index_path(app_data_dir), &index_bytes).await?;
-        let stored = StoredMeta {
-            version: version.clone(),
-            commit: None,
-            fetched_at: fetched_at.clone(),
-            count: corpus.count(),
-        };
-        let meta_bytes = serde_json::to_vec_pretty(&stored).map_err(|e| AppError::Internal {
-            message: format!("serialize corpus-meta.json: {e}"),
+    tokio::fs::create_dir_all(&sdir)
+        .await
+        .map_err(|e| AppError::Io {
+            message: format!("create state dir {}: {e}", sdir.display()),
         })?;
-        atomic_write(&meta_path(app_data_dir), &meta_bytes).await
+    let index_live = index_path(app_data_dir);
+    let meta_live = meta_path(app_data_dir);
+    let index_staged = staged_catalog_path(&index_live, "staging")?;
+    let meta_staged = staged_catalog_path(&meta_live, "staging")?;
+    let index_bytes = corpus.index_json()?;
+    let stored = StoredMeta {
+        version: version.clone(),
+        commit: None,
+        fetched_at: fetched_at.clone(),
+        count: corpus.count(),
+    };
+    let meta_bytes = serde_json::to_vec_pretty(&stored).map_err(|e| AppError::Internal {
+        message: format!("serialize corpus-meta.json: {e}"),
+    })?;
+    let state_stage_result = async {
+        write_catalog_state(&index_staged, &index_bytes).await?;
+        write_catalog_state(&meta_staged, &meta_bytes).await
     }
     .await;
-    if let Err(error) = persist_result {
-        if let Err(rollback) = restore_catalog_snapshot(&dir, backup.as_deref()) {
+    if let Err(error) = state_stage_result {
+        let _ = std::fs::remove_dir_all(&staged);
+        let _ = std::fs::remove_file(&index_staged);
+        let _ = std::fs::remove_file(&meta_staged);
+        return Err(error);
+    }
+
+    let planned = (|| {
+        Ok::<CatalogActivationRecord, AppError>(CatalogActivationRecord {
+            schema_version: CATALOG_ACTIVATION_SCHEMA_VERSION,
+            phase: CatalogActivationPhase::Prepared,
+            source: source.clone(),
+            catalog: plan_catalog_activation_artifact(
+                CatalogActivationArtifactKind::Directory,
+                &dir,
+                &staged,
+            )?,
+            index: plan_catalog_activation_artifact(
+                CatalogActivationArtifactKind::File,
+                &index_live,
+                &index_staged,
+            )?,
+            meta: plan_catalog_activation_artifact(
+                CatalogActivationArtifactKind::File,
+                &meta_live,
+                &meta_staged,
+            )?,
+        })
+    })();
+    let mut record = match planned {
+        Ok(record) => record,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staged);
+            let _ = std::fs::remove_file(&index_staged);
+            let _ = std::fs::remove_file(&meta_staged);
+            return Err(error);
+        }
+    };
+    if let Err(error) = save_catalog_activation_record(app_data_dir, &record).await {
+        let _ = std::fs::remove_dir_all(&staged);
+        let _ = std::fs::remove_file(&index_staged);
+        let _ = std::fs::remove_file(&meta_staged);
+        return Err(error);
+    }
+    if let Err(error) = apply_catalog_activation(app_data_dir, &mut record).await {
+        if take_injected_catalog_crash() {
+            return Err(error);
+        }
+        if let Err(rollback) = recover_catalog_activation(app_data_dir) {
             return Err(AppError::Internal {
                 message: format!("catalog refresh failed: {error}; rollback failed: {rollback}"),
             });
         }
         return Err(error);
-    }
-    if let Some(backup) = backup {
-        let _ = std::fs::remove_dir_all(backup);
     }
 
     Ok(corpus.meta)
@@ -2590,11 +3247,44 @@ async fn detect_catalogs(scan: bool) -> CatalogDetection {
 /// Ensure `~/.agency-agents` holds a catalog, cloning (git) or unpacking the
 /// snapshot (no git) as needed. Returns the managed root path. Idempotent: if
 /// it already looks like a catalog, this is a no-op (use pull to update).
+fn validate_managed_provision_target(path: &Path) -> Result<(), AppError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("inspect managed catalog target {}: {error}", path.display()),
+            });
+        }
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "refusing to provision into unowned target {}",
+                path.display()
+            ),
+        });
+    }
+    if !is_empty_dir(path) && !looks_like_catalog(path) {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "refusing to provision into non-empty unowned target {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 async fn provision_managed_from_tarball(
     app_data_dir: &Path,
     path: &Path,
     bytes: &[u8],
 ) -> Result<(), AppError> {
+    validate_managed_provision_target(path)?;
     let source = CatalogSource::Managed {
         path: path.to_string_lossy().into_owned(),
     };
@@ -2607,6 +3297,7 @@ async fn provision_managed(app_data_dir: &Path) -> Result<PathBuf, AppError> {
     let path = home_agency_dir().ok_or_else(|| AppError::Io {
         message: "cannot resolve home directory".into(),
     })?;
+    validate_managed_provision_target(&path)?;
     if looks_like_catalog(&path) {
         return Ok(path); // already provisioned
     }
@@ -3435,6 +4126,7 @@ fn read_playbook(root: &Path, relative_path: &str) -> Result<PlaybookDocument, A
 fn playbook_catalog(root: &Path) -> Result<Vec<PlaybookCatalogEntry>, AppError> {
     validate_real_directory(root, "catalog root")?;
     let mut documents = Vec::new();
+    let mut total_entries = 0usize;
     for allowed_root in PLAYBOOK_ROOTS {
         let directory = root.join(allowed_root);
         let metadata = match std::fs::symlink_metadata(&directory) {
@@ -3454,16 +4146,25 @@ fn playbook_catalog(root: &Path) -> Result<Vec<PlaybookCatalogEntry>, AppError> 
                 message: format!("{allowed_root}/ must be a real directory"),
             });
         }
-        let mut directories = VecDeque::from([directory]);
-        while let Some(directory) = directories.pop_front() {
-            let mut entries = std::fs::read_dir(&directory)
-                .map_err(|error| AppError::Io {
-                    message: format!("read {allowed_root} playbooks: {error}"),
-                })?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| AppError::Io {
+        let mut directories = VecDeque::from([(directory, 0usize)]);
+        while let Some((directory, depth)) = directories.pop_front() {
+            let read_dir = std::fs::read_dir(&directory).map_err(|error| AppError::Io {
+                message: format!("read {allowed_root} playbooks: {error}"),
+            })?;
+            let mut entries = Vec::new();
+            for entry in read_dir {
+                total_entries += 1;
+                if total_entries > MAX_PLAYBOOK_ENTRIES {
+                    return Err(AppError::InvalidArgument {
+                        message: format!(
+                            "playbook traversal exceeds its {MAX_PLAYBOOK_ENTRIES}-entry limit"
+                        ),
+                    });
+                }
+                entries.push(entry.map_err(|error| AppError::Io {
                     message: format!("read {allowed_root} playbook entry: {error}"),
-                })?;
+                })?);
+            }
             entries.sort_by_key(std::fs::DirEntry::file_name);
             for entry in entries {
                 let path = entry.path();
@@ -3482,7 +4183,14 @@ fn playbook_catalog(root: &Path) -> Result<Vec<PlaybookCatalogEntry>, AppError> 
                 }
                 let relative_path = normalized_corpus_relative_path(root, &path)?;
                 if metadata.is_dir() {
-                    directories.push_back(path);
+                    if depth >= MAX_PLAYBOOK_DEPTH {
+                        return Err(AppError::InvalidArgument {
+                            message: format!(
+                                "playbook traversal exceeds its {MAX_PLAYBOOK_DEPTH}-level depth limit"
+                            ),
+                        });
+                    }
+                    directories.push_back((path, depth + 1));
                     continue;
                 }
                 if path.extension().and_then(|value| value.to_str()) != Some("md") {
@@ -5663,6 +6371,30 @@ echo done
     }
 
     #[tokio::test]
+    async fn managed_snapshot_provision_refuses_a_nonempty_foreign_target() {
+        let app_data = tempfile::tempdir().unwrap();
+        let managed_parent = tempfile::tempdir().unwrap();
+        let managed = managed_parent.path().join(".agency-agents");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::write(managed.join("foreign.txt"), b"foreign bytes stay exact\n").unwrap();
+        let valid_tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nComplete\n",
+        )]);
+
+        let error = provision_managed_from_tarball(app_data.path(), &managed, &valid_tar)
+            .await
+            .expect_err("a nonempty non-catalog target must not be claimed by provisioning");
+
+        assert!(error.to_string().contains("non-empty"));
+        assert_eq!(
+            std::fs::read(managed.join("foreign.txt")).unwrap(),
+            b"foreign bytes stay exact\n"
+        );
+        assert!(!managed.join("engineering/reviewer.md").exists());
+    }
+
+    #[tokio::test]
     async fn failed_catalog_activation_and_restore_retains_both_recovery_trees() {
         let app_data = tempfile::tempdir().unwrap();
         let live = corpus_dir(app_data.path());
@@ -5723,6 +6455,91 @@ echo done
         assert_eq!(
             std::fs::read(staged.join("engineering/reviewer.md")).unwrap(),
             b"---\nname: Reviewer\n---\nReplacement\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_a_crash_between_catalog_backup_and_publish_idempotently() {
+        let app_data = tempfile::tempdir().unwrap();
+        let baseline = tempfile::tempdir().unwrap();
+        let live = corpus_dir(app_data.path());
+        std::fs::create_dir_all(live.join("engineering")).unwrap();
+        std::fs::write(
+            live.join("engineering/original.md"),
+            b"---\nname: Original\n---\nOriginal\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(state_dir(app_data.path())).unwrap();
+        std::fs::write(index_path(app_data.path()), b"old index bytes\n").unwrap();
+        std::fs::write(meta_path(app_data.path()), b"old meta bytes\n").unwrap();
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nReplacement\n",
+        )]);
+        inject_catalog_crash_after_backup();
+
+        refresh_from_tarball(app_data.path(), &CatalogSource::Bundled, &tar)
+            .await
+            .expect_err("the test must stop after preserving the previous catalog");
+        assert!(!live.exists());
+
+        let first = resolve_active(app_data.path(), baseline.path()).await;
+        assert_eq!(first.count(), 1);
+        assert_eq!(first.agents[0].name, "Original");
+        assert_eq!(
+            std::fs::read(live.join("engineering/original.md")).unwrap(),
+            b"---\nname: Original\n---\nOriginal\n"
+        );
+        assert!(!live.join("engineering/reviewer.md").exists());
+
+        let second = resolve_active(app_data.path(), baseline.path()).await;
+        assert_eq!(second.count(), 1);
+        assert_eq!(second.agents[0].name, "Original");
+        assert!(std::fs::read_dir(app_data.path()).unwrap().all(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().to_str().map(str::to_owned))
+                .is_none_or(|name| {
+                    !name.starts_with(".corpus.backup-") && !name.starts_with(".corpus.staging-")
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_second_catalog_state_write_restores_tree_index_and_meta_together() {
+        let app_data = tempfile::tempdir().unwrap();
+        let live = corpus_dir(app_data.path());
+        std::fs::create_dir_all(live.join("engineering")).unwrap();
+        std::fs::write(
+            live.join("engineering/original.md"),
+            b"---\nname: Original\n---\nOriginal\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(state_dir(app_data.path())).unwrap();
+        std::fs::write(index_path(app_data.path()), b"old index bytes\n").unwrap();
+        std::fs::write(meta_path(app_data.path()), b"old meta bytes\n").unwrap();
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nReplacement\n",
+        )]);
+        inject_catalog_state_write_failure_after(1);
+
+        refresh_from_tarball(app_data.path(), &CatalogSource::Bundled, &tar)
+            .await
+            .expect_err("the second state write must fail the complete refresh");
+
+        assert_eq!(
+            std::fs::read(live.join("engineering/original.md")).unwrap(),
+            b"---\nname: Original\n---\nOriginal\n"
+        );
+        assert!(!live.join("engineering/reviewer.md").exists());
+        assert_eq!(
+            std::fs::read(index_path(app_data.path())).unwrap(),
+            b"old index bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(meta_path(app_data.path())).unwrap(),
+            b"old meta bytes\n"
         );
     }
 
@@ -5814,6 +6631,38 @@ echo done
             .unwrap();
         }
         assert!(playbook_catalog(root.path()).is_err());
+    }
+
+    #[test]
+    fn playbook_catalog_rejects_a_non_document_entry_flood() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("examples")).unwrap();
+        for index in 0..1025 {
+            std::fs::write(
+                root.path().join(format!("examples/ignored-{index:04}.txt")),
+                b"ignored",
+            )
+            .unwrap();
+        }
+
+        let error = playbook_catalog(root.path())
+            .expect_err("non-document entries must consume the traversal budget");
+        assert!(error.to_string().contains("entry limit"));
+    }
+
+    #[test]
+    fn playbook_catalog_rejects_excessive_directory_depth() {
+        let root = tempfile::tempdir().unwrap();
+        let mut directory = root.path().join("strategy");
+        std::fs::create_dir(&directory).unwrap();
+        for index in 0..17 {
+            directory.push(format!("level-{index:02}"));
+            std::fs::create_dir(&directory).unwrap();
+        }
+
+        let error = playbook_catalog(root.path())
+            .expect_err("deep directory trees must stop before further queueing");
+        assert!(error.to_string().contains("depth limit"));
     }
 
     #[test]
