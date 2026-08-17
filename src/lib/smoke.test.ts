@@ -5402,7 +5402,7 @@ describe("frontend test harness", () => {
     expect(installStoreSource).toContain("agentRostersReconcile()");
   });
 
-  it("keeps roster install disable enable and rollback live while Agent truth is unavailable", async () => {
+  it("keeps roster lifecycle and modified-file rollback live while Agent truth is unavailable", async () => {
     const projectPath = "/tmp/roster-project";
     const packages = [
       staleControlPackage,
@@ -5459,7 +5459,7 @@ describe("frontend test harness", () => {
       blockers: [],
       rollbackAvailable: false,
     };
-    let rosterRows: Array<{ record: typeof record; state: "current" | "disabled" }> = [];
+    let rosterRows: Array<{ record: typeof record; state: "current" | "disabled" | "modified" }> = [];
     const invokeMock = vi.mocked(invoke);
     invokeMock.mockImplementation(async (command: string, args) => {
       if (command === "projects_list") return projectRows as never;
@@ -5481,7 +5481,7 @@ describe("frontend test harness", () => {
       }
       if (command === "agent_roster_enable") {
         record.disabledPath = null;
-        rosterRows = [{ record, state: "current" }];
+        rosterRows = [{ record, state: "modified" }];
         return record as never;
       }
       if (command === "agent_roster_version_history") return [{
@@ -5489,6 +5489,9 @@ describe("frontend test harness", () => {
         sourceHash: "c".repeat(64), renderedHash: "d".repeat(64), contentPath: "/tmp/snapshot",
       }] as never;
       if (command === "agent_roster_version_rollback") {
+        expect(args).toMatchObject({
+          tool: "aider", projectPath, snapshotId: "roster-snapshot", confirmed: true,
+        });
         rosterRows = [{ record, state: "current" }];
         return record as never;
       }
@@ -5534,7 +5537,7 @@ describe("frontend test harness", () => {
       buttonNamed("Disable")!.click();
       await vi.waitFor(() => expect(buttonNamed("Enable")).toBeTruthy());
       buttonNamed("Enable")!.click();
-      await vi.waitFor(() => expect(buttonNamed("Disable")).toBeTruthy());
+      await vi.waitFor(() => expect(buttonNamed("Version history")).toBeTruthy());
 
       buttonNamed("Version history")!.click();
       const rollback = await vi.waitFor(() => {

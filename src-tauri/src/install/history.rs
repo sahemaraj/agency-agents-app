@@ -36,12 +36,31 @@ pub(super) struct RosterHistoryMutation {
 }
 
 impl RosterHistoryMutation {
-    pub(super) async fn commit(self) {
+    pub(super) fn retired_snapshot_ids(&self) -> Vec<String> {
+        self.retired
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect()
+    }
+
+    pub(super) async fn commit(self) -> Result<(), AppError> {
         for path in self.retired {
-            if path.parent() == Some(self.directory.as_path()) {
-                let _ = tokio::fs::remove_dir_all(&path).await;
+            if path.parent() != Some(self.directory.as_path()) {
+                return Err(AppError::StorageCorrupt {
+                    message: "Retired Agent roster snapshot escaped its history directory".into(),
+                });
+            }
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::Io {
+                        message: format!("prune retired Agent roster snapshot: {error}"),
+                    });
+                }
             }
         }
+        Ok(())
     }
 
     pub(super) async fn rollback(self) -> Result<(), AppError> {
@@ -90,6 +109,66 @@ impl RosterHistoryMutation {
         }
         Ok(())
     }
+}
+
+pub(super) async fn commit_roster_retention(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    retired_snapshot_ids: &[String],
+) -> Result<(), AppError> {
+    if retired_snapshot_ids.is_empty() {
+        return Ok(());
+    }
+    let directory = app_data_dir
+        .join("agents/history")
+        .join(identity_hash(identity)?);
+    let retained = load_index(&directory.join("index.json"))
+        .await?
+        .into_iter()
+        .map(|snapshot| snapshot.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for id in retired_snapshot_ids {
+        if id.is_empty()
+            || !id.is_ascii()
+            || id.len() <= 36
+            || uuid::Uuid::parse_str(&id[id.len() - 36..]).is_err()
+            || Path::new(id).components().count() != 1
+            || retained.contains(id)
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster retention recovery metadata is invalid".into(),
+            });
+        }
+        let path = directory.join(id);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || crate::skills::metadata_is_reparse_point(&metadata) =>
+            {
+                return Err(AppError::StorageCorrupt {
+                    message: "Retired Agent roster snapshot is not a regular directory".into(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect retired Agent roster snapshot: {error}"),
+                });
+            }
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("prune retired Agent roster snapshot: {error}"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn roster_record_hash(record: &crate::types::AgentRosterInstallRecord) -> Result<String, AppError> {
@@ -212,7 +291,7 @@ pub(super) async fn create_snapshot_protected(
     )
     .await?;
     let snapshot = mutation.snapshot.clone();
-    mutation.commit().await;
+    mutation.commit().await?;
     Ok(snapshot)
 }
 
@@ -236,7 +315,7 @@ pub(super) async fn create_snapshot_from_bytes(
     )
     .await?;
     let snapshot = mutation.snapshot.clone();
-    mutation.commit().await;
+    mutation.commit().await?;
     Ok(snapshot)
 }
 
@@ -395,7 +474,7 @@ pub(super) async fn create_roster_snapshot(
     )
     .await?;
     let snapshot = mutation.snapshot.clone();
-    mutation.commit().await;
+    mutation.commit().await?;
     Ok(snapshot)
 }
 
