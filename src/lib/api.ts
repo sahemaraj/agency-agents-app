@@ -59,6 +59,8 @@ import type {
   AgentSourceResult,
   AgentUpdatePolicy,
   AgentMutationPlan,
+  AgentRosterInstallRecord,
+  AgentRosterMutationPlan,
   AgentVersionSnapshot,
   AgentWorkspaceProfile,
   AgentDiff,
@@ -394,6 +396,46 @@ export const agentBatchApply = (
   planRevision: string,
 ) => invoke<InstallRecord[]>("agent_batch_apply", {
   references, tool, projectPath, planRevision, confirmed: true,
+});
+
+export const agentRostersReconcile = () =>
+  invoke<import("./types").InstalledAgentRoster[]>("agent_rosters_reconcile");
+
+export const agentRosterPlan = (
+  references: AgentReference[],
+  operation: "install" | "update" | "uninstall",
+  tool: Tool,
+  projectPath: string,
+) => invoke<AgentRosterMutationPlan>("agent_roster_plan", {
+  references, operation, tool, projectPath,
+});
+
+export const agentRosterApply = (
+  plan: AgentRosterMutationPlan,
+) => invoke<AgentRosterInstallRecord>("agent_roster_apply", {
+  references: plan.members.map((member) => member.reference),
+  operation: plan.operation,
+  tool: plan.tool,
+  projectPath: plan.projectPath,
+  planRevision: plan.revision,
+  confirmed: true,
+});
+
+export const agentRosterDisable = (tool: Tool, projectPath: string) =>
+  invoke<AgentRosterInstallRecord>("agent_roster_disable", { tool, projectPath, confirmed: true });
+
+export const agentRosterEnable = (tool: Tool, projectPath: string) =>
+  invoke<AgentRosterInstallRecord>("agent_roster_enable", { tool, projectPath, confirmed: true });
+
+export const agentRosterVersionHistory = (tool: Tool, projectPath: string) =>
+  invoke<AgentVersionSnapshot[]>("agent_roster_version_history", { tool, projectPath });
+
+export const agentRosterVersionRollback = (
+  tool: Tool,
+  projectPath: string,
+  snapshotId: string,
+) => invoke<AgentRosterInstallRecord>("agent_roster_version_rollback", {
+  tool, projectPath, snapshotId, confirmed: true,
 });
 
 export function skillInstallPlan(

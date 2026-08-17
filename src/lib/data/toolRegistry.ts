@@ -54,6 +54,8 @@ const IMPLEMENTED_FORMATS = new Set([
   "skill-md",
   "kimi-agent",
   "openclaw-workspace",
+  "aider-conventions",
+  "windsurf-rules",
 ]);
 
 // Brand marks (Lobe Icons, MIT) — monochrome SVG keyed by filename stem.

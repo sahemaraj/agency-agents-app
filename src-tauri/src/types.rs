@@ -1525,6 +1525,54 @@ pub struct InstallRecord {
     pub deployment_notice: Option<String>,
 }
 
+/// One exact source member of a project-scoped aggregate roster.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRosterMember {
+    pub reference: AgentReference,
+    pub name: String,
+    pub source_hash: String,
+}
+
+/// Lifecycle truth for Aider/Windsurf's one-file project roster. This is a
+/// distinct install-ledger entry, never an Agent install row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRosterInstallRecord {
+    pub tool: Tool,
+    pub scope: Scope,
+    pub project_path: String,
+    pub dest: String,
+    pub members: Vec<AgentRosterMember>,
+    pub rendered_hash: String,
+    #[serde(default)]
+    pub disabled_path: Option<String>,
+    pub installed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledAgentRoster {
+    pub record: AgentRosterInstallRecord,
+    pub state: InstallState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRosterMutationPlan {
+    pub revision: String,
+    pub operation: String,
+    pub tool: Tool,
+    pub scope: Scope,
+    pub project_path: String,
+    pub destination: String,
+    pub members: Vec<AgentRosterMember>,
+    pub state: Option<InstallState>,
+    pub warnings: Vec<String>,
+    pub blockers: Vec<String>,
+    pub rollback_available: bool,
+}
+
 // ---------- Reconciliation ----------
 
 /// The seven reconciliation states (like a package manager's installed /
@@ -1594,6 +1642,8 @@ pub struct AgentVersionSnapshot {
     #[serde(default)]
     pub artifact_hashes: Vec<String>,
     pub content_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_record: Option<AgentRosterInstallRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

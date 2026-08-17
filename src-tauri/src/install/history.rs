@@ -132,6 +132,7 @@ pub(super) async fn create_snapshot_protected(
         rendered_hash,
         created_at,
         protected_snapshot_id,
+        None,
     )
     .await
 }
@@ -152,10 +153,12 @@ pub(super) async fn create_snapshot_from_bytes(
         rendered_hash,
         created_at,
         None,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // ponytail: one internal primitive keeps Agent and roster history atomic.
 async fn create_snapshot_from_bytes_protected(
     app_data_dir: &Path,
     identity: &AgentInstallIdentity,
@@ -164,6 +167,7 @@ async fn create_snapshot_from_bytes_protected(
     rendered_hash: &str,
     created_at: &str,
     protected_snapshot_id: Option<&str>,
+    roster_record: Option<&crate::types::AgentRosterInstallRecord>,
 ) -> Result<AgentVersionSnapshot, AppError> {
     if contents.is_empty() {
         return Err(invalid("Agent version snapshot requires at least one file"));
@@ -222,6 +226,7 @@ async fn create_snapshot_from_bytes_protected(
                 .map(|bytes| crate::render::sha256_hex(bytes))
                 .collect(),
             content_path: snapshot_directory.to_string_lossy().into_owned(),
+            roster_record: roster_record.cloned(),
         };
         let index_path = directory.join("index.json");
         let mut snapshots = load_index(&index_path).await?;
@@ -274,6 +279,41 @@ async fn create_snapshot_from_bytes_protected(
         let _ = tokio::fs::remove_dir_all(&snapshot_directory).await;
     }
     result
+}
+
+pub(super) async fn create_roster_snapshot(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    source_paths: &[PathBuf],
+    record: &crate::types::AgentRosterInstallRecord,
+    created_at: &str,
+    protected_snapshot_id: Option<&str>,
+) -> Result<AgentVersionSnapshot, AppError> {
+    if source_paths.is_empty() {
+        return Err(invalid("Agent roster snapshot requires its aggregate file"));
+    }
+    let mut contents = Vec::with_capacity(source_paths.len());
+    for source in source_paths {
+        regular_file(source)?;
+        contents.push(read_capped(source, MAX_SNAPSHOT_BYTES).await?);
+    }
+    let source_hash =
+        crate::render::sha256_hex(&serde_json::to_vec(&record.members).map_err(|error| {
+            AppError::Internal {
+                message: format!("serialize Agent roster membership: {error}"),
+            }
+        })?);
+    create_snapshot_from_bytes_protected(
+        app_data_dir,
+        identity,
+        &contents,
+        &source_hash,
+        &record.rendered_hash,
+        created_at,
+        protected_snapshot_id,
+        Some(record),
+    )
+    .await
 }
 
 pub(super) async fn list_snapshots(

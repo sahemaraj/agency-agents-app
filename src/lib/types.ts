@@ -1270,6 +1270,42 @@ export interface InstalledAgent {
   tracked: boolean;
 }
 
+export interface AgentRosterMember {
+  reference: AgentReference;
+  name: string;
+  sourceHash: string;
+}
+
+export interface AgentRosterInstallRecord {
+  tool: Tool;
+  scope: Scope;
+  projectPath: string;
+  dest: string;
+  members: AgentRosterMember[];
+  renderedHash: string;
+  disabledPath: string | null;
+  installedAt: string;
+}
+
+export interface InstalledAgentRoster {
+  record: AgentRosterInstallRecord;
+  state: InstallState;
+}
+
+export interface AgentRosterMutationPlan {
+  revision: string;
+  operation: "install" | "update" | "uninstall";
+  tool: Tool;
+  scope: Scope;
+  projectPath: string;
+  destination: string;
+  members: AgentRosterMember[];
+  state: InstallState | null;
+  warnings: string[];
+  blockers: string[];
+  rollbackAvailable: boolean;
+}
+
 export interface AgentPlanItem {
   reference: AgentReference;
   name: string;
@@ -1493,6 +1529,7 @@ export interface AgentVersionSnapshot {
   renderedHash: string;
   artifactHashes: string[];
   contentPath: string;
+  rosterRecord?: AgentRosterInstallRecord | null;
 }
 
 /** Result of `agent_diff` — current on-disk contents vs the canonical render

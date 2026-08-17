@@ -29,6 +29,8 @@ const IMPLEMENTED_FORMATS: &[&str] = &[
     "skill-md",
     "kimi-agent",
     "openclaw-workspace",
+    "aider-conventions",
+    "windsurf-rules",
 ];
 
 /// Scope capabilities — whether a tool can deploy user-globally and/or per-project.
@@ -203,6 +205,8 @@ mod tests {
             "antigravity",
             "kimi",
             "openclaw",
+            "aider",
+            "windsurf",
         ] {
             let m = get(id).unwrap_or_else(|| panic!("missing tool {id}"));
             assert!(m.installable(), "{id} should be installable");
@@ -210,16 +214,6 @@ mod tests {
                 m.format.is_some() && m.dest.is_some(),
                 "{id} needs format + dest"
             );
-        }
-    }
-
-    #[test]
-    fn recognized_tools_are_not_installable() {
-        // These carry a real (upstream) format the app doesn't render yet.
-        for id in ["windsurf", "aider"] {
-            let m = get(id).unwrap();
-            assert!(!m.installable(), "{id} is recognized-only in the app");
-            assert!(m.format.is_some(), "{id} still has an upstream format");
         }
     }
 

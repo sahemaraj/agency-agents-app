@@ -27,6 +27,13 @@ import {
   agentEnable,
   agentInstallPlan,
   agentInstallWithDependencies,
+  agentRosterApply,
+  agentRosterDisable,
+  agentRosterEnable,
+  agentRosterPlan,
+  agentRostersReconcile,
+  agentRosterVersionHistory,
+  agentRosterVersionRollback,
   agentTrackExact,
   agentUninstallExact,
   agentUninstallPlan,
@@ -41,8 +48,11 @@ import type {
   AgentDiff,
   AgentMutationPlan,
   AgentReference,
+  AgentRosterInstallRecord,
+  AgentRosterMutationPlan,
   AgentVersionSnapshot,
   InstalledAgent,
+  InstalledAgentRoster,
   InstallRecord,
   InstallState,
   Tool,
@@ -103,6 +113,7 @@ function mutationDeploymentNotice(value: unknown): string | undefined {
 export interface ToolDef {
   id: Tool;
   label: string;
+  installKind: string;
   scope: "user" | "project";
   /** Can deploy user-globally (`~/…`). */
   supportsUser: boolean;
@@ -124,6 +135,7 @@ const INSTALL_SELECTION_KEY = "agency-agents:install-selection";
 export const SUPPORTED_TOOLS: ToolDef[] = wiredTools().map((t) => ({
   id: t.id,
   label: t.label,
+  installKind: t.installKind ?? "per-agent",
   scope: t.scope?.user ? "user" : "project",
   supportsUser: t.scope?.user ?? false,
   supportsProject: t.scope?.project ?? false,
@@ -132,6 +144,11 @@ export const SUPPORTED_TOOLS: ToolDef[] = wiredTools().map((t) => ({
 class InstallStore {
   /** Reconciled cross-tool installs (the Library model). */
   installed: InstalledAgent[] = $state([]);
+  /** Project-scoped aggregate Aider/Windsurf roster truth. */
+  rosters: InstalledAgentRoster[] = $state([]);
+  rosterReconciling: boolean = $state(false);
+  rostersReconciled: boolean = $state(false);
+  rosterReconcileError: string | null = $state(null);
   /** Detected tools + counts (the Tools section). */
   tools: ToolInfo[] = $state([]);
   /** `${slug}:${tool}` currently mid-install/uninstall (for spinners). */
@@ -218,6 +235,21 @@ class InstallStore {
       }
     })();
     return reconcileInflight;
+  }
+
+  async reconcileRosters(): Promise<void> {
+    this.rosterReconciling = true;
+    try {
+      const rosters = await agentRostersReconcile();
+      if (!Array.isArray(rosters)) throw new Error("Agent roster reconciliation returned no rows");
+      this.rosters = rosters;
+      this.rostersReconciled = true;
+      this.rosterReconcileError = null;
+    } catch (error) {
+      this.rosterReconcileError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      this.rosterReconciling = false;
+    }
   }
 
   async loadTools(): Promise<void> {
@@ -428,6 +460,62 @@ class InstallStore {
     projectPath: string | null,
   ): Promise<AgentMutationPlan> {
     return agentBatchInstallPlan(references, tool, projectPath);
+  }
+
+  planRoster(
+    references: AgentReference[],
+    operation: "install" | "update" | "uninstall",
+    tool: Tool,
+    projectPath: string,
+  ): Promise<AgentRosterMutationPlan> {
+    return agentRosterPlan(references, operation, tool, projectPath);
+  }
+
+  async applyRoster(plan: AgentRosterMutationPlan): Promise<AgentRosterInstallRecord> {
+    this.busy = JSON.stringify(["roster", plan.tool, plan.projectPath]);
+    try {
+      const record = await agentRosterApply(plan);
+      await this.reconcile();
+      activity.log({
+        action: plan.operation,
+        subject: "agentLibrary",
+        subjectName: `${this.toolLabel(plan.tool)} roster`,
+        tool: plan.tool,
+        scope: "project",
+        projectPath: plan.projectPath,
+        outcome: "ok",
+        detail: `${plan.members.length} exact agents · ${plan.destination}`,
+      });
+      return record;
+    } finally {
+      this.busy = null;
+    }
+  }
+
+  async moveRoster(
+    tool: Tool,
+    projectPath: string,
+    enable: boolean,
+  ): Promise<AgentRosterInstallRecord> {
+    const record = enable
+      ? await agentRosterEnable(tool, projectPath)
+      : await agentRosterDisable(tool, projectPath);
+    await this.reconcile();
+    return record;
+  }
+
+  rosterHistory(tool: Tool, projectPath: string): Promise<AgentVersionSnapshot[]> {
+    return agentRosterVersionHistory(tool, projectPath);
+  }
+
+  async rollbackRoster(
+    tool: Tool,
+    projectPath: string,
+    snapshotId: string,
+  ): Promise<AgentRosterInstallRecord> {
+    const record = await agentRosterVersionRollback(tool, projectPath, snapshotId);
+    await this.reconcile();
+    return record;
   }
 
   async applyBatch(plan: AgentMutationPlan): Promise<{ records: InstallRecord[]; receiptId: string }> {

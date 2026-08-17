@@ -42,9 +42,11 @@
     type AgentMutationPlan,
     type AgentPackageResult,
     type AgentReference,
+    type AgentRosterMutationPlan,
     type AgentUpdatePolicy,
     type AgentVersionSnapshot,
     type InstalledAgent,
+    type InstalledAgentRoster,
     type InstallState,
   } from "$lib/types";
 
@@ -70,11 +72,13 @@
   }
   let { title, agentSlugs = [], agentPackage, agentReferences = [], allowedTools, collectionName, reviewIntent, historyIntent, onClose, onApplied, onHistoryComplete }: Props = $props();
   const installTruthFresh = $derived(install.reconciled && !install.reconciling && !install.reconcileError);
+  const rosterTruthFresh = $derived(install.rostersReconciled && !install.rosterReconciling && !install.rosterReconcileError);
 
   onMount(() => {
     projects.refresh();
     // Refresh detection so the columns reflect tools ACTUALLY on this device.
     void install.loadTools();
+    if (exactReferences.length > 1) void install.reconcileRosters();
   });
 
   // The agents in this set that exist in the corpus (stale slugs skipped).
@@ -119,6 +123,16 @@
     );
   }
 
+  const referenceKey = (reference: AgentReference) => `${reference.sourceId}:${reference.relativePath}`;
+  function isRosterTool(tool: Tool): boolean {
+    return SUPPORTED_TOOLS.some((candidate) => candidate.id === tool && candidate.installKind === "roster");
+  }
+  function sameRosterMembers(row: InstalledAgentRoster): boolean {
+    if (row.record.members.length !== exactReferences.length) return false;
+    const selected = new Set(exactReferences.map(referenceKey));
+    return row.record.members.every((member) => selected.has(referenceKey(member.reference)));
+  }
+
   // Columns = tools present on this device (detected, or already holding an
   // install of this set), that can take an agent in SOME scope.
   function detected(t: ToolDef): boolean {
@@ -129,11 +143,12 @@
         exactReferences.length
           ? matchesExact(r)
           : slugSet.has(r.slug)
-      ))
+      )) || install.rosters.some((row) => row.record.tool === t.id && row.state !== "missing")
     );
   }
   const cols = $derived(SUPPORTED_TOOLS.filter((t) =>
     (t.supportsUser || t.supportsProject)
+    && (t.installKind !== "roster" || exactReferences.length > 1)
     && (!allowedTools || allowedTools.includes(t.id))
     && detected(t)
   ));
@@ -167,13 +182,14 @@
     const destination = targetOf(row);
     const cov = cover(t.id, destination);
     const isBusy = busy === cellKey(t.id, destination);
+    const truthFresh = isRosterTool(t.id) ? rosterTruthFresh : installTruthFresh;
     const unavailable = i18n.optional("reconcile.unavailableLabel", "Installation status unavailable");
     return {
       state: cov.all ? "on" : cov.some ? "partial" : "off",
       busy: isBusy,
-      disabled: !installTruthFresh || total === 0,
-      title: installTruthFresh ? i18n.t("install.cellTitle", { tool: t.label, target: row.kind === "global" ? i18n.t("common.global") : row.label }) : unavailable,
-      ariaLabel: installTruthFresh ? i18n.t(cov.all ? "install.removeFromAria" : "install.installIntoAria", {
+      disabled: !truthFresh || total === 0,
+      title: truthFresh ? i18n.t("install.cellTitle", { tool: t.label, target: row.kind === "global" ? i18n.t("common.global") : row.label }) : unavailable,
+      ariaLabel: truthFresh ? i18n.t(cov.all ? "install.removeFromAria" : "install.installIntoAria", {
         tool: t.label,
         target: row.kind === "global" ? i18n.t("install.globally") : i18n.t("install.inProject", { project: row.label }),
       }) : unavailable,
@@ -182,6 +198,21 @@
 
   // Coverage of the set in one (tool, target) cell.
   function cover(tool: Tool, target: string | null) {
+    if (isRosterTool(tool)) {
+      const roster = target
+        ? install.rosters.find((row) => row.record.tool === tool && row.record.projectPath === target) ?? null
+        : null;
+      const selected = new Set(exactReferences.map(referenceKey));
+      const overlap = roster?.record.members.filter((member) => selected.has(referenceKey(member.reference))).length ?? 0;
+      return {
+        rows: [] as InstalledAgent[],
+        roster,
+        count: overlap,
+        all: !!roster && roster.state !== "missing" && sameRosterMembers(roster),
+        some: !!roster && roster.state !== "missing" && !sameRosterMembers(roster) && overlap > 0,
+        hasForeign: false,
+      };
+    }
     const rs = install.installed.filter(
       (r) => r.state !== "missing" &&
         (exactReferences.length
@@ -192,6 +223,7 @@
     const present = new Set(rs.map((r) => exactReferences.length ? `${r.sourceId}:${r.relativePath}` : r.slug));
     return {
       rows: rs,
+      roster: null as InstalledAgentRoster | null,
       count: present.size,
       all: total > 0 && present.size === total,
       some: present.size > 0 && present.size < total,
@@ -209,9 +241,11 @@
     collectionName: string | null;
     batchReferences: AgentReference[];
   } | null>(null);
+  let rosterPending = $state<AgentRosterMutationPlan | null>(null);
   let planLoading = $state(false);
   let actionError = $state<string | null>(null);
   let historyRow = $state<InstalledAgent | null>(null);
+  let rosterHistoryRow = $state<InstalledAgentRoster | null>(null);
   let snapshots = $state<AgentVersionSnapshot[]>([]);
   let rollbackConfirm = $state<string | null>(null);
   let diffRow = $state<InstalledAgent | null>(null);
@@ -232,6 +266,11 @@
     }
     return [...targets.values()];
   });
+  const rosterTargets = $derived(
+    exactReferences.length > 1
+      ? install.rosters.filter(sameRosterMembers).slice().sort((a, b) => a.record.dest.localeCompare(b.record.dest))
+      : [],
+  );
   const updatePolicy = $derived.by<AgentUpdatePolicy>(() => {
     if (!exactReference) return "notify";
     return agentLibrary.library.updatePolicies.find((entry) => sameAgent(entry.agent, exactReference))?.policy ?? "notify";
@@ -334,6 +373,38 @@
     }
   }
 
+  async function reviewRoster(
+    operation: "install" | "update" | "uninstall",
+    tool: Tool,
+    target: string | null,
+  ) {
+    if (!rosterTruthFresh || !target || exactReferences.length < 2) return;
+    planLoading = true;
+    actionError = null;
+    try {
+      rosterPending = await install.planRoster(exactReferences, operation, tool, target);
+    } catch (error) {
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      planLoading = false;
+    }
+  }
+
+  async function applyRosterPlan() {
+    if (!rosterTruthFresh || !rosterPending || rosterPending.blockers.length) return;
+    busy = cellKey(rosterPending.tool, rosterPending.projectPath);
+    actionError = null;
+    try {
+      await install.applyRoster(rosterPending);
+      toast.success(i18n.t("agents.lifecycleApplied", { operation: rosterPending.operation }));
+      rosterPending = null;
+    } catch (error) {
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      busy = null;
+    }
+  }
+
   async function applyPlan() {
     if (!installTruthFresh || !pending || !canApplyAgentPlan(pending.plan)) return;
     const { operation, reference, collectionName: pendingCollection, batchReferences, plan } = pending;
@@ -406,6 +477,56 @@
     }
   }
 
+  async function runRosterLifecycle(row: InstalledAgentRoster, enable: boolean) {
+    if (!rosterTruthFresh) return;
+    busy = cellKey(row.record.tool, row.record.projectPath);
+    actionError = null;
+    try {
+      await install.moveRoster(row.record.tool, row.record.projectPath, enable);
+      toast.success(i18n.t("agents.lifecycleApplied", { operation: enable ? "enable" : "disable" }));
+    } catch (error) {
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function showRosterHistory(row: InstalledAgentRoster) {
+    rosterHistoryRow = row;
+    historyRow = null;
+    snapshots = [];
+    rollbackConfirm = null;
+    actionError = null;
+    try {
+      snapshots = await install.rosterHistory(row.record.tool, row.record.projectPath);
+    } catch (error) {
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
+    }
+  }
+
+  async function rollbackRoster(snapshotId: string) {
+    if (!rosterTruthFresh || !rosterHistoryRow) return;
+    if (rollbackConfirm !== snapshotId) {
+      rollbackConfirm = snapshotId;
+      return;
+    }
+    busy = cellKey(rosterHistoryRow.record.tool, rosterHistoryRow.record.projectPath);
+    try {
+      await install.rollbackRoster(
+        rosterHistoryRow.record.tool,
+        rosterHistoryRow.record.projectPath,
+        snapshotId,
+      );
+      toast.success(i18n.t("agents.rollbackSucceeded"));
+      rosterHistoryRow = null;
+      rollbackConfirm = null;
+    } catch (error) {
+      actionError = isAppError(error) ? appErrorMessage(error) : String(error);
+    } finally {
+      busy = null;
+    }
+  }
+
   async function rollback(snapshotId: string) {
     if (!install.reconciled || install.reconciling || install.reconcileError || !exactReference || !historyRow) return;
     if (rollbackConfirm !== snapshotId) {
@@ -439,6 +560,11 @@
   async function toggle(tool: Tool, target: string | null) {
     if (!installTruthFresh || busy) return;
     const cov = cover(tool, target);
+    if (isRosterTool(tool)) {
+      if (!target) return;
+      await reviewRoster(cov.roster ? (cov.all ? "uninstall" : "update") : "install", tool, target);
+      return;
+    }
     if (cov.all) {
       if (collectionName) {
         await reviewCollection("uninstall", tool, target);
@@ -577,7 +703,34 @@
   {#if actionError}<p class="plan-error" role="alert">{actionError}</p>{/if}
   {#if planLoading}<p class="sub">{i18n.t("agents.loadingPlan")}</p>{/if}
 
-  {#if pending}
+  {#if rosterPending}
+    <section class="plan" aria-label="Agent roster mutation plan">
+      <h3>{i18n.t("agents.mutationPlan")}: {rosterPending.operation}</h3>
+      <p class="rollback-note"><strong>{install.toolLabel(rosterPending.tool)}</strong> · project only</p>
+      <code title={rosterPending.destination}>{rosterPending.destination}</code>
+      {#if rosterPending.blockers.length > 0}
+        <div class="plan-blockers" role="alert">
+          <strong>{i18n.t("agents.planBlocked")}</strong>
+          <ul>{#each rosterPending.blockers as blocker}<li>{blocker}</li>{/each}</ul>
+        </div>
+      {/if}
+      {#if rosterPending.warnings.length > 0}
+        <div class="plan-warnings">
+          <strong>{i18n.t("agents.planWarnings")}</strong>
+          <ul>{#each rosterPending.warnings as warning}<li>{warning}</li>{/each}</ul>
+        </div>
+      {/if}
+      <ul class="plan-agents">
+        {#each rosterPending.members as member (referenceKey(member.reference))}
+          <li>
+            <strong>{member.name}</strong>
+            <code>{referenceKey(member.reference)}</code>
+          </li>
+        {/each}
+      </ul>
+      <p class="rollback-note">{rosterPending.rollbackAvailable ? i18n.t("agents.rollbackAvailable") : i18n.t("agents.rollbackUnavailable")}</p>
+    </section>
+  {:else if pending}
     <section class="plan" aria-label={i18n.t("agents.mutationPlan")}>
       <h3>{i18n.t("agents.mutationPlan")}: {pending.operation}</h3>
       {#if pending.plan.blockers.length > 0}
@@ -606,7 +759,7 @@
     </section>
   {/if}
 
-  {#if exactReference && exactRows.length > 0 && !pending}
+  {#if exactReference && exactRows.length > 0 && !pending && !rosterPending}
     <section class="lifecycle" aria-label={i18n.t("agents.lifecycleInstalls")}>
       <h3>{i18n.t("agents.lifecycleInstalls")}</h3>
       {#each exactRows as row (row.dest)}
@@ -641,7 +794,7 @@
     </section>
   {/if}
 
-  {#if collectionName && collectionTargets.length > 0 && !pending}
+  {#if collectionName && collectionTargets.length > 0 && !pending && !rosterPending}
     <section class="lifecycle" aria-label={i18n.t("agents.collectionLifecycle")}>
       <h3>{i18n.t("agents.collectionLifecycle")}</h3>
       {#each collectionTargets as target (`${target.tool}:${target.projectPath ?? ""}`)}
@@ -659,7 +812,35 @@
     </section>
   {/if}
 
-  {#if historyRow && !pending}
+  {#if rosterTargets.length > 0 && !pending && !rosterPending}
+    <section class="lifecycle" aria-label="Agent roster installs">
+      <h3>Project rosters</h3>
+      {#each rosterTargets as row (`${row.record.tool}:${row.record.projectPath}`)}
+        <article class="install-row">
+          <div class="install-facts">
+            <strong>{install.toolLabel(row.record.tool)} · {labelOf(row.record.projectPath)}</strong>
+            <span class="state-text" data-state={row.state}>{i18n.t(installStateMessageKey(row.state))}</span>
+            <code title={row.record.dest}>{row.record.dest}</code>
+            <small>{row.record.members.length} exact agents in one managed roster</small>
+          </div>
+          <div class="row-actions">
+            {#if ["outdated", "modified", "missing"].includes(row.state)}
+              <button disabled={!rosterTruthFresh || row.state === "disabled"} onclick={() => reviewRoster("update", row.record.tool, row.record.projectPath)}>{i18n.t("common.update")}</button>
+            {/if}
+            {#if row.state === "disabled"}
+              <button disabled={!rosterTruthFresh} onclick={() => runRosterLifecycle(row, true)}>{i18n.t("agents.enable")}</button>
+            {:else}
+              <button disabled={!rosterTruthFresh} onclick={() => runRosterLifecycle(row, false)}>{i18n.t("agents.disable")}</button>
+            {/if}
+            <button onclick={() => showRosterHistory(row)}>{i18n.t("agents.versionHistory")}</button>
+            <button class="danger" disabled={!rosterTruthFresh} onclick={() => reviewRoster("uninstall", row.record.tool, row.record.projectPath)}>{i18n.t("common.uninstall")}</button>
+          </div>
+        </article>
+      {/each}
+    </section>
+  {/if}
+
+  {#if historyRow && !pending && !rosterPending}
     <section class="history" aria-label={i18n.t("agents.versionHistory")}>
       <div class="history-head"><h3>{i18n.t("agents.versionHistory")}</h3><button onclick={() => (historyRow = null)}>{i18n.t("common.close")}</button></div>
       {#if snapshots.length === 0}
@@ -678,9 +859,28 @@
     </section>
   {/if}
 
-  {#if !pending && cols.length === 0}
+  {#if rosterHistoryRow && !pending && !rosterPending}
+    <section class="history" aria-label={i18n.t("agents.versionHistory")}>
+      <div class="history-head"><h3>{i18n.t("agents.versionHistory")}</h3><button onclick={() => (rosterHistoryRow = null)}>{i18n.t("common.close")}</button></div>
+      {#if snapshots.length === 0}
+        <p class="sub">{i18n.t("agents.noVersionHistory")}</p>
+      {:else}
+        {#each snapshots as snapshot (snapshot.id)}
+          <div class="snapshot">
+            <span>{new Date(snapshot.createdAt).toLocaleString()}</span>
+            <code>{snapshot.sourceHash.slice(0, 12)}</code>
+            <button disabled={!rosterTruthFresh} onclick={() => rollbackRoster(snapshot.id)}>
+              {rollbackConfirm === snapshot.id ? i18n.t("agents.confirmRollback") : i18n.t("agents.rollback")}
+            </button>
+          </div>
+        {/each}
+      {/if}
+    </section>
+  {/if}
+
+  {#if !pending && !rosterPending && cols.length === 0}
     <p class="no-tools">{i18n.t("install.noTools")}</p>
-  {:else if !pending}
+  {:else if !pending && !rosterPending}
     <DeploymentTargetGrid
       columns={cols}
       {rows}
@@ -727,7 +927,10 @@
   </div>
 
   {#snippet actions()}
-    {#if pending}
+    {#if rosterPending}
+      <Button onclick={() => (rosterPending = null)}>{i18n.t("common.cancel")}</Button>
+      <Button variant="primary" disabled={!rosterTruthFresh || rosterPending.blockers.length > 0 || !!busy} onclick={applyRosterPlan}>{i18n.t("agents.applyPlan")}</Button>
+    {:else if pending}
       <Button onclick={() => (pending = null)}>{i18n.t("common.cancel")}</Button>
       <Button variant="primary" disabled={!installTruthFresh || !canApplyAgentPlan(pending.plan) || !!busy} onclick={applyPlan}>{i18n.t("agents.applyPlan")}</Button>
     {:else}

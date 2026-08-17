@@ -31,7 +31,7 @@ import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
 import { catalog } from "$lib/stores/catalog.svelte";
 import { corpus } from "$lib/stores/corpus.svelte";
 import { experts, summarizeExpertPerformance } from "$lib/stores/experts.svelte";
-import { install } from "$lib/stores/install.svelte";
+import { install, SUPPORTED_TOOLS } from "$lib/stores/install.svelte";
 import { i18n } from "$lib/stores/i18n.svelte";
 import { projects } from "$lib/stores/projects.svelte";
 import { settings } from "$lib/stores/settings.svelte";
@@ -284,6 +284,10 @@ beforeEach(async () => {
   experts.runs = [];
   experts.loading = false;
   install.installed = [];
+  install.rosters = [];
+  install.rosterReconciling = false;
+  install.rostersReconciled = false;
+  install.rosterReconcileError = null;
   install.tools = [];
   install.reconciling = false;
   install.reconciled = false;
@@ -5338,7 +5342,7 @@ describe("frontend test harness", () => {
       ["./components/CatalogFirstRun.svelte", [/firstRun\.error[^\n]*appErrorMessage/]],
       ["./components/SkillsWorkspace.svelte", [/skillCollectionBatch[^]*?announcement = isAppError[^\n]*appErrorMessage/, /readSkillText[^]*?folderError = isAppError[^\n]*appErrorMessage/, /skillInstallPlan[^]*?announcement = isAppError[^\n]*appErrorMessage/]],
       ["./components/Experts.svelte", [/Could not plan activation[^\n]*appErrorMessage/, /detail: isAppError[^\n]*appErrorMessage/, /Activation failed[^\n]*appErrorMessage/, /Could not save Expert[^\n]*appErrorMessage/, /Could not reject Expert proposal[^\n]*appErrorMessage/, /Could not review run[^\n]*appErrorMessage/, /Import failed[^\n]*appErrorMessage/, /Export failed[^\n]*appErrorMessage/]],
-      ["./components/InstallModal.svelte", [/async function reviewPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewCollection[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollback[^]*?actionError = isAppError[^\n]*appErrorMessage/]],
+      ["./components/InstallModal.svelte", [/async function reviewPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewCollection[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollback[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewRoster[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyRosterPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runRosterLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showRosterHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollbackRoster[^]*?actionError = isAppError[^\n]*appErrorMessage/]],
       ["./components/DiffModal.svelte", [/install\.diff[^]*?appErrorMessage/]],
       ["./components/AgencyDashboard.svelte", [/async function updateCatalog[^]*?appErrorMessage/]],
       ["./components/Projects.svelte", [/async function reveal[^]*?appErrorMessage/, /async function forgetProject[^]*?appErrorMessage/, /async function uninstallAndRemove[^]*?appErrorMessage/, /async function refreshProjectInstructions[^]*?appErrorMessage/, /async function reviewInstruction[^]*?appErrorMessage/, /async function applyInstruction[^]*?appErrorMessage/]],
@@ -5347,14 +5351,14 @@ describe("frontend test harness", () => {
       ["./stores/experts.svelte.ts", [/expert_runs_list[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/activity.svelte.ts", [/safeActivityDetail[^]*?isAppError\(value\) \? appErrorMessage\(value\)/]],
     ]);
-    expect([...inventory.values()].flat()).toHaveLength(47);
+    expect([...inventory.values()].flat()).toHaveLength(52);
     for (const [path, markers] of inventory) {
       const source = rel01Sources[path];
       expect(source, path).toBeTruthy();
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(59);
+      .toHaveLength(64);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -5379,6 +5383,23 @@ describe("frontend test harness", () => {
       './components/Experts.svelte:toast.error("Copy failed", String(error));',
       './components/Runbooks.svelte:toast.error(i18n.t("common.copyFailed"), String(e));',
     ].toSorted());
+  });
+
+  it("exposes project roster targets only for multiple exact Agents with isolated truth", () => {
+    expect(SUPPORTED_TOOLS.filter((tool) => tool.installKind === "roster").map((tool) => tool.id))
+      .toEqual(["aider", "windsurf"]);
+    expect(SUPPORTED_TOOLS.filter((tool) => tool.installKind === "roster").every((tool) =>
+      tool.supportsProject && !tool.supportsUser)).toBe(true);
+    expect(installModalSource).toContain('t.installKind !== "roster" || exactReferences.length > 1');
+    expect(installModalSource).toContain("rosterPending.destination");
+    expect(installModalSource).toContain("rosterPending.members");
+    expect(installModalSource).toContain("sameRosterMembers");
+    expect(installModalSource).toContain("reviewRoster(cov.roster ? (cov.all ? \"uninstall\" : \"update\") : \"install\"");
+    expect(installModalSource).toContain("install.rostersReconciled && !install.rosterReconciling && !install.rosterReconcileError");
+    const installStoreSource = rel01Sources["./stores/install.svelte.ts"];
+    expect(installStoreSource).toContain('invoke<InstalledAgent[]>("installs_reconcile"');
+    expect(installStoreSource).toContain("async reconcileRosters()");
+    expect(installStoreSource).toContain("agentRostersReconcile()");
   });
 
   it("pins every Phase 6 truth-aware install-ledger consumer and every deployment mutation control", () => {
@@ -5461,8 +5482,9 @@ describe("frontend test harness", () => {
         /modalAction="confirm" disabled=\{!installTruthFresh \|\| plan\.blockers\.length > 0\}/,
         /confirmDisabled=\{!installTruthFresh \|\| \(uninstallCandidate/,
       ] }],
-      ["InstallModal", { source: installModalSource, freshnessUses: 19, markers: [
-        /disabled: !installTruthFresh \|\| total === 0,/,
+      ["InstallModal", { source: installModalSource, freshnessUses: 18, markers: [
+        /const truthFresh = isRosterTool\(t\.id\) \? rosterTruthFresh : installTruthFresh;/,
+        /disabled: !truthFresh \|\| total === 0,/,
         /disabled=\{!installTruthFresh\}[^\n]*reviewPlan\("update"/,
         /disabled=\{!installTruthFresh\}[^\n]*runLifecycle\("track"/,
         /disabled=\{!installTruthFresh\}[^\n]*runLifecycle\("enable"/,
@@ -5473,6 +5495,10 @@ describe("frontend test harness", () => {
         /disabled=\{!installTruthFresh\} onclick=\{\(\) => rollback\(snapshot\.id\)\}/,
         /disabled=\{!installTruthFresh \|\| !canApplyAgentPlan\(pending\.plan\) \|\| !!busy\}/,
         /confirmDisabled=\{!installTruthFresh\}/,
+        /disabled=\{!rosterTruthFresh[^\n]*reviewRoster\("update"/,
+        /disabled=\{!rosterTruthFresh\}[^\n]*runRosterLifecycle\(row, true\)/,
+        /disabled=\{!rosterTruthFresh\}[^\n]*runRosterLifecycle\(row, false\)/,
+        /disabled=\{!rosterTruthFresh\}[^\n]*rollbackRoster\(snapshot\.id\)/,
       ] }],
       ["DeployBrowser", { source: deployBrowserSource, freshnessUses: 3, markers: [
         /disabled=\{!installTruthFresh \|\| isBusy \|\| setTotal === 0\}/,
