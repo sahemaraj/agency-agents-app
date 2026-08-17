@@ -174,6 +174,10 @@ pub(super) async fn create_snapshot_from_bytes(
             created_at: created_at.into(),
             source_hash: source_hash.into(),
             rendered_hash: rendered_hash.into(),
+            artifact_hashes: contents
+                .iter()
+                .map(|bytes| crate::render::sha256_hex(bytes))
+                .collect(),
             content_path: snapshot_directory.to_string_lossy().into_owned(),
         };
         let index_path = directory.join("index.json");
@@ -212,12 +216,12 @@ pub(super) async fn list_snapshots(
     load_index(&directory.join("index.json")).await
 }
 
-pub(super) async fn restore_snapshot(
+pub(super) async fn snapshot_contents(
     app_data_dir: &Path,
     identity: &AgentInstallIdentity,
     snapshot_id: &str,
     destinations: &[PathBuf],
-) -> Result<AgentVersionSnapshot, AppError> {
+) -> Result<(AgentVersionSnapshot, Vec<Vec<u8>>), AppError> {
     let identity_hash = identity_hash(identity)?;
     let directory = app_data_dir.join("agents/history").join(&identity_hash);
     let snapshot = list_snapshots(app_data_dir, identity)
@@ -264,6 +268,18 @@ pub(super) async fn restore_snapshot(
         }
         contents.push(bytes);
     }
+
+    Ok((snapshot, contents))
+}
+
+pub(super) async fn restore_snapshot(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    snapshot_id: &str,
+    destinations: &[PathBuf],
+) -> Result<AgentVersionSnapshot, AppError> {
+    let (snapshot, contents) =
+        snapshot_contents(app_data_dir, identity, snapshot_id, destinations).await?;
 
     let mut prior = Vec::with_capacity(destinations.len());
     for destination in destinations {
@@ -377,6 +393,42 @@ mod tests {
         .is_err());
         assert_eq!(std::fs::read(&first).unwrap(), b"changed-active");
         assert_eq!(std::fs::read(&second).unwrap(), b"changed-active");
+    }
+
+    #[tokio::test]
+    async fn late_multi_file_restore_failure_restores_every_prior_destination() {
+        let app_data = tempfile::tempdir().unwrap();
+        let destinations = tempfile::tempdir().unwrap();
+        let first = destinations.path().join("agent/agent.yaml");
+        let second = destinations.path().join("agent/system.md");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"snapshot-one").unwrap();
+        std::fs::write(&second, b"snapshot-two").unwrap();
+        let snapshot = create_snapshot(
+            app_data.path(),
+            &identity("builtin:agency-agents"),
+            &[first.clone(), second.clone()],
+            "source-1",
+            "render-1",
+            "2026-08-17T01:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(&first, b"prior-one").unwrap();
+        std::fs::write(&second, b"prior-two").unwrap();
+        std::fs::create_dir(second.with_extension("md.tmp")).unwrap();
+
+        assert!(restore_snapshot(
+            app_data.path(),
+            &identity("builtin:agency-agents"),
+            &snapshot.id,
+            &[first.clone(), second.clone()],
+        )
+        .await
+        .is_err());
+        assert_eq!(std::fs::read(&first).unwrap(), b"prior-one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"prior-two");
     }
 
     #[tokio::test]

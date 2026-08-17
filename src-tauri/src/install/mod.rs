@@ -25,14 +25,15 @@ use crate::registry;
 use crate::render;
 use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
-    AgentApprovalAction, AgentDiff, AgentInstallIdentity, AgentMutationPlan, AgentPlanItem,
-    AgentReference, AgentSourceResult, AgentVersionSnapshot, BaselineAgentRequirement,
-    BaselineRequirement, BaselineSkillRequirement, CatalogChange, CatalogFeedBatch, InstallRecord,
-    InstallState, InstalledAgent, ProjectInfo, ProjectReadinessBaseline, ProjectReadinessOverall,
-    ProjectReadinessReport, ProjectRecommendation, ProjectRecommendationTarget,
-    ProjectSubscription, ReadinessCategoryKind, ReadinessCategoryReport, ReadinessCategoryState,
-    ReadinessRow, ReadinessRowState, RecommendationChangeKind, RecommendationLifecycle,
-    RecommendationOperation, SkillReference, Tool, ToolInfo, ToolVersion, UpdateKind,
+    AgentApprovalAction, AgentArtifactDiff, AgentDiff, AgentInstallIdentity, AgentMutationPlan,
+    AgentPlanItem, AgentReference, AgentSourceResult, AgentVersionSnapshot,
+    BaselineAgentRequirement, BaselineRequirement, BaselineSkillRequirement, CatalogChange,
+    CatalogFeedBatch, InstallArtifact, InstallRecord, InstallState, InstalledAgent, ProjectInfo,
+    ProjectReadinessBaseline, ProjectReadinessOverall, ProjectReadinessReport,
+    ProjectRecommendation, ProjectRecommendationTarget, ProjectSubscription, ReadinessCategoryKind,
+    ReadinessCategoryReport, ReadinessCategoryState, ReadinessRow, ReadinessRowState,
+    RecommendationChangeKind, RecommendationLifecycle, RecommendationOperation, SkillReference,
+    Tool, ToolInfo, ToolVersion, UpdateKind,
 };
 use crate::util::fs::{atomic_write, read_capped};
 
@@ -52,7 +53,23 @@ struct AgentInstallOperation {
     previous: Option<InstallRecord>,
     next: InstallRecord,
     targets: Vec<String>,
-    rendered: String,
+    rendered: AgentRenderedPayload,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+enum AgentRenderedPayload {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl AgentRenderedPayload {
+    fn contents(&self) -> Vec<&str> {
+        match self {
+            Self::One(content) => vec![content],
+            Self::Many(contents) => contents.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -304,6 +321,29 @@ fn migrate_install_records(
             record.source_snapshot_hash = record.source_hash.clone();
             changed = true;
         }
+        if !record.artifacts.is_empty() {
+            let valid_hash =
+                |hash: &str| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+            let destinations = record
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.dest.as_str())
+                .collect::<BTreeSet<_>>();
+            if record.artifacts.len() > 8
+                || destinations.len() != record.artifacts.len()
+                || record.artifacts[0].dest != record.dest
+                || record.artifacts[0].rendered_hash != record.rendered_hash
+                || record.artifacts[0].disabled_path != record.disabled_path
+                || record
+                    .artifacts
+                    .iter()
+                    .any(|artifact| !valid_hash(&artifact.rendered_hash))
+            {
+                return Err(AppError::InvalidArgument {
+                    message: format!("invalid Agent artifact manifest for {}", record.slug),
+                });
+            }
+        }
     }
     Ok((records, changed))
 }
@@ -498,6 +538,7 @@ fn record_for(
         source_hash: source_hash.to_string(),
         body_hash: body_hash.to_string(),
         rendered_hash,
+        artifacts: Vec::new(),
         disabled_path: None,
         source_snapshot_hash: source_hash.to_string(),
         capabilities: Vec::new(),
@@ -505,6 +546,38 @@ fn record_for(
         publisher_verified: false,
         installed_at: installed_at.to_string(),
         corpus_version: corpus_version.to_string(),
+    }
+}
+
+fn artifact_manifest(
+    paths: &[PathBuf],
+    rendered: &[render::RenderedArtifact],
+) -> Result<Vec<InstallArtifact>, AppError> {
+    if paths.is_empty() || paths.len() != rendered.len() || paths.len() > 8 {
+        return Err(AppError::InvalidArgument {
+            message: "Agent artifact destinations do not match rendered artifacts".into(),
+        });
+    }
+    Ok(paths
+        .iter()
+        .zip(rendered)
+        .map(|(path, artifact)| InstallArtifact {
+            dest: path.to_string_lossy().into_owned(),
+            rendered_hash: render::sha256_hex(artifact.content.as_bytes()),
+            disabled_path: None,
+        })
+        .collect())
+}
+
+fn record_artifacts(record: &InstallRecord) -> Vec<InstallArtifact> {
+    if record.artifacts.is_empty() {
+        vec![InstallArtifact {
+            dest: record.dest.clone(),
+            rendered_hash: record.rendered_hash.clone(),
+            disabled_path: record.disabled_path.clone(),
+        }]
+    } else {
+        record.artifacts.clone()
     }
 }
 
@@ -650,6 +723,7 @@ async fn do_install_locked(
         .map(|record| PathBuf::from(&record.dest));
     let targets = install_target_paths(
         &agent,
+        Some(&raw),
         &tool,
         &home,
         proot.as_deref(),
@@ -674,18 +748,20 @@ async fn do_install_locked(
         .cloned()
         .collect::<Vec<_>>();
     let installed_at = now_iso();
-    let (rendered, rendered_hash) = render::render_with_hash(&agent, &raw, &tool)?;
+    let rendered = render::render_artifacts(&agent, &raw, &tool)?;
+    let manifest = artifact_manifest(&targets, &rendered)?;
     let mut planned_record = record_for(
         &agent,
         &targets[0],
         &tool,
         proot.as_deref(),
-        rendered_hash,
+        manifest[0].rendered_hash.clone(),
         &package.source_hash,
         &package.body_hash,
         &revision,
         &installed_at,
     );
+    planned_record.artifacts = manifest;
     planned_record.source_id = reference.source_id.clone();
     planned_record.relative_path = reference.relative_path.clone();
     planned_record.source_snapshot_hash = package.source_hash.clone();
@@ -709,7 +785,13 @@ async fn do_install_locked(
                             .iter()
                             .map(|path| path.to_string_lossy().into_owned())
                             .collect(),
-                        rendered,
+                        rendered: if rendered.len() == 1 {
+                            AgentRenderedPayload::One(rendered[0].content.clone())
+                        } else {
+                            AgentRenderedPayload::Many(
+                                rendered.iter().map(|item| item.content.clone()).collect(),
+                            )
+                        },
                     },
                 )
                 .await?,
@@ -957,17 +1039,14 @@ async fn do_track(
 
     let home = tool_home(state, &tool).await?;
     let proot = project_path.as_ref().map(PathBuf::from);
-    let candidates = candidate_dests(&agent, &raw, &tool, &home, proot.as_deref())?;
-    let existing = candidates
-        .iter()
-        .filter(|path| path.exists())
-        .cloned()
-        .collect::<Vec<_>>();
-    if existing.is_empty() {
+    let existing = candidate_destination_sets(&agent, &raw, &tool, &home, proot.as_deref())?
+        .into_iter()
+        .find(|paths| paths.iter().all(|path| path.exists()));
+    let Some(existing) = existing else {
         return Err(AppError::InvalidArgument {
-            message: "no existing Agent destination is available to track".into(),
+            message: "no complete existing Agent destination is available to track".into(),
         });
-    }
+    };
     let mut ledger = load_ledger(app, state).await?;
     ensure_destinations_available(
         &ledger,
@@ -1021,26 +1100,33 @@ fn track_agent_record(
     corpus_version: &str,
     installed_at: &str,
 ) -> Result<InstallRecord, AppError> {
-    let (_bytes, rendered_hash) = render::render_with_hash(agent, raw, tool)?;
-    let paths = candidate_dests(agent, raw, tool, home, project_root)?;
-    let primary = paths.iter().find(|p| p.exists()).unwrap_or(&paths[0]);
-    Ok(record_for(
+    let rendered = render::render_artifacts(agent, raw, tool)?;
+    let candidate_sets = candidate_destination_sets(agent, raw, tool, home, project_root)?;
+    let paths = candidate_sets
+        .iter()
+        .find(|paths| paths.iter().all(|path| path.exists()))
+        .unwrap_or(&candidate_sets[0]);
+    let manifest = artifact_manifest(paths, &rendered)?;
+    let mut record = record_for(
         agent,
-        primary,
+        &paths[0],
         tool,
         project_root,
-        rendered_hash,
+        manifest[0].rendered_hash.clone(),
         source_hash,
         body_hash,
         corpus_version,
         installed_at,
-    ))
+    );
+    record.artifacts = manifest;
+    Ok(record)
 }
 
 /// Possible physical destinations for one logical install. App-authored files
 /// historically used the catalog filename slug; upstream `convert.sh` uses
 /// `slugify(name)` for transform tools. Recognize both without changing the
 /// catalog's stable identity.
+#[cfg(test)]
 fn candidate_dests(
     agent: &crate::types::Agent,
     raw: &str,
@@ -1048,16 +1134,30 @@ fn candidate_dests(
     home: &Path,
     project_root: Option<&Path>,
 ) -> Result<Vec<PathBuf>, AppError> {
-    let mut paths = render::dests(tool, &agent.slug, home, project_root)?;
+    Ok(
+        candidate_destination_sets(agent, raw, tool, home, project_root)?
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
+}
+
+fn candidate_destination_sets(
+    agent: &crate::types::Agent,
+    raw: &str,
+    tool: &str,
+    home: &Path,
+    project_root: Option<&Path>,
+) -> Result<Vec<Vec<PathBuf>>, AppError> {
+    let mut sets = vec![render::dests(tool, &agent.slug, home, project_root)?];
     let conversion_slug = render::output_slug(agent, raw, tool);
     if conversion_slug != agent.slug {
-        for path in render::dests(tool, &conversion_slug, home, project_root)? {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
+        let converted = render::dests(tool, &conversion_slug, home, project_root)?;
+        if !sets.contains(&converted) {
+            sets.push(converted);
         }
     }
-    Ok(paths)
+    Ok(sets)
 }
 
 /// True when the tool's per-agent unit is a directory (`{slug}/LEAF`) rather
@@ -1132,6 +1232,29 @@ async fn remove_file_strict(path: &Path) -> Result<(), AppError> {
     }
 }
 
+async fn remove_agent_artifacts_with<F>(paths: &[PathBuf], mut remove: F) -> Result<(), AppError>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let prior = capture_batch_files(paths).await?;
+    for path in paths {
+        if let Err(error) = remove(path) {
+            let original = AppError::Io {
+                message: format!("remove agent file {}: {error}", path.display()),
+            };
+            return match restore_batch_files(&prior).await {
+                Ok(()) => Err(original),
+                Err(rollback) => Err(rollback_error(
+                    "uninstall Agent artifacts",
+                    original,
+                    rollback,
+                )),
+            };
+        }
+    }
+    Ok(())
+}
+
 fn disabled_destination(destination: &Path) -> Result<PathBuf, AppError> {
     let parent = destination
         .parent()
@@ -1150,34 +1273,63 @@ fn disabled_destination(destination: &Path) -> Result<PathBuf, AppError> {
     Ok(parent.join(format!(".{name}.agency-agents-disabled")))
 }
 
+#[cfg(test)]
 fn move_managed_files(
     sources: &[PathBuf],
     destinations: &[PathBuf],
     expected_hash: &str,
 ) -> Result<(), AppError> {
-    move_managed_files_with(
+    let hashes = vec![expected_hash.to_owned(); sources.len()];
+    move_managed_artifacts(sources, destinations, &hashes)
+}
+
+fn move_managed_artifacts(
+    sources: &[PathBuf],
+    destinations: &[PathBuf],
+    expected_hashes: &[String],
+) -> Result<(), AppError> {
+    move_managed_artifacts_with(
         sources,
         destinations,
-        expected_hash,
+        expected_hashes,
         |source, destination| std::fs::rename(source, destination),
     )
 }
 
+#[cfg(test)]
 fn move_managed_files_with<F>(
     sources: &[PathBuf],
     destinations: &[PathBuf],
     expected_hash: &str,
+    rename: F,
+) -> Result<(), AppError>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let hashes = vec![expected_hash.to_owned(); sources.len()];
+    move_managed_artifacts_with(sources, destinations, &hashes, rename)
+}
+
+fn move_managed_artifacts_with<F>(
+    sources: &[PathBuf],
+    destinations: &[PathBuf],
+    expected_hashes: &[String],
     mut rename: F,
 ) -> Result<(), AppError>
 where
     F: FnMut(&Path, &Path) -> std::io::Result<()>,
 {
-    if sources.is_empty() || sources.len() != destinations.len() {
+    if sources.is_empty()
+        || sources.len() != destinations.len()
+        || sources.len() != expected_hashes.len()
+    {
         return Err(AppError::InvalidArgument {
             message: "Agent lifecycle move requires matching source and destination files".into(),
         });
     }
-    for (source, destination) in sources.iter().zip(destinations) {
+    for ((source, destination), expected_hash) in
+        sources.iter().zip(destinations).zip(expected_hashes)
+    {
         if source.parent() != destination.parent() {
             return Err(AppError::InvalidArgument {
                 message: "Agent lifecycle files must move within the same parent directory".into(),
@@ -1200,7 +1352,7 @@ where
         let bytes = std::fs::read(source).map_err(|error| AppError::Io {
             message: format!("read managed Agent file {}: {error}", source.display()),
         })?;
-        if render::sha256_hex(&bytes) != expected_hash {
+        if render::sha256_hex(&bytes) != *expected_hash {
             return Err(AppError::InvalidArgument {
                 message: format!("managed Agent file was modified: {}", source.display()),
             });
@@ -1238,6 +1390,31 @@ where
         }
     }
     Ok(())
+}
+
+fn record_rendered_hashes(record: &InstallRecord, count: usize) -> Vec<String> {
+    if record.artifacts.is_empty() {
+        vec![record.rendered_hash.clone(); count]
+    } else {
+        record
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.rendered_hash.clone())
+            .collect()
+    }
+}
+
+fn set_record_disabled_paths(record: &mut InstallRecord, disabled: Option<&[PathBuf]>) {
+    record.disabled_path = disabled
+        .and_then(|paths| paths.first())
+        .map(|path| path.to_string_lossy().into_owned());
+    if !record.artifacts.is_empty() {
+        for (index, artifact) in record.artifacts.iter_mut().enumerate() {
+            artifact.disabled_path = disabled
+                .and_then(|paths| paths.get(index))
+                .map(|path| path.to_string_lossy().into_owned());
+        }
+    }
 }
 
 fn install_identity(record: &InstallRecord) -> AgentInstallIdentity {
@@ -1279,6 +1456,63 @@ async fn resolved_record_paths(
 ) -> Result<Vec<PathBuf>, AppError> {
     let home = tool_home(state, &record.tool).await?;
     let project = record.project_path.as_deref().map(Path::new);
+    if !record.artifacts.is_empty() {
+        let recorded = record
+            .artifacts
+            .iter()
+            .map(|artifact| PathBuf::from(&artifact.dest))
+            .collect::<Vec<_>>();
+        let root = project.unwrap_or(&home);
+        let templates = crate::registry::get(&record.tool)
+            .and_then(|meta| meta.dest.as_ref())
+            .map(|dest| {
+                if project.is_some() {
+                    &dest.project
+                } else {
+                    &dest.user
+                }
+            })
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "tracked Agent tool has no destinations".into(),
+            })?;
+        let slug = templates
+            .first()
+            .and_then(|template| destination_template_slug(root, template, &recorded[0]))
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "tracked Agent artifact destination does not match its registry template"
+                    .into(),
+            })?;
+        let expected = render::dests(&record.tool, &slug, &home, project)?;
+        let disabled_paths_match = if record.disabled_path.is_some() {
+            let expected_disabled = recorded
+                .iter()
+                .map(|path| disabled_destination(path))
+                .collect::<Result<Vec<_>, _>>()?;
+            record
+                .artifacts
+                .iter()
+                .zip(expected_disabled)
+                .all(|(artifact, expected)| artifact.disabled_path.as_deref() == expected.to_str())
+        } else {
+            record
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.disabled_path.is_none())
+        };
+        if recorded != expected
+            || record.artifacts.len() > 8
+            || record.artifacts[0].dest != record.dest
+            || record.artifacts[0].rendered_hash != record.rendered_hash
+            || record.artifacts[0].disabled_path != record.disabled_path
+            || !disabled_paths_match
+        {
+            return Err(AppError::InvalidArgument {
+                message: "tracked Agent artifact manifest no longer matches its tool registry"
+                    .into(),
+            });
+        }
+        return Ok(recorded);
+    }
     let mut paths = render::dests(&record.tool, &record.slug, &home, project)?;
     let recorded = PathBuf::from(&record.dest);
     if paths.len() == 1 {
@@ -1291,6 +1525,29 @@ async fn resolved_record_paths(
         });
     }
     Ok(paths)
+}
+
+fn destination_template_slug(root: &Path, template: &str, target: &Path) -> Option<String> {
+    let relative = target.strip_prefix(root).ok()?;
+    let relative = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    let (before, after) = template.split_once("{slug}")?;
+    let token = relative
+        .strip_prefix(before.trim_matches('/'))?
+        .strip_prefix('/')?
+        .strip_suffix(after.trim_start_matches('/'))?
+        .trim_end_matches('/');
+    (!token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+    .then(|| token.to_owned())
 }
 
 fn same_agent_install(left: &InstallRecord, right: &InstallRecord) -> bool {
@@ -1388,8 +1645,13 @@ async fn recover_agent_install_operation(
         .map_err(|_| AppError::StorageCorrupt {
             message: "Agent install recovery payload is invalid".into(),
         })?;
-    if payload.rendered.len() as u64 > MAX_INSTALLED_BYTES
-        || render::sha256_hex(payload.rendered.as_bytes()) != payload.next.rendered_hash
+    let contents = payload.rendered.contents();
+    let artifacts = record_artifacts(&payload.next);
+    if contents.len() != artifacts.len()
+        || contents.iter().zip(&artifacts).any(|(content, artifact)| {
+            content.len() as u64 > MAX_INSTALLED_BYTES
+                || render::sha256_hex(content.as_bytes()) != artifact.rendered_hash
+        })
         || payload
             .previous
             .as_ref()
@@ -1416,7 +1678,11 @@ async fn recover_agent_install_operation(
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or(tool_home(state, &payload.next.tool).await?);
-    for target in &resolved {
+    let previous = payload.previous.as_ref().map(record_artifacts);
+    let mut needs_write = Vec::with_capacity(resolved.len());
+    for (index, ((target, _content), artifact)) in
+        resolved.iter().zip(&contents).zip(&artifacts).enumerate()
+    {
         ensure_agent_recovery_parent(&base, target)?;
         match std::fs::symlink_metadata(target) {
             Ok(metadata)
@@ -1428,10 +1694,10 @@ async fn recover_agent_install_operation(
                     message: format!("read Agent recovery destination: {error}"),
                 })?;
                 let hash = render::sha256_hex(&bytes);
-                if hash != payload.next.rendered_hash {
-                    if payload
-                        .previous
+                if hash != artifact.rendered_hash {
+                    if previous
                         .as_ref()
+                        .and_then(|items| items.get(index))
                         .is_none_or(|previous| hash != previous.rendered_hash)
                     {
                         return Err(AppError::StorageCorrupt {
@@ -1439,14 +1705,9 @@ async fn recover_agent_install_operation(
                                 .into(),
                         });
                     }
-                    backup_if_differs(
-                        target,
-                        payload.rendered.as_bytes(),
-                        &backups_dir_for(&state.app_data_dir),
-                        &operation.id,
-                    )
-                    .await?;
-                    atomic_write(target, payload.rendered.as_bytes()).await?;
+                    needs_write.push(true);
+                } else {
+                    needs_write.push(false);
                 }
             }
             Ok(_) => {
@@ -1455,13 +1716,40 @@ async fn recover_agent_install_operation(
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                atomic_write(target, payload.rendered.as_bytes()).await?;
+                needs_write.push(true);
             }
             Err(error) => {
                 return Err(AppError::Io {
                     message: format!("inspect Agent recovery destination: {error}"),
                 });
             }
+        }
+    }
+    let prior = capture_batch_files(&resolved).await?;
+    for ((target, content), needs_write) in resolved.iter().zip(&contents).zip(needs_write) {
+        if !needs_write {
+            continue;
+        }
+        let result = async {
+            backup_if_differs(
+                target,
+                content.as_bytes(),
+                &backups_dir_for(&state.app_data_dir),
+                &operation.id,
+            )
+            .await?;
+            atomic_write(target, content.as_bytes()).await
+        }
+        .await;
+        if let Err(error) = result {
+            return match restore_batch_files(&prior).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error(
+                    "recover Agent install artifacts",
+                    error,
+                    rollback,
+                )),
+            };
         }
     }
     match operation.phase {
@@ -1587,15 +1875,18 @@ async fn recover_agent_move_operation(
     };
     let mut remaining_sources = Vec::new();
     let mut remaining_targets = Vec::new();
-    for (source, target) in sources.iter().zip(targets) {
+    let expected_hashes = record_rendered_hashes(&payload.next, sources.len());
+    let mut remaining_hashes = Vec::new();
+    for ((source, target), expected_hash) in sources.iter().zip(targets).zip(&expected_hashes) {
         let source_hash = recovery_file_hash(source)?;
         let target_hash = recovery_file_hash(target)?;
         match (source_hash.as_deref(), target_hash.as_deref()) {
-            (Some(hash), None) if hash == payload.next.rendered_hash => {
+            (Some(hash), None) if hash == expected_hash => {
                 remaining_sources.push(source.clone());
                 remaining_targets.push(target.clone());
+                remaining_hashes.push(expected_hash.clone());
             }
-            (None, Some(hash)) if hash == payload.next.rendered_hash => {}
+            (None, Some(hash)) if hash == expected_hash => {}
             _ => {
                 return Err(AppError::StorageCorrupt {
                     message: "Agent move recovery found changed or duplicate content".into(),
@@ -1606,11 +1897,7 @@ async fn recover_agent_move_operation(
     match operation.phase {
         crate::state_db::FilesystemOperationPhase::Prepared => {
             if !remaining_sources.is_empty() {
-                move_managed_files(
-                    &remaining_sources,
-                    &remaining_targets,
-                    &payload.next.rendered_hash,
-                )?;
+                move_managed_artifacts(&remaining_sources, &remaining_targets, &remaining_hashes)?;
             }
             apply_recovered_agent_move(state, &operation.id, &payload).await?;
             database.commit_filesystem_operation(&operation.id).await
@@ -1684,10 +1971,11 @@ async fn recover_agent_uninstall_operation(
     }
     match operation.phase {
         crate::state_db::FilesystemOperationPhase::Prepared => {
+            let mut existing = Vec::new();
             for (path, expected_hash) in paths.iter().zip(&payload.hashes) {
                 match (recovery_file_hash(path)?, expected_hash) {
                     (Some(hash), Some(expected)) if hash == *expected => {
-                        remove_file_strict(path).await?
+                        existing.push(path.clone())
                     }
                     (None, _) | (_, None) if !path.exists() => {}
                     _ => {
@@ -1697,6 +1985,7 @@ async fn recover_agent_uninstall_operation(
                     }
                 }
             }
+            remove_agent_artifacts_with(&existing, |path| std::fs::remove_file(path)).await?;
             apply_recovered_agent_uninstall(state, &operation.id, &payload.previous).await?;
             database.commit_filesystem_operation(&operation.id).await
         }
@@ -1817,11 +2106,13 @@ async fn write_agent_files_to(
     installed_at: &str,
     preferred_dest: Option<&Path>,
 ) -> Result<InstallRecord, AppError> {
-    let (bytes, rendered_hash) = render::render_with_hash(agent, raw, tool)?;
-    let paths = install_target_paths(agent, tool, home, project_root, preferred_dest)?;
-    for dest in &paths {
+    let rendered = render::render_artifacts(agent, raw, tool)?;
+    let paths = install_target_paths(agent, Some(raw), tool, home, project_root, preferred_dest)?;
+    let manifest = artifact_manifest(&paths, &rendered)?;
+    let prior = capture_batch_files(&paths).await?;
+    for ((dest, artifact), entry) in paths.iter().zip(&rendered).zip(&manifest) {
         if let Some(bdir) = backup_dir {
-            backup_if_differs(dest, bytes.as_bytes(), bdir, installed_at).await?;
+            backup_if_differs(dest, artifact.content.as_bytes(), bdir, installed_at).await?;
         }
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent)
@@ -1830,29 +2121,55 @@ async fn write_agent_files_to(
                     message: format!("create {}: {e}", parent.display()),
                 })?;
         }
-        atomic_write(dest, bytes.as_bytes()).await?;
+        let write = async {
+            atomic_write(dest, artifact.content.as_bytes()).await?;
+            let saved = read_capped(dest, MAX_INSTALLED_BYTES).await?;
+            if render::sha256_hex(&saved) != entry.rendered_hash {
+                return Err(AppError::Internal {
+                    message: format!("verify Agent artifact {} failed", dest.display()),
+                });
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = write {
+            return match restore_batch_files(&prior).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("write Agent artifacts", error, rollback)),
+            };
+        }
     }
-    Ok(record_for(
+    let mut record = record_for(
         agent,
         &paths[0],
         tool,
         project_root,
-        rendered_hash,
+        manifest[0].rendered_hash.clone(),
         source_hash,
         body_hash,
         corpus_version,
         installed_at,
-    ))
+    );
+    record.artifacts = manifest;
+    Ok(record)
 }
 
 fn install_target_paths(
     agent: &crate::types::Agent,
+    raw: Option<&str>,
     tool: &str,
     home: &Path,
     project_root: Option<&Path>,
     preferred_dest: Option<&Path>,
 ) -> Result<Vec<PathBuf>, AppError> {
-    let mut paths = render::dests(tool, &agent.slug, home, project_root)?;
+    let slug =
+        if crate::registry::get(tool).and_then(|meta| meta.slug_from.as_deref()) == Some("name") {
+            raw.map(|source| render::output_slug(agent, source, tool))
+                .unwrap_or_else(|| render::slugify(&agent.name))
+        } else {
+            agent.slug.clone()
+        };
+    let mut paths = render::dests(tool, &slug, home, project_root)?;
     if let Some(preferred) = preferred_dest {
         if paths.len() == 1 {
             paths[0] = preferred.to_path_buf();
@@ -1865,6 +2182,7 @@ fn install_target_paths(
 
 // ---------- Reconciliation core (pure, testable) ----------
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct ReconcileFacts<'a> {
     tracked: bool,
@@ -1876,6 +2194,7 @@ struct ReconcileFacts<'a> {
     current_source_hash: Option<&'a str>,
 }
 
+#[cfg(test)]
 fn classify_install(facts: ReconcileFacts<'_>) -> InstallState {
     if !facts.tracked {
         return InstallState::Foreign;
@@ -1904,6 +2223,83 @@ fn classify_install(facts: ReconcileFacts<'_>) -> InstallState {
         }
         Some(_) => InstallState::Current,
     }
+}
+
+fn classify_artifact_install(
+    active_hashes: &[Option<&str>],
+    disabled_hashes: &[Option<&str>],
+    rendered_hashes: &[&str],
+    disabled: bool,
+    installed_source_hash: &str,
+    current_source_hash: Option<&str>,
+) -> InstallState {
+    if active_hashes.len() != rendered_hashes.len()
+        || disabled_hashes.len() != rendered_hashes.len()
+        || rendered_hashes.is_empty()
+    {
+        return InstallState::Modified;
+    }
+    if disabled {
+        if active_hashes.iter().all(Option::is_none)
+            && disabled_hashes
+                .iter()
+                .zip(rendered_hashes)
+                .all(|(actual, expected)| actual.as_deref() == Some(*expected))
+        {
+            return InstallState::Disabled;
+        }
+        if active_hashes.iter().any(Option::is_some)
+            || disabled_hashes.iter().any(|hash| hash.is_some())
+        {
+            return InstallState::Modified;
+        }
+        return if current_source_hash.is_none() {
+            InstallState::SourceUnavailable
+        } else {
+            InstallState::Missing
+        };
+    }
+    if current_source_hash.is_none() {
+        return InstallState::SourceUnavailable;
+    }
+    if active_hashes
+        .iter()
+        .zip(rendered_hashes)
+        .any(|(actual, expected)| actual.is_some_and(|hash| hash != *expected))
+    {
+        return InstallState::Modified;
+    }
+    if active_hashes.iter().any(Option::is_none) {
+        return InstallState::Missing;
+    }
+    if current_source_hash != Some(installed_source_hash) {
+        InstallState::Outdated
+    } else {
+        InstallState::Current
+    }
+}
+
+async fn record_reconcile_hashes(
+    state: &AppState,
+    record: &InstallRecord,
+) -> Result<(Vec<String>, Vec<Option<String>>, Vec<Option<String>>), AppError> {
+    let active = resolved_record_paths(state, record).await?;
+    let manifest = record_artifacts(record);
+    let expected = if record.artifacts.is_empty() {
+        vec![record.rendered_hash.clone(); active.len()]
+    } else {
+        manifest
+            .iter()
+            .map(|artifact| artifact.rendered_hash.clone())
+            .collect()
+    };
+    let mut active_hashes = Vec::with_capacity(active.len());
+    let mut disabled_hashes = Vec::with_capacity(active.len());
+    for path in &active {
+        active_hashes.push(recovery_file_hash(path)?);
+        disabled_hashes.push(recovery_file_hash(&disabled_destination(path)?)?);
+    }
+    Ok((expected, active_hashes, disabled_hashes))
 }
 
 fn find_agent_package<'a>(
@@ -1994,10 +2390,11 @@ fn ensure_destinations_available(
             && record.project_path.as_deref() == project_path
             && !same_identity(record)
     }) {
-        if destinations
-            .iter()
-            .any(|path| path == Path::new(&record.dest))
-        {
+        if record_artifacts(record).iter().any(|artifact| {
+            destinations
+                .iter()
+                .any(|path| path == Path::new(&artifact.dest))
+        }) {
             return Err(AppError::InvalidArgument {
                 message: format!(
                     "Agent destination collision: {}:{} conflicts with {}:{} at {}",
@@ -2171,7 +2568,8 @@ async fn build_mutation_plan(
             }
         };
         let preferred = existing.map(|record| Path::new(&record.dest));
-        let paths = match install_target_paths(agent, &tool, &home, project, preferred) {
+        let paths = match install_target_paths(agent, Some(&raw), &tool, &home, project, preferred)
+        {
             Ok(paths) => paths,
             Err(error) => {
                 blockers.push(error.to_string());
@@ -2231,6 +2629,12 @@ async fn build_mutation_plan(
             capabilities: package.capabilities.clone(),
         });
         let _ = raw;
+    }
+    if tool == "openclaw" {
+        warnings.push(
+            "OpenClaw installs workspace files only. Register the agent and restart OpenClaw separately; Agency Agents will not run the OpenClaw CLI."
+                .into(),
+        );
     }
     warnings.sort();
     warnings.dedup();
@@ -2300,6 +2704,7 @@ async fn execute_install_plan(
         });
         paths.extend(install_target_paths(
             agent,
+            None,
             &plan.tool,
             &home,
             project,
@@ -2515,10 +2920,15 @@ pub(crate) async fn mcp_collection_plan(
 
 async fn rollback_clean_agent_files(
     paths: &[PathBuf],
-    rendered_hash: &str,
+    rendered_hashes: &[String],
     authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<(), AppError> {
-    for path in paths.iter().rev() {
+    if paths.len() != rendered_hashes.len() {
+        return Err(AppError::InvalidArgument {
+            message: "Agent rollback paths and artifact hashes disagree".into(),
+        });
+    }
+    for (path, rendered_hash) in paths.iter().zip(rendered_hashes).rev() {
         if let Some(authorization) = authorization {
             crate::skills::install::remove_project_file(
                 authorization.root(),
@@ -2527,7 +2937,7 @@ async fn rollback_clean_agent_files(
             )?;
         } else {
             let bytes = read_capped(path, MAX_INSTALLED_BYTES).await?;
-            if render::sha256_hex(&bytes) != rendered_hash {
+            if render::sha256_hex(&bytes) != *rendered_hash {
                 return Err(AppError::InvalidArgument {
                     message: format!(
                         "new Agent install changed before rollback: {}",
@@ -2568,7 +2978,7 @@ pub(crate) async fn mcp_install_agent_clean(
     })?;
     let home = tool_home(state, &tool).await?;
     let project = project_path.as_deref().map(Path::new);
-    let paths = install_target_paths(&agent, &tool, &home, project, None)?;
+    let paths = install_target_paths(&agent, Some(&raw), &tool, &home, project, None)?;
     let mut ledger = load_ledger_for_state(state).await?;
     if ledger.iter().any(|record| {
         record.source_id == reference.source_id
@@ -2588,14 +2998,19 @@ pub(crate) async fn mcp_install_agent_clean(
         &paths,
         false,
     )?;
-    let (rendered, rendered_hash) = render::render_with_hash(&agent, &raw, &tool)?;
+    let rendered = render::render_artifacts(&agent, &raw, &tool)?;
+    let manifest = artifact_manifest(&paths, &rendered)?;
+    let hashes = manifest
+        .iter()
+        .map(|artifact| artifact.rendered_hash.clone())
+        .collect::<Vec<_>>();
     let mut created = Vec::with_capacity(paths.len());
-    for path in &paths {
+    for (path, artifact) in paths.iter().zip(&rendered) {
         let result = if let Some(authorization) = authorization {
             crate::skills::install::create_project_file(
                 authorization.root(),
                 &capability_relative(authorization, path)?,
-                rendered.as_bytes(),
+                artifact.content.as_bytes(),
             )
         } else {
             if let Some(parent) = path.parent() {
@@ -2614,7 +3029,7 @@ pub(crate) async fn mcp_install_agent_clean(
                     message: format!("create Agent destination {}: {error}", path.display()),
                 })?;
             let result = async {
-                file.write_all(rendered.as_bytes())
+                file.write_all(artifact.content.as_bytes())
                     .await
                     .map_err(|error| AppError::Io {
                         message: format!("write Agent destination {}: {error}", path.display()),
@@ -2630,7 +3045,13 @@ pub(crate) async fn mcp_install_agent_clean(
             result
         };
         if let Err(error) = result {
-            return match rollback_clean_agent_files(&created, &rendered_hash, authorization).await {
+            return match rollback_clean_agent_files(
+                &created,
+                &hashes[..created.len()],
+                authorization,
+            )
+            .await
+            {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(rollback_error("install Agent", error, rollback)),
             };
@@ -2646,12 +3067,13 @@ pub(crate) async fn mcp_install_agent_clean(
         &paths[0],
         &tool,
         project,
-        rendered_hash.clone(),
+        manifest[0].rendered_hash.clone(),
         &package.source_hash,
         &package.body_hash,
         &revision,
         &now_iso(),
     );
+    record.artifacts = manifest;
     record.source_id = reference.source_id.clone();
     record.relative_path = reference.relative_path.clone();
     record.source_snapshot_hash = package.source_hash;
@@ -2660,7 +3082,7 @@ pub(crate) async fn mcp_install_agent_clean(
     record.publisher_verified = package.publisher_verified;
     ledger.push(record.clone());
     if let Err(error) = save_ledger_for(&state.app_data_dir, &ledger).await {
-        return match rollback_clean_agent_files(&created, &rendered_hash, authorization).await {
+        return match rollback_clean_agent_files(&created, &hashes, authorization).await {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("save Agent install", error, rollback)),
         };
@@ -2715,11 +3137,11 @@ pub(crate) async fn mcp_move_agent_install(
     }
     let stored_disabled = records[index].disabled_path.clone();
     let previous = records[index].clone();
-    records[index].disabled_path = if enable {
-        None
-    } else {
-        Some(disabled[0].to_string_lossy().into_owned())
-    };
+    let hashes = record_rendered_hashes(&records[index], active.len());
+    set_record_disabled_paths(
+        &mut records[index],
+        if enable { None } else { Some(&disabled) },
+    );
     let database = state.completed_state_database().await?;
     let operation = if let Some(database) = &database {
         Some(
@@ -2789,7 +3211,7 @@ pub(crate) async fn mcp_move_agent_install(
         }
     } else {
         snapshot_record(state, &records[index], sources).await?;
-        move_managed_files(sources, destinations, &records[index].rendered_hash)?;
+        move_managed_artifacts(sources, destinations, &hashes)?;
     }
     let save = match &operation {
         Some(operation) => save_ledger_after_filesystem(state, &records, &operation.id).await,
@@ -2799,7 +3221,10 @@ pub(crate) async fn mcp_move_agent_install(
         if operation.is_some() {
             return Err(error);
         }
-        records[index].disabled_path = stored_disabled;
+        set_record_disabled_paths(
+            &mut records[index],
+            stored_disabled.as_ref().map(|_| disabled.as_slice()),
+        );
         let rollback = if let Some(authorization) = authorization {
             for (source, destination) in sources.iter().zip(destinations).rev() {
                 crate::skills::install::rename_project_file(
@@ -2811,7 +3236,7 @@ pub(crate) async fn mcp_move_agent_install(
             }
             Ok(())
         } else {
-            move_managed_files(destinations, sources, &records[index].rendered_hash)
+            move_managed_artifacts(destinations, sources, &hashes)
         };
         return match rollback {
             Ok(()) => Err(error),
@@ -2908,6 +3333,7 @@ fn classify(
 /// for `tool`. Pure (no I/O) so it's unit-testable. When they match, the file
 /// on disk IS this agent verbatim — there's nothing to "adopt"; reconcile can
 /// treat it as `Current` even if we didn't install it.
+#[cfg(test)]
 fn bytes_match_render(
     agent: &crate::types::Agent,
     raw: &str,
@@ -2918,6 +3344,34 @@ fn bytes_match_render(
         Ok((_, expected)) => render::sha256_hex(file_bytes) == expected,
         Err(_) => false,
     }
+}
+
+async fn destinations_match_render(
+    agent: &crate::types::Agent,
+    raw: &str,
+    tool: &str,
+    output_slug: &str,
+    home: &Path,
+    project_root: Option<&Path>,
+) -> bool {
+    let Ok(rendered) = render::render_artifacts(agent, raw, tool) else {
+        return false;
+    };
+    let Ok(paths) = render::dests(tool, output_slug, home, project_root) else {
+        return false;
+    };
+    if paths.len() != rendered.len() {
+        return false;
+    }
+    for (path, expected) in paths.iter().zip(rendered) {
+        let Ok(bytes) = read_capped(path, MAX_INSTALLED_BYTES).await else {
+            return false;
+        };
+        if bytes != expected.content.as_bytes() {
+            return false;
+        }
+    }
+    true
 }
 
 // ---------- Tool detection ----------
@@ -3347,7 +3801,8 @@ pub async fn disable_agent(
         .map(|path| disabled_destination(path))
         .collect::<Result<Vec<_>, _>>()?;
     let previous = records[index].clone();
-    records[index].disabled_path = Some(disabled[0].to_string_lossy().into_owned());
+    let hashes = record_rendered_hashes(&records[index], active.len());
+    set_record_disabled_paths(&mut records[index], Some(&disabled));
     let database = state.completed_state_database().await?;
     let operation = if let Some(database) = &database {
         Some(
@@ -3373,7 +3828,7 @@ pub async fn disable_agent(
         None
     };
     snapshot_record(&state, &records[index], &active).await?;
-    move_managed_files(&active, &disabled, &records[index].rendered_hash)?;
+    move_managed_artifacts(&active, &disabled, &hashes)?;
     let save = match &operation {
         Some(operation) => save_ledger_after_filesystem(&state, &records, &operation.id).await,
         None => save_ledger(&app, &records).await,
@@ -3382,7 +3837,7 @@ pub async fn disable_agent(
         if operation.is_some() {
             return Err(error);
         }
-        return match move_managed_files(&disabled, &active, &records[index].rendered_hash) {
+        return match move_managed_artifacts(&disabled, &active, &hashes) {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("disable Agent", error, rollback)),
         };
@@ -3430,7 +3885,8 @@ pub async fn enable_agent(
         });
     }
     let previous = records[index].clone();
-    records[index].disabled_path = None;
+    let hashes = record_rendered_hashes(&records[index], active.len());
+    set_record_disabled_paths(&mut records[index], None);
     let database = state.completed_state_database().await?;
     let operation = if let Some(database) = &database {
         Some(
@@ -3455,7 +3911,7 @@ pub async fn enable_agent(
     } else {
         None
     };
-    move_managed_files(&disabled, &active, &records[index].rendered_hash)?;
+    move_managed_artifacts(&disabled, &active, &hashes)?;
     let save = match &operation {
         Some(operation) => save_ledger_after_filesystem(&state, &records, &operation.id).await,
         None => save_ledger(&app, &records).await,
@@ -3464,8 +3920,8 @@ pub async fn enable_agent(
         if operation.is_some() {
             return Err(error);
         }
-        records[index].disabled_path = Some(stored_disabled);
-        return match move_managed_files(&active, &disabled, &records[index].rendered_hash) {
+        set_record_disabled_paths(&mut records[index], Some(&disabled));
+        return match move_managed_artifacts(&active, &disabled, &hashes) {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("enable Agent", error, rollback)),
         };
@@ -3525,20 +3981,91 @@ async fn rollback_agent_version(
     }
     let identity = install_identity(&records[index]);
     let paths = resolved_record_paths(state, &records[index]).await?;
+    let (selected_meta, selected_contents) =
+        history::snapshot_contents(&state.app_data_dir, &identity, &snapshot_id, &paths).await?;
+    if !records[index].artifacts.is_empty()
+        && selected_meta.artifact_hashes.len() != records[index].artifacts.len()
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Agent version snapshot artifact count changed".into(),
+        });
+    }
     let prior = snapshot_record(state, &records[index], &paths).await?;
-    let selected =
-        history::restore_snapshot(&state.app_data_dir, &identity, &snapshot_id, &paths).await?;
-    records[index].source_hash = selected.source_hash.clone();
-    records[index].source_snapshot_hash = selected.source_hash;
-    records[index].rendered_hash = selected.rendered_hash;
-    records[index].installed_at = now_iso();
-    if let Err(error) = save_ledger(app, &records).await {
+    let previous = records[index].clone();
+    let mut next = previous.clone();
+    next.source_hash = selected_meta.source_hash.clone();
+    next.source_snapshot_hash = selected_meta.source_hash.clone();
+    next.rendered_hash = selected_meta.rendered_hash.clone();
+    if !next.artifacts.is_empty() {
+        for (artifact, hash) in next
+            .artifacts
+            .iter_mut()
+            .zip(selected_meta.artifact_hashes.iter())
+        {
+            artifact.rendered_hash.clone_from(hash);
+        }
+        next.rendered_hash = next.artifacts[0].rendered_hash.clone();
+    }
+    next.installed_at = now_iso();
+    let rendered = selected_contents
+        .into_iter()
+        .map(|bytes| {
+            String::from_utf8(bytes).map_err(|_| AppError::InvalidArgument {
+                message: "Agent version snapshot content is not UTF-8".into(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "agent_update",
+                    &AgentInstallOperation {
+                        previous: Some(previous),
+                        next: next.clone(),
+                        targets: paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                        rendered: if rendered.len() == 1 {
+                            AgentRenderedPayload::One(rendered[0].clone())
+                        } else {
+                            AgentRenderedPayload::Many(rendered)
+                        },
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+    if let Err(error) =
+        history::restore_snapshot(&state.app_data_dir, &identity, &snapshot_id, &paths).await
+    {
+        if let (Some(database), Some(operation)) = (&database, &operation) {
+            database.abort_filesystem_operation(&operation.id).await?;
+        }
+        return Err(error);
+    }
+    records[index] = next;
+    let save = match &operation {
+        Some(operation) => save_ledger_after_filesystem(state, &records, &operation.id).await,
+        None => save_ledger(app, &records).await,
+    };
+    if let Err(error) = save {
+        if operation.is_some() {
+            return Err(error);
+        }
         return match history::restore_snapshot(&state.app_data_dir, &identity, &prior.id, &paths)
             .await
         {
             Ok(_) => Err(error),
             Err(rollback) => Err(rollback_error("rollback Agent version", error, rollback)),
         };
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     Ok(records[index].clone())
 }
@@ -3744,38 +4271,52 @@ pub async fn agent_diff(
         message: "Agent package has no valid metadata".into(),
     })?;
     let raw = crate::agents::read_agent_text(&state.app_data_dir, &reference).await?;
-    let (proposed, _hash) = render::render_with_hash(&agent, &raw, &tool)?;
+    let rendered = render::render_artifacts(&agent, &raw, &tool)?;
 
     let home = tool_home(&state, &tool).await?;
     let proot = project_path.as_ref().map(PathBuf::from);
     let ledger = load_ledger(&app, &state).await?;
-    let ledger_dest = ledger
-        .iter()
-        .find(|record| {
-            record.source_id == reference.source_id
-                && record.relative_path == reference.relative_path
-                && record.tool == tool
-                && record.project_path == project_path
-        })
-        .map(|r| PathBuf::from(&r.dest));
-    let candidates = candidate_dests(&agent, &raw, &tool, &home, proot.as_deref())?;
-    let dest = ledger_dest
-        .as_ref()
-        .or_else(|| candidates.iter().find(|p| p.exists()))
-        .unwrap_or(&candidates[0]);
-    let on_disk = match read_capped(dest, MAX_INSTALLED_BYTES).await {
-        Ok(b) => Some(String::from_utf8_lossy(&b).into_owned()),
-        Err(_) => None,
+    let ledger_record = ledger.iter().find(|record| {
+        record.source_id == reference.source_id
+            && record.relative_path == reference.relative_path
+            && record.tool == tool
+            && record.project_path == project_path
+    });
+    let paths = match ledger_record {
+        Some(record) => resolved_record_paths(&state, record).await?,
+        None => install_target_paths(&agent, Some(&raw), &tool, &home, proot.as_deref(), None)?,
     };
-    let differs = on_disk.as_deref() != Some(proposed.as_str());
+    if paths.len() != rendered.len() {
+        return Err(AppError::InvalidArgument {
+            message: "Agent diff destinations do not match rendered artifacts".into(),
+        });
+    }
+    let mut artifacts = Vec::with_capacity(paths.len());
+    for (dest, rendered) in paths.iter().zip(rendered) {
+        let on_disk = match read_capped(dest, MAX_INSTALLED_BYTES).await {
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(_) => None,
+        };
+        let differs = on_disk.as_deref() != Some(rendered.content.as_str());
+        artifacts.push(AgentArtifactDiff {
+            dest: dest.to_string_lossy().into_owned(),
+            on_disk,
+            proposed: rendered.content,
+            differs,
+        });
+    }
+    let primary = artifacts.first().ok_or_else(|| AppError::InvalidArgument {
+        message: "Agent diff has no rendered artifacts".into(),
+    })?;
     Ok(AgentDiff {
         slug: agent.slug,
         tool,
         project_path,
-        dest: dest.to_string_lossy().to_string(),
-        on_disk,
-        proposed,
-        differs,
+        dest: primary.dest.clone(),
+        on_disk: primary.on_disk.clone(),
+        proposed: primary.proposed.clone(),
+        differs: artifacts.iter().any(|artifact| artifact.differs),
+        artifacts,
     })
 }
 
@@ -3872,25 +4413,13 @@ async fn do_uninstall_locked(
     } else {
         None
     };
-    for path in &existing {
-        if let Err(error) = remove_file_strict(path).await {
-            if let Some(snapshot) = &snapshot {
-                if let Err(rollback) = history::restore_snapshot(
-                    &state.app_data_dir,
-                    &install_identity(&record),
-                    &snapshot.id,
-                    &existing,
-                )
-                .await
-                {
-                    return Err(rollback_error("uninstall Agent", error, rollback));
-                }
-            }
-            if let (Some(database), Some(operation)) = (&database, &operation) {
-                database.abort_filesystem_operation(&operation.id).await?;
-            }
-            return Err(error);
+    if let Err(error) =
+        remove_agent_artifacts_with(&existing, |path| std::fs::remove_file(path)).await
+    {
+        if let (Some(database), Some(operation)) = (&database, &operation) {
+            database.abort_filesystem_operation(&operation.id).await?;
         }
+        return Err(error);
     }
     ledger.remove(index);
     let save = match &operation {
@@ -3979,28 +4508,16 @@ async fn reconcile_agent_installs_locked(
     let agent_sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
     let mut installed = Vec::with_capacity(ledger.len());
     for record in ledger {
-        let destination_hash = match read_capped(Path::new(&record.dest), MAX_INSTALLED_BYTES).await
-        {
-            Ok(bytes) => Some(render::sha256_hex(&bytes)),
-            Err(AppError::Io { .. }) if !Path::new(&record.dest).exists() => None,
-            Err(error) => return Err(error),
-        };
-        let disabled_hash = match record.disabled_path.as_deref() {
-            Some(path) if Path::new(path).exists() => Some(render::sha256_hex(
-                &read_capped(Path::new(path), MAX_INSTALLED_BYTES).await?,
-            )),
-            _ => None,
-        };
         let package = find_agent_package(&agent_sources, &record);
-        let lifecycle = classify_install(ReconcileFacts {
-            tracked: true,
-            destination_hash: destination_hash.as_deref(),
-            disabled_path: record.disabled_path.is_some(),
-            disabled_hash: disabled_hash.as_deref(),
-            rendered_hash: &record.rendered_hash,
-            installed_source_hash: &record.source_snapshot_hash,
-            current_source_hash: package.map(|package| package.source_hash.as_str()),
-        });
+        let (expected, active, disabled) = record_reconcile_hashes(state, &record).await?;
+        let lifecycle = classify_artifact_install(
+            &active.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            &disabled.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            &expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            record.disabled_path.is_some(),
+            &record.source_snapshot_hash,
+            package.map(|package| package.source_hash.as_str()),
+        );
         let update_kind = (lifecycle == InstallState::Outdated).then(|| {
             if package.map(|value| value.body_hash.as_str()) == Some(record.body_hash.as_str()) {
                 UpdateKind::Cosmetic
@@ -4047,33 +4564,17 @@ pub async fn installs_reconcile(
     let agent_sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
     let mut out = Vec::with_capacity(ledger.len());
     for r in &ledger {
-        let dest = PathBuf::from(&r.dest);
-        let disk_hash = if dest.exists() {
-            read_capped(&dest, MAX_INSTALLED_BYTES)
-                .await
-                .ok()
-                .map(|b| render::sha256_hex(&b))
-        } else {
-            None
-        };
-        let disabled_hash = match r.disabled_path.as_deref().map(Path::new) {
-            Some(path) if path.exists() => read_capped(path, MAX_INSTALLED_BYTES)
-                .await
-                .ok()
-                .map(|bytes| render::sha256_hex(&bytes)),
-            _ => None,
-        };
         let package = find_agent_package(&agent_sources, r);
         let current_source_hash = package.map(|package| package.source_hash.as_str());
-        let st = classify_install(ReconcileFacts {
-            tracked: true,
-            destination_hash: disk_hash.as_deref(),
-            disabled_path: r.disabled_path.is_some(),
-            disabled_hash: disabled_hash.as_deref(),
-            rendered_hash: &r.rendered_hash,
-            installed_source_hash: &r.source_snapshot_hash,
+        let (expected, active, disabled) = record_reconcile_hashes(&state, r).await?;
+        let st = classify_artifact_install(
+            &active.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            &disabled.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            &expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            r.disabled_path.is_some(),
+            &r.source_snapshot_hash,
             current_source_hash,
-        });
+        );
         // Cosmetic vs substantive: only meaningful when Outdated. Body unchanged
         // upstream → the update is metadata-only.
         let update_kind = if st == InstallState::Outdated {
@@ -4207,11 +4708,20 @@ pub async fn installs_reconcile(
                 // here (recognized above), so we never claim unrelated files. A
                 // recognized-but-DIVERGENT file stays Foreign + untracked.
                 let raw = corpus::read_source(&app, &agent.category, &slug).await.ok();
-                let disk = read_capped(&byte_path, MAX_INSTALLED_BYTES).await.ok();
-                let canonical = matches!(
-                    (raw.as_deref(), disk.as_deref()),
-                    (Some(rw), Some(db)) if bytes_match_render(&agent, rw, tool, db)
-                );
+                let canonical = match raw.as_deref() {
+                    Some(raw) => {
+                        destinations_match_render(
+                            &agent,
+                            raw,
+                            tool,
+                            cand,
+                            &home,
+                            proj.as_deref().map(Path::new),
+                        )
+                        .await
+                    }
+                    None => false,
+                };
                 let mut tracked = false;
                 let state = if canonical {
                     if let (Some(rw), Some(entry)) = (raw.as_deref(), corpus.entry(&slug)) {
@@ -4300,6 +4810,11 @@ fn agent_units(tool: &str, home: &Path, project_root: Option<&Path>) -> Vec<(Pat
     let (templates, root): (&[String], &Path) = match project_root {
         Some(p) => (&dest.project, p),
         None => (&dest.user, home),
+    };
+    let templates = if matches!(tool, "kimi" | "openclaw") {
+        &templates[..templates.len().min(1)]
+    } else {
+        templates
     };
     templates
         .iter()
@@ -8315,6 +8830,7 @@ async fn build_workspace_pack_plan(
                 .map(|agent| {
                     install_target_paths(
                         agent,
+                        None,
                         &requested.tool,
                         &home,
                         plan.project_path.as_deref().map(Path::new),
@@ -11445,6 +11961,7 @@ mod tests {
             source_hash: String::new(),
             body_hash: String::new(),
             rendered_hash: String::new(),
+            artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: String::new(),
             capabilities: Vec::new(),
@@ -11468,6 +11985,7 @@ mod tests {
             source_hash: "a".repeat(64),
             body_hash: "b".repeat(64),
             rendered_hash,
+            artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: "a".repeat(64),
             capabilities: Vec::new(),
@@ -11505,7 +12023,7 @@ mod tests {
                     previous: None,
                     next: next.clone(),
                     targets: vec![destination.to_string_lossy().into_owned()],
-                    rendered: rendered.clone(),
+                    rendered: AgentRenderedPayload::One(rendered.clone()),
                 },
             )
             .await
@@ -11530,6 +12048,102 @@ mod tests {
             operation.phase,
             crate::state_db::FilesystemOperationPhase::Prepared
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_multi_artifact_rollback_recovers_every_file_and_ledger_once() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+
+        let app = tempfile::tempdir().unwrap();
+        let tool_home = tempfile::tempdir().unwrap();
+        let tool_home = std::fs::canonicalize(tool_home.path()).unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let mut settings = Settings::default();
+        settings
+            .tool_paths
+            .insert("kimi".into(), tool_home.to_string_lossy().into_owned());
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        database
+            .mutate(installs_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+
+        let paths = render::dests("kimi", "frontend-developer", &tool_home, None).unwrap();
+        let old = ["old agent yaml", "old system instructions"];
+        let next_content = ["new agent yaml", "new system instructions"];
+        for (path, content) in paths.iter().zip(old) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let mut previous = recovery_record(&tool_home, render::sha256_hex(old[0].as_bytes()));
+        previous.tool = "kimi".into();
+        previous.scope = crate::types::Scope::User;
+        previous.project_path = None;
+        previous.dest = paths[0].to_string_lossy().into_owned();
+        previous.artifacts = paths
+            .iter()
+            .zip(old)
+            .map(|(path, content)| InstallArtifact {
+                dest: path.to_string_lossy().into_owned(),
+                rendered_hash: render::sha256_hex(content.as_bytes()),
+                disabled_path: None,
+            })
+            .collect();
+        let mut next = previous.clone();
+        next.source_hash = "d".repeat(64);
+        next.source_snapshot_hash = next.source_hash.clone();
+        next.rendered_hash = render::sha256_hex(next_content[0].as_bytes());
+        for (artifact, content) in next.artifacts.iter_mut().zip(next_content) {
+            artifact.rendered_hash = render::sha256_hex(content.as_bytes());
+        }
+        database
+            .mutate(installs_spec(), Vec::new(), {
+                let previous = previous.clone();
+                move |records| {
+                    records.push(previous);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        database
+            .prepare_filesystem_operation(
+                "agent_update",
+                &AgentInstallOperation {
+                    previous: Some(previous),
+                    next: next.clone(),
+                    targets: paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect(),
+                    rendered: AgentRenderedPayload::Many(
+                        next_content.iter().map(ToString::to_string).collect(),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::write(&paths[0], next_content[0]).unwrap();
+
+        recover_agent_operations(&state).await.unwrap();
+        recover_agent_operations(&state).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), next_content[0]);
+        assert_eq!(std::fs::read_to_string(&paths[1]).unwrap(), next_content[1]);
+        let records = load_ledger_for_state(&state).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(exact_agent_install(&records[0], &next));
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -12438,7 +13052,8 @@ mod tests {
     #[tokio::test]
     async fn install_writes_then_reconciles_through_states() {
         let home = tempfile::tempdir().unwrap();
-        let agent = sample_agent();
+        let mut agent = sample_agent();
+        agent.slug = "source-filename-differs".into();
         let raw = "---\nname: Frontend Developer\n---\nORIGINAL\n";
 
         // Codex (user-scoped, TOML transform).
@@ -12594,6 +13209,63 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn multi_artifact_foreign_match_requires_every_exact_file() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = sample_agent();
+        let raw = "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\nBODY\n";
+        let paths = render::dests("kimi", "frontend-developer", home.path(), None).unwrap();
+        let rendered = render::render_artifacts(&agent, raw, "kimi").unwrap();
+        for (path, artifact) in paths.iter().zip(&rendered) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, artifact.content.as_bytes()).unwrap();
+        }
+
+        assert!(destinations_match_render(
+            &agent,
+            raw,
+            "kimi",
+            "frontend-developer",
+            home.path(),
+            None,
+        )
+        .await);
+        let tracked = track_agent_record(
+            &agent,
+            raw,
+            "kimi",
+            home.path(),
+            None,
+            "src-1",
+            "body-1",
+            "v1",
+            "2026-08-17T01:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(tracked.artifacts.len(), 2);
+        assert_eq!(
+            tracked
+                .artifacts
+                .iter()
+                .map(|artifact| PathBuf::from(&artifact.dest))
+                .collect::<Vec<_>>(),
+            paths
+        );
+
+        std::fs::write(&paths[1], b"changed secondary").unwrap();
+        assert!(
+            !destinations_match_render(
+                &agent,
+                raw,
+                "kimi",
+                "frontend-developer",
+                home.path(),
+                None,
+            )
+            .await
+        );
+    }
+
     /// Track records provenance but must NOT create or touch any file.
     #[tokio::test]
     async fn track_writes_no_file() {
@@ -12708,6 +13380,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn kimi_write_is_atomic_across_both_artifacts() {
+        let home = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let agent = sample_agent();
+        let raw = "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\nBODY\n";
+        let destinations = render::dests("kimi", "frontend-developer", home.path(), None).unwrap();
+        std::fs::create_dir_all(destinations[0].parent().unwrap()).unwrap();
+        std::fs::write(&destinations[0], b"previous agent yaml").unwrap();
+        std::fs::create_dir(destinations[1].with_extension("md.tmp")).unwrap();
+
+        let result = write_agent_files(
+            &agent,
+            raw,
+            "kimi",
+            home.path(),
+            None,
+            Some(backups.path()),
+            "src-2",
+            "body-2",
+            "v2",
+            "2026-08-17T01:02:03Z",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&destinations[0]).unwrap(),
+            b"previous agent yaml"
+        );
+        assert!(!destinations[1].exists());
+    }
+
+    #[tokio::test]
+    async fn kimi_write_persists_exact_per_artifact_manifest() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = sample_agent();
+        let raw = "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\nBODY\n";
+        let record = write_agent_files(
+            &agent,
+            raw,
+            "kimi",
+            home.path(),
+            None,
+            None,
+            "src-1",
+            "body-1",
+            "v1",
+            "2026-08-17T01:02:03Z",
+        )
+        .await
+        .unwrap();
+        let rendered = render::render_artifacts(&agent, raw, "kimi").unwrap();
+        assert_eq!(record.artifacts.len(), 2);
+        for (manifest, expected) in record.artifacts.iter().zip(rendered) {
+            assert_eq!(
+                std::fs::read(&manifest.dest).unwrap(),
+                expected.content.as_bytes()
+            );
+            assert_eq!(
+                manifest.rendered_hash,
+                render::sha256_hex(expected.content.as_bytes())
+            );
+            assert_eq!(manifest.disabled_path, None);
+        }
+        assert_eq!(record.dest, record.artifacts[0].dest);
+        assert_eq!(record.rendered_hash, record.artifacts[0].rendered_hash);
+    }
+
+    #[test]
+    fn multi_artifact_destinations_use_upstream_name_slug() {
+        let home = Path::new("/home/user");
+        let mut agent = sample_agent();
+        agent.slug = "source-filename-differs".into();
+        let raw = "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\nBODY\n";
+        assert_eq!(
+            install_target_paths(&agent, Some(raw), "kimi", home, None, None).unwrap(),
+            vec![
+                home.join(".config/kimi/agents/frontend-developer/agent.yaml"),
+                home.join(".config/kimi/agents/frontend-developer/system.md"),
+            ]
+        );
+        assert_eq!(
+            install_target_paths(&agent, Some(raw), "openclaw", home, None, None).unwrap(),
+            vec![
+                home.join(".openclaw/agency-agents/frontend-developer/SOUL.md"),
+                home.join(".openclaw/agency-agents/frontend-developer/AGENTS.md"),
+                home.join(".openclaw/agency-agents/frontend-developer/IDENTITY.md"),
+            ]
+        );
+    }
+
     #[test]
     fn lifecycle_disable_and_enable_move_exact_managed_files() {
         let root = tempfile::tempdir().unwrap();
@@ -12734,6 +13498,68 @@ mod tests {
         assert!(active
             .iter()
             .all(|path| std::fs::read(path).unwrap() == b"managed"));
+    }
+
+    #[test]
+    fn multi_artifact_reconcile_uses_required_precedence() {
+        let expected = ["one", "two", "three"];
+        assert_eq!(
+            classify_artifact_install(
+                &[Some("one"), Some("changed"), None],
+                &[None, None, None],
+                &expected,
+                false,
+                "source-1",
+                Some("source-1"),
+            ),
+            InstallState::Modified,
+            "Modified outranks a simultaneously missing artifact"
+        );
+        assert_eq!(
+            classify_artifact_install(
+                &[Some("one"), None, Some("three")],
+                &[None, None, None],
+                &expected,
+                false,
+                "source-1",
+                Some("source-2"),
+            ),
+            InstallState::Missing,
+            "Missing outranks an available source update"
+        );
+        assert_eq!(
+            classify_artifact_install(
+                &[Some("one"), Some("two"), Some("three")],
+                &[None, None, None],
+                &expected,
+                false,
+                "source-1",
+                Some("source-2"),
+            ),
+            InstallState::Outdated
+        );
+        assert_eq!(
+            classify_artifact_install(
+                &[None, None, None],
+                &[Some("one"), Some("two"), Some("three")],
+                &expected,
+                true,
+                "source-1",
+                Some("source-2"),
+            ),
+            InstallState::Disabled
+        );
+        assert_eq!(
+            classify_artifact_install(
+                &[Some("one"), Some("two"), Some("three")],
+                &[None, None, None],
+                &expected,
+                false,
+                "source-1",
+                None,
+            ),
+            InstallState::SourceUnavailable
+        );
     }
 
     #[test]
@@ -12785,6 +13611,124 @@ mod tests {
             .iter()
             .all(|path| std::fs::read(path).unwrap() == b"managed"));
         assert!(disabled.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn multi_artifact_move_checks_each_hash_and_restores_on_late_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let active = [
+            root.path().join("agent.yaml"),
+            root.path().join("system.md"),
+        ];
+        let bytes = [b"yaml".as_slice(), b"prompt".as_slice()];
+        for (path, content) in active.iter().zip(bytes) {
+            std::fs::write(path, content).unwrap();
+        }
+        let disabled = active
+            .iter()
+            .map(|path| disabled_destination(path).unwrap())
+            .collect::<Vec<_>>();
+        let hashes = bytes
+            .iter()
+            .map(|content| render::sha256_hex(content))
+            .collect::<Vec<_>>();
+        let calls = std::cell::Cell::new(0usize);
+        let result =
+            move_managed_artifacts_with(&active, &disabled, &hashes, |source, destination| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 1 {
+                    Err(std::io::Error::other("injected second artifact failure"))
+                } else {
+                    std::fs::rename(source, destination)
+                }
+            });
+        assert!(result.is_err());
+        for (path, content) in active.iter().zip(bytes) {
+            assert_eq!(std::fs::read(path).unwrap(), content);
+        }
+        assert!(disabled.iter().all(|path| !path.exists()));
+    }
+
+    #[tokio::test]
+    async fn multi_artifact_uninstall_restores_every_file_on_late_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = [root.path().join("SOUL.md"), root.path().join("AGENTS.md")];
+        for (path, content) in paths.iter().zip([b"soul".as_slice(), b"agents".as_slice()]) {
+            std::fs::write(path, content).unwrap();
+        }
+        let calls = std::cell::Cell::new(0usize);
+        let result = remove_agent_artifacts_with(&paths, |path| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 1 {
+                Err(std::io::Error::other("injected second artifact failure"))
+            } else {
+                std::fs::remove_file(path)
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"soul");
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"agents");
+    }
+
+    #[tokio::test]
+    async fn deleting_or_modifying_a_secondary_artifact_changes_reconciled_state() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+
+        let home = tempfile::tempdir().unwrap();
+        let state = AppState::build().unwrap();
+        let mut settings = Settings::default();
+        settings
+            .tool_paths
+            .insert("kimi".into(), home.path().to_string_lossy().into_owned());
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let mut agent = sample_agent();
+        agent.slug = "source-filename-differs".into();
+        let raw = "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\nBODY\n";
+        let record = write_agent_files(
+            &agent,
+            raw,
+            "kimi",
+            home.path(),
+            None,
+            None,
+            "source-1",
+            "body-1",
+            "v1",
+            "2026-08-17T01:02:03Z",
+        )
+        .await
+        .unwrap();
+
+        std::fs::remove_file(&record.artifacts[1].dest).unwrap();
+        let (expected, active, disabled) = record_reconcile_hashes(&state, &record).await.unwrap();
+        assert_eq!(
+            classify_artifact_install(
+                &active.iter().map(Option::as_deref).collect::<Vec<_>>(),
+                &disabled.iter().map(Option::as_deref).collect::<Vec<_>>(),
+                &expected.iter().map(String::as_str).collect::<Vec<_>>(),
+                false,
+                "source-1",
+                Some("source-1"),
+            ),
+            InstallState::Missing
+        );
+
+        std::fs::write(&record.artifacts[1].dest, b"changed").unwrap();
+        let (expected, active, disabled) = record_reconcile_hashes(&state, &record).await.unwrap();
+        assert_eq!(
+            classify_artifact_install(
+                &active.iter().map(Option::as_deref).collect::<Vec<_>>(),
+                &disabled.iter().map(Option::as_deref).collect::<Vec<_>>(),
+                &expected.iter().map(String::as_str).collect::<Vec<_>>(),
+                false,
+                "source-1",
+                Some("source-1"),
+            ),
+            InstallState::Modified
+        );
     }
 
     /// A write that overwrites an existing, DIFFERENT file must preserve the old
@@ -13045,6 +13989,7 @@ mod tests {
             source_hash: "sh".into(),
             body_hash: "bh".into(),
             rendered_hash: "rh".into(),
+            artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: "sh".into(),
             capabilities: Vec::new(),

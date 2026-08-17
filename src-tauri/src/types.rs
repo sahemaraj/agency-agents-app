@@ -1467,6 +1467,15 @@ pub struct CorpusMeta {
 
 // ---------- Install ledger ----------
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallArtifact {
+    pub dest: String,
+    pub rendered_hash: String,
+    #[serde(default)]
+    pub disabled_path: Option<String>,
+}
+
 /// One row of `installs.json` — the ledger of local install actions.
 /// `source_hash` records the corpus version installed from;
 /// `rendered_hash` is the SHA-256 of the exact bytes written after
@@ -1493,6 +1502,10 @@ pub struct InstallRecord {
     #[serde(default)]
     pub body_hash: String,
     pub rendered_hash: String,
+    /// Exact ordered files for multi-artifact tools. Empty means the legacy
+    /// single-file tuple (`dest`, `rendered_hash`, `disabled_path`).
+    #[serde(default)]
+    pub artifacts: Vec<InstallArtifact>,
     /// Same-parent hidden destination while the install is disabled.
     #[serde(default)]
     pub disabled_path: Option<String>,
@@ -1575,6 +1588,8 @@ pub struct AgentVersionSnapshot {
     pub created_at: String,
     pub source_hash: String,
     pub rendered_hash: String,
+    #[serde(default)]
+    pub artifact_hashes: Vec<String>,
     pub content_path: String,
 }
 
@@ -1609,6 +1624,15 @@ pub struct AgentMutationPlan {
 /// what an Update/Restore would change before any file is touched.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentArtifactDiff {
+    pub dest: String,
+    pub on_disk: Option<String>,
+    pub proposed: String,
+    pub differs: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentDiff {
     pub slug: String,
     pub tool: Tool,
@@ -1620,6 +1644,9 @@ pub struct AgentDiff {
     pub proposed: String,
     /// Whether the two differ (false ⇒ Update is a no-op).
     pub differs: bool,
+    /// Every physical file in this logical install. The legacy top-level fields
+    /// mirror the first artifact for existing clients.
+    pub artifacts: Vec<AgentArtifactDiff>,
 }
 
 // ---------- Tools / categories / projects ----------

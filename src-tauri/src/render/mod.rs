@@ -11,9 +11,8 @@
 //! "render" is the raw corpus source. Transform tools (cursor/.mdc, codex/TOML,
 //! gemini-cli, opencode, qwen) rebuild the file from frontmatter fields + body.
 //! Skill tools (osaurus, antigravity) emit an Agent-Skills `SKILL.md` directory.
-//! The remaining tools (openclaw multi-file, aider / windsurf accumulated files,
-//! kimi) are special multi-file shapes — not yet supported here; `render`/`dests`
-//! return an error so the UI can disable them cleanly.
+//! Multi-file per-agent tools use [`render_artifacts`]; the original [`render`]
+//! API remains the single-file contract.
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +21,11 @@ use sha2::{Digest, Sha256};
 use crate::error::AppError;
 use crate::registry;
 use crate::types::{Agent, Scope};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedArtifact {
+    pub content: String,
+}
 
 /// Whether `tool` can deploy USER-GLOBALLY (`~/…`). Most CLIs read a user-level
 /// agents dir; Cursor is the exception — its global rules live in the Settings
@@ -141,7 +145,13 @@ pub fn output_slug(agent: &Agent, raw_source: &str, tool: &str) -> String {
         agent.slug.clone()
     } else {
         let prefix = meta.and_then(|m| m.slug_prefix.as_deref()).unwrap_or("");
-        format!("{prefix}{}", slugify(source_field(raw_source, "name")))
+        let source_name = source_field(raw_source, "name");
+        let name = if source_name.is_empty() {
+            agent.name.as_str()
+        } else {
+            source_name
+        };
+        format!("{prefix}{}", slugify(name))
     }
 }
 
@@ -240,7 +250,89 @@ pub fn render(_agent: &Agent, raw_source: &str, tool: &str) -> Result<String, Ap
     Ok(out)
 }
 
+/// Render the ordered artifact set corresponding to the registry's ordered
+/// destination templates. Single-file tools preserve their existing renderer.
+pub fn render_artifacts(
+    agent: &Agent,
+    raw_source: &str,
+    tool: &str,
+) -> Result<Vec<RenderedArtifact>, AppError> {
+    let format = registry::get(tool).and_then(|meta| meta.format.as_deref());
+    let contents = match format {
+        Some("kimi-agent") => {
+            let name = source_field(raw_source, "name");
+            let description = source_field(raw_source, "description");
+            let body = source_body(raw_source);
+            let slug = slugify(name);
+            vec![
+                format!(
+                    "version: 1\nagent:\n  name: {slug}\n  extend: default\n  system_prompt_path: ./system.md\n"
+                ),
+                format!("# {name}\n\n{description}\n\n{body}\n"),
+            ]
+        }
+        Some("openclaw-workspace") => render_openclaw(raw_source),
+        _ => vec![render(agent, raw_source, tool)?],
+    };
+    Ok(contents
+        .into_iter()
+        .map(|content| RenderedArtifact { content })
+        .collect())
+}
+
+fn render_openclaw(raw_source: &str) -> Vec<String> {
+    let body = source_body(raw_source);
+    let mut soul = String::new();
+    let mut agents = String::new();
+    let mut section = String::new();
+    let mut soul_target = false;
+
+    for line in body.lines() {
+        if line.starts_with("## ") {
+            if soul_target {
+                soul.push_str(&section);
+            } else {
+                agents.push_str(&section);
+            }
+            section.clear();
+            let header = line.to_ascii_lowercase();
+            soul_target = header.contains("identity")
+                || (header.contains("learning") && header.contains("memory"))
+                || header.contains("communication")
+                || header.contains("style")
+                || (header.contains("critical") && header.contains("rule"))
+                || (header.contains("rules")
+                    && header.contains("you")
+                    && header.contains("must")
+                    && header.contains("follow"));
+        }
+        section.push_str(line);
+        section.push('\n');
+    }
+    if soul_target {
+        soul.push_str(&section);
+    } else {
+        agents.push_str(&section);
+    }
+    // Upstream writes each accumulated shell variable through a heredoc. The
+    // heredoc contributes one newline in addition to the section's own newline.
+    soul.push('\n');
+    agents.push('\n');
+
+    let name = source_field(raw_source, "name");
+    let description = source_field(raw_source, "description");
+    let emoji = source_field(raw_source, "emoji");
+    let vibe = source_field(raw_source, "vibe");
+    let identity = if !emoji.is_empty() && !vibe.is_empty() {
+        format!("# {emoji} {name}\n{vibe}\n")
+    } else {
+        format!("# {name}\n{description}\n")
+    };
+    vec![soul, agents, identity]
+}
+
 /// Render + hash in one shot.
+#[cfg(test)]
 pub fn render_with_hash(
     agent: &Agent,
     raw_source: &str,
@@ -510,6 +602,49 @@ mod tests {
     }
 
     #[test]
+    fn kimi_artifact_set_matches_upstream_converter() {
+        let artifacts = render_artifacts(&agent(), raw(), "kimi").unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(
+            artifacts[0].content,
+            "version: 1\nagent:\n  name: frontend-developer\n  extend: default\n  system_prompt_path: ./system.md\n"
+        );
+        assert_eq!(
+            artifacts[1].content,
+            "# Frontend Developer\n\nBuilds UIs.\n\nYou are a frontend dev.\n"
+        );
+    }
+
+    #[test]
+    fn openclaw_artifact_set_matches_upstream_converter() {
+        let source = "---\nname: Frontend Developer\ndescription: Builds UIs.\nemoji: 🎨\nvibe: Ships pixels.\n---\n## Mission\nBuild reliable UIs.\n## Identity\nYou care about craft.\n## Workflow\nVerify the result.\n## Communication Style\nBe direct.\n";
+        let artifacts = render_artifacts(&agent(), source, "openclaw").unwrap();
+        assert_eq!(artifacts.len(), 3);
+        assert_eq!(
+            artifacts[0].content,
+            "## Identity\nYou care about craft.\n## Communication Style\nBe direct.\n\n"
+        );
+        assert_eq!(
+            artifacts[1].content,
+            "## Mission\nBuild reliable UIs.\n## Workflow\nVerify the result.\n\n"
+        );
+        assert_eq!(
+            artifacts[2].content,
+            "# 🎨 Frontend Developer\nShips pixels.\n"
+        );
+    }
+
+    #[test]
+    fn openclaw_fallback_identity_matches_upstream_converter() {
+        let source =
+            "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\n## Mission\nBuild.\n";
+        let artifacts = render_artifacts(&agent(), source, "openclaw").unwrap();
+        assert_eq!(artifacts[0].content, "\n");
+        assert_eq!(artifacts[1].content, "## Mission\nBuild.\n\n");
+        assert_eq!(artifacts[2].content, "# Frontend Developer\nBuilds UIs.\n");
+    }
+
+    #[test]
     fn agent_prompt_content_is_rendered_as_data_without_execution() {
         let root = tempfile::tempdir().unwrap();
         let marker = root.path().join("must-not-exist");
@@ -666,6 +801,82 @@ mod tests {
             conversion_slugs.len(),
             compared
         );
+    }
+
+    #[test]
+    #[ignore = "requires AGENCY_AGENTS_PARITY_ROOT and executes upstream convert.sh"]
+    fn upstream_convert_sh_is_byte_identical_for_multi_artifact_tools() {
+        let root = PathBuf::from(
+            std::env::var("AGENCY_AGENTS_PARITY_ROOT")
+                .expect("set AGENCY_AGENTS_PARITY_ROOT to an agency-agents clone"),
+        );
+        let script = root.join("scripts/convert.sh");
+        let temp = tempfile::tempdir().unwrap();
+        for tool in ["kimi", "openclaw"] {
+            let status = Command::new("bash")
+                .arg(&script)
+                .args(["--tool", tool, "--out"])
+                .arg(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "convert.sh failed for {tool}");
+        }
+
+        let script_text = fs::read_to_string(&script).unwrap();
+        let dirs_start = script_text.find("AGENT_DIRS=(").expect("AGENT_DIRS");
+        let dirs_tail = &script_text[dirs_start + "AGENT_DIRS=(".len()..];
+        let categories = dirs_tail
+            .split(')')
+            .next()
+            .expect("AGENT_DIRS close")
+            .split_whitespace();
+        let mut files = Vec::new();
+        for category in categories {
+            collect_markdown(&root.join(category), &mut files);
+        }
+        files.sort();
+
+        let mut compared = 0usize;
+        for path in files {
+            let raw = fs::read_to_string(&path).unwrap();
+            let name = source_field(&raw, "name");
+            if name.is_empty() || !raw.starts_with("---\n") {
+                continue;
+            }
+            let agent = Agent {
+                slug: path.file_stem().unwrap().to_string_lossy().into_owned(),
+                name: name.into(),
+                description: String::new(),
+                category: String::new(),
+                emoji: None,
+                color: None,
+                vibe: None,
+                body: String::new(),
+            };
+            let slug = slugify(name);
+            for (tool, leaves) in [
+                ("kimi", &["agent.yaml", "system.md"][..]),
+                ("openclaw", &["SOUL.md", "AGENTS.md", "IDENTITY.md"][..]),
+            ] {
+                let actual = render_artifacts(&agent, &raw, tool).unwrap();
+                assert_eq!(actual.len(), leaves.len());
+                for (artifact, leaf) in actual.iter().zip(leaves) {
+                    let expected_path = temp.path().join(tool).join(&slug).join(leaf);
+                    let expected = fs::read(&expected_path).unwrap_or_else(|error| {
+                        panic!("read {}: {error}", expected_path.display())
+                    });
+                    assert_eq!(
+                        artifact.content.as_bytes(),
+                        expected,
+                        "{tool}/{leaf} parity mismatch for {}",
+                        path.display()
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 0);
+        eprintln!("multi-artifact renderer parity: {compared} byte comparisons");
     }
 
     #[test]

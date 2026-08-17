@@ -1211,6 +1211,8 @@ export interface InstallRecord {
   /** SHA-256 of the agent body at install time (cosmetic vs substantive updates). */
   bodyHash: string;
   renderedHash: string;
+  /** Exact ordered files for multi-artifact tools; empty on legacy rows. */
+  artifacts?: InstallArtifact[];
   disabledPath: string | null;
   sourceSnapshotHash: string;
   capabilities: string[];
@@ -1218,6 +1220,12 @@ export interface InstallRecord {
   publisherVerified: boolean;
   installedAt: string;
   corpusVersion: string;
+}
+
+export interface InstallArtifact {
+  dest: string;
+  renderedHash: string;
+  disabledPath: string | null;
 }
 
 /**
@@ -1481,11 +1489,19 @@ export interface AgentVersionSnapshot {
   createdAt: string;
   sourceHash: string;
   renderedHash: string;
+  artifactHashes: string[];
   contentPath: string;
 }
 
 /** Result of `agent_diff` — current on-disk contents vs the canonical render
     the app would write. Powers "review before Update" with zero file writes. */
+export interface AgentArtifactDiff {
+  dest: string;
+  onDisk: string | null;
+  proposed: string;
+  differs: boolean;
+}
+
 export interface AgentDiff {
   slug: string;
   tool: Tool;
@@ -1497,6 +1513,8 @@ export interface AgentDiff {
   proposed: string;
   /** Whether the two differ (false ⇒ Update is a no-op). */
   differs: boolean;
+  /** Every physical file in the logical install; top-level fields mirror the first. */
+  artifacts: AgentArtifactDiff[];
 }
 
 /** View-model for the Tools section — a detected AI tool plus its
