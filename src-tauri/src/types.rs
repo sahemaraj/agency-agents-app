@@ -1520,6 +1520,9 @@ pub struct InstallRecord {
     pub publisher_verified: bool,
     pub installed_at: String,
     pub corpus_version: String,
+    /// Truthful post-install follow-up for tools whose files need external activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_notice: Option<String>,
 }
 
 // ---------- Reconciliation ----------

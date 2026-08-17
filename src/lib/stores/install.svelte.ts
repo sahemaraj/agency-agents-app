@@ -67,6 +67,7 @@ function planReceiptItems(plan: AgentMutationPlan, records: InstallRecord[]): Ac
       name: planned?.name ?? record.relativePath,
       destination: record.dest,
       outcome: "ok",
+      ...(record.deploymentNotice ? { detail: record.deploymentNotice } : {}),
     };
   });
 }

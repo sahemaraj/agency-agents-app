@@ -2542,6 +2542,10 @@ describe("frontend test harness", () => {
         warnings: [], blockers: [], rollbackAvailable: false,
       };
       const records = [installRecord("reviewer", "/actual/reviewer.md"), installRecord("audit", "/actual/audit.md")];
+      records[0] = {
+        ...records[0],
+        deploymentNotice: "Workspace files installed; OpenClaw registration and restart remain required.",
+      } as InstallRecord;
       vi.mocked(invoke).mockImplementation(async (command: string) => {
         if (command === "agent_batch_apply" || command === "agent_collection_apply") return records as never;
         if (command === "installs_reconcile" || command === "tools_list") return [] as never;
@@ -2556,6 +2560,10 @@ describe("frontend test harness", () => {
       expect(receipt).toMatchObject({ operation: "install", succeeded: 2, failed: 0 });
       expect(receipt?.items.map((item) => item.destination)).toEqual(["/actual/reviewer.md", "/actual/audit.md"]);
       expect(receipt?.items.map((item) => item.name)).toEqual(["Reviewer", "Audit"]);
+      expect(receipt?.items.map((item) => item.detail)).toEqual([
+        "Workspace files installed; OpenClaw registration and restart remain required.",
+        undefined,
+      ]);
     },
   );
 

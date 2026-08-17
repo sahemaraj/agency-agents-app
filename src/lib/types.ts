@@ -1220,6 +1220,8 @@ export interface InstallRecord {
   publisherVerified: boolean;
   installedAt: string;
   corpusVersion: string;
+  /** Truthful post-install follow-up for tools whose files need external activation. */
+  deploymentNotice?: string | null;
 }
 
 export interface InstallArtifact {

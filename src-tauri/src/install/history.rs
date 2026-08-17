@@ -95,6 +95,27 @@ pub(super) async fn create_snapshot(
     rendered_hash: &str,
     created_at: &str,
 ) -> Result<AgentVersionSnapshot, AppError> {
+    create_snapshot_protected(
+        app_data_dir,
+        identity,
+        source_paths,
+        source_hash,
+        rendered_hash,
+        created_at,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn create_snapshot_protected(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    source_paths: &[PathBuf],
+    source_hash: &str,
+    rendered_hash: &str,
+    created_at: &str,
+    protected_snapshot_id: Option<&str>,
+) -> Result<AgentVersionSnapshot, AppError> {
     if source_paths.is_empty() {
         return Err(invalid("Agent version snapshot requires at least one file"));
     }
@@ -103,13 +124,14 @@ pub(super) async fn create_snapshot(
         regular_file(source)?;
         contents.push(read_capped(source, MAX_SNAPSHOT_BYTES).await?);
     }
-    create_snapshot_from_bytes(
+    create_snapshot_from_bytes_protected(
         app_data_dir,
         identity,
         &contents,
         source_hash,
         rendered_hash,
         created_at,
+        protected_snapshot_id,
     )
     .await
 }
@@ -121,6 +143,27 @@ pub(super) async fn create_snapshot_from_bytes(
     source_hash: &str,
     rendered_hash: &str,
     created_at: &str,
+) -> Result<AgentVersionSnapshot, AppError> {
+    create_snapshot_from_bytes_protected(
+        app_data_dir,
+        identity,
+        contents,
+        source_hash,
+        rendered_hash,
+        created_at,
+        None,
+    )
+    .await
+}
+
+async fn create_snapshot_from_bytes_protected(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    contents: &[Vec<u8>],
+    source_hash: &str,
+    rendered_hash: &str,
+    created_at: &str,
+    protected_snapshot_id: Option<&str>,
 ) -> Result<AgentVersionSnapshot, AppError> {
     if contents.is_empty() {
         return Err(invalid("Agent version snapshot requires at least one file"));
@@ -182,6 +225,13 @@ pub(super) async fn create_snapshot_from_bytes(
         };
         let index_path = directory.join("index.json");
         let mut snapshots = load_index(&index_path).await?;
+        if protected_snapshot_id
+            .is_some_and(|protected| !snapshots.iter().any(|snapshot| snapshot.id == protected))
+        {
+            return Err(invalid(
+                "Protected Agent version snapshot failed exact revalidation",
+            ));
+        }
         snapshots.push(snapshot.clone());
         snapshots.sort_by(|left, right| {
             right
@@ -189,7 +239,27 @@ pub(super) async fn create_snapshot_from_bytes(
                 .cmp(&left.created_at)
                 .then_with(|| right.id.cmp(&left.id))
         });
-        let retired = snapshots.split_off(snapshots.len().min(super::MAX_AGENT_HISTORY_ENTRIES));
+        let excess = snapshots
+            .len()
+            .saturating_sub(super::MAX_AGENT_HISTORY_ENTRIES);
+        let retired = snapshots
+            .iter()
+            .rev()
+            .filter(|candidate| candidate.id != snapshot.id)
+            .filter(|candidate| Some(candidate.id.as_str()) != protected_snapshot_id)
+            .take(excess)
+            .cloned()
+            .collect::<Vec<_>>();
+        if retired.len() != excess {
+            return Err(invalid(
+                "Agent version history cannot be pruned without removing a protected snapshot",
+            ));
+        }
+        let retired_ids = retired
+            .iter()
+            .map(|snapshot| snapshot.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        snapshots.retain(|snapshot| !retired_ids.contains(snapshot.id.as_str()));
         save_index(&index_path, &snapshots).await?;
         for retired_snapshot in retired {
             let path = PathBuf::from(retired_snapshot.content_path);

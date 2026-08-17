@@ -79,7 +79,7 @@ export function normalizeActivityReceipt(value: unknown): ActivityReceipt | unde
       : boundedReceiptText(item.destination, RECEIPT_DESTINATION_MAX);
     const destination = destinationText || null;
     if (!name || (item.outcome === "ok" && !destination)) return [];
-    const detail = item.outcome === "error" && item.detail != null
+    const detail = item.detail != null
       ? safeActivityDetail(item.detail)
       : undefined;
     return [{
