@@ -2973,6 +2973,21 @@ impl ServerHandler for SkillMcpServer {
             ));
         };
         let action_name = action.as_str();
+        let policy_lease = if action == McpAction::Read {
+            None
+        } else {
+            match crate::state_db::SecurityPolicyLease::exclusive(&self.state.app_data_dir).await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
+                        .await?;
+                    self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                        .await?;
+                    return Err(ErrorData::internal_error(error.to_string(), None));
+                }
+            }
+        };
         let requested_project = requested_project_path(&tool, request.arguments.as_ref());
         let authorization = self
             .state
@@ -3015,6 +3030,7 @@ impl ServerHandler for SkillMcpServer {
         let peer = context.peer.clone();
         let tool_context = ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(tool_context).await;
+        drop(policy_lease);
         let success = tool_call_succeeded(&result);
         let catalog_after = if catalog_before.is_some() {
             source_catalog_revision(&self.state, &tool).await
@@ -4276,6 +4292,115 @@ mod tests {
         for secret in ["audit-secret", "hunter2", "BEGIN PRIVATE KEY"] {
             assert!(!raw.contains(secret), "audit leaked {secret}: {raw}");
         }
+    }
+
+    #[tokio::test]
+    async fn strict_posture_serializes_with_an_authorized_full_tool_mutation() {
+        let app = tempfile::tempdir().expect("app data");
+        let first_source = tempfile::tempdir().expect("first source");
+        let second_source = tempfile::tempdir().expect("second source");
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist permissive MCP policy");
+        let mcp_state = test_state(app.path());
+        let strict_state = test_state(app.path());
+
+        let source_lock_path = app.path().join("state/skill-sources.lock");
+        std::fs::create_dir_all(source_lock_path.parent().expect("lock parent"))
+            .expect("state directory");
+        let source_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(source_lock_path)
+            .expect("open source lock");
+        source_lock.lock().expect("pause source mutation");
+
+        let first_root = first_source.path().to_path_buf();
+        let first_call = tokio::spawn(call_tools_over_stdio(
+            Arc::clone(&mcp_state),
+            vec![serde_json::json!({
+                "name": "skills_add_local_source",
+                "arguments": {"root": first_root},
+            })],
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if crate::state::load_mcp_audit(app.path())
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|entry| {
+                        entry.tool == "skills_add_local_source" && entry.phase == "attempt"
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mutation reached the post-authorization boundary");
+
+        let mut strict_apply = tokio::spawn(async move {
+            crate::commands::settings::security_posture_apply_inner(
+                &strict_state,
+                crate::commands::settings::SecurityPosturePreset::Strict,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut strict_apply)
+                .await
+                .is_err(),
+            "Strict returned while an authorized mutation could still commit"
+        );
+
+        drop(source_lock);
+        let first_response = first_call.await.expect("first tool task");
+        assert!(
+            first_response[0].get("error").is_none(),
+            "{}",
+            first_response[0]
+        );
+        let strict = strict_apply
+            .await
+            .expect("Strict task")
+            .expect("apply Strict");
+        assert!(strict.paranoid_mode);
+        assert!(!strict.mcp_source_access);
+
+        let sources_after_strict = super::super::load_skill_sources(app.path())
+            .await
+            .expect("load sources after Strict");
+        assert_eq!(sources_after_strict.len(), 1);
+        let second_response = call_tools_over_stdio(
+            Arc::clone(&mcp_state),
+            vec![serde_json::json!({
+                "name": "skills_add_local_source",
+                "arguments": {"root": second_source.path()},
+            })],
+        )
+        .await;
+        assert!(
+            second_response[0]["error"].is_object(),
+            "{}",
+            second_response[0]
+        );
+        assert_eq!(
+            super::super::load_skill_sources(app.path())
+                .await
+                .expect("load final sources"),
+            sources_after_strict,
+            "no source mutation may commit after Strict returns"
+        );
     }
 
     #[tokio::test]

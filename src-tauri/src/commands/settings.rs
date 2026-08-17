@@ -826,6 +826,8 @@ pub(crate) async fn security_posture_apply_inner(
     state: &AppState,
     preset: SecurityPosturePreset,
 ) -> Result<Settings, AppError> {
+    let _policy_lease =
+        crate::state_db::SecurityPolicyLease::exclusive(&state.app_data_dir).await?;
     let mut cache = state.settings.write().await;
     if let SettingsLoadState::Corrupt { message } = &*cache {
         return Err(AppError::Internal {
@@ -836,6 +838,9 @@ pub(crate) async fn security_posture_apply_inner(
         SettingsLoadState::Loaded(latest) => latest,
         SettingsLoadState::FirstLaunch => Settings::default(),
         SettingsLoadState::Corrupt { message } => {
+            *cache = SettingsLoadState::Corrupt {
+                message: message.clone(),
+            };
             return Err(AppError::Internal {
                 message: format!("settings file is unreadable: {message}"),
             });
@@ -1154,6 +1159,41 @@ mod tests {
             &*state.settings.read().await,
             SettingsLoadState::Corrupt { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn posture_apply_marks_a_previously_loaded_cache_corrupt_and_fails_closed() {
+        let app = tempfile::tempdir().expect("app data");
+        let permissive = Settings {
+            github_enabled: true,
+            mcp_source_access: true,
+            ..Settings::default()
+        };
+        persist(app.path(), permissive.clone()).await.expect("seed");
+        let corrupt = b"{bad json";
+        tokio::fs::write(settings_path(app.path()), corrupt)
+            .await
+            .expect("corrupt persisted settings");
+        let state = test_app_state(app.path(), SettingsLoadState::Loaded(permissive));
+
+        assert!(
+            security_posture_apply_inner(&state, SecurityPosturePreset::Strict)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read(settings_path(app.path())).await.unwrap(),
+            corrupt
+        );
+        assert!(matches!(
+            &*state.settings.read().await,
+            SettingsLoadState::Corrupt { .. }
+        ));
+        assert!(state.require_network("test").await.is_err());
+        assert!(state
+            .authorize_mcp_client("claude", crate::state::McpAction::Source, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

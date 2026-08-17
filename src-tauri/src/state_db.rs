@@ -124,6 +124,28 @@ pub(crate) struct StorageLease {
     _file: File,
 }
 
+/// Serializes security-policy changes with MCP mutations across app processes.
+/// The lease must be held from the mutation's fresh authorization through its
+/// commit, and by an atomic posture change until that policy is persisted.
+pub(crate) struct SecurityPolicyLease {
+    _file: File,
+}
+
+impl SecurityPolicyLease {
+    pub(crate) async fn exclusive(app_data_dir: &Path) -> Result<Self, AppError> {
+        let app_data_dir = app_data_dir.to_path_buf();
+        run_blocking(move || Self::exclusive_blocking(&app_data_dir)).await
+    }
+
+    fn exclusive_blocking(app_data_dir: &Path) -> Result<Self, AppError> {
+        let file = open_named_lock(app_data_dir, "security-policy.lock")?;
+        file.lock().map_err(|error| AppError::Io {
+            message: format!("lock security policy: {error}"),
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
 impl StorageLease {
     pub(crate) fn shared(app_data_dir: &Path) -> Result<Self, AppError> {
         let file = open_lock_file(app_data_dir)?;
