@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import Button from "./Button.svelte";
   import Modal from "./Modal.svelte";
   import { agentApprovalFacts } from "$lib/agents/libraryModel";
@@ -8,8 +8,8 @@
   import type { MessageKey } from "$lib/i18n/messages";
   import type { AgentApprovalAction } from "$lib/types";
 
-  interface Props { open: boolean; onClose: () => void; }
-  let { open, onClose }: Props = $props();
+  interface Props { open: boolean; onClose: () => void; focusId?: string | null; }
+  let { open, onClose, focusId = null }: Props = $props();
 
   const actionKeys: Record<AgentApprovalAction["action"], MessageKey> = {
     sourceRemove: "agents.approvalAction.sourceRemove",
@@ -35,6 +35,13 @@
     if (open) untrack(() => void agentLibrary.load(true));
   });
 
+  $effect(() => {
+    if (!open || !focusId || !approvals.some((approval) => approval.id === focusId)) return;
+    void tick().then(() => [...document.querySelectorAll<HTMLElement>("[data-agent-approval-id]")]
+      .find((candidate) => candidate.dataset.agentApprovalId === focusId)
+      ?.querySelector<HTMLElement>("button")?.focus({ preventScroll: true }));
+  });
+
   function stale(result: string | null): boolean {
     return !!result && /stale|revision|changed since/i.test(result);
   }
@@ -49,7 +56,7 @@
     <ul class="requests">
       {#each approvals as approval (approval.id)}
         {@const facts = agentApprovalFacts(approval.request)}
-        <li>
+        <li data-agent-approval-id={approval.id}>
           <div class="request-head">
             <strong>{i18n.t(actionKeys[facts.kind])}</strong>
             <span class:stale={stale(approval.result)}>{i18n.t(`agents.approvalState.${approval.state}`)}</span>

@@ -10,18 +10,135 @@
 
   import Button from "./Button.svelte";
   import EmptyState from "./EmptyState.svelte";
-  import { activity, type JournalEntry } from "$lib/stores/activity.svelte";
+  import { activity, safeActivityDetail, type JournalEntry } from "$lib/stores/activity.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { install } from "$lib/stores/install.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import type { MessageKey } from "$lib/i18n/messages";
+  import {
+    agentLibraryList,
+    expertActivationRequests,
+    expertCreationRequests,
+    expertRunsList,
+    projectReadinessGet,
+    projectRecommendationsList,
+    projectsList,
+    skillFoldersList,
+  } from "$lib/api";
+
+  type ReviewSource = "agent" | "skill" | "expert-change" | "expert-run" | "expert-activation" | "recommendation";
+  type ReviewItem = {
+    id: string;
+    source: ReviewSource;
+    label: string;
+    meta: string;
+    projectPath?: string;
+  };
+  type SourceState = { status: "loading" | "ready" | "unavailable"; items: ReviewItem[]; error: string };
+
+  const sourceState = (): SourceState => ({ status: "loading", items: [], error: "" });
+  let mode = $state<"review" | "history">(ui.activityReceiptId ? "history" : "review");
+  let modeAnnouncement = $state(ui.activityReceiptId ? "History mode" : "Review mode");
+  let review: Record<ReviewSource, SourceState> = $state({
+    agent: sourceState(), skill: sourceState(), "expert-change": sourceState(),
+    "expert-run": sourceState(), "expert-activation": sourceState(), recommendation: sourceState(),
+  });
+  const approvalSources: ReviewSource[] = ["agent", "skill", "expert-change", "expert-run", "expert-activation"];
+  const approvalTotal = $derived(approvalSources.reduce((count, source) =>
+    count + (review[source].status === "ready" ? review[source].items.length : 0), 0));
+  const approvalsPartial = $derived(approvalSources.some((source) => review[source].status !== "ready"));
 
   onMount(() => {
     void activity.refreshMcpAudit();
+    void Promise.all([
+      loadSource("agent"), loadSource("skill"), loadSource("expert-change"),
+      loadSource("expert-run"), loadSource("expert-activation"), loadSource("recommendation"),
+    ]);
   });
 
   let root: HTMLElement | undefined = $state();
   let receiptAnnouncement = $state("");
+
+  function setMode(next: "review" | "history") {
+    mode = next;
+    modeAnnouncement = next === "review" ? "Review mode" : "History mode";
+  }
+
+  function sourceLabel(source: ReviewSource): string {
+    if (source === "agent") return "Agent approvals";
+    if (source === "skill") return "Skill approvals";
+    if (source === "expert-change") return "Expert change requests";
+    if (source === "expert-run") return "Expert runs awaiting review";
+    if (source === "expert-activation") return "Expert activation requests";
+    return "Subscription Recommendations";
+  }
+
+  async function readSource(source: ReviewSource): Promise<ReviewItem[]> {
+    if (source === "agent") {
+      return (await agentLibraryList()).approvals.filter((item) => item.state === "pending").map((item) => ({
+        id: item.id, source, label: `Agent ${item.request.action}`, meta: `Requested by ${item.requestedBy}`,
+      }));
+    }
+    if (source === "skill") {
+      return (await skillFoldersList()).approvals.filter((item) => item.state === "pending").map((item) => ({
+        id: item.id, source, label: `Skill ${item.request.action}`, meta: `Requested by ${item.requestedBy}`,
+      }));
+    }
+    if (source === "expert-change") {
+      return (await expertCreationRequests()).filter((item) => item.state === "pending").map((item) => ({
+        id: item.id, source, label: `${item.kind} ${item.proposal.name}`, meta: `Requested by ${item.requestedBy}`,
+      }));
+    }
+    if (source === "expert-run") {
+      return (await expertRunsList()).filter((item) => item.state === "awaitingReview").map((item) => ({
+        id: item.id, source, label: `Run ${item.id.slice(0, 8)}`, meta: item.expertId,
+      }));
+    }
+    if (source === "expert-activation") {
+      return (await expertActivationRequests()).filter((item) => item.state === "pending").map((item) => ({
+        id: item.id, source, label: `Activate ${item.expertId}`, meta: `Requested by ${item.requestedBy}`,
+      }));
+    }
+    const registered = await projectsList();
+    const labels = new Map(registered.map((project) => [project.path, project.label]));
+    const subscribed = (await Promise.all(registered.map((project) => projectReadinessGet(project.path))))
+      .filter((report) => report.subscribed);
+    const lists = await Promise.all(subscribed.map((report) => projectRecommendationsList(report.projectPath)));
+    return lists.flatMap((items, index) => items
+      .filter((item) => ["new", "pending"].includes(item.lifecycle))
+      .map((item) => ({
+        id: item.id, source, label: item.summary, meta: labels.get(subscribed[index].projectPath) ?? "Subscribed project",
+        projectPath: subscribed[index].projectPath,
+      })));
+  }
+
+  async function loadSource(source: ReviewSource) {
+    review = { ...review, [source]: { ...review[source], status: "loading", error: "" } };
+    try {
+      const items = await readSource(source);
+      review = { ...review, [source]: { status: "ready", items, error: "" } };
+    } catch (error) {
+      review = { ...review, [source]: { ...review[source], status: "unavailable", error: safeActivityDetail(error) } };
+    }
+  }
+
+  async function retrySource(source: ReviewSource) {
+    await loadSource(source);
+    await tick();
+    const group = [...(root?.querySelectorAll<HTMLElement>("[data-review-group]") ?? [])]
+      .find((candidate) => candidate.dataset.reviewGroup === source);
+    group?.querySelector<HTMLElement>("button, h2")?.focus({ preventScroll: true });
+    receiptAnnouncement = `${sourceLabel(source)} refreshed.`;
+  }
+
+  function openReview(item: ReviewItem, triggerId: string) {
+    if (item.source === "agent") ui.openAgentApproval(item.id, triggerId);
+    else if (item.source === "skill") ui.openSkillApproval(item.id, triggerId);
+    else if (item.source === "expert-change") ui.openExpertReview("change", item.id, triggerId);
+    else if (item.source === "expert-run") ui.openExpertReview("run", item.id, triggerId);
+    else if (item.source === "expert-activation") ui.openExpertReview("activation", item.id, triggerId);
+    else if (item.projectPath) ui.openProjectRecommendation(item.projectPath, item.id, triggerId);
+  }
 
   $effect(() => {
     const id = ui.activityReceiptId;
@@ -40,6 +157,19 @@
       details.querySelector<HTMLElement>("summary")?.focus({ preventScroll: true });
       receiptAnnouncement = i18n.optional("activity.receiptOpened", "Receipt opened in Activity.");
       ui.activityReceiptId = null;
+    });
+  });
+
+  $effect(() => {
+    if (ui.section !== "activity" || !ui.reviewReturnId) return;
+    const id = ui.reviewReturnId;
+    void tick().then(() => {
+      const trigger = [...(root?.querySelectorAll<HTMLButtonElement>("[data-review-trigger]") ?? [])]
+        .find((candidate) => candidate.dataset.reviewTrigger === id);
+      if (!trigger) return;
+      trigger.focus({ preventScroll: true });
+      ui.consumeReviewReturn();
+      receiptAnnouncement = "Returned to Review.";
     });
   });
 
@@ -169,20 +299,53 @@
 </script>
 
 <section class="hist" bind:this={root}>
-  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{receiptAnnouncement}</div>
-  {#if activity.hasLocalEntries}
-    <header class="panel-head" data-tauri-drag-region>
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{receiptAnnouncement} {modeAnnouncement}</div>
+  <header class="panel-head" data-tauri-drag-region>
+    <div class="modes" data-tauri-drag-region="false" aria-label="Activity mode">
+      <button type="button" aria-pressed={mode === "review"} onclick={() => setMode("review")}>Review</button>
+      <button type="button" aria-pressed={mode === "history"} onclick={() => setMode("history")}>History</button>
+    </div>
+    {#if mode === "history" && activity.hasLocalEntries}
       <span class="action-wrap" data-tauri-drag-region="false">
         <Button size="sm" variant="ghost" onclick={() => activity.clear()}>
           {#snippet icon()}<Trash2 size={14} />{/snippet}
           {i18n.t("activity.clearLocal")}
         </Button>
       </span>
-    </header>
-  {/if}
+    {/if}
+  </header>
 
   <div class="list-wrap">
-    {#if activity.entries.length === 0}
+    {#if mode === "review"}
+      <div class="review-summary">{approvalTotal} pending{approvalsPartial ? " · partial" : ""}</div>
+      {#each approvalSources as source (source)}
+        {@const state = review[source]}
+        <section class="review-group" data-review-group={source} aria-busy={state.status === "loading"}>
+          <h2 tabindex="-1">{sourceLabel(source)} {state.status === "ready" ? state.items.length : ""} <span>{state.status === "ready" ? "Ready" : state.status === "loading" ? "Loading" : "Unavailable"}</span></h2>
+          {#if state.status === "unavailable"}
+            <p class="review-error" role="alert">{state.error}</p>
+            <button type="button" data-review-retry onclick={() => void retrySource(source)}>Retry</button>
+          {:else if state.status === "ready" && state.items.length === 0}
+            <p class="review-empty">Nothing pending.</p>
+          {:else}
+            <ul class="review-list">
+              {#each state.items as item (item.id)}
+                {@const triggerId = `${source}:${item.id}`}
+                <li><div><strong>{item.label}</strong><span>{item.meta}</span></div><button type="button" data-review-source={source} data-review-trigger={triggerId} onclick={() => openReview(item, triggerId)}>Open review</button></li>
+              {/each}
+            </ul>
+          {/if}
+        </section>
+      {/each}
+      {@const recommendations = review.recommendation}
+      <section class="review-group recommendations" data-review-group="recommendation" aria-busy={recommendations.status === "loading"}>
+        <h2 tabindex="-1">{sourceLabel("recommendation")} {recommendations.status === "ready" ? recommendations.items.length : ""} <span>{recommendations.status === "ready" ? "Ready" : recommendations.status === "loading" ? "Loading" : "Unavailable"}</span></h2>
+        {#if recommendations.status === "unavailable"}
+          <p class="review-error" role="alert">{recommendations.error}</p><button type="button" data-review-retry onclick={() => void retrySource("recommendation")}>Retry</button>
+        {:else if recommendations.status === "ready" && recommendations.items.length === 0}<p class="review-empty">No subscription recommendations.</p>
+        {:else}<ul class="review-list">{#each recommendations.items as item (item.id)}{@const triggerId = `recommendation:${item.id}`}<li><div><strong>{item.label}</strong><span>{item.meta}</span></div><button type="button" data-review-source="recommendation" data-review-trigger={triggerId} onclick={() => openReview(item, triggerId)}>Open recommendation</button></li>{/each}</ul>{/if}
+      </section>
+    {:else if activity.entries.length === 0}
       <EmptyState
         title={i18n.t("activity.emptyTitle")}
         body={i18n.t("activity.emptyBody")}
@@ -245,10 +408,27 @@
 <style>
   .hist { display: flex; flex-direction: column; min-height: 0; height: 100%; }
   .panel-head {
-    display: flex; justify-content: flex-end; align-items: center;
+    display: flex; justify-content: space-between; align-items: center;
     padding: var(--space-4);
     border-bottom: 1px solid var(--color-border);
   }
+  .modes { display: flex; gap: var(--space-1); }
+  .modes button, .review-group > button, .review-list button {
+    padding: 6px var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md);
+    color: var(--color-text-primary); background: var(--color-surface-raised); cursor: pointer;
+  }
+  .modes button[aria-pressed="true"] { color: var(--color-text-inverse); background: var(--color-brand); border-color: var(--color-brand); }
+  .modes button:focus-visible, .review-group > button:focus-visible, .review-list button:focus-visible { outline: 2px solid var(--color-brand); outline-offset: 2px; }
+  .review-summary { padding: var(--space-3) var(--space-4); font-weight: var(--fw-semibold); border-bottom: 1px solid var(--color-border); }
+  .review-group { padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); }
+  .review-group h2 { font-size: var(--text-body); font-weight: var(--fw-semibold); }
+  .review-group h2 span { margin-left: var(--space-1); color: var(--color-text-muted); font-size: var(--text-caption); font-weight: var(--fw-medium); }
+  .review-list { display: grid; gap: var(--space-2); margin-top: var(--space-2); }
+  .review-list li { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+  .review-list li div { min-width: 0; display: grid; }
+  .review-list span, .review-empty { color: var(--color-text-muted); font-size: var(--text-body-sm); }
+  .review-error { margin: var(--space-2) 0; color: var(--color-danger); font-size: var(--text-body-sm); overflow-wrap: anywhere; }
+  .recommendations { border-left: 3px solid var(--color-brand); }
 
   .list-wrap { flex: 1; overflow-y: auto; min-height: 0; }
 

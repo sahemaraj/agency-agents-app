@@ -165,6 +165,19 @@
     recommendations.filter((recommendation) => recommendation.lifecycle === "new").length,
   );
 
+  $effect(() => {
+    const id = ui.projectRecommendationId;
+    if (!id || !recommendations.some((recommendation) => recommendation.id === id)) return;
+    void tick().then(() => {
+      const button = [...(projectsRoot?.querySelectorAll<HTMLButtonElement>("button[data-recommendation-id]") ?? [])]
+        .find((candidate) => candidate.dataset.recommendationId === id);
+      if (!button) return;
+      ui.projectRecommendationId = null;
+      button.focus({ preventScroll: true });
+      button.click();
+    });
+  });
+
   function readinessCategoryLabel(category: ProjectReadinessReport["categories"][number]["category"]): string {
     return ({ agentRoster: "Agent roster", skills: "Skills", instructions: "Instructions", mcp: "MCP", tools: "Tools" })[category];
   }

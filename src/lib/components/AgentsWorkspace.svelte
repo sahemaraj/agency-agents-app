@@ -328,8 +328,11 @@
     setTimeout(() => organizerButton?.focus());
   }
   function closeApprovals() {
+    const returnToReview = !!ui.reviewReturnId;
+    ui.agentApprovalId = null;
     approvalsOpen = false;
-    setTimeout(() => approvalsButton?.focus());
+    if (returnToReview) ui.returnToActivityReview();
+    else setTimeout(() => approvalsButton?.focus());
   }
 
   const pendingApprovals = $derived(agentLibrary.library.approvals.filter((approval) => approval.state === "pending").length);
@@ -339,6 +342,18 @@
   // ── Install modal (the shared destinations × tools grid) for the open agent ──
   let installOpen = $state(false);
   let ollamaOpen = $state(false);
+
+  $effect(() => {
+    if (ui.agentApprovalId) approvalsOpen = true;
+  });
+
+  $effect(() => {
+    const recovery = ui.agentRecovery;
+    if (!recovery || !panelPackage || !install.reconciled) return;
+    if (panelPackage.reference.sourceId !== recovery.reference.sourceId
+      || panelPackage.reference.relativePath !== recovery.reference.relativePath) return;
+    installOpen = true;
+  });
 
   // ── Bulk select (lifted from the old Library, now over the unified list) ──
   let selectMode = $state(false);
@@ -696,14 +711,15 @@
 <AgentSourceManager open={sourceManagerOpen} onClose={closeSourceManager} />
 <AgentCreatorModal open={creatorOpen} initial={creatorInitial} onClose={closeCreator} />
 <AgentOrganizerModal open={organizerOpen} pkg={panelPackage} onClose={closeOrganizer} />
-<AgentApprovalInbox open={approvalsOpen} onClose={closeApprovals} />
+<AgentApprovalInbox open={approvalsOpen} focusId={ui.agentApprovalId} onClose={closeApprovals} />
 
 {#if installOpen && panelAgent}
   <InstallModal
     title={i18n.t("agents.installAgentTitle", { name: panelAgent.name })}
     agentSlugs={panelPackage ? [] : [panelAgent.slug]}
     agentPackage={panelPackage ?? undefined}
-    onClose={() => (installOpen = false)}
+    historyIntent={ui.agentRecovery ?? undefined}
+    onClose={() => { installOpen = false; ui.agentRecovery = null; }}
   />
 {/if}
 

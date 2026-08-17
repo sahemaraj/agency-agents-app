@@ -309,6 +309,13 @@ beforeEach(async () => {
   ui.teamsSelected = null;
   ui.toolsSelected = null;
   ui.activityReceiptId = null;
+  ui.reviewReturnId = null;
+  ui.agentApprovalId = null;
+  ui.skillApprovalId = null;
+  ui.expertReview = null;
+  ui.projectRecommendationId = null;
+  ui.agentRecovery = null;
+  ui.skillRecovery = null;
   ui.agentsReference = null;
   ui.skillsSelected = null;
   ui.paletteOpen = false;
@@ -474,8 +481,7 @@ describe("frontend test harness", () => {
       const callsBeforeRetry = vi.mocked(invoke).mock.calls.length;
       action("retryDoctor").click();
       await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.length).toBe(callsBeforeRetry + 1));
-      expect(vi.mocked(invoke).mock.calls.map(([command]) => command))
-        .toEqual(Array(callsBeforeRetry + 1).fill("doctor_report"));
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "doctor_report")).toHaveLength(2);
     } finally {
       unmount(component);
       target.remove();
@@ -490,10 +496,14 @@ describe("frontend test harness", () => {
       checks: [{ id: "catalog", category: "library", title: "Catalog", classification: "unavailable", evidence: "Cached local evidence", guidance: "Retry.", action: "retryDoctor" }],
     };
     let resolveRefresh: ((value: DoctorReport) => void) | undefined;
-    vi.mocked(invoke)
-      .mockResolvedValueOnce(report as never)
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve as (value: DoctorReport) => void; }))
-      .mockRejectedValueOnce({ code: "internal", message: "doctor unavailable" });
+    let doctorCalls = 0;
+    vi.mocked(invoke).mockImplementation((command: string) => {
+      if (command !== "doctor_report") return Promise.resolve([] as never);
+      doctorCalls += 1;
+      if (doctorCalls === 1) return Promise.resolve(report as never);
+      if (doctorCalls === 2) return new Promise((resolve) => { resolveRefresh = resolve as (value: DoctorReport) => void; });
+      return Promise.reject({ code: "internal", message: "doctor unavailable" });
+    });
     const writeText = vi.fn().mockRejectedValue(new Error("clipboard denied"));
     vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
     const { default: SettingsSectionDoctor } = await import("$lib/components/SettingsSectionDoctor.svelte");
@@ -509,7 +519,7 @@ describe("frontend test harness", () => {
       expect(target.textContent).toContain("prior evidence");
       expect(target.textContent).toContain("Cached local evidence");
       refresh.click();
-      expect(vi.mocked(invoke)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "doctor_report")).toHaveLength(2);
       resolveRefresh?.(report);
       await vi.waitFor(() => expect(refresh.disabled).toBe(false));
       refresh.click();
@@ -1000,6 +1010,259 @@ describe("frontend test harness", () => {
       expect(ui.section).toBe("activity");
       expect(ui.activityReceiptId).toBeNull();
       expect(target.querySelector("details[open]")).toBeNull();
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("aggregates five review groups, separates recommendations, and deep-links without mutation authority", async () => {
+    const projectPath = "/private/work/review-project";
+    const recommendation = updatedProjectRecommendation(projectPath);
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_library_list") return {
+        ...emptyFolderState(),
+        approvals: [{
+          id: "agent-approval", submittedAt: "2026-08-17T01:00:00Z", state: "pending",
+          requestedBy: "codex", request: { action: "draftPublish", id: "agent-draft", planRevision: "agent-revision" }, result: null,
+        }],
+      } as never;
+      if (command === "skill_folders_list") return {
+        ...emptyFolderState(),
+        approvals: [{
+          id: "skill-approval", submittedAt: "2026-08-17T02:00:00Z", state: "pending",
+          requestedBy: "claude", request: { action: "draftPublish", id: "skill-draft", planRevision: "skill-revision" }, result: null,
+        }],
+      } as never;
+      if (command === "expert_creation_requests") return [{
+        id: "expert-change", state: "pending", requestedBy: "codex", requestedAt: "2026-08-17T03:00:00Z",
+        kind: "update", targetExpertId: "reviewer", proposal: { name: "Review Expert" },
+      }] as never;
+      if (command === "expert_runs_list") return [{
+        id: "expert-run", expertId: "reviewer", state: "awaitingReview", startedAt: "2026-08-17T04:00:00Z",
+      }] as never;
+      if (command === "expert_activation_requests") return [{
+        id: "expert-activation", expertId: "reviewer", projectPath, state: "pending",
+        requestedBy: "codex", requestedAt: "2026-08-17T05:00:00Z", client: "codex",
+      }] as never;
+      if (command === "projects_list") return [{ path: projectPath, label: "Review project", installedCount: 0 }] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath, true) as never;
+      if (command === "project_recommendations_list") return [recommendation] as never;
+      return [] as never;
+    });
+    ui.section = "activity";
+    ui.navStack = [];
+    ui.navIndex = -1;
+    ui.initNav();
+    const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(ActivityHistory, { target });
+    try {
+      const review = await vi.waitFor(() => {
+        const button = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((candidate) => candidate.textContent?.trim() === "Review");
+        expect(button).toBeTruthy();
+        return button!;
+      });
+      const history = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((candidate) => candidate.textContent?.trim() === "History")!;
+      expect(review.getAttribute("aria-pressed")).toBe("true");
+      expect(history.getAttribute("aria-pressed")).toBe("false");
+      expect(review.getAttribute("role")).toBeNull();
+      expect(target.querySelector('[role="tablist"]')).toBeNull();
+      history.focus();
+      history.click();
+      await tick();
+      expect(history.getAttribute("aria-pressed")).toBe("true");
+      expect(target.querySelector('[role="status"]')?.textContent).toContain("History mode");
+      review.click();
+      await tick();
+      expect(review.getAttribute("aria-pressed")).toBe("true");
+      await vi.waitFor(() => expect(target.textContent).toContain("5 pending"));
+      for (const label of [
+        "Agent approvals 1", "Skill approvals 1", "Expert change requests 1",
+        "Expert runs awaiting review 1", "Expert activation requests 1",
+      ]) expect(target.textContent).toContain(label);
+      expect(target.textContent).toContain("Subscription Recommendations 1");
+      expect(target.textContent).not.toContain(projectPath);
+
+      const deepLink = (source: string) => target.querySelector<HTMLButtonElement>(`[data-review-source="${source}"]`)!;
+      deepLink("agent").click();
+      expect(ui.section).toBe("personas");
+      expect((ui as unknown as { agentApprovalId: string | null }).agentApprovalId).toBe("agent-approval");
+      ui.back();
+      await vi.waitFor(() => expect(document.activeElement).toBe(deepLink("agent")));
+
+      deepLink("skill").click();
+      expect(ui.section).toBe("skills");
+      expect((ui as unknown as { skillApprovalId: string | null }).skillApprovalId).toBe("skill-approval");
+      ui.back();
+
+      deepLink("expert-change").click();
+      expect(ui.section).toBe("experts");
+      expect((ui as unknown as { expertReview: unknown }).expertReview).toEqual({ kind: "change", id: "expert-change" });
+      ui.back();
+
+      deepLink("expert-run").click();
+      expect((ui as unknown as { expertReview: unknown }).expertReview).toEqual({ kind: "run", id: "expert-run" });
+      ui.back();
+
+      deepLink("expert-activation").click();
+      expect((ui as unknown as { expertReview: unknown }).expertReview).toEqual({ kind: "activation", id: "expert-activation" });
+      ui.back();
+
+      deepLink("recommendation").click();
+      expect(ui.section).toBe("projects");
+      expect(ui.projectsSelected).toBe(projectPath);
+      expect((ui as unknown as { projectRecommendationId: string | null }).projectRecommendationId).toBe(recommendation.id);
+      expect(vi.mocked(invoke).mock.calls.map(([command]) => command)
+        .some((command) => /approve|reject|resolve|review$|finalize/.test(command))).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("keeps review sources partial on failure and retries only the unavailable group", async () => {
+    let skillAttempts = 0;
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_library_list") return { ...emptyFolderState(), approvals: [] } as never;
+      if (command === "skill_folders_list") {
+        skillAttempts += 1;
+        if (skillAttempts === 1) throw new Error(`token=secret123 ${"x".repeat(800)}`);
+        return { ...emptyFolderState(), approvals: [{
+          id: "skill-retry", submittedAt: "2026-08-17T02:00:00Z", state: "pending", requestedBy: "codex",
+          request: { action: "draftPublish", id: "skill-draft", planRevision: "revision" }, result: null,
+        }] } as never;
+      }
+      if (["expert_creation_requests", "expert_runs_list", "expert_activation_requests", "projects_list"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(ActivityHistory, { target });
+    try {
+      await vi.waitFor(() => expect(target.querySelector('[data-review-group="skill"]')?.textContent).toContain("Unavailable"));
+      expect(target.textContent).toContain("0 pending · partial");
+      const skillGroup = target.querySelector<HTMLElement>('[data-review-group="skill"]')!;
+      expect(skillGroup.textContent).toContain("Unavailable");
+      expect(skillGroup.textContent).not.toContain("secret123");
+      expect(skillGroup.textContent!.length).toBeLessThan(800);
+      skillGroup.querySelector<HTMLButtonElement>("[data-review-retry]")!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("1 pending"));
+      expect(target.textContent).not.toContain("partial");
+      expect(skillGroup.contains(document.activeElement)).toBe(true);
+      expect(skillAttempts).toBe(2);
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_library_list")).toHaveLength(1);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("loads recovery sources independently and uses exact existing rollback and reveal boundaries", async () => {
+    const agent = { ...staleControlRow, sourceId: "agents", relativePath: "engineering/reviewer.md", tracked: true, state: "current" as const };
+    const skill: InstalledSkill = {
+      sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user",
+      projectPath: null, path: "/private/.codex/skills/audit", state: "current", tracked: true,
+    };
+    const backupPath = "/private/app/state/backups/agency-agents-verified.sqlite3";
+    let agentAttempts = 0;
+    vi.mocked(invoke).mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "doctor_report") return {
+        generatedAt: "2026-08-17T00:00:00Z", overall: "healthy",
+        counts: { healthy: 1, needsAttention: 0, unavailable: 0 }, copyText: "healthy", checks: [],
+      } as never;
+      if (command === "installs_reconcile") {
+        agentAttempts += 1;
+        if (agentAttempts === 1) throw new Error("Agent inventory unavailable");
+        return [agent] as never;
+      }
+      if (command === "agent_version_history") return [{
+        id: "agent-snapshot", createdAt: "2026-08-17T00:00:00Z",
+        sourceHash: "a".repeat(64), renderedHash: "b".repeat(64), contentPath: "/private/agent-snapshot",
+      }] as never;
+      if (command === "projects_list") return [] as never;
+      if (command === "skill_installs_reconcile") return [skill] as never;
+      if (command === "skill_backups_list") return ["/private/skill-backup"] as never;
+      if (command === "storage_migration_status") return { state: "complete", stage: null, detail: null, legacyConflicts: [] } as never;
+      if (command === "storage_backup") return backupPath as never;
+      if (command === "reveal_path") {
+        expect(args).toEqual({ path: backupPath });
+        return undefined as never;
+      }
+      return [] as never;
+    });
+    const { default: SettingsSectionDoctor } = await import("$lib/components/SettingsSectionDoctor.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionDoctor, { target });
+    try {
+      await vi.waitFor(() => expect(target.querySelector('[data-recovery-source="agents"]')?.textContent).toContain("Unavailable"));
+      expect(target.querySelector('[data-recovery-source="skills"]')?.textContent).toContain("1 rollback point");
+      expect(target.querySelector('[data-recovery-source="storage"]')?.textContent).toContain("Ready");
+      expect(target.textContent).toContain("offline/manual");
+      expect(target.textContent).toContain("WAL");
+      expect(target.textContent).not.toContain("/private/skill-backup");
+
+      target.querySelector<HTMLButtonElement>('[data-recovery-source="agents"] [data-recovery-retry]')!.click();
+      await vi.waitFor(() => expect(target.querySelector('[data-recovery-source="agents"]')?.textContent).toContain("1 rollback point"));
+      expect(target.querySelector('[data-recovery-source="agents"]')?.contains(document.activeElement)).toBe(true);
+      target.querySelector<HTMLButtonElement>('[data-agent-recovery]')!.click();
+      expect(ui.section).toBe("personas");
+      expect((ui as unknown as { agentRecovery: unknown }).agentRecovery).toEqual({
+        reference: { sourceId: "agents", relativePath: "engineering/reviewer.md" },
+        tool: agent.tool, projectPath: null,
+      });
+
+      ui.openSettings("doctor");
+      target.querySelector<HTMLButtonElement>('[data-skill-recovery]')!.click();
+      expect(ui.section).toBe("skills");
+      expect((ui as unknown as { skillRecovery: unknown }).skillRecovery).toEqual({
+        reference: { sourceId: "skills", relativePath: "audit" }, runtime: "codex", projectPath: null,
+      });
+
+      const createBackup = target.querySelector<HTMLButtonElement>("[data-storage-backup]")!;
+      createBackup.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Verified backup created"));
+      expect(document.activeElement).toBe(target.querySelector("[data-storage-reveal]"));
+      expect(target.textContent).toContain("agency-agents-verified.sqlite3");
+      expect(target.textContent).not.toContain(backupPath);
+      target.querySelector<HTMLButtonElement>("[data-storage-reveal]")!.click();
+      await vi.waitFor(() => expect(vi.mocked(invoke)).toHaveBeenCalledWith("reveal_path", { path: backupPath }));
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "open" || command === "shell_open")).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("keeps verified backup failure visible without erasing Agent and Skill recovery truth", async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "doctor_report") return {
+        generatedAt: "2026-08-17T00:00:00Z", overall: "healthy",
+        counts: { healthy: 0, needsAttention: 0, unavailable: 0 }, copyText: "healthy", checks: [],
+      } as never;
+      if (command === "installs_reconcile" || command === "projects_list" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "storage_migration_status") return { state: "complete", stage: null, detail: null, legacyConflicts: [] } as never;
+      if (command === "storage_backup") throw new Error("token=secret123 backup verification failed");
+      return [] as never;
+    });
+    const { default: SettingsSectionDoctor } = await import("$lib/components/SettingsSectionDoctor.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionDoctor, { target });
+    try {
+      await vi.waitFor(() => expect(target.querySelector('[data-recovery-source="agents"]')?.textContent).toContain("0 rollback points"));
+      target.querySelector<HTMLButtonElement>("[data-storage-backup]")!.click();
+      await vi.waitFor(() => expect(target.querySelector('[data-recovery-source="storage"] [role="alert"]')).not.toBeNull());
+      expect(target.textContent).toContain("backup verification failed");
+      expect(target.textContent).not.toContain("secret123");
+      expect(target.querySelector('[data-recovery-source="agents"]')?.textContent).toContain("0 rollback points");
+      expect(target.querySelector('[data-recovery-source="skills"]')?.textContent).toContain("0 rollback points");
+      expect(target.querySelector('[aria-live="polite"]')?.textContent).toBeTruthy();
     } finally {
       unmount(component);
       target.remove();
@@ -2309,11 +2572,13 @@ describe("frontend test harness", () => {
     document.body.append(target);
     const component = mount(AgentApprovalInbox, {
       target,
-      props: { open: true, onClose: vi.fn() },
+      props: { open: true, focusId: "agent-approval-1", onClose: vi.fn() },
     });
     try {
       await vi.waitFor(() => {
         expect(target.textContent).toContain("agent-draft-1");
+        expect((document.activeElement as HTMLElement).closest("[data-agent-approval-id]")?.getAttribute("data-agent-approval-id"))
+          .toBe("agent-approval-1");
       });
     } finally {
       unmount(component);
@@ -3868,7 +4133,7 @@ describe("frontend test harness", () => {
     }
 
     const mutationControls = new Map<string, { source: string; freshnessUses: number; markers: RegExp[] }>([
-      ["SkillsWorkspace", { source: skillsWorkspaceSource, freshnessUses: 17, markers: [
+      ["SkillsWorkspace", { source: skillsWorkspaceSource, freshnessUses: 18, markers: [
         /disabled: !installTruthFresh \|\| !selected\.pkg\.installable \|\| !canInstall,/,
         /size="sm" disabled=\{!installTruthFresh\}[^\n]*runLifecycle\("disable", installed\)/,
         /size="sm" variant="danger" disabled=\{!installTruthFresh\}[^\n]*uninstallCandidate = installed/,
@@ -3882,7 +4147,7 @@ describe("frontend test harness", () => {
         /modalAction="confirm" disabled=\{!installTruthFresh \|\| plan\.blockers\.length > 0\}/,
         /confirmDisabled=\{!installTruthFresh \|\| \(uninstallCandidate/,
       ] }],
-      ["InstallModal", { source: installModalSource, freshnessUses: 18, markers: [
+      ["InstallModal", { source: installModalSource, freshnessUses: 19, markers: [
         /disabled: !installTruthFresh \|\| total === 0,/,
         /disabled=\{!installTruthFresh\}[^\n]*reviewPlan\("update"/,
         /disabled=\{!installTruthFresh\}[^\n]*runLifecycle\("track"/,

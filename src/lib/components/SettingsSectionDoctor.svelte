@@ -1,17 +1,43 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
-  import { doctorReport } from "$lib/api";
+  import {
+    agentInstallsReconcile,
+    agentVersionHistory,
+    doctorReport,
+    projectsList,
+    skillBackupsList,
+    skillInstallsReconcile,
+    storageBackup,
+    storageMigrationStatus,
+  } from "$lib/api";
   import { i18n } from "$lib/stores/i18n.svelte";
+  import { safeActivityDetail } from "$lib/stores/activity.svelte";
+  import { install } from "$lib/stores/install.svelte";
   import { ui } from "$lib/stores/ui.svelte";
-  import { appErrorMessage, isAppError, type DoctorAction, type DoctorCategory, type DoctorClassification, type DoctorReport } from "$lib/types";
+  import { appErrorMessage, isAppError, type AgentVersionSnapshot, type DoctorAction, type DoctorCategory, type DoctorClassification, type DoctorReport, type InstalledAgent, type InstalledSkill } from "$lib/types";
+
+  type RecoveryStatus = "loading" | "ready" | "unavailable";
+  type AgentRecoveryRow = { installed: InstalledAgent; snapshots: AgentVersionSnapshot[] };
 
   const CATEGORIES: DoctorCategory[] = ["core", "library", "installations", "tools", "integrations", "updates"];
   let report: DoctorReport | null = $state(null);
   let loading = $state(false);
   let error = $state("");
   let announcement = $state("");
+  let recoveryAnnouncement = $state("");
+  let agentRecoveryStatus = $state<RecoveryStatus>("loading");
+  let agentRecoveryError = $state("");
+  let agentRecoveryRows = $state<AgentRecoveryRow[]>([]);
+  let skillRecoveryStatus = $state<RecoveryStatus>("loading");
+  let skillRecoveryError = $state("");
+  let skillRecoveryRows = $state<InstalledSkill[]>([]);
+  let skillBackups = $state<string[]>([]);
+  let storageRecoveryStatus = $state<RecoveryStatus>("loading");
+  let storageRecoveryError = $state("");
+  let backupPath = $state<string | null>(null);
+  let backupBusy = $state(false);
 
   const label = (classification: DoctorClassification) => i18n.t(`settings.doctor.${classification}`);
   const categoryLabel = (category: DoctorCategory) => i18n.t(`settings.doctor.category.${category}`);
@@ -48,6 +74,122 @@
     }
   }
 
+  function recoveryError(error: unknown): string {
+    return safeActivityDetail(isAppError(error) ? appErrorMessage(error) : error);
+  }
+
+  async function loadAgentRecovery() {
+    agentRecoveryStatus = "loading";
+    agentRecoveryError = "";
+    try {
+      const installed = (await agentInstallsReconcile()).filter((item) => item.tracked && item.sourceId && item.relativePath);
+      agentRecoveryRows = await Promise.all(installed.map(async (item) => ({
+        installed: item,
+        snapshots: await agentVersionHistory(
+          { sourceId: item.sourceId, relativePath: item.relativePath }, item.tool, item.projectPath,
+        ),
+      })));
+      agentRecoveryStatus = "ready";
+      recoveryAnnouncement = `Agent recovery ready. ${agentRecoveryRows.reduce((count, row) => count + row.snapshots.length, 0)} rollback points.`;
+    } catch (error) {
+      agentRecoveryStatus = "unavailable";
+      agentRecoveryError = recoveryError(error);
+      recoveryAnnouncement = `Agent recovery unavailable. ${agentRecoveryError}`;
+    }
+  }
+
+  async function loadSkillRecovery() {
+    skillRecoveryStatus = "loading";
+    skillRecoveryError = "";
+    try {
+      const registered = await projectsList();
+      [skillRecoveryRows, skillBackups] = await Promise.all([
+        skillInstallsReconcile(registered.map((project) => project.path)), skillBackupsList(),
+      ]);
+      skillRecoveryRows = skillRecoveryRows.filter((item) => item.tracked);
+      skillRecoveryStatus = "ready";
+      recoveryAnnouncement = `Skill recovery ready. ${skillBackups.length} rollback points.`;
+    } catch (error) {
+      skillRecoveryStatus = "unavailable";
+      skillRecoveryError = recoveryError(error);
+      recoveryAnnouncement = `Skill recovery unavailable. ${skillRecoveryError}`;
+    }
+  }
+
+  async function loadStorageRecovery() {
+    storageRecoveryStatus = "loading";
+    storageRecoveryError = "";
+    try {
+      const status = await storageMigrationStatus();
+      if (status.state !== "complete") throw new Error("SQLite migration must complete before verified backups are available.");
+      storageRecoveryStatus = "ready";
+      recoveryAnnouncement = "Database backup recovery is ready.";
+    } catch (error) {
+      storageRecoveryStatus = "unavailable";
+      storageRecoveryError = recoveryError(error);
+      recoveryAnnouncement = `Database backup recovery unavailable. ${storageRecoveryError}`;
+    }
+  }
+
+  function openAgentRecovery(row: AgentRecoveryRow) {
+    ui.closeSettings();
+    ui.openAgentRecovery({
+      reference: { sourceId: row.installed.sourceId, relativePath: row.installed.relativePath },
+      tool: row.installed.tool,
+      projectPath: row.installed.projectPath,
+    });
+  }
+
+  function openSkillRecovery(installed: InstalledSkill) {
+    ui.closeSettings();
+    ui.openSkillRecovery({
+      reference: { sourceId: installed.sourceId, relativePath: installed.relativePath },
+      runtime: installed.runtime,
+      projectPath: installed.projectPath,
+    });
+  }
+
+  async function createBackup() {
+    if (backupBusy || storageRecoveryStatus !== "ready") return;
+    backupBusy = true;
+    storageRecoveryError = "";
+    try {
+      backupPath = await storageBackup();
+      recoveryAnnouncement = `Verified backup created: ${backupName(backupPath)}.`;
+      await tick();
+      document.querySelector<HTMLButtonElement>("[data-storage-reveal]")?.focus({ preventScroll: true });
+    } catch (error) {
+      storageRecoveryError = recoveryError(error);
+      recoveryAnnouncement = `Verified backup failed. ${storageRecoveryError}`;
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  async function revealBackup() {
+    if (!backupPath) return;
+    storageRecoveryError = "";
+    try {
+      await install.revealPath(backupPath);
+      recoveryAnnouncement = "Verified backup revealed in the system file manager.";
+    } catch (error) {
+      storageRecoveryError = recoveryError(error);
+      recoveryAnnouncement = `Could not reveal verified backup. ${storageRecoveryError}`;
+    }
+  }
+
+  function backupName(path: string): string {
+    return path.split(/[\\/]/).filter(Boolean).at(-1) ?? "database backup";
+  }
+
+  async function retryRecovery(source: "agents" | "skills" | "storage") {
+    if (source === "agents") await loadAgentRecovery();
+    else if (source === "skills") await loadSkillRecovery();
+    else await loadStorageRecovery();
+    await tick();
+    document.querySelector<HTMLElement>(`[data-recovery-source="${source}"] h3`)?.focus({ preventScroll: true });
+  }
+
   function runAction(action: DoctorAction) {
     if (action === "retryDoctor") return void refresh();
     if (action === "openCatalog" || action === "openMcp" || action === "openNetwork") {
@@ -66,7 +208,10 @@
     });
   }
 
-  onMount(() => void refresh());
+  onMount(() => {
+    void refresh();
+    void Promise.all([loadAgentRecovery(), loadSkillRecovery(), loadStorageRecovery()]);
+  });
 </script>
 
 <section class="section" aria-labelledby="doctor-title">
@@ -125,6 +270,36 @@
       {/if}
     {/each}
   {/if}
+
+  <section class="recovery" aria-labelledby="recovery-title">
+    <div><h2 id="recovery-title">Recovery</h2><p>Use the existing exact rollback controls and verified app-owned backups.</p></div>
+    <p class="sr-only" role="status" aria-live="polite" aria-atomic="true">{recoveryAnnouncement}</p>
+
+    <article data-recovery-source="agents" aria-busy={agentRecoveryStatus === "loading"}>
+      <div class="recovery-head"><h3 tabindex="-1">Agent versions</h3><strong>{agentRecoveryStatus === "ready" ? `${agentRecoveryRows.reduce((count, row) => count + row.snapshots.length, 0)} rollback ${agentRecoveryRows.reduce((count, row) => count + row.snapshots.length, 0) === 1 ? "point" : "points"}` : agentRecoveryStatus === "loading" ? "Loading" : "Unavailable"}</strong></div>
+      {#if agentRecoveryStatus === "unavailable"}<p role="alert" class="error">{agentRecoveryError}</p><button type="button" data-recovery-retry onclick={() => void retryRecovery("agents")}>Retry</button>
+      {:else if agentRecoveryStatus === "ready"}
+        {#if agentRecoveryRows.length === 0}<p>No tracked Agent installs.</p>{:else}<ul>{#each agentRecoveryRows as row (`${row.installed.sourceId}:${row.installed.relativePath}:${row.installed.tool}:${row.installed.projectPath ?? ""}`)}<li><span>{row.installed.name} · {row.installed.tool} · {row.snapshots.length} snapshots</span><button type="button" data-agent-recovery onclick={() => openAgentRecovery(row)}>Open rollback</button></li>{/each}</ul>{/if}
+      {/if}
+    </article>
+
+    <article data-recovery-source="skills" aria-busy={skillRecoveryStatus === "loading"}>
+      <div class="recovery-head"><h3 tabindex="-1">Skill backups</h3><strong>{skillRecoveryStatus === "ready" ? `${skillBackups.length} rollback ${skillBackups.length === 1 ? "point" : "points"}` : skillRecoveryStatus === "loading" ? "Loading" : "Unavailable"}</strong></div>
+      {#if skillRecoveryStatus === "unavailable"}<p role="alert" class="error">{skillRecoveryError}</p><button type="button" data-recovery-retry onclick={() => void retryRecovery("skills")}>Retry</button>
+      {:else if skillRecoveryStatus === "ready"}
+        {#if skillRecoveryRows.length === 0}<p>No tracked Skill installs.</p>{:else}<ul>{#each skillRecoveryRows as installed (`${installed.sourceId}:${installed.relativePath}:${installed.runtime}:${installed.projectPath ?? ""}`)}<li><span>{installed.name} · {installed.runtime}</span><button type="button" data-skill-recovery onclick={() => openSkillRecovery(installed)}>Open rollback</button></li>{/each}</ul>{/if}
+      {/if}
+    </article>
+
+    <article data-recovery-source="storage" aria-busy={storageRecoveryStatus === "loading"}>
+      <div class="recovery-head"><h3 tabindex="-1">Database backup</h3><strong>{storageRecoveryStatus === "ready" ? "Ready" : storageRecoveryStatus === "loading" ? "Loading" : "Unavailable"}</strong></div>
+      <p>Creates a verified SQLite backup. Backup creation is not restore.</p>
+      <p>Database restore is offline/manual because the running app owns the WAL, process lease, and caches. Close the app before restoring.</p>
+      {#if storageRecoveryError}<p role="alert" class="error">{storageRecoveryError}</p>{/if}
+      {#if storageRecoveryStatus === "unavailable"}<button type="button" data-recovery-retry onclick={() => void retryRecovery("storage")}>Retry</button>
+      {:else if storageRecoveryStatus === "ready"}<div class="recovery-actions"><button type="button" data-storage-backup disabled={backupBusy} onclick={() => void createBackup()}>{backupBusy ? "Creating…" : "Create verified backup"}</button>{#if backupPath}<span>Verified backup created: {backupName(backupPath)}</span><button type="button" data-storage-reveal onclick={() => void revealBackup()}>Reveal backup</button>{/if}</div>{/if}
+    </article>
+  </section>
 </section>
 
 <style>
@@ -156,6 +331,14 @@
   .error { color: var(--color-danger); font-size: var(--text-body-sm); }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   .spin { animation: spin 800ms linear infinite; }
+  .recovery { display: grid; gap: var(--space-3); padding-top: var(--space-4); border-top: 1px solid var(--color-border); }
+  .recovery > div > p, .recovery article p, .recovery li { color: var(--color-text-muted); font-size: var(--text-body-sm); }
+  .recovery article { display: grid; gap: var(--space-2); padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+  .recovery-head, .recovery-actions, .recovery li { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+  .recovery ul { display: grid; gap: var(--space-2); }
+  .recovery button { width: fit-content; }
+  .recovery button:focus-visible { outline: 2px solid var(--color-brand); outline-offset: 2px; }
+  .recovery-actions { justify-content: flex-start; flex-wrap: wrap; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
 </style>

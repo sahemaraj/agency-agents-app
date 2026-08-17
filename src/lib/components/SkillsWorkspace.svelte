@@ -235,6 +235,18 @@
   });
 
   $effect(() => {
+    const id = ui.skillApprovalId;
+    if (!id || !pendingApprovals.some((approval) => approval.id === id)) return;
+    if (approvalInbox) approvalInbox.open = true;
+    void tick().then(() => {
+      [...(approvalInbox?.querySelectorAll<HTMLElement>("[data-skill-approval-id]") ?? [])]
+        .find((candidate) => candidate.dataset.skillApprovalId === id)
+        ?.querySelector<HTMLElement>("button")?.focus({ preventScroll: true });
+      ui.skillApprovalId = null;
+    });
+  });
+
+  $effect(() => {
     if (catalogLoaded && selectedKey !== null && !filtered.some(({ pkg }) => skillSources.packageKey(pkg) === selectedKey)) {
       selectedKey = null;
       ui.selectSkill(null);
@@ -475,6 +487,28 @@
       announcement = skillSources.addError ?? i18n.t("skills.historyFailed");
     }
   }
+
+  let startedRecovery = $state("");
+  $effect(() => {
+    const recovery = ui.skillRecovery;
+    if (!recovery || !selected || !installTruthFresh) return;
+    if (selected.pkg.sourceId !== recovery.reference.sourceId || selected.pkg.relativePath !== recovery.reference.relativePath) return;
+    const installed = selectedInstalls.find((item) => item.runtime === recovery.runtime
+      && (item.projectPath ?? null) === recovery.projectPath);
+    if (!installed) return;
+    const key = lifecycleKey(installed);
+    if (startedRecovery === key) return;
+    startedRecovery = key;
+    void tick().then(() => {
+      const details = [...document.querySelectorAll<HTMLDetailsElement>("details[data-skill-history]")]
+        .find((candidate) => candidate.dataset.skillHistory === key);
+      if (!details) return;
+      details.open = true;
+      details.querySelector<HTMLElement>("summary")?.focus({ preventScroll: true });
+      void loadVersionHistory(installed);
+      ui.skillRecovery = null;
+    });
+  });
 
   async function rollbackVersion(installed: InstalledSkill, snapshotPath: string): Promise<void> {
     if (!installTruthFresh) return;
@@ -913,7 +947,7 @@
           <p class="quiet">{i18n.t("skills.noDrafts")}</p>
         {:else}
           {#each pendingApprovals as approval (approval.id)}
-            <article class="draft">
+            <article class="draft" data-skill-approval-id={approval.id}>
               <div>
                 <strong>{approvalLabel(approval.request)}</strong>
                 <span>{approval.requestedBy} · {new Date(approval.submittedAt).toLocaleString()}</span>
@@ -1366,6 +1400,7 @@
                         {/if}
                         <details
                           class="version-history"
+                          data-skill-history={lifecycleKey(installed)}
                           ontoggle={(event) => {
                             if (event.currentTarget.open && !versionHistory[lifecycleKey(installed)]) {
                               void loadVersionHistory(installed);

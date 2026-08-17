@@ -5,6 +5,10 @@
 
 import type { AgentReference, SettingsSection, SidebarSection, SkillReference, ThemePreference, Tool } from "$lib/types";
 
+type ExpertReviewLink = { kind: "change" | "run" | "activation"; id: string };
+type AgentRecoveryLink = { reference: AgentReference; tool: Tool; projectPath: string | null };
+type SkillRecoveryLink = { reference: SkillReference; runtime: "claudeCode" | "codex"; projectPath: string | null };
+
 /** A navigable app location — the unit of back/forward history. Captures the
     section plus the full Agents workspace view-state so a back/forward jump
     restores the filter, category, and the open agent. */
@@ -108,6 +112,16 @@ class UiStore {
   drawerMinimized: boolean = $state(false);
   /** Transient post-action receipt target consumed by Activity after render. */
   activityReceiptId: string | null = $state(null);
+  /** Transient Review Center targets. Domain surfaces consume these; Activity
+      never owns approval or review mutations. */
+  reviewReturnId: string | null = $state(null);
+  agentApprovalId: string | null = $state(null);
+  skillApprovalId: string | null = $state(null);
+  expertReview: ExpertReviewLink | null = $state(null);
+  projectRecommendationId: string | null = $state(null);
+  /** Transient Recovery targets consumed by existing exact rollback controls. */
+  agentRecovery: AgentRecoveryLink | null = $state(null);
+  skillRecovery: SkillRecoveryLink | null = $state(null);
   paletteOpen: boolean = $state(false);
   /** Settings modal (Phase 12b). Opened via the top-right gear icon or ⌘,. */
   settingsOpen: boolean = $state(false);
@@ -204,6 +218,54 @@ class UiStore {
   openActivityReceipt(id: string) {
     this.activityReceiptId = id;
     this.setSection("activity");
+  }
+
+  private rememberReviewTrigger(triggerId: string) { this.reviewReturnId = triggerId; }
+
+  openAgentApproval(id: string, triggerId: string) {
+    this.rememberReviewTrigger(triggerId);
+    this.openAgents();
+    this.agentApprovalId = id;
+  }
+
+  openSkillApproval(id: string, triggerId: string) {
+    this.rememberReviewTrigger(triggerId);
+    this.setSection("skills");
+    this.skillApprovalId = id;
+  }
+
+  openExpertReview(kind: ExpertReviewLink["kind"], id: string, triggerId: string) {
+    this.rememberReviewTrigger(triggerId);
+    this.setSection("experts");
+    this.expertReview = { kind, id };
+  }
+
+  openProjectRecommendation(projectPath: string, id: string, triggerId: string) {
+    this.rememberReviewTrigger(triggerId);
+    this.selectProject(projectPath);
+    this.projectRecommendationId = id;
+  }
+
+  returnToActivityReview() {
+    if (!this.reviewReturnId) return;
+    if (this.canBack) this.back();
+    else this.setSection("activity");
+  }
+
+  consumeReviewReturn(): string | null {
+    const id = this.reviewReturnId;
+    this.reviewReturnId = null;
+    return id;
+  }
+
+  openAgentRecovery(link: AgentRecoveryLink) {
+    this.agentRecovery = { ...link, reference: { ...link.reference } };
+    this.openAgentReference(link.reference);
+  }
+
+  openSkillRecovery(link: SkillRecoveryLink) {
+    this.skillRecovery = { ...link, reference: { ...link.reference } };
+    this.openSkill(link.reference);
   }
 
   /** Open the Projects detail pane for a project path (null = back to the list).

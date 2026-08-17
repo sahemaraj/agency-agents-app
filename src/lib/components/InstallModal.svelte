@@ -13,7 +13,7 @@
    * "Global" only offers user-capable tools (Cursor's global cell is blank — its
    * global rules are UI-only). Removal of `foreign` files asks first.
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import FolderIcon from "@lucide/svelte/icons/folder";
   import Modal from "./Modal.svelte";
@@ -62,10 +62,11 @@
       tool: Tool;
       projectPath: string;
     };
+    historyIntent?: { reference: AgentReference; tool: Tool; projectPath: string | null };
     onClose: () => void;
     onApplied?: (plan: AgentMutationPlan) => void;
   }
-  let { title, agentSlugs = [], agentPackage, agentReferences = [], allowedTools, collectionName, reviewIntent, onClose, onApplied }: Props = $props();
+  let { title, agentSlugs = [], agentPackage, agentReferences = [], allowedTools, collectionName, reviewIntent, historyIntent, onClose, onApplied }: Props = $props();
   const installTruthFresh = $derived(install.reconciled && !install.reconciling && !install.reconcileError);
 
   onMount(() => {
@@ -270,6 +271,23 @@
       reviewIntent.tool,
       reviewIntent.projectPath,
     );
+  });
+
+  let startedHistoryIntent = $state("");
+  $effect(() => {
+    if (!historyIntent || !installTruthFresh || !exactReference) return;
+    if (exactReference.sourceId !== historyIntent.reference.sourceId
+      || exactReference.relativePath !== historyIntent.reference.relativePath) return;
+    const key = `${historyIntent.reference.sourceId}:${historyIntent.reference.relativePath}:${historyIntent.tool}:${historyIntent.projectPath ?? ""}`;
+    if (startedHistoryIntent === key) return;
+    const row = exactRows.find((candidate) => candidate.tool === historyIntent.tool
+      && (candidate.projectPath ?? null) === historyIntent.projectPath);
+    if (!row) return;
+    startedHistoryIntent = key;
+    void showHistory(row).then(async () => {
+      await tick();
+      document.querySelector<HTMLElement>(".history button")?.focus({ preventScroll: true });
+    });
   });
 
   async function reviewCollection(

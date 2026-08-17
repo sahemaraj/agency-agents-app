@@ -74,6 +74,11 @@ import type {
   ProjectReadinessBaseline,
   ProjectReadinessReport,
   ProjectRecommendation,
+  ProjectInfo,
+  InstalledAgent,
+  ExpertActivationRequest,
+  ExpertCreationRequest,
+  ExpertRun,
   WorkspacePack,
 } from "./types";
 
@@ -143,6 +148,16 @@ export const projectRecommendationOpen = (projectPath: string, recommendationId:
   invoke<ProjectRecommendation>("project_recommendation_open", { projectPath, recommendationId });
 export const projectRecommendationFinalize = (projectPath: string, recommendationId: string) =>
   invoke<ProjectReadinessBaseline>("project_recommendation_finalize", { projectPath, recommendationId });
+export const projectsList = () => invoke<ProjectInfo[]>("projects_list");
+
+export const expertCreationRequests = () =>
+  invoke<ExpertCreationRequest[]>("expert_creation_requests");
+export const expertRunsList = () => invoke<ExpertRun[]>("expert_runs_list", { projectPath: null });
+export const expertActivationRequests = () =>
+  invoke<ExpertActivationRequest[]>("expert_activation_requests");
+
+export const agentInstallsReconcile = () =>
+  invoke<InstalledAgent[]>("installs_reconcile", { projectRoots: [] });
 
 // ============================================================
 // Agent sources, drafts, and personal library
