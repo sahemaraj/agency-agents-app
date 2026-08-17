@@ -4810,6 +4810,69 @@ pub(crate) async fn skill_version_history(
     Ok(snapshots)
 }
 
+async fn restore_failed_skill_rollback(
+    state: &AppState,
+    identity: &SkillVersionIdentity,
+    safety_snapshot: &Path,
+    previous: &SkillInstallRecord,
+    destination: &Path,
+    project_authorization: Option<&AuthorizedMcpProject>,
+    operation_id: Option<&str>,
+) -> Result<(), AppError> {
+    let (safety, content, files) =
+        validate_skill_version_snapshot(state, identity, safety_snapshot).await?;
+    if safety.content_hash != previous.installed_hash {
+        return Err(AppError::StorageCorrupt {
+            message: "Skill rollback safety snapshot no longer matches the previous install".into(),
+        });
+    }
+    let backups = state.app_data_dir.join("skill-backups");
+    match (project_authorization, operation_id) {
+        (Some(authorization), Some(operation_id)) => {
+            install::install_validated_directory_in_project_with_id(
+                authorization.root(),
+                &content,
+                &files,
+                &install::project_target_path(&previous.runtime, &previous.name)?,
+                &backups,
+                true,
+                operation_id,
+            )?;
+        }
+        (Some(authorization), None) => {
+            install::install_validated_directory_in_project(
+                authorization.root(),
+                &content,
+                &files,
+                &install::project_target_path(&previous.runtime, &previous.name)?,
+                &backups,
+                true,
+            )?;
+        }
+        (None, Some(operation_id)) => {
+            install::install_validated_directory_with_id(
+                &content,
+                &files,
+                destination,
+                &backups,
+                true,
+                operation_id,
+            )?;
+        }
+        (None, None) => {
+            install::install_validated_directory(&content, &files, destination, &backups, true)?;
+        }
+    }
+    if mutation_tree_hash(project_authorization, destination)?.as_deref()
+        != Some(previous.installed_hash.as_str())
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Skill rollback failed to restore the previous exact bytes".into(),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn rollback_skill_authorized(
     state: &AppState,
     source_id: &str,
@@ -4824,7 +4887,7 @@ pub(crate) async fn rollback_skill_authorized(
     let project = canonical_project_string_authorized(project_path, project_authorization)?;
     let mut records = install::load_ledger_for_state(state).await?;
     let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
-    let old_records = records.clone();
+    let previous_records = records.clone();
     let record = records[index].clone();
     let (_, destination) = record_destination_authorized(&record, project_authorization)?;
     let identity = skill_version_identity_for_record(&record)?;
@@ -4840,7 +4903,7 @@ pub(crate) async fn rollback_skill_authorized(
             )
         })
         .transpose()?;
-    create_skill_version_snapshot(
+    let safety_snapshot = create_skill_version_snapshot(
         state,
         &record,
         &destination,
@@ -4855,10 +4918,36 @@ pub(crate) async fn rollback_skill_authorized(
     records[index].source_hash = selected.content_hash.clone();
     records[index].installed_hash = selected.content_hash;
     records[index].installed_at = chrono::Utc::now().to_rfc3339();
-    install::save_ledger_for_state(state, &records).await?;
+    let database = state.completed_state_database().await?;
+    let operation = if let Some(database) = &database {
+        Some(
+            database
+                .prepare_filesystem_operation(
+                    "skill_update",
+                    &SkillInstallOperation {
+                        previous: Some(record.clone()),
+                        next: records[index].clone(),
+                    },
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
 
-    let install_result = match project_authorization {
-        Some(authorization) => install::install_validated_directory_in_project(
+    let install_result = match (project_authorization, operation.as_ref()) {
+        (Some(authorization), Some(operation)) => {
+            install::install_validated_directory_in_project_with_id(
+                authorization.root(),
+                &content,
+                &files,
+                &install::project_target_path(runtime, &record.name)?,
+                &backup_root,
+                true,
+                &operation.id,
+            )
+        }
+        (Some(authorization), None) => install::install_validated_directory_in_project(
             authorization.root(),
             &content,
             &files,
@@ -4866,15 +4955,97 @@ pub(crate) async fn rollback_skill_authorized(
             &backup_root,
             true,
         ),
-        None => {
+        (None, Some(operation)) => install::install_validated_directory_with_id(
+            &content,
+            &files,
+            &destination,
+            &backup_root,
+            true,
+            &operation.id,
+        ),
+        (None, None) => {
             install::install_validated_directory(&content, &files, &destination, &backup_root, true)
         }
     };
     if let Err(error) = install_result {
-        return match install::save_ledger_for_state(state, &old_records).await {
-            Ok(()) => Err(error),
-            Err(rollback) => Err(rollback_error("rollback skill", error, rollback)),
-        };
+        if let (Some(database), Some(operation)) = (&database, &operation) {
+            database.abort_filesystem_operation(&operation.id).await?;
+        }
+        return Err(error);
+    }
+    let post_apply_error = match mutation_tree_hash(project_authorization, &destination) {
+        Ok(Some(hash)) if hash == records[index].installed_hash => None,
+        Ok(Some(_)) => Some(AppError::StorageCorrupt {
+            message: "Skill rollback destination changed before its ledger commit".into(),
+        }),
+        Ok(None) => Some(AppError::StorageCorrupt {
+            message: "Skill rollback destination disappeared before its ledger commit".into(),
+        }),
+        Err(error) => Some(error),
+    };
+    if let Some(error) = post_apply_error {
+        let restored = restore_failed_skill_rollback(
+            state,
+            &identity,
+            Path::new(&safety_snapshot.path),
+            &record,
+            &destination,
+            project_authorization,
+            operation.as_ref().map(|operation| operation.id.as_str()),
+        )
+        .await;
+        if let Err(rollback) = restored {
+            if let (Some(database), Some(operation)) = (&database, &operation) {
+                database
+                    .retain_filesystem_operation_error(&operation.id, &rollback.to_string())
+                    .await?;
+            }
+            return Err(rollback_error("rollback skill", error, rollback));
+        }
+        if let (Some(database), Some(operation)) = (&database, &operation) {
+            database.abort_filesystem_operation(&operation.id).await?;
+        } else if let Err(rollback) = install::save_ledger_for_state(state, &previous_records).await
+        {
+            return Err(rollback_error("rollback skill", error, rollback));
+        }
+        return Err(error);
+    }
+
+    let save_result = match &operation {
+        Some(operation) => {
+            install::save_ledger_after_filesystem(state, &records, &operation.id).await
+        }
+        None => install::save_ledger_for_state(state, &records).await,
+    };
+    if let Err(error) = save_result {
+        let restored = restore_failed_skill_rollback(
+            state,
+            &identity,
+            Path::new(&safety_snapshot.path),
+            &record,
+            &destination,
+            project_authorization,
+            operation.as_ref().map(|operation| operation.id.as_str()),
+        )
+        .await;
+        if let Err(rollback) = restored {
+            if let (Some(database), Some(operation)) = (&database, &operation) {
+                database
+                    .retain_filesystem_operation_error(&operation.id, &rollback.to_string())
+                    .await?;
+            }
+            return Err(rollback_error("rollback skill", error, rollback));
+        }
+        if let (Some(database), Some(operation)) = (&database, &operation) {
+            database.abort_filesystem_operation(&operation.id).await?;
+        } else if let Err(rollback) = install::save_ledger_for_state(state, &previous_records).await
+        {
+            return Err(rollback_error("rollback skill", error, rollback));
+        }
+        return Err(error);
+    }
+    if let (Some(database), Some(operation)) = (&database, &operation) {
+        database.commit_filesystem_operation(&operation.id).await?;
     }
     Ok(installed_view(&records[index], SkillInstallState::Current))
 }
@@ -5507,6 +5678,156 @@ mod tests {
     use crate::state::AppState;
     use crate::types::{SkillInstallState, SkillSource, SkillSourceKind, SkillValidationCode};
 
+    async fn completed_sqlite_skill_state(
+        app_data_dir: &Path,
+    ) -> (crate::state_db::StateDatabase, AppState) {
+        let database =
+            crate::state_db::StateDatabase::open(app_data_dir).expect("open state database");
+        database
+            .mutate(skill_sources_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .expect("seed Skill sources");
+        let installs = crate::state_db::DocumentSpec::<Vec<crate::types::SkillInstallRecord>>::new(
+            "skill_installs",
+            1,
+            16_777_216,
+            |_| Ok(()),
+        );
+        database
+            .mutate(installs, Vec::new(), |_| Ok(()))
+            .await
+            .expect("seed Skill installs");
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .expect("complete state migration");
+        (database, test_state(app_data_dir))
+    }
+
+    struct RollbackRecoveryFixture {
+        _app: tempfile::TempDir,
+        _source: tempfile::TempDir,
+        _project: tempfile::TempDir,
+        database: crate::state_db::StateDatabase,
+        state: AppState,
+        previous: crate::types::SkillInstallRecord,
+        next: crate::types::SkillInstallRecord,
+        identity: super::SkillVersionIdentity,
+        destination: PathBuf,
+        content: PathBuf,
+        files: Vec<crate::types::SkillPackageFile>,
+        selected: super::SkillVersionSnapshot,
+        safety: super::SkillVersionSnapshot,
+    }
+
+    async fn rollback_recovery_fixture() -> RollbackRecoveryFixture {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let (database, state) = completed_sqlite_skill_state(app.path()).await;
+        write_skill(source.path(), "reviewer", "reviewer", "Version zero");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        write_skill(source.path(), "reviewer", "reviewer", "Version one");
+        super::update_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let selected = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("version-zero snapshot");
+        let previous = super::install::load_ledger_for_state(&state)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let destination = PathBuf::from(&previous.dest);
+        let identity = super::skill_version_identity_for_record(&previous).unwrap();
+        let safety = super::create_skill_version_snapshot(
+            &state,
+            &previous,
+            &destination,
+            None,
+            Some(Path::new(&selected.path)),
+        )
+        .await
+        .unwrap();
+        let (selected, content, files) =
+            super::validate_skill_version_snapshot(&state, &identity, Path::new(&selected.path))
+                .await
+                .unwrap();
+        let mut next = previous.clone();
+        next.source_hash = selected.content_hash.clone();
+        next.installed_hash = selected.content_hash.clone();
+        next.installed_at = chrono::Utc::now().to_rfc3339();
+        RollbackRecoveryFixture {
+            _app: app,
+            _source: source,
+            _project: project,
+            database,
+            state,
+            previous,
+            next,
+            identity,
+            destination,
+            content,
+            files,
+            selected,
+            safety,
+        }
+    }
+
+    async fn assert_recovery_snapshots_remain_exact(fixture: &RollbackRecoveryFixture) {
+        super::validate_skill_version_snapshot(
+            &fixture.state,
+            &fixture.identity,
+            Path::new(&fixture.selected.path),
+        )
+        .await
+        .expect("selected snapshot remains exact");
+        super::validate_skill_version_snapshot(
+            &fixture.state,
+            &fixture.identity,
+            Path::new(&fixture.safety.path),
+        )
+        .await
+        .expect("safety snapshot remains exact");
+    }
+
+    fn assert_operation_recovery_paths_removed(destination: &Path, operation_id: &str) {
+        let parent = destination.parent().expect("destination parent");
+        assert!(!parent
+            .join(format!(".agency-skill-{operation_id}.stage"))
+            .exists());
+        assert!(!parent
+            .join(format!(".agency-skill-{operation_id}.previous"))
+            .exists());
+    }
+
     fn test_state(app_data_dir: &Path) -> AppState {
         let mut state = AppState::build().expect("build app state");
         state.app_data_dir = app_data_dir.to_path_buf();
@@ -5539,6 +5860,372 @@ mod tests {
         } else {
             snapshot.join("SKILL.md")
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_rollback_commits_an_exact_skill_update_after_installing_bytes() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let (database, state) = completed_sqlite_skill_state(app.path()).await;
+        write_skill(source.path(), "reviewer", "reviewer", "Version zero");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        write_skill(source.path(), "reviewer", "reviewer", "Version one");
+        super::update_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let selected = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("version-zero snapshot");
+        let previous = super::install::load_ledger_for_state(&state)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        super::rollback_skill_authorized(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+            &selected.path,
+            None,
+        )
+        .await
+        .expect("transactional rollback");
+
+        let next = super::install::load_ledger_for_state(&state)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let connection =
+            rusqlite::Connection::open(app.path().join("state/agency-agents.sqlite3")).unwrap();
+        let update_count: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM filesystem_operations WHERE kind = 'skill_update'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(update_count, 2, "update plus rollback operation");
+        let (phase, payload): (String, String) = connection
+            .query_row(
+                "SELECT phase, payload FROM filesystem_operations \
+                 WHERE kind = 'skill_update' ORDER BY created_at DESC, id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let payload: super::SkillInstallOperation = serde_json::from_str(&payload).unwrap();
+        assert_eq!(phase, "committed");
+        assert_eq!(payload.previous, Some(previous));
+        assert_eq!(payload.next, next);
+        assert_eq!(
+            super::install::tree_hash(Path::new(&payload.next.dest)).unwrap(),
+            payload.next.installed_hash
+        );
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_rollback_without_a_write_aborts_with_previous_state() {
+        let fixture = rollback_recovery_fixture().await;
+        let operation = fixture
+            .database
+            .prepare_filesystem_operation(
+                "skill_update",
+                &super::SkillInstallOperation {
+                    previous: Some(fixture.previous.clone()),
+                    next: fixture.next.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        super::recover_install_operations(&fixture.state)
+            .await
+            .unwrap();
+        super::recover_install_operations(&fixture.state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            super::install::load_ledger_for_state(&fixture.state)
+                .await
+                .unwrap(),
+            std::slice::from_ref(&fixture.previous)
+        );
+        assert_eq!(
+            super::install::tree_hash(&fixture.destination).unwrap(),
+            fixture.previous.installed_hash
+        );
+        assert!(fixture
+            .database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_operation_recovery_paths_removed(&fixture.destination, &operation.id);
+        assert_recovery_snapshots_remain_exact(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_rollback_with_applied_bytes_rolls_forward_exactly_once() {
+        let fixture = rollback_recovery_fixture().await;
+        let operation = fixture
+            .database
+            .prepare_filesystem_operation(
+                "skill_update",
+                &super::SkillInstallOperation {
+                    previous: Some(fixture.previous.clone()),
+                    next: fixture.next.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        super::install::install_validated_directory_with_id(
+            &fixture.content,
+            &fixture.files,
+            &fixture.destination,
+            &fixture.state.app_data_dir.join("skill-backups"),
+            true,
+            &operation.id,
+        )
+        .unwrap();
+        assert_eq!(
+            super::install::load_ledger_for_state(&fixture.state)
+                .await
+                .unwrap(),
+            std::slice::from_ref(&fixture.previous)
+        );
+
+        super::recover_install_operations(&fixture.state)
+            .await
+            .unwrap();
+        super::recover_install_operations(&fixture.state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            super::install::load_ledger_for_state(&fixture.state)
+                .await
+                .unwrap(),
+            std::slice::from_ref(&fixture.next)
+        );
+        assert_eq!(
+            super::install::tree_hash(&fixture.destination).unwrap(),
+            fixture.next.installed_hash
+        );
+        assert!(fixture
+            .database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_operation_recovery_paths_removed(&fixture.destination, &operation.id);
+        assert_recovery_snapshots_remain_exact(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn filesystem_applied_rollback_commits_and_cleans_up_idempotently() {
+        let fixture = rollback_recovery_fixture().await;
+        let operation = fixture
+            .database
+            .prepare_filesystem_operation(
+                "skill_update",
+                &super::SkillInstallOperation {
+                    previous: Some(fixture.previous.clone()),
+                    next: fixture.next.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        super::install::install_validated_directory_with_id(
+            &fixture.content,
+            &fixture.files,
+            &fixture.destination,
+            &fixture.state.app_data_dir.join("skill-backups"),
+            true,
+            &operation.id,
+        )
+        .unwrap();
+        super::install::save_ledger_after_filesystem(
+            &fixture.state,
+            std::slice::from_ref(&fixture.next),
+            &operation.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture
+                .database
+                .pending_filesystem_operations()
+                .await
+                .unwrap()[0]
+                .phase,
+            crate::state_db::FilesystemOperationPhase::FilesystemApplied
+        );
+
+        super::recover_install_operations(&fixture.state)
+            .await
+            .unwrap();
+        super::recover_install_operations(&fixture.state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            super::install::load_ledger_for_state(&fixture.state)
+                .await
+                .unwrap(),
+            std::slice::from_ref(&fixture.next)
+        );
+        assert!(fixture
+            .database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_operation_recovery_paths_removed(&fixture.destination, &operation.id);
+        assert_recovery_snapshots_remain_exact(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn rollback_ledger_failure_restores_previous_bytes_and_aborts_operation() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let (database, state) = completed_sqlite_skill_state(app.path()).await;
+        write_skill(source.path(), "reviewer", "reviewer", "Version zero");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        write_skill(source.path(), "reviewer", "reviewer", "Version one");
+        super::update_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let selected = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let previous = super::install::load_ledger_for_state(&state)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let connection =
+            rusqlite::Connection::open(app.path().join("state/agency-agents.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_skill_rollback_ledger \
+                 BEFORE UPDATE ON state_documents \
+                 WHEN NEW.name = 'skill_installs' \
+                 BEGIN SELECT RAISE(FAIL, 'injected Skill ledger failure'); END;",
+            )
+            .unwrap();
+
+        let result = super::rollback_skill_authorized(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+            &selected.path,
+            None,
+        )
+        .await;
+        connection
+            .execute_batch("DROP TRIGGER fail_skill_rollback_ledger;")
+            .unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(
+            super::install::load_ledger_for_state(&state).await.unwrap(),
+            std::slice::from_ref(&previous)
+        );
+        assert_eq!(
+            super::install::tree_hash(Path::new(&previous.dest)).unwrap(),
+            previous.installed_hash
+        );
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        let committed_rollbacks: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM filesystem_operations \
+                 WHERE kind = 'skill_update' AND phase = 'committed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed_rollbacks, 2, "update plus aborted rollback");
+        let identity = super::skill_version_identity_for_record(&previous).unwrap();
+        let history = super::exact_skill_version_snapshots(&state, &identity)
+            .await
+            .unwrap();
+        assert!(history
+            .iter()
+            .any(|snapshot| snapshot.path == selected.path));
+        assert!(history.iter().any(|snapshot| {
+            snapshot.path != selected.path && snapshot.content_hash == previous.installed_hash
+        }));
     }
 
     #[tokio::test]
