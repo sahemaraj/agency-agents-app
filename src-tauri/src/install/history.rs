@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::types::{AgentInstallIdentity, AgentVersionSnapshot, Scope};
+use crate::types::{AgentInstallIdentity, AgentRosterInstallRecord, AgentVersionSnapshot, Scope};
 use crate::util::fs::{atomic_write, read_capped};
 
 const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
+const UNJOURNALED_INTENT_FILE: &str = "unjournaled-intent.json";
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,8 +26,21 @@ struct SnapshotManifest {
     roster_record_hash: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnjournaledRosterHistoryIntent {
+    identity: AgentInstallIdentity,
+    snapshot_id: String,
+    retired_snapshot_ids: Vec<String>,
+    previous_index_hash: Option<String>,
+    next_index_hash: String,
+    expected_record: AgentRosterInstallRecord,
+}
+
 pub(super) struct RosterHistoryMutation {
     pub(super) snapshot: AgentVersionSnapshot,
+    app_data_dir: PathBuf,
+    identity: AgentInstallIdentity,
     identity_hash: String,
     directory: PathBuf,
     snapshot_directory: PathBuf,
@@ -42,6 +56,32 @@ pub(super) struct RosterHistoryMutation {
 }
 
 impl RosterHistoryMutation {
+    fn validate_owned_paths(&self) -> Result<(), AppError> {
+        let directory = app_owned_directory(
+            &self.app_data_dir,
+            &["agents", "history", &self.identity_hash],
+            false,
+        )?;
+        let staging_id = self
+            .staging_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent roster history staging identity changed".into(),
+            })?;
+        let staging = app_owned_directory(
+            &self.app_data_dir,
+            &["state", "roster-history-staging", staging_id],
+            false,
+        )?;
+        if directory != self.directory || staging != self.staging_directory {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster history owned path changed".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn retired_snapshot_ids(&self) -> Vec<String> {
         self.retired
             .iter()
@@ -63,10 +103,38 @@ impl RosterHistoryMutation {
         crate::render::sha256_hex(&self.next_index)
     }
 
+    pub(super) async fn prepare_unjournaled_publication(&self) -> Result<(), AppError> {
+        self.validate_owned_paths()?;
+        let expected_record =
+            self.snapshot
+                .roster_record
+                .clone()
+                .ok_or_else(|| AppError::StorageCorrupt {
+                    message: "Unjournaled Agent roster history lost its roster metadata".into(),
+                })?;
+        let intent = UnjournaledRosterHistoryIntent {
+            identity: self.identity.clone(),
+            snapshot_id: self.snapshot.id.clone(),
+            retired_snapshot_ids: self.retired_snapshot_ids(),
+            previous_index_hash: self.previous_index_hash(),
+            next_index_hash: self.next_index_hash(),
+            expected_record,
+        };
+        let bytes = serde_json::to_vec_pretty(&intent).map_err(|error| AppError::Internal {
+            message: format!("serialize unjournaled Agent roster history intent: {error}"),
+        })?;
+        atomic_write(
+            &self.staging_directory.join(UNJOURNALED_INTENT_FILE),
+            &bytes,
+        )
+        .await
+    }
+
     pub(super) async fn publish(&mut self) -> Result<(), AppError> {
         if self.published {
             return Ok(());
         }
+        self.validate_owned_paths()?;
         let current_index = match read_capped(&self.index_path, MAX_SNAPSHOT_BYTES).await {
             Ok(bytes) => Some(bytes),
             Err(AppError::Io { .. }) if !self.index_path.exists() => None,
@@ -83,11 +151,16 @@ impl RosterHistoryMutation {
             &self.snapshot,
         )
         .await?;
-        tokio::fs::create_dir_all(&self.directory)
-            .await
-            .map_err(|error| AppError::Io {
-                message: format!("create Agent history directory: {error}"),
-            })?;
+        let directory = app_owned_directory(
+            &self.app_data_dir,
+            &["agents", "history", &self.identity_hash],
+            true,
+        )?;
+        if directory != self.directory {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent history directory identity changed before publication".into(),
+            });
+        }
         match tokio::fs::rename(&self.staged_snapshot_directory, &self.snapshot_directory).await {
             Ok(()) => {}
             Err(error) => {
@@ -125,7 +198,8 @@ impl RosterHistoryMutation {
                 message: "Agent roster history was not published before commit".into(),
             });
         }
-        for path in self.retired {
+        self.validate_owned_paths()?;
+        for path in &self.retired {
             if path.parent() != Some(self.directory.as_path()) {
                 return Err(AppError::StorageCorrupt {
                     message: "Retired Agent roster snapshot escaped its history directory".into(),
@@ -141,19 +215,12 @@ impl RosterHistoryMutation {
                 }
             }
         }
-        match tokio::fs::remove_dir_all(&self.staging_directory).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(AppError::Io {
-                    message: format!("remove Agent roster history staging: {error}"),
-                });
-            }
-        }
+        cleanup_roster_staging(&self.app_data_dir, &self.staging_path()).await?;
         Ok(())
     }
 
     pub(super) async fn rollback(self) -> Result<(), AppError> {
+        self.validate_owned_paths()?;
         let history_was_absent = self.previous_index.is_none();
         if self.published {
             match &self.previous_index {
@@ -180,7 +247,7 @@ impl RosterHistoryMutation {
                 }
             }
         }
-        let _ = tokio::fs::remove_dir_all(&self.staging_directory).await;
+        cleanup_roster_staging(&self.app_data_dir, &self.staging_path()).await?;
         let restored_index = match read_capped(&self.index_path, MAX_SNAPSHOT_BYTES).await {
             Ok(bytes) => Some(bytes),
             Err(AppError::Io { .. }) if !self.index_path.exists() => None,
@@ -214,9 +281,9 @@ pub(super) async fn commit_roster_retention(
     if retired_snapshot_ids.is_empty() {
         return Ok(());
     }
-    let directory = app_data_dir
-        .join("agents/history")
-        .join(identity_hash(identity)?);
+    let identity_hash = identity_hash(identity)?;
+    let directory =
+        app_owned_directory(app_data_dir, &["agents", "history", &identity_hash], false)?;
     let retained = load_index(&directory.join("index.json"))
         .await?
         .into_iter()
@@ -271,7 +338,8 @@ fn validated_roster_staging_directory(
     staging_path: &str,
 ) -> Result<PathBuf, AppError> {
     let path = PathBuf::from(staging_path);
-    let expected_parent = app_data_dir.join("state/roster-history-staging");
+    let expected_parent =
+        app_owned_directory(app_data_dir, &["state", "roster-history-staging"], false)?;
     let valid_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -367,7 +435,26 @@ async fn validate_snapshot_directory(
             message: "Staged Agent roster snapshot is not a regular directory".into(),
         });
     }
-    let manifest_bytes = read_capped(&directory.join("manifest.json"), MAX_SNAPSHOT_BYTES).await?;
+    let manifest_path = directory.join("manifest.json");
+    regular_file(&manifest_path)?;
+    let content_directory = directory.join("content");
+    let content_metadata =
+        std::fs::symlink_metadata(&content_directory).map_err(|error| AppError::Io {
+            message: format!("inspect staged Agent snapshot content directory: {error}"),
+        })?;
+    if !content_metadata.is_dir()
+        || content_metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&content_metadata)
+        || std::fs::canonicalize(&content_directory).map_err(|error| AppError::Io {
+            message: format!("resolve staged Agent snapshot content directory: {error}"),
+        })? != content_directory
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Staged Agent snapshot content directory contains a link or reparse point"
+                .into(),
+        });
+    }
+    let manifest_bytes = read_capped(&manifest_path, MAX_SNAPSHOT_BYTES).await?;
     let manifest: SnapshotManifest =
         serde_json::from_slice(&manifest_bytes).map_err(|error| AppError::StorageCorrupt {
             message: format!("parse staged Agent roster snapshot manifest: {error}"),
@@ -392,7 +479,7 @@ async fn validate_snapshot_directory(
                 message: "Staged Agent roster snapshot filename changed".into(),
             });
         }
-        let content = directory.join("content").join(&file.name);
+        let content = content_directory.join(&file.name);
         regular_file(&content)?;
         let bytes = read_capped(&content, MAX_SNAPSHOT_BYTES).await?;
         let hash = crate::render::sha256_hex(&bytes);
@@ -434,7 +521,8 @@ pub(super) async fn recover_roster_publication(
         });
     }
     let identity_hash = identity_hash(identity)?;
-    let directory = app_data_dir.join("agents/history").join(&identity_hash);
+    let directory =
+        app_owned_directory(app_data_dir, &["agents", "history", &identity_hash], false)?;
     let index_path = directory.join("index.json");
     let current = optional_index_bytes(&index_path).await?;
     let current_hash = index_hash(current.as_deref());
@@ -515,11 +603,13 @@ pub(super) async fn recover_roster_publication(
         }
     };
     validate_snapshot_directory(source, &identity_hash, &snapshot).await?;
-    tokio::fs::create_dir_all(&directory)
-        .await
-        .map_err(|error| AppError::Io {
-            message: format!("create Agent roster history directory: {error}"),
-        })?;
+    let created_directory =
+        app_owned_directory(app_data_dir, &["agents", "history", &identity_hash], true)?;
+    if created_directory != directory {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster history directory changed during recovery".into(),
+        });
+    }
     if must_move {
         tokio::fs::rename(&staged_snapshot, &final_snapshot)
             .await
@@ -567,6 +657,119 @@ pub(super) async fn cleanup_roster_staging(
         })
 }
 
+fn validate_unjournaled_intent(intent: &UnjournaledRosterHistoryIntent) -> Result<(), AppError> {
+    let project_path =
+        intent
+            .identity
+            .project_path
+            .as_deref()
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster history identity is not project scoped".into(),
+            })?;
+    let expected_relative_path = format!(
+        "projects/{}.md",
+        crate::render::sha256_hex(intent.expected_record.project_path.as_bytes())
+    );
+    if intent.identity.scope != Scope::Project
+        || project_path != intent.expected_record.project_path
+        || intent.identity.tool != intent.expected_record.tool
+        || intent.identity.reference.source_id != format!("roster:{}", intent.expected_record.tool)
+        || intent.identity.reference.relative_path != expected_relative_path
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Unjournaled Agent roster history identity changed".into(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) async fn recover_unjournaled_roster_publications(
+    app_data_dir: &Path,
+) -> Result<(), AppError> {
+    let root = app_owned_directory(app_data_dir, &["state", "roster-history-staging"], false)?;
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("read unjournaled Agent roster history staging: {error}"),
+            });
+        }
+    };
+    let mut paths = entries
+        .take(1025)
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| AppError::Io {
+                    message: format!("read unjournaled Agent roster history entry: {error}"),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if paths.len() > 1024 {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster history staging exceeds its entry limit".into(),
+        });
+    }
+    paths.sort();
+    for staging in paths {
+        let staging_path = staging.to_string_lossy().into_owned();
+        validated_roster_staging_directory(app_data_dir, &staging_path)?;
+        let metadata = std::fs::symlink_metadata(&staging).map_err(|error| AppError::Io {
+            message: format!("inspect unjournaled Agent roster history staging: {error}"),
+        })?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || crate::skills::metadata_is_reparse_point(&metadata)
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster history staging is not a regular directory"
+                    .into(),
+            });
+        }
+        let intent_path = staging.join(UNJOURNALED_INTENT_FILE);
+        match std::fs::symlink_metadata(&intent_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect unjournaled Agent roster history intent: {error}"),
+                });
+            }
+            Ok(metadata)
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || crate::skills::metadata_is_reparse_point(&metadata) =>
+            {
+                return Err(AppError::StorageCorrupt {
+                    message: "Unjournaled Agent roster history intent is not a regular file".into(),
+                });
+            }
+            Ok(_) => {}
+        }
+        let bytes = read_capped(&intent_path, MAX_SNAPSHOT_BYTES).await?;
+        let intent: UnjournaledRosterHistoryIntent =
+            serde_json::from_slice(&bytes).map_err(|error| AppError::StorageCorrupt {
+                message: format!("parse unjournaled Agent roster history intent: {error}"),
+            })?;
+        validate_unjournaled_intent(&intent)?;
+        recover_roster_publication(
+            app_data_dir,
+            &intent.identity,
+            &intent.snapshot_id,
+            &intent.retired_snapshot_ids,
+            &staging_path,
+            intent.previous_index_hash.as_deref(),
+            &intent.next_index_hash,
+            &intent.expected_record,
+        )
+        .await?;
+        commit_roster_retention(app_data_dir, &intent.identity, &intent.retired_snapshot_ids)
+            .await?;
+        cleanup_roster_staging(app_data_dir, &staging_path).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn sweep_roster_staging(
     app_data_dir: &Path,
     retained_staging_paths: &[String],
@@ -575,7 +778,7 @@ pub(super) async fn sweep_roster_staging(
         .iter()
         .map(|path| validated_roster_staging_directory(app_data_dir, path))
         .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-    let root = app_data_dir.join("state/roster-history-staging");
+    let root = app_owned_directory(app_data_dir, &["state", "roster-history-staging"], false)?;
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -636,6 +839,59 @@ fn invalid(message: impl Into<String>) -> AppError {
     }
 }
 
+fn app_owned_directory(
+    app_data_dir: &Path,
+    components: &[&str],
+    create: bool,
+) -> Result<PathBuf, AppError> {
+    let mut current = std::fs::canonicalize(app_data_dir).map_err(|error| AppError::Io {
+        message: format!("resolve Agent app-data directory: {error}"),
+    })?;
+    for (index, component) in components.iter().enumerate() {
+        let candidate = current.join(component);
+        if create {
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(AppError::Io {
+                        message: format!("create app-owned Agent history directory: {error}"),
+                    });
+                }
+            }
+        }
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(components[index..]
+                    .iter()
+                    .fold(current, |path, component| path.join(component)));
+            }
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect app-owned Agent history directory: {error}"),
+                });
+            }
+        };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || crate::skills::metadata_is_reparse_point(&metadata)
+            || std::fs::canonicalize(&candidate).map_err(|error| AppError::Io {
+                message: format!("resolve app-owned Agent history directory: {error}"),
+            })? != candidate
+        {
+            return Err(AppError::StorageCorrupt {
+                message: format!(
+                    "App-owned Agent history directory contains a link or reparse point: {}",
+                    candidate.display()
+                ),
+            });
+        }
+        current = candidate;
+    }
+    Ok(current)
+}
+
 fn identity_hash(identity: &AgentInstallIdentity) -> Result<String, AppError> {
     crate::library::validate_reference(
         &identity.reference.source_id,
@@ -658,7 +914,10 @@ fn identity_hash(identity: &AgentInstallIdentity) -> Result<String, AppError> {
 #[cfg(test)]
 pub(super) fn history_directory(app_data_dir: &Path, identity: &AgentInstallIdentity) -> PathBuf {
     let hash = identity_hash(identity).unwrap_or_else(|_| "invalid".into());
-    app_data_dir.join("agents/history").join(hash)
+    std::fs::canonicalize(app_data_dir)
+        .unwrap_or_else(|_| app_data_dir.to_path_buf())
+        .join("agents/history")
+        .join(hash)
 }
 
 async fn load_index(path: &Path) -> Result<Vec<AgentVersionSnapshot>, AppError> {
@@ -781,7 +1040,10 @@ async fn create_snapshot_from_bytes_protected(
         return Err(invalid("Agent version snapshot requires at least one file"));
     }
     let identity_hash = identity_hash(identity)?;
-    let directory = app_data_dir.join("agents/history").join(&identity_hash);
+    let canonical_app_data = app_owned_directory(app_data_dir, &[], false)?;
+    app_owned_directory(app_data_dir, &["agents", "history"], true)?;
+    let directory =
+        app_owned_directory(app_data_dir, &["agents", "history", &identity_hash], false)?;
     let directory_existed = directory.is_dir();
     let index_path = directory.join("index.json");
     let previous_index = match read_capped(&index_path, MAX_SNAPSHOT_BYTES).await {
@@ -789,17 +1051,29 @@ async fn create_snapshot_from_bytes_protected(
         Err(AppError::Io { .. }) if !index_path.exists() => None,
         Err(error) => return Err(error),
     };
-    let staging_directory = app_data_dir
-        .join("state/roster-history-staging")
-        .join(Uuid::new_v4().to_string());
-    let staged_snapshot_directory = staging_directory.join("snapshot");
+    let staging_id = Uuid::new_v4().to_string();
+    let staging_directory = app_owned_directory(
+        app_data_dir,
+        &["state", "roster-history-staging", &staging_id],
+        true,
+    )?;
+    let staged_snapshot_directory = app_owned_directory(
+        app_data_dir,
+        &["state", "roster-history-staging", &staging_id, "snapshot"],
+        true,
+    )?;
     let staged_index_path = staging_directory.join("index.json");
-    let content_directory = staged_snapshot_directory.join("content");
-    tokio::fs::create_dir_all(&content_directory)
-        .await
-        .map_err(|error| AppError::Io {
-            message: format!("create Agent snapshot staging directory: {error}"),
-        })?;
+    let content_directory = app_owned_directory(
+        app_data_dir,
+        &[
+            "state",
+            "roster-history-staging",
+            &staging_id,
+            "snapshot",
+            "content",
+        ],
+        true,
+    )?;
     let id = format!("{}-{}", created_at.replace([':', '/'], "-"), Uuid::new_v4());
     let snapshot_directory = directory.join(&id);
 
@@ -900,6 +1174,8 @@ async fn create_snapshot_from_bytes_protected(
             .collect();
         Ok(RosterHistoryMutation {
             snapshot,
+            app_data_dir: canonical_app_data,
+            identity: identity.clone(),
             identity_hash,
             directory,
             snapshot_directory: snapshot_directory.clone(),
@@ -916,7 +1192,7 @@ async fn create_snapshot_from_bytes_protected(
     }
     .await;
     if result.is_err() {
-        let _ = tokio::fs::remove_dir_all(&staging_directory).await;
+        let _ = cleanup_roster_staging(app_data_dir, &staging_directory.to_string_lossy()).await;
     }
     result
 }
@@ -989,9 +1265,9 @@ pub(super) async fn list_snapshots(
     app_data_dir: &Path,
     identity: &AgentInstallIdentity,
 ) -> Result<Vec<AgentVersionSnapshot>, AppError> {
-    let directory = app_data_dir
-        .join("agents/history")
-        .join(identity_hash(identity)?);
+    let identity_hash = identity_hash(identity)?;
+    let directory =
+        app_owned_directory(app_data_dir, &["agents", "history", &identity_hash], false)?;
     load_index(&directory.join("index.json")).await
 }
 
@@ -1002,7 +1278,8 @@ pub(super) async fn snapshot_contents(
     destinations: &[PathBuf],
 ) -> Result<(AgentVersionSnapshot, Vec<Vec<u8>>), AppError> {
     let identity_hash = identity_hash(identity)?;
-    let directory = app_data_dir.join("agents/history").join(&identity_hash);
+    let directory =
+        app_owned_directory(app_data_dir, &["agents", "history", &identity_hash], false)?;
     let snapshot = list_snapshots(app_data_dir, identity)
         .await?
         .into_iter()
@@ -1391,6 +1668,163 @@ mod tests {
         .unwrap();
 
         assert_eq!(tree(&directory), before);
+    }
+
+    async fn assert_unjournaled_crash_recovery_is_exact(publish_index_before_crash: bool) {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project.join("CONVENTIONS.md");
+        std::fs::write(&destination, b"roster bytes").unwrap();
+        let (identity, record) = roster_identity(&project);
+        for index in 0..super::super::MAX_AGENT_HISTORY_ENTRIES {
+            create_roster_snapshot(
+                app_data.path(),
+                &identity,
+                std::slice::from_ref(&destination),
+                &record,
+                &format!("2026-08-17T00:00:{index:02}Z"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let mutation = begin_roster_snapshot(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&destination),
+            &record,
+            "2026-08-17T01:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mutation.retired_snapshot_ids().len(), 1);
+        mutation.prepare_unjournaled_publication().await.unwrap();
+        let staging = mutation.staging_directory.clone();
+        std::fs::rename(
+            &mutation.staged_snapshot_directory,
+            &mutation.snapshot_directory,
+        )
+        .unwrap();
+        if publish_index_before_crash {
+            atomic_write(&mutation.index_path, &mutation.next_index)
+                .await
+                .unwrap();
+        }
+        drop(mutation);
+
+        let mut state = crate::state::AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        super::super::recover_agent_operations(&state)
+            .await
+            .unwrap();
+        super::super::recover_agent_operations(&state)
+            .await
+            .unwrap();
+
+        assert!(!staging.exists());
+        let snapshots = list_snapshots(app_data.path(), &identity).await.unwrap();
+        assert_eq!(snapshots.len(), super::super::MAX_AGENT_HISTORY_ENTRIES);
+        let indexed = snapshots
+            .iter()
+            .map(|snapshot| PathBuf::from(&snapshot.content_path))
+            .collect::<std::collections::BTreeSet<_>>();
+        let directory = history_directory(app_data.path(), &identity);
+        let physical = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(physical, indexed);
+    }
+
+    #[tokio::test]
+    async fn unjournaled_crash_after_snapshot_rename_recovers_index_and_retention_twice() {
+        assert_unjournaled_crash_recovery_is_exact(false).await;
+    }
+
+    #[tokio::test]
+    async fn unjournaled_crash_after_index_publish_recovers_retention_twice() {
+        assert_unjournaled_crash_recovery_is_exact(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn roster_history_rejects_linked_owned_roots_without_external_deletion() {
+        use std::os::unix::fs::symlink;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let external_staging = tempfile::tempdir().unwrap();
+        let external_entry = external_staging.path().join(Uuid::new_v4().to_string());
+        std::fs::create_dir(&external_entry).unwrap();
+        std::fs::create_dir(app_data.path().join("state")).unwrap();
+        symlink(
+            external_staging.path(),
+            app_data.path().join("state/roster-history-staging"),
+        )
+        .unwrap();
+
+        assert!(sweep_roster_staging(app_data.path(), &[]).await.is_err());
+        assert!(external_entry.exists());
+
+        let external_history = tempfile::tempdir().unwrap();
+        std::fs::create_dir(app_data.path().join("agents")).unwrap();
+        symlink(
+            external_history.path(),
+            app_data.path().join("agents/history"),
+        )
+        .unwrap();
+        let identity = identity("builtin:agency-agents");
+        let retired_id = format!("2026-08-17T00-00-00Z-{}", Uuid::new_v4());
+        let external_retired = external_history
+            .path()
+            .join(identity_hash(&identity).unwrap())
+            .join(&retired_id);
+        std::fs::create_dir_all(&external_retired).unwrap();
+
+        assert!(
+            commit_roster_retention(app_data.path(), &identity, &[retired_id])
+                .await
+                .is_err()
+        );
+        assert!(external_retired.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn roster_publication_rejects_linked_staged_content() {
+        use std::os::unix::fs::symlink;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project.join("CONVENTIONS.md");
+        std::fs::write(&destination, b"roster bytes").unwrap();
+        let (identity, record) = roster_identity(&project);
+        let mut mutation = begin_roster_snapshot(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&destination),
+            &record,
+            "2026-08-17T01:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        let external_content = tempfile::tempdir().unwrap();
+        std::fs::write(external_content.path().join("0.bin"), b"roster bytes").unwrap();
+        let content = mutation.staged_snapshot_directory.join("content");
+        std::fs::remove_dir_all(&content).unwrap();
+        symlink(external_content.path(), &content).unwrap();
+
+        assert!(mutation.publish().await.is_err());
+        mutation.rollback().await.unwrap();
+        assert_eq!(
+            std::fs::read(external_content.path().join("0.bin")).unwrap(),
+            b"roster bytes"
+        );
     }
 
     #[tokio::test]

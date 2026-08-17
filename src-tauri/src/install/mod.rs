@@ -1411,6 +1411,16 @@ async fn publish_roster_history_if(
     Ok(())
 }
 
+async fn publish_unjournaled_roster_history(
+    mutation: &mut Option<history::RosterHistoryMutation>,
+) -> Result<(), AppError> {
+    if let Some(mutation) = mutation.as_mut() {
+        mutation.prepare_unjournaled_publication().await?;
+        mutation.publish().await?;
+    }
+    Ok(())
+}
+
 async fn prepare_roster_retention(
     database: Option<&crate::state_db::StateDatabase>,
     previous: &AgentRosterInstallRecord,
@@ -3178,6 +3188,7 @@ fn pending_roster_staging_path(
 }
 
 async fn recover_agent_operations_locked(state: &AppState) -> Result<(), AppError> {
+    history::recover_unjournaled_roster_publications(&state.app_data_dir).await?;
     let Some(database) = state.completed_state_database().await? else {
         history::sweep_roster_staging(&state.app_data_dir, &[]).await?;
         return Ok(());
@@ -4495,7 +4506,11 @@ async fn apply_roster_plan(
             Err(rollback) => Err(rollback_error("save Agent roster", error, rollback)),
         };
     }
-    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_none()).await {
+    if let Err(error) = if database.is_none() {
+        publish_unjournaled_roster_history(&mut history_mutation).await
+    } else {
+        Ok(())
+    } {
         let rollback = rollback_unjournaled_roster_success(
             state,
             &prior,
@@ -4757,7 +4772,11 @@ async fn move_roster(
             Err(rollback) => Err(rollback_error("move Agent roster", error, rollback)),
         };
     }
-    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_none()).await {
+    if let Err(error) = if database.is_none() {
+        publish_unjournaled_roster_history(&mut history_mutation).await
+    } else {
+        Ok(())
+    } {
         let rollback = rollback_unjournaled_roster_success(
             state,
             &prior,
@@ -4986,7 +5005,11 @@ async fn uninstall_roster(
             Err(rollback) => Err(rollback_error("uninstall Agent roster", error, rollback)),
         };
     }
-    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_none()).await {
+    if let Err(error) = if database.is_none() {
+        publish_unjournaled_roster_history(&mut history_mutation).await
+    } else {
+        Ok(())
+    } {
         let rollback = rollback_unjournaled_roster_success(
             state,
             &prior,
@@ -5218,7 +5241,11 @@ async fn rollback_roster(
             )),
         };
     }
-    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_none()).await {
+    if let Err(error) = if database.is_none() {
+        publish_unjournaled_roster_history(&mut history_mutation).await
+    } else {
+        Ok(())
+    } {
         let rollback = rollback_unjournaled_roster_success(
             state,
             &prior,
