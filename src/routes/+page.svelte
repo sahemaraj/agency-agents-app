@@ -568,4 +568,25 @@
   @media (prefers-reduced-motion: reduce) {
     .section-pane { animation: none; }
   }
+  @media (max-width: 600px) {
+    .app {
+      --titlebar-toggle-left: 12px;
+      --titlebar-title-left: 52px;
+    }
+    .app.macos {
+      --titlebar-toggle-left: 84px;
+      --titlebar-title-left: 124px;
+    }
+    .titlebar-nav, .titlebar-title { display: none; }
+    .titlebar-right { right: var(--space-2); }
+    .main :global(.handle) { display: none; }
+    .main :global(.sidebar) {
+      position: fixed;
+      inset: 36px auto 0 0;
+      z-index: 30;
+      max-width: min(85vw, 280px);
+      box-shadow: var(--shadow-lg);
+    }
+    .app.sidebar-collapsed .main :global(.sidebar) { display: none; }
+  }
 </style>

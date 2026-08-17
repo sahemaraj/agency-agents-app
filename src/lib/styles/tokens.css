@@ -6,9 +6,9 @@
 /* ---------- LIGHT MODE (default) ---------- */
 :root {
   /* Brand — warm amber, brew-bottle */
-  --color-brand:           oklch(67% 0.15 45);
-  --color-brand-hover:     oklch(62% 0.16 45);
-  --color-brand-active:    oklch(56% 0.16 45);
+  --color-brand:           #9a3412; /* 7.3:1 with inverse text */
+  --color-brand-hover:     #7c2d12;
+  --color-brand-active:    #6c2b0b;
   --color-brand-subtle:    oklch(96% 0.03 65);
 
   /* Surfaces — layered */

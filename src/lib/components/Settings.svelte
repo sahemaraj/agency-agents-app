@@ -70,6 +70,22 @@
     return i18n.t("settings.about");
   }
 
+  function selectTab(index: number) {
+    activeSection = NAV[index].id;
+    modalEl?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[index]?.focus();
+  }
+
+  function onTabKey(event: KeyboardEvent, index: number) {
+    let next = index;
+    if (event.key === "ArrowDown" || event.key === "ArrowRight") next = (index + 1) % NAV.length;
+    else if (event.key === "ArrowUp" || event.key === "ArrowLeft") next = (index - 1 + NAV.length) % NAV.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = NAV.length - 1;
+    else return;
+    event.preventDefault();
+    selectTab(next);
+  }
+
   /** Reset the section pick whenever the modal is reopened. Honors
       `ui.settingsInitialSection` when the caller deep-linked
       (e.g. PackageDetail intercepts a GitHub action while signed out);
@@ -133,20 +149,23 @@
       bind:this={modalEl}
       data-tauri-drag-region="false"
     >
-      <div class="nav" role="tablist" aria-label={i18n.t("settings.sections")}>
+      <div class="nav">
         <h1 class="nav-title">{i18n.t("settings.title")}</h1>
-        <ul>
-          {#each NAV as entry (entry.id)}
+        <ul role="tablist" aria-orientation="vertical" aria-label={i18n.t("settings.sections")}>
+          {#each NAV as entry, index (entry.id)}
             {@const isActive = activeSection === entry.id}
-            <li>
+            <li role="presentation">
               <button
                 type="button"
+                id={`settings-tab-${entry.id}`}
                 class="nav-item"
                 class:active={isActive}
                 role="tab"
                 aria-selected={isActive}
                 aria-controls="settings-pane"
+                tabindex={isActive ? 0 : -1}
                 onclick={() => (activeSection = entry.id)}
+                onkeydown={(event) => onTabKey(event, index)}
               >
                 <span class="nav-icon" aria-hidden="true"><entry.icon size={14} /></span>
                 <span>{sectionLabel(entry.id)}</span>
@@ -160,7 +179,7 @@
         class="pane"
         id="settings-pane"
         role="tabpanel"
-        aria-label={i18n.t("settings.paneLabel", { section: sectionLabel(activeSection) })}
+        aria-labelledby={`settings-tab-${activeSection}`}
       >
         <button
           type="button"
@@ -308,5 +327,21 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .scrim, .settings { animation: none; }
+  }
+  @media (max-width: 600px) {
+    .settings-wrap { padding: var(--space-2); }
+    .settings {
+      height: calc(100dvh - var(--space-4));
+      max-height: none;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 35dvh) minmax(0, 1fr);
+    }
+    .nav {
+      min-width: 0;
+      border-right: 0;
+      border-bottom: 1px solid var(--color-border);
+      padding: var(--space-3) var(--space-2);
+    }
+    .pane { min-width: 0; padding: var(--space-5) var(--space-4); }
   }
 </style>

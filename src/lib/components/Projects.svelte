@@ -1150,4 +1150,15 @@
   .del-body { color: var(--color-text-primary); font-size: var(--text-body); }
   .del-note { margin-top: var(--space-3); color: var(--color-text-muted); font-size: var(--text-body-sm); line-height: 1.5; }
 
+  @media (max-width: 600px) {
+    .pr-head { flex-wrap: wrap; padding: var(--space-3); }
+    .pr-head.detail .dh-id { flex-basis: calc(100% - 52px); }
+    .pr-head.detail .dh-count { margin-left: 52px; }
+    .readiness, .instruction-manager { padding-left: var(--space-3); padding-right: var(--space-3); }
+    .readiness-heading > div, .instruction-heading > div { min-width: 100%; }
+    .recommendations li, .instruction-target { align-items: stretch; flex-direction: column; }
+    .recommendations li .btn, .instruction-target .btn { align-self: flex-start; }
+    .proj-row { gap: var(--space-2); padding: var(--space-2); }
+  }
+
 </style>

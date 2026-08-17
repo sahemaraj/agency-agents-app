@@ -1,4 +1,5 @@
 import { createRawSnippet, mount, tick, unmount } from "svelte";
+import { readFileSync } from "node:fs";
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Modal from "$lib/components/Modal.svelte";
@@ -12,6 +13,9 @@ import RunbooksView from "$lib/components/Runbooks.svelte";
 import agentsWorkspaceSource from "$lib/components/AgentsWorkspace.svelte?raw";
 import skillsWorkspaceSource from "$lib/components/SkillsWorkspace.svelte?raw";
 import installModalSource from "$lib/components/InstallModal.svelte?raw";
+import settingsSource from "$lib/components/Settings.svelte?raw";
+import activityHistorySource from "$lib/components/ActivityHistory.svelte?raw";
+import pageSource from "../routes/+page.svelte?raw";
 import ollamaDeployModalSource from "$lib/components/OllamaDeployModal.svelte?raw";
 import deployBrowserSource from "$lib/components/DeployBrowser.svelte?raw";
 import dashboardSource from "$lib/components/AgencyDashboard.svelte?raw";
@@ -351,6 +355,114 @@ afterEach(async () => {
 describe("frontend test harness", () => {
   it("runs unit tests", () => {
     expect(true).toBe(true);
+  });
+
+  it("uses one owned, keyboard-roving Settings tab stop", async () => {
+    ui.openSettings();
+    const { default: Settings } = await import("$lib/components/Settings.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Settings, { target });
+    try {
+      const tabs = await vi.waitFor(() => {
+        const candidates = [...target.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+        expect(candidates).toHaveLength(8);
+        return candidates;
+      });
+      expect(target.querySelector('[role="tablist"]')?.tagName).toBe("UL");
+      expect([...target.querySelectorAll('[role="tablist"] li')]
+        .every((item) => item.getAttribute("role") === "presentation")).toBe(true);
+      expect(tabs.map((tab) => tab.tabIndex)).toEqual([0, -1, -1, -1, -1, -1, -1, -1]);
+
+      tabs[0].focus();
+      tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+      await tick();
+      expect(document.activeElement).toBe(tabs[1]);
+      expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+      expect(tabs[1].tabIndex).toBe(0);
+      expect(tabs[0].tabIndex).toBe(-1);
+      expect(target.querySelector('[role="tabpanel"]')?.getAttribute("aria-labelledby")).toBe(tabs[1].id);
+
+      tabs[1].dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+      await tick();
+      expect(document.activeElement).toBe(tabs.at(-1));
+      expect(tabs.at(-1)?.getAttribute("aria-selected")).toBe("true");
+    } finally {
+      unmount(component);
+      target.remove();
+      ui.closeSettings();
+    }
+  });
+
+  it("moves focus to and announces an asynchronously prepared install plan", async () => {
+    let resolvePlan!: (plan: AgentMutationPlan) => void;
+    const planPromise = new Promise<AgentMutationPlan>((resolve) => { resolvePlan = resolve; });
+    const plan: AgentMutationPlan = {
+      revision: "focus-plan", operation: "install", tool: "claudeCode", scope: "user", projectPath: null,
+      agents: [{
+        reference: staleControlPackage.reference, name: "Reviewer", sourceHash: "source",
+        dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: [],
+      }],
+      warnings: [], blockers: [], rollbackAvailable: true,
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "projects_list" || command === "installs_reconcile") return [] as never;
+      if (command === "tools_list") return [staleControlTool] as never;
+      if (command === "agent_install_plan") return planPromise as never;
+      return [] as never;
+    });
+    install.installed = [];
+    install.tools = [staleControlTool];
+    install.reconciled = true;
+    projects.list = [];
+    const { default: InstallModal } = await import("$lib/components/InstallModal.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(InstallModal, {
+      target,
+      props: { title: "Install Reviewer", agentPackage: staleControlPackage, onClose: vi.fn() },
+    });
+    try {
+      const toggle = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLButtonElement>(".grid-wrap .toggle");
+        expect(candidate?.disabled).toBe(false);
+        return candidate!;
+      });
+      toggle.focus();
+      toggle.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Building the exact mutation plan"));
+      resolvePlan(plan);
+      const planRegion = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLElement>('[data-install-plan]');
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      expect(document.activeElement).toBe(planRegion);
+      expect(target.querySelector('[data-plan-announcement]')?.textContent).toContain("Mutation plan ready");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("keeps light brand buttons above 4.5:1 and reflows the app surfaces at 375px", () => {
+    const tokensSource = readFileSync("src/lib/styles/tokens.css", "utf8");
+    expect(tokensSource).toContain("#9a3412");
+    const hex = tokensSource.match(/--color-brand:\s*(#[0-9a-f]{6})/i)?.[1];
+    expect(hex).toBeTruthy();
+    const channel = (value: number) => {
+      const normalized = value / 255;
+      return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+    };
+    const rgb = hex!.slice(1).match(/.{2}/g)!.map((value) => Number.parseInt(value, 16));
+    const luminance = 0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2]);
+    expect(1.05 / (luminance + 0.05)).toBeGreaterThanOrEqual(4.5);
+
+    expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.main :global\(\.handle\)[^]*?display:\s*none/);
+    expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.app\.sidebar-collapsed \.main :global\(\.sidebar\)[^]*?display:\s*none/);
+    expect(settingsSource).toMatch(/@media \(max-width: 600px\)[^]*?grid-template-columns:\s*minmax\(0, 1fr\)/);
+    expect(activityHistorySource).toMatch(/@media \(max-width: 600px\)[^]*?\.review-list li[^]*?flex-direction:\s*column/);
+    expect(projectsSource).toMatch(/@media \(max-width: 600px\)[^]*?\.pr-head[^]*?flex-wrap:\s*wrap/);
   });
 
   it("uses right-to-left document direction for Persian", async () => {

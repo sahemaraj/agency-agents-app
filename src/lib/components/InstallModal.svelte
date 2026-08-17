@@ -243,6 +243,8 @@
   } | null>(null);
   let rosterPending = $state<AgentRosterMutationPlan | null>(null);
   let planLoading = $state(false);
+  let planRoot: HTMLElement | undefined = $state();
+  let planAnnouncement = $state("");
   let actionError = $state<string | null>(null);
   let historyRow = $state<InstalledAgent | null>(null);
   let rosterHistoryRow = $state<InstalledAgentRoster | null>(null);
@@ -276,6 +278,12 @@
     return agentLibrary.library.updatePolicies.find((entry) => sameAgent(entry.agent, exactReference))?.policy ?? "notify";
   });
 
+  async function focusPreparedPlan() {
+    planAnnouncement = `${i18n.t("agents.mutationPlan")} ready.`;
+    await tick();
+    planRoot?.focus({ preventScroll: true });
+  }
+
   async function reviewPlan(
     operation: "install" | "update" | "uninstall",
     reference: AgentReference,
@@ -284,6 +292,7 @@
   ) {
     if (!installTruthFresh) return;
     planLoading = true;
+    planAnnouncement = i18n.t("agents.loadingPlan");
     actionError = null;
     try {
       pending = {
@@ -293,6 +302,7 @@
         collectionName: null,
         batchReferences: [],
       };
+      await focusPreparedPlan();
     } catch (error) {
       actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
@@ -338,6 +348,7 @@
   ) {
     if (!installTruthFresh || !collectionName) return;
     planLoading = true;
+    planAnnouncement = i18n.t("agents.loadingPlan");
     actionError = null;
     try {
       pending = {
@@ -347,6 +358,7 @@
         collectionName,
         batchReferences: [],
       };
+      await focusPreparedPlan();
     } catch (error) {
       actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
@@ -357,6 +369,7 @@
   async function reviewBatch(tool: Tool, target: string | null) {
     if (!installTruthFresh || agentReferences.length === 0) return;
     planLoading = true;
+    planAnnouncement = i18n.t("agents.loadingPlan");
     actionError = null;
     try {
       pending = {
@@ -366,6 +379,7 @@
         collectionName: null,
         batchReferences: agentReferences,
       };
+      await focusPreparedPlan();
     } catch (error) {
       actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
@@ -380,9 +394,11 @@
   ) {
     if (!rosterTruthFresh || !target || exactReferences.length < 2) return;
     planLoading = true;
+    planAnnouncement = i18n.t("agents.loadingPlan");
     actionError = null;
     try {
       rosterPending = await install.planRoster(exactReferences, operation, tool, target);
+      await focusPreparedPlan();
     } catch (error) {
       actionError = isAppError(error) ? appErrorMessage(error) : String(error);
     } finally {
@@ -704,9 +720,10 @@
 
   {#if actionError}<p class="plan-error" role="alert">{actionError}</p>{/if}
   {#if planLoading}<p class="sub">{i18n.t("agents.loadingPlan")}</p>{/if}
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true" data-plan-announcement>{planAnnouncement}</div>
 
   {#if rosterPending}
-    <section class="plan" aria-label="Agent roster mutation plan">
+    <section bind:this={planRoot} class="plan" tabindex="-1" data-install-plan aria-label="Agent roster mutation plan">
       <h3>{i18n.t("agents.mutationPlan")}: {rosterPending.operation}</h3>
       <p class="rollback-note"><strong>{install.toolLabel(rosterPending.tool)}</strong> · project only</p>
       <code title={rosterPending.destination}>{rosterPending.destination}</code>
@@ -733,7 +750,7 @@
       <p class="rollback-note">{rosterPending.rollbackAvailable ? i18n.t("agents.rollbackAvailable") : i18n.t("agents.rollbackUnavailable")}</p>
     </section>
   {:else if pending}
-    <section class="plan" aria-label={i18n.t("agents.mutationPlan")}>
+    <section bind:this={planRoot} class="plan" tabindex="-1" data-install-plan aria-label={i18n.t("agents.mutationPlan")}>
       <h3>{i18n.t("agents.mutationPlan")}: {pending.operation}</h3>
       {#if pending.plan.blockers.length > 0}
         <div class="plan-blockers" role="alert">

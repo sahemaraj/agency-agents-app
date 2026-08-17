@@ -505,4 +505,12 @@
   }
   .status-dot.ok   { background: var(--color-success); }
   .status-dot.fail { background: var(--color-danger); }
+  @media (max-width: 600px) {
+    .panel-head { flex-wrap: wrap; gap: var(--space-2); padding: var(--space-3); }
+    .review-summary, .review-group { padding-left: var(--space-3); padding-right: var(--space-3); }
+    .review-list li { align-items: stretch; flex-direction: column; gap: var(--space-2); }
+    .review-list button { align-self: flex-start; }
+    .row { grid-template-columns: 20px minmax(0, 1fr) auto 8px; gap: var(--space-2); padding: var(--space-2); }
+    .receipt-counts { display: block; margin-left: 0; }
+  }
 </style>
