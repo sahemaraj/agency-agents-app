@@ -3060,8 +3060,14 @@ pub(crate) async fn install_skill_authorized(
                 )
             })
             .transpose()?;
-        create_skill_version_snapshot(state, previous, &destination, project_capability.as_ref())
-            .await?;
+        create_skill_version_snapshot(
+            state,
+            previous,
+            &destination,
+            project_capability.as_ref(),
+            None,
+        )
+        .await?;
     }
 
     let installed_hash = source_hash.clone();
@@ -4611,11 +4617,98 @@ async fn exact_skill_version_snapshots(
     Ok(snapshots)
 }
 
+async fn prune_skill_version_snapshots(
+    state: &AppState,
+    identity: &SkillVersionIdentity,
+    directory: &Path,
+    created_snapshot: &Path,
+    protected_snapshot: Option<&Path>,
+) -> Result<(), AppError> {
+    let canonical_directory = std::fs::canonicalize(directory).map_err(|error| AppError::Io {
+        message: format!("resolve Skill identity history: {error}"),
+    })?;
+    let canonical_created =
+        std::fs::canonicalize(created_snapshot).map_err(|error| AppError::Io {
+            message: format!("resolve new Skill version snapshot: {error}"),
+        })?;
+    let canonical_protected = protected_snapshot
+        .map(|path| {
+            std::fs::canonicalize(path).map_err(|error| AppError::Io {
+                message: format!("resolve protected Skill version snapshot: {error}"),
+            })
+        })
+        .transpose()?;
+
+    for path in std::iter::once(&canonical_created).chain(canonical_protected.iter()) {
+        if path.parent() != Some(canonical_directory.as_path())
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| Uuid::parse_str(name).ok())
+                .is_none()
+        {
+            return Err(AppError::InvalidArgument {
+                message: "Protected Skill version snapshot escaped its exact install history"
+                    .into(),
+            });
+        }
+    }
+
+    let snapshots = exact_skill_version_snapshots(state, identity).await?;
+    let contains = |path: &Path| {
+        snapshots
+            .iter()
+            .any(|snapshot| Path::new(&snapshot.path) == path)
+    };
+    if !contains(&canonical_created) {
+        return Err(AppError::InvalidArgument {
+            message: "New Skill version safety snapshot failed verification".into(),
+        });
+    }
+    if canonical_protected
+        .as_deref()
+        .is_some_and(|path| !contains(path))
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Protected Skill version snapshot failed exact revalidation".into(),
+        });
+    }
+
+    let excess = snapshots.len().saturating_sub(MAX_SKILL_HISTORY_ENTRIES);
+    let retired = snapshots
+        .iter()
+        .rev()
+        .map(|snapshot| PathBuf::from(&snapshot.path))
+        .filter(|path| path != &canonical_created)
+        .filter(|path| canonical_protected.as_ref() != Some(path))
+        .take(excess)
+        .collect::<Vec<_>>();
+    if retired.len() != excess {
+        return Err(AppError::InvalidArgument {
+            message: "Skill version history cannot be pruned without removing a protected snapshot"
+                .into(),
+        });
+    }
+    for path in retired {
+        if path.parent() != Some(canonical_directory.as_path()) {
+            return Err(AppError::InvalidArgument {
+                message: "Skill version snapshot selected for pruning escaped its exact history"
+                    .into(),
+            });
+        }
+        std::fs::remove_dir_all(&path).map_err(|error| AppError::Io {
+            message: format!("prune Skill version snapshot {}: {error}", path.display()),
+        })?;
+    }
+    Ok(())
+}
+
 async fn create_skill_version_snapshot(
     state: &AppState,
     record: &SkillInstallRecord,
     source: &Path,
     project_capability: Option<&install::ProjectDirectoryCapability>,
+    protected_snapshot: Option<&Path>,
 ) -> Result<SkillVersionSnapshot, AppError> {
     let identity = skill_version_identity_for_record(record)?;
     let directory = ensure_skill_history_directory(state, &identity)?;
@@ -4674,12 +4767,28 @@ async fn create_skill_version_snapshot(
             return Err(error);
         }
     };
-    let snapshots = exact_skill_version_snapshots(state, &identity).await?;
-    for retired in snapshots.into_iter().skip(MAX_SKILL_HISTORY_ENTRIES) {
-        let retired = PathBuf::from(retired.path);
-        if retired.parent() == Some(directory.as_path()) {
-            let _ = std::fs::remove_dir_all(retired);
+    if let Err(error) = prune_skill_version_snapshots(
+        state,
+        &identity,
+        &directory,
+        &snapshot_directory,
+        protected_snapshot,
+    )
+    .await
+    {
+        if let Err(cleanup) = std::fs::remove_dir_all(&snapshot_directory) {
+            return Err(rollback_error(
+                "prune Skill version history",
+                error,
+                AppError::Io {
+                    message: format!(
+                        "remove new Skill version safety snapshot {}: {cleanup}",
+                        snapshot_directory.display()
+                    ),
+                },
+            ));
         }
+        return Err(error);
     }
     Ok(snapshot)
 }
@@ -4720,7 +4829,9 @@ pub(crate) async fn rollback_skill_authorized(
     let (_, destination) = record_destination_authorized(&record, project_authorization)?;
     let identity = skill_version_identity_for_record(&record)?;
     let selected_path = PathBuf::from(snapshot_path);
-    validate_skill_version_snapshot(state, &identity, &selected_path).await?;
+    let (selected_before_snapshot, _, _) =
+        validate_skill_version_snapshot(state, &identity, &selected_path).await?;
+    let selected_path = PathBuf::from(selected_before_snapshot.path);
     let project_capability = project_authorization
         .map(|authorization| {
             install::project_directory_capability(
@@ -4729,8 +4840,14 @@ pub(crate) async fn rollback_skill_authorized(
             )
         })
         .transpose()?;
-    create_skill_version_snapshot(state, &record, &destination, project_capability.as_ref())
-        .await?;
+    create_skill_version_snapshot(
+        state,
+        &record,
+        &destination,
+        project_capability.as_ref(),
+        Some(&selected_path),
+    )
+    .await?;
     let (selected, content, files) =
         validate_skill_version_snapshot(state, &identity, &selected_path).await?;
 
@@ -5579,6 +5696,240 @@ mod tests {
             std::fs::read_to_string(Path::new(&restored.path).join("SKILL.md"))
                 .unwrap()
                 .contains("First source v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_preserves_the_oldest_selected_snapshot_at_the_retention_boundary() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Codex version 0");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "claudeCode",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+
+        write_skill(source.path(), "reviewer", "reviewer", "Claude version 1");
+        super::update_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "claudeCode",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let unrelated_before = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "claudeCode",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unrelated_before.len(), 1);
+
+        for revision in 1..=10 {
+            write_skill(
+                source.path(),
+                "reviewer",
+                "reviewer",
+                &format!("Codex version {revision}"),
+            );
+            super::update_skill(
+                &state,
+                &registered.id,
+                "reviewer",
+                "codex",
+                Some(&project_path),
+            )
+            .await
+            .unwrap();
+        }
+        let before = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.len(), super::MAX_SKILL_HISTORY_ENTRIES);
+        let selected = before.last().expect("oldest retained snapshot").clone();
+        assert!(
+            std::fs::read_to_string(snapshot_skill_file(Path::new(&selected.path)))
+                .unwrap()
+                .contains("Codex version 0")
+        );
+
+        let restored = super::rollback_skill_authorized(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+            &selected.path,
+            None,
+        )
+        .await
+        .expect("rollback oldest exact snapshot");
+        assert!(
+            std::fs::read_to_string(Path::new(&restored.path).join("SKILL.md"))
+                .unwrap()
+                .contains("Codex version 0")
+        );
+
+        let after = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let records = super::install::load_ledger_for_state(&state).await.unwrap();
+        let codex_record = records
+            .iter()
+            .find(|record| record.runtime == "codex")
+            .expect("tracked codex install");
+        let codex_identity = super::skill_version_identity_for_record(codex_record).unwrap();
+        let exact_after = super::exact_skill_version_snapshots(&state, &codex_identity)
+            .await
+            .unwrap();
+        assert!(exact_after.len() <= super::MAX_SKILL_HISTORY_ENTRIES);
+        super::validate_skill_version_snapshot(&state, &codex_identity, Path::new(&selected.path))
+            .await
+            .expect("selected snapshot remains exactly valid after rollback");
+        assert!(after.len() <= super::MAX_SKILL_HISTORY_ENTRIES);
+        assert!(after.iter().any(|snapshot| snapshot.path == selected.path));
+        let safety = after
+            .iter()
+            .find(|snapshot| !before.iter().any(|prior| prior.path == snapshot.path))
+            .expect("pre-mutation safety snapshot");
+        assert!(
+            std::fs::read_to_string(snapshot_skill_file(Path::new(&safety.path)))
+                .unwrap()
+                .contains("Codex version 10")
+        );
+
+        let unrelated_after = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "claudeCode",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unrelated_after
+                .iter()
+                .map(|snapshot| (&snapshot.path, &snapshot.content_hash))
+                .collect::<Vec<_>>(),
+            unrelated_before
+                .iter()
+                .map(|snapshot| (&snapshot.path, &snapshot.content_hash))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_pruning_failure_removes_the_new_safety_snapshot() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Version zero");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        write_skill(source.path(), "reviewer", "reviewer", "Version one");
+        super::update_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+
+        let records = super::install::load_ledger_for_state(&state).await.unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.runtime == "codex")
+            .expect("tracked codex install");
+        let identity = super::skill_version_identity_for_record(record).unwrap();
+        let history_directory =
+            std::fs::canonicalize(super::skill_history_directory(&state, &identity).unwrap())
+                .unwrap();
+        let history_entries = |directory: &Path| {
+            let mut entries = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        let before = history_entries(&history_directory);
+        let before_history = super::exact_skill_version_snapshots(&state, &identity)
+            .await
+            .unwrap();
+        let missing_protected = history_directory.join(uuid::Uuid::new_v4().to_string());
+
+        let error = super::create_skill_version_snapshot(
+            &state,
+            record,
+            Path::new(&record.dest),
+            None,
+            Some(&missing_protected),
+        )
+        .await
+        .expect_err("missing protected snapshot must abort pruning");
+
+        assert!(error
+            .to_string()
+            .contains("protected Skill version snapshot"));
+        assert_eq!(history_entries(&history_directory), before);
+        assert_eq!(
+            super::exact_skill_version_snapshots(&state, &identity)
+                .await
+                .unwrap(),
+            before_history
+        );
+        assert!(
+            std::fs::read_to_string(Path::new(&record.dest).join("SKILL.md"))
+                .unwrap()
+                .contains("Version one")
         );
     }
 
