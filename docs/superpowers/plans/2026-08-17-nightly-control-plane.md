@@ -48,7 +48,7 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 ## Global Safety and UX Contracts
 
-- `control-center` cap: 4 MiB; 64 project baselines; 256 Agent refs + 256 Skill refs + 32 instruction + 32 MCP + 32 tool requirements per project; 128 subscriptions; 10,000 active snapshot items; 100 feed batches and 2,000 feed items; ordinary strings <=256 characters and normalized relative paths <=512.
+- `control-center` cap: 4 MiB; 64 project baselines; 256 Agent refs + 256 Skill refs + 32 instruction + 32 MCP + 32 tool requirements per project; 64 subscriptions (one unique subscription per baseline); 10,000 active snapshot items; 100 feed batches and 2,000 feed items; ordinary strings <=256 characters and normalized relative paths <=512.
 - Roster ledger caps: 128 records, 512 exact Agent refs and 8 artifacts per record. Raise an existing byte cap only to the measured serialized maximum plus bounded headroom.
 - Multi-artifact paths come only from registry templates, are normalized relative paths without absolute/parent components, and remain below a validated no-link/reparse supported root.
 - Every multi-artifact write preflights all targets, records exact prior bytes in the existing prepared filesystem journal, writes and verifies all bytes, commits ledger last, and rolls every file back on failure.

@@ -73,7 +73,7 @@ Alternative: invoke OpenClaw for registration/version. Rejected because the appr
 - [A failed evidence source can make readiness conservative] → Keep successful evidence visible and label the result Unavailable rather than overclaiming.
 - [Generic flows may not have enough roster context] → Block early with an explicit reason and a handoff to multi-Agent roster review.
 - [Multi-artifact rollback can fail] → Preserve the prepared journal and exact prior bytes, surface recovery honestly, and never commit ledger success early.
-- [A project could be removed while aggregate artifacts remain] → Include roster truth in inventory and require lifecycle completion or retained registration before forgetting.
+- [A project could be removed while aggregate artifacts remain] → Include roster truth in inventory; remove-only atomically discards associated tracking while leaving bytes, and remove-and-uninstall completes verified roster lifecycle before unregistering.
 - [Responsive CSS can compress dense controls] → Wrap/stack controls at narrow widths and preserve visible focus and document access rather than hiding overflow.
 
 ## Migration Plan

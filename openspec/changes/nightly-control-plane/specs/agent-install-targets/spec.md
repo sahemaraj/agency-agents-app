@@ -34,11 +34,11 @@ The system SHALL represent Aider and Windsurf as project-scoped aggregate roster
 - **THEN** the target is routed to the roster planner or explicitly blocked before an incompatible apply path is reachable
 
 ### Requirement: Project inventory and removal preserve roster lifecycle truth
-Tracked project rosters SHALL contribute to project inventory and removal decisions. A project MUST NOT be unregistered while a retained tracked roster would become unreachable; Remove-and-uninstall SHALL remove verified roster artifacts and ledger truth before unregistering.
+Tracked project rosters SHALL contribute to project inventory and removal decisions. Remove-only SHALL atomically discard associated Agent and roster tracking while leaving project bytes untouched; Remove-and-uninstall SHALL remove verified roster artifacts and ledger truth before unregistering. A project MUST NOT be unregistered while a tracked roster would remain unreachable.
 
 #### Scenario: User chooses remove only with a tracked roster
 - **WHEN** the project still owns an Aider or Windsurf roster record
-- **THEN** the app retains project registration or explicitly blocks removal until the roster is handled
+- **THEN** the app leaves aggregate bytes untouched, atomically removes the project roster tracking with the other project tracking, and unregisters only after no tracked roster remains
 
 #### Scenario: User chooses remove and uninstall
 - **WHEN** all tracked Agent, Skill, and roster artifacts remain safely removable
