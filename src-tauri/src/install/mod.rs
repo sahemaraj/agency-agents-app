@@ -8330,6 +8330,9 @@ pub async fn reveal_path(state: State<'_, AppState>, path: String) -> Result<(),
 /// The `<bin> --version`-style probe command for a tool, or `None` when we don't
 /// know one. Best-effort and uneven by nature — GUI tools may not ship a CLI.
 fn version_cmd(tool: &str) -> Option<(&'static str, Vec<&'static str>)> {
+    if tool == "openclaw" {
+        return None;
+    }
     // The registry is cached for the process lifetime (`OnceLock`), so its
     // `&str`s are effectively `'static` — fine to hand to the version probe.
     let v = registry::get(tool)?.version.as_ref()?;
@@ -19670,6 +19673,11 @@ mod tests {
         );
         assert!(OPENCLAW_DEPLOYMENT_NOTICE.contains("files installed"));
         assert!(OPENCLAW_DEPLOYMENT_NOTICE.contains("registration and restart remain required"));
+    }
+
+    #[test]
+    fn openclaw_never_has_an_executable_version_probe() {
+        assert!(version_cmd("openclaw").is_none());
     }
 
     #[test]
