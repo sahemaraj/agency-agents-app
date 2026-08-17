@@ -4053,15 +4053,15 @@ describe("frontend test harness", () => {
     }
   });
 
-  it("finalizes a reviewed rename only after InstallModal applies its exact target", async () => {
+  it("remounts a mixed rename with only its remaining per-target InstallModal operation", async () => {
     const { default: Projects } = await import("$lib/components/Projects.svelte");
     const projectPath = "/tmp/project";
     const initialRecommendation = renamedProjectRecommendation(projectPath);
     const recommendation: ProjectRecommendation = {
       ...initialRecommendation,
       targets: [
-        ...initialRecommendation.targets,
-        { ...initialRecommendation.targets[0], tool: "codex" },
+        { ...initialRecommendation.targets[0], tool: "claudeCode", operation: "update" },
+        { ...initialRecommendation.targets[0], tool: "codex", operation: "install" },
       ],
     };
     const projectRows = [{ path: projectPath, label: "project", installedCount: 0 }];
@@ -4071,9 +4071,9 @@ describe("frontend test harness", () => {
       reference: nextReference,
       agent: { ...staleControlAgent, slug: "new-reviewer", name: "New Reviewer" },
     };
-    const planFor = (tool: string): AgentMutationPlan => ({
+    const planFor = (tool: string, operation: "install" | "update"): AgentMutationPlan => ({
       revision: "rename-install",
-      operation: "install",
+      operation,
       tool,
       scope: "project",
       projectPath,
@@ -4088,13 +4088,13 @@ describe("frontend test harness", () => {
       }],
       warnings: [], blockers: [], rollbackAvailable: true,
     });
-    const installedTools = new Set<string>();
+    const targetStates = new Map<string, "outdated" | "current">([["claudeCode", "outdated"]]);
     let finalized = false;
     const liveRecommendation = (): ProjectRecommendation => {
-      const targets = recommendation.targets.filter((target) => !installedTools.has(target.tool));
+      const targets = recommendation.targets.filter((target) => targetStates.get(target.tool) !== "current");
       return {
         ...recommendation,
-        lifecycle: installedTools.size > 0 ? "pending" : "new",
+        lifecycle: targetStates.get("claudeCode") === "current" ? "pending" : "new",
         targets,
         finalizeOnly: targets.length === 0,
       };
@@ -4111,7 +4111,7 @@ describe("frontend test harness", () => {
     document.body.append(target);
     const invokeMock = vi.mocked(invoke);
     invokeMock.mockImplementation(async (command: string, args) => {
-      if (command === "installs_reconcile") return [...installedTools].map((tool) => ({
+      if (command === "installs_reconcile") return [...targetStates].map(([tool, state]) => ({
         ...staleControlRow,
         slug: "new-reviewer",
         name: "New Reviewer",
@@ -4121,7 +4121,7 @@ describe("frontend test harness", () => {
         projectPath,
         dest: `/tmp/project/.agents/${tool}/new-reviewer.md`,
         scope: "project",
-        state: "current",
+        state,
         tracked: true,
       })) as never;
       if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
@@ -4138,12 +4138,28 @@ describe("frontend test harness", () => {
       }] as never;
       if (command === "agent_drafts_list") return [] as never;
       if (command === "agent_library_list") return emptyFolderState() as never;
-      if (command === "agent_install_plan") return planFor((args as { tool: string }).tool) as never;
+      if (command === "agent_update_plan" || command === "agent_install_plan") {
+        const operation = command === "agent_update_plan" ? "update" : "install";
+        return planFor((args as { tool: string }).tool, operation) as never;
+      }
+      if (command === "update_agent") {
+        expect((args as { tool: string }).tool).toBe("claudeCode");
+        targetStates.set("claudeCode", "current");
+        return {
+          ...installRecord("new-reviewer", `/tmp/project/.agents/claudeCode/new-reviewer.md`),
+          sourceId: nextReference.sourceId,
+          relativePath: nextReference.relativePath,
+          tool: "claudeCode",
+          projectPath,
+          scope: "project",
+        } as never;
+      }
       if (command === "agent_install_with_dependencies") {
         expect(invokeMock.mock.calls.some(([name]) => name === "project_recommendation_finalize")).toBe(false);
         const tool = (args as { tool: string }).tool;
-        const plan = planFor(tool);
-        installedTools.add(tool);
+        expect(tool).toBe("codex");
+        const plan = planFor(tool, "install");
+        targetStates.set(tool, "current");
         return [{
           ...installRecord("new-reviewer", plan.agents[0].destination),
           sourceId: nextReference.sourceId,
@@ -4154,7 +4170,10 @@ describe("frontend test harness", () => {
         }] as never;
       }
       if (command === "project_recommendation_finalize") {
-        expect([...installedTools].sort()).toEqual(["claudeCode", "codex"]);
+        expect([...targetStates].sort()).toEqual([
+          ["claudeCode", "current"],
+          ["codex", "current"],
+        ]);
         expect(args).toEqual({ projectPath, recommendationId: recommendation.id });
         finalized = true;
         return {
@@ -4175,13 +4194,16 @@ describe("frontend test harness", () => {
         .find((button) => button.textContent?.trim() === "Open review")!;
       open.focus();
       open.click();
-      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) => command === "agent_install_plan")).toBe(true));
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) => command === "agent_update_plan")).toBe(true));
       const apply = [...target.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.trim() === "Apply plan")!;
       apply.click();
 
-      await vi.waitFor(() => expect(invokeMock.mock.calls.filter(([command]) =>
-        command === "agent_install_plan")).toHaveLength(2));
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) => command === "agent_install_plan")).toBe(true));
+      expect(invokeMock.mock.calls.filter(([command]) =>
+        command === "agent_update_plan")).toHaveLength(1);
+      expect(invokeMock.mock.calls.filter(([command]) =>
+        command === "agent_install_plan")).toHaveLength(1);
       expect(invokeMock.mock.calls.some(([command]) => command === "project_recommendation_finalize")).toBe(false);
       unmount(component);
       firstMounted = false;
@@ -4195,13 +4217,18 @@ describe("frontend test harness", () => {
         .find((button) => button.textContent?.trim() === "Open review")!;
       resumeOpen.click();
       await vi.waitFor(() => expect(invokeMock.mock.calls.filter(([command]) =>
-        command === "agent_install_plan")).toHaveLength(3));
+        command === "agent_install_plan")).toHaveLength(2));
+      expect(invokeMock.mock.calls.filter(([command]) =>
+        command === "agent_update_plan")).toHaveLength(1);
       const secondApply = [...resumedTarget.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.trim() === "Apply plan")!;
       secondApply.click();
 
       await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) =>
         command === "project_recommendation_finalize")).toBe(true));
+      expect(invokeMock.mock.calls.filter(([command]) => command === "update_agent")).toHaveLength(1);
+      expect(invokeMock.mock.calls.filter(([command]) =>
+        command === "agent_install_with_dependencies")).toHaveLength(1);
       await vi.waitFor(() => expect(resumedTarget?.textContent).toContain("No catalog recommendations."));
       expect((document.activeElement as HTMLButtonElement).textContent?.trim()).toBe("Retry");
     } finally {

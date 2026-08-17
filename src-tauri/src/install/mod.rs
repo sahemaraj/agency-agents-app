@@ -5664,6 +5664,7 @@ enum RecommendationInstallState {
     Current,
     Outdated,
     Absent,
+    Missing,
     Unsafe,
 }
 
@@ -5679,8 +5680,7 @@ fn recommendation_install_state(
     let matches = installed
         .iter()
         .filter(|row| {
-            row.tracked
-                && row.project_path.as_deref() == Some(project_path)
+            row.project_path.as_deref() == Some(project_path)
                 && row.source_id == reference.source_id
                 && row.relative_path == reference.relative_path
                 && row.tool == tool
@@ -5691,11 +5691,14 @@ fn recommendation_install_state(
         [row] => row,
         _ => return RecommendationInstallState::Unsafe,
     };
+    if !row.tracked {
+        return RecommendationInstallState::Unsafe;
+    }
     match row.state {
         InstallState::Current => RecommendationInstallState::Current,
         InstallState::Outdated => RecommendationInstallState::Outdated,
+        InstallState::Missing => RecommendationInstallState::Missing,
         InstallState::Modified
-        | InstallState::Missing
         | InstallState::Foreign
         | InstallState::Disabled
         | InstallState::SourceUnavailable => RecommendationInstallState::Unsafe,
@@ -5769,6 +5772,7 @@ fn derive_project_recommendations_with_installs(
                                 RecommendationOperation::Update
                             }
                             RecommendationInstallState::Absent
+                            | RecommendationInstallState::Missing
                             | RecommendationInstallState::Unsafe => {
                                 all_targets_current = false;
                                 unsafe_action_target = true;
@@ -5783,7 +5787,8 @@ fn derive_project_recommendations_with_installs(
                                 &requirement.tool,
                             ) {
                                 RecommendationInstallState::Current => return None,
-                                RecommendationInstallState::Absent => {
+                                RecommendationInstallState::Absent
+                                | RecommendationInstallState::Missing => {
                                     all_targets_current = false;
                                     RecommendationOperation::Install
                                 }
@@ -6337,28 +6342,63 @@ pub async fn project_recommendation_open(
             message: "Recommendation has no safe deployment operation".into(),
         });
     }
-    if recommendation
+    let installed = mcp_reconcile_agent_installs(&state).await?;
+    validate_project_recommendation_target_states(&recommendation, &installed)?;
+    for target in recommendation
         .targets
         .iter()
-        .any(|target| target.operation == RecommendationOperation::Update)
+        .filter(|target| target.operation == RecommendationOperation::Install)
     {
-        let installed = mcp_reconcile_agent_installs(&state).await?;
-        if !recommendation.targets.iter().all(|target| {
-            installed.iter().any(|row| {
-                row.project_path.as_deref() == Some(target.project_path.as_str())
-                    && row.source_id == target.reference.source_id
-                    && row.relative_path == target.reference.relative_path
-                    && row.tool == target.tool
-                    && row.state == InstallState::Outdated
-            })
-        }) {
+        let plan = build_mutation_plan(
+            &state,
+            vec![target.reference.clone()],
+            target.tool.clone(),
+            Some(target.project_path.clone()),
+            "install",
+            true,
+        )
+        .await?;
+        if !plan.blockers.is_empty() {
             return Err(AppError::InvalidArgument {
-                message: "Updated recommendation no longer targets an exact outdated install"
-                    .into(),
+                message: format!(
+                    "Install recommendation no longer has a safe destination: {}",
+                    plan.blockers.join("; ")
+                ),
             });
         }
     }
     Ok(recommendation)
+}
+
+fn validate_project_recommendation_target_states(
+    recommendation: &ProjectRecommendation,
+    installed: &[InstalledAgent],
+) -> Result<(), AppError> {
+    for target in &recommendation.targets {
+        let state = recommendation_install_state(
+            Some(installed),
+            &target.project_path,
+            &target.reference,
+            &target.tool,
+        );
+        let valid = match target.operation {
+            RecommendationOperation::Update => state == RecommendationInstallState::Outdated,
+            RecommendationOperation::Install => matches!(
+                state,
+                RecommendationInstallState::Absent | RecommendationInstallState::Missing
+            ),
+            RecommendationOperation::Informational => false,
+        };
+        if !valid {
+            return Err(AppError::InvalidArgument {
+                message: format!(
+                    "Recommendation target is no longer safe for its {:?} operation",
+                    target.operation
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn finalize_rename_recommendation_in_document(
@@ -10515,6 +10555,105 @@ mod tests {
         assert_eq!(finalize[0].lifecycle, RecommendationLifecycle::Pending);
         assert!(finalize[0].targets.is_empty());
         assert!(finalize[0].finalize_only);
+    }
+
+    #[test]
+    fn mixed_rename_open_validates_each_target_by_its_own_operation() {
+        let old = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/old-reviewer.md".into(),
+        };
+        let new = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/new-reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&old, &["claudeCode", "codex"]);
+        let installed = vec![
+            recommendation_install(&new, "claudeCode", InstallState::Outdated),
+            recommendation_install(&new, "codex", InstallState::Missing),
+        ];
+
+        let recommendations = derive_project_recommendations_with_installs(
+            &baseline,
+            &recommendation_subscription(),
+            &renamed_batch(&old, &new),
+            &BTreeMap::from([(new, 1)]),
+            Some(&installed),
+        );
+
+        assert_eq!(recommendations.len(), 1);
+        assert_eq!(recommendations[0].lifecycle, RecommendationLifecycle::New);
+        assert_eq!(
+            recommendations[0]
+                .targets
+                .iter()
+                .map(|target| (target.tool.as_str(), target.operation))
+                .collect::<Vec<_>>(),
+            vec![
+                ("claudeCode", RecommendationOperation::Update),
+                ("codex", RecommendationOperation::Install),
+            ]
+        );
+        assert!(
+            validate_project_recommendation_target_states(&recommendations[0], &installed,).is_ok()
+        );
+    }
+
+    #[test]
+    fn install_recommendation_open_rejects_unsafe_exact_target_states() {
+        let old = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/old-reviewer.md".into(),
+        };
+        let new = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/new-reviewer.md".into(),
+        };
+        let baseline = recommendation_baseline(&old, &["codex"]);
+        let recommendation = derive_project_recommendations_with_installs(
+            &baseline,
+            &recommendation_subscription(),
+            &renamed_batch(&old, &new),
+            &BTreeMap::from([(new.clone(), 1)]),
+            Some(&[]),
+        )
+        .remove(0);
+        assert_eq!(
+            recommendation.targets[0].operation,
+            RecommendationOperation::Install
+        );
+        assert!(validate_project_recommendation_target_states(&recommendation, &[]).is_ok());
+        assert!(validate_project_recommendation_target_states(
+            &recommendation,
+            &[recommendation_install(&new, "codex", InstallState::Missing)],
+        )
+        .is_ok());
+
+        let mut untracked_missing = recommendation_install(&new, "codex", InstallState::Missing);
+        untracked_missing.tracked = false;
+        assert!(validate_project_recommendation_target_states(
+            &recommendation,
+            &[untracked_missing]
+        )
+        .is_err());
+
+        for state in [
+            InstallState::Current,
+            InstallState::Outdated,
+            InstallState::Modified,
+            InstallState::Foreign,
+            InstallState::Disabled,
+            InstallState::SourceUnavailable,
+        ] {
+            let mut row = recommendation_install(&new, "codex", state);
+            if state == InstallState::Foreign {
+                row.tracked = false;
+            }
+            assert!(
+                validate_project_recommendation_target_states(&recommendation, &[row]).is_err(),
+                "Install target unexpectedly accepted {state:?}",
+            );
+        }
     }
 
     #[test]
