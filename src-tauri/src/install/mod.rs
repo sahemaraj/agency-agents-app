@@ -5883,6 +5883,28 @@ fn derive_project_recommendations_with_installs(
     recommendations
 }
 
+fn current_project_recommendation_candidate_ids(
+    baseline: &ProjectReadinessBaseline,
+    subscription: &ProjectSubscription,
+    batches: &[CatalogFeedBatch],
+    available: &BTreeMap<AgentReference, usize>,
+    installed: Option<&[InstalledAgent]>,
+) -> BTreeSet<String> {
+    let mut candidate_projection = subscription.clone();
+    candidate_projection.dismissed_recommendation_ids.clear();
+    derive_project_recommendations_with_installs(
+        baseline,
+        &candidate_projection,
+        batches,
+        available,
+        installed,
+    )
+    .into_iter()
+    .filter(|recommendation| recommendation.lifecycle != RecommendationLifecycle::Superseded)
+    .map(|recommendation| recommendation.id)
+    .collect()
+}
+
 #[cfg(test)]
 fn derive_project_recommendations(
     baseline: &ProjectReadinessBaseline,
@@ -5948,7 +5970,14 @@ async fn current_recommendations(
     state: &AppState,
     project_path: &str,
     include_seen_latest: bool,
-) -> Result<(ProjectSubscription, Vec<ProjectRecommendation>), AppError> {
+) -> Result<
+    (
+        ProjectSubscription,
+        Vec<ProjectRecommendation>,
+        BTreeSet<String>,
+    ),
+    AppError,
+> {
     let database = control_center_database(state).await?;
     let document = corpus::load_control_center(&database).await?;
     let baseline = document
@@ -5979,7 +6008,14 @@ async fn current_recommendations(
         &available,
         installed.as_deref(),
     );
-    Ok((subscription, recommendations))
+    let candidate_ids = current_project_recommendation_candidate_ids(
+        baseline,
+        &projection,
+        &document.catalog_feed,
+        &available,
+        installed.as_deref(),
+    );
+    Ok((subscription, recommendations, candidate_ids))
 }
 
 async fn available_agent_reference_counts(state: &AppState) -> BTreeMap<AgentReference, usize> {
@@ -6014,17 +6050,8 @@ async fn list_project_recommendations_for_state(
     state: &AppState,
     project_path: &str,
 ) -> Result<Vec<ProjectRecommendation>, AppError> {
-    let (_, recommendations) = current_recommendations(state, project_path, false).await?;
-    let represented_ids = recommendations
-        .iter()
-        .filter(|recommendation| {
-            !matches!(
-                recommendation.lifecycle,
-                RecommendationLifecycle::Superseded | RecommendationLifecycle::Dismissed
-            )
-        })
-        .map(|recommendation| recommendation.id.clone())
-        .collect::<BTreeSet<_>>();
+    let (_, recommendations, candidate_ids) =
+        current_recommendations(state, project_path, false).await?;
     let inferred_pending_ids = recommendations
         .iter()
         .filter(|recommendation| recommendation.lifecycle == RecommendationLifecycle::Pending)
@@ -6040,7 +6067,7 @@ async fn list_project_recommendations_for_state(
                 prune_project_pending_recommendations(
                     document,
                     &retained_project,
-                    &represented_ids,
+                    &candidate_ids,
                     &inferred_pending_ids,
                 )
             },
@@ -6052,7 +6079,7 @@ async fn list_project_recommendations_for_state(
 fn prune_project_pending_recommendations(
     document: &mut crate::types::ControlCenterDocument,
     project_path: &str,
-    represented_ids: &BTreeSet<String>,
+    candidate_ids: &BTreeSet<String>,
     inferred_pending_ids: &BTreeSet<String>,
 ) -> Result<(), AppError> {
     let subscription = document
@@ -6064,7 +6091,10 @@ fn prune_project_pending_recommendations(
         })?;
     subscription
         .pending_recommendation_ids
-        .retain(|id| represented_ids.contains(id));
+        .retain(|id| candidate_ids.contains(id));
+    subscription
+        .dismissed_recommendation_ids
+        .retain(|id| candidate_ids.contains(id));
     for id in inferred_pending_ids {
         if !subscription.pending_recommendation_ids.contains(id) {
             subscription.pending_recommendation_ids.push(id.clone());
@@ -6162,7 +6192,7 @@ pub async fn project_recommendations_acknowledge(
             message: "Surfaced recommendation receipt is invalid".into(),
         });
     }
-    let (subscription, recommendations) =
+    let (subscription, recommendations, candidate_ids) =
         current_recommendations(&state, &project_path, false).await?;
     let mut expected_ids = recommendations
         .iter()
@@ -6190,20 +6220,10 @@ pub async fn project_recommendations_acknowledge(
         });
     }
     let expected_cursor = subscription.last_seen_batch;
-    let represented_ids = recommendations
-        .iter()
-        .filter(|recommendation| {
-            !matches!(
-                recommendation.lifecycle,
-                RecommendationLifecycle::Superseded | RecommendationLifecycle::Dismissed
-            )
-        })
-        .map(|recommendation| recommendation.id.as_str())
-        .collect::<BTreeSet<_>>();
     let mut pending_ids = subscription
         .pending_recommendation_ids
         .into_iter()
-        .filter(|id| represented_ids.contains(id.as_str()))
+        .filter(|id| candidate_ids.contains(id))
         .collect::<Vec<_>>();
     pending_ids.extend(supplied_ids);
     pending_ids.sort();
@@ -6240,7 +6260,8 @@ pub async fn project_recommendation_dismiss(
 ) -> Result<(), AppError> {
     let _project_lock = lock_project_registry(&state.app_data_dir)?;
     let project_path = exact_registered_project(&state, &project_path).await?;
-    let (_, recommendations) = current_recommendations(&state, &project_path, true).await?;
+    let (_, recommendations, candidate_ids) =
+        current_recommendations(&state, &project_path, true).await?;
     if !recommendations
         .iter()
         .any(|recommendation| recommendation.id == recommendation_id)
@@ -6249,10 +6270,6 @@ pub async fn project_recommendation_dismiss(
             message: "Recommendation is not current for this project subscription".into(),
         });
     }
-    let represented_ids = recommendations
-        .iter()
-        .map(|recommendation| recommendation.id.clone())
-        .collect::<BTreeSet<_>>();
     control_center_database(&state)
         .await?
         .mutate(
@@ -6263,7 +6280,7 @@ pub async fn project_recommendation_dismiss(
                     document,
                     &project_path,
                     recommendation_id,
-                    &represented_ids,
+                    &candidate_ids,
                 )
             },
         )
@@ -6274,7 +6291,7 @@ fn dismiss_project_recommendation(
     document: &mut crate::types::ControlCenterDocument,
     project_path: &str,
     recommendation_id: String,
-    represented_ids: &BTreeSet<String>,
+    candidate_ids: &BTreeSet<String>,
 ) -> Result<(), AppError> {
     let subscription = document
         .project_subscriptions
@@ -6285,10 +6302,10 @@ fn dismiss_project_recommendation(
         })?;
     subscription
         .pending_recommendation_ids
-        .retain(|id| id != &recommendation_id && represented_ids.contains(id));
+        .retain(|id| id != &recommendation_id && candidate_ids.contains(id));
     subscription
         .dismissed_recommendation_ids
-        .retain(|id| represented_ids.contains(id));
+        .retain(|id| candidate_ids.contains(id));
     if !subscription
         .dismissed_recommendation_ids
         .contains(&recommendation_id)
@@ -6309,7 +6326,7 @@ pub async fn project_recommendation_open(
 ) -> Result<ProjectRecommendation, AppError> {
     let _project_lock = lock_project_registry(&state.app_data_dir)?;
     let project_path = exact_registered_project(&state, &project_path).await?;
-    let (_, recommendations) = current_recommendations(&state, &project_path, true).await?;
+    let (_, recommendations, _) = current_recommendations(&state, &project_path, true).await?;
     let recommendation = recommendations
         .into_iter()
         .find(|recommendation| recommendation.id == recommendation_id)
@@ -9923,6 +9940,180 @@ mod tests {
             document.project_subscriptions[0].pending_recommendation_ids,
             vec!["b".repeat(64)]
         );
+    }
+
+    #[test]
+    fn sequential_dismissals_retain_current_receipts_and_prune_only_obsolete_ids() {
+        let first = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/first.md".into(),
+        };
+        let second = AgentReference {
+            source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
+            relative_path: "engineering/second.md".into(),
+        };
+        let baseline = ProjectReadinessBaseline {
+            project_path: "/registered/project".into(),
+            label: "Reviewers".into(),
+            agent_requirements: vec![
+                BaselineAgentRequirement {
+                    reference: first.clone(),
+                    tool: "codex".into(),
+                },
+                BaselineAgentRequirement {
+                    reference: second.clone(),
+                    tool: "codex".into(),
+                },
+            ],
+            skill_requirements: Vec::new(),
+            agents: vec![first.clone(), second.clone()],
+            skills: Vec::new(),
+            instructions: Vec::new(),
+            mcp_servers: Vec::new(),
+            tools: vec!["codex".into()],
+        };
+        let batch =
+            |reference: &AgentReference, at: &str, before: char, after: char| CatalogFeedBatch {
+                at: at.into(),
+                changes: vec![CatalogChange::Updated {
+                    before: CatalogSnapshotItem {
+                        category: "engineering".into(),
+                        relative_path: reference.relative_path.clone(),
+                        source_hash: before.to_string().repeat(64),
+                        body_hash: before.to_string().repeat(64),
+                    },
+                    after: CatalogSnapshotItem {
+                        category: "engineering".into(),
+                        relative_path: reference.relative_path.clone(),
+                        source_hash: after.to_string().repeat(64),
+                        body_hash: after.to_string().repeat(64),
+                    },
+                }],
+            };
+        let batches = vec![
+            batch(&first, "2026-08-17T01:00:00Z", 'a', 'b'),
+            batch(&second, "2026-08-17T02:00:00Z", 'c', 'd'),
+        ];
+        let available = BTreeMap::from([(first.clone(), 1), (second.clone(), 1)]);
+        let installed = vec![
+            recommendation_install(&first, "codex", InstallState::Outdated),
+            recommendation_install(&second, "codex", InstallState::Outdated),
+        ];
+        let subscription = recommendation_subscription();
+        let visible = derive_project_recommendations_with_installs(
+            &baseline,
+            &subscription,
+            &batches,
+            &available,
+            Some(&installed),
+        );
+        let first_id = visible
+            .iter()
+            .find(|recommendation| recommendation.baseline_reference == first)
+            .unwrap()
+            .id
+            .clone();
+        let second_id = visible
+            .iter()
+            .find(|recommendation| recommendation.baseline_reference == second)
+            .unwrap()
+            .id
+            .clone();
+        let mut document = crate::types::ControlCenterDocument {
+            project_baselines: vec![baseline.clone()],
+            project_subscriptions: vec![subscription],
+            catalog_feed: batches.clone(),
+            catalog_last_success_at: Some("2026-08-17T02:00:00Z".into()),
+            ..Default::default()
+        };
+
+        let candidates = current_project_recommendation_candidate_ids(
+            &baseline,
+            &document.project_subscriptions[0],
+            &batches,
+            &available,
+            Some(&installed),
+        );
+        dismiss_project_recommendation(
+            &mut document,
+            "/registered/project",
+            first_id.clone(),
+            &candidates,
+        )
+        .unwrap();
+        let candidates = current_project_recommendation_candidate_ids(
+            &baseline,
+            &document.project_subscriptions[0],
+            &batches,
+            &available,
+            Some(&installed),
+        );
+        dismiss_project_recommendation(
+            &mut document,
+            "/registered/project",
+            second_id.clone(),
+            &candidates,
+        )
+        .unwrap();
+
+        assert!(derive_project_recommendations_with_installs(
+            &baseline,
+            &document.project_subscriptions[0],
+            &batches,
+            &available,
+            Some(&installed),
+        )
+        .is_empty());
+        let mut retained = vec![first_id.clone(), second_id.clone()];
+        retained.sort();
+        assert_eq!(
+            document.project_subscriptions[0].dismissed_recommendation_ids,
+            retained
+        );
+        assert!(corpus::validate_control_center(&document).is_ok());
+
+        let second_only = recommendation_baseline(&second, &["codex"]);
+        document.project_baselines[0] = second_only.clone();
+        let candidates = current_project_recommendation_candidate_ids(
+            &second_only,
+            &document.project_subscriptions[0],
+            &batches,
+            &available,
+            Some(&installed),
+        );
+        prune_project_pending_recommendations(
+            &mut document,
+            "/registered/project",
+            &candidates,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            document.project_subscriptions[0].dismissed_recommendation_ids,
+            vec![second_id]
+        );
+        assert!(corpus::validate_control_center(&document).is_ok());
+
+        document.catalog_feed.clear();
+        document.catalog_last_success_at = None;
+        let candidates = current_project_recommendation_candidate_ids(
+            &second_only,
+            &document.project_subscriptions[0],
+            &[],
+            &available,
+            Some(&installed),
+        );
+        prune_project_pending_recommendations(
+            &mut document,
+            "/registered/project",
+            &candidates,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(document.project_subscriptions[0]
+            .dismissed_recommendation_ids
+            .is_empty());
+        assert!(corpus::validate_control_center(&document).is_ok());
     }
 
     #[test]
