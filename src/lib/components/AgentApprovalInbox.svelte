@@ -30,6 +30,7 @@
   const approvals = $derived([...agentLibrary.library.approvals].sort((left, right) =>
     Date.parse(right.submittedAt) - Date.parse(left.submittedAt)
   ));
+  let status: HTMLDivElement | undefined = $state();
 
   $effect(() => {
     if (open) untrack(() => void agentLibrary.load(true));
@@ -45,11 +46,24 @@
   function stale(result: string | null): boolean {
     return !!result && /stale|revision|changed since/i.test(result);
   }
+
+  async function resolve(id: string, decision: "approve" | "reject"): Promise<void> {
+    const linked = !!focusId;
+    const succeeded = decision === "approve"
+      ? await agentLibrary.approveRequest(id)
+      : await agentLibrary.rejectRequest(id);
+    if (!linked) return;
+    if (succeeded) onClose();
+    else {
+      await tick();
+      status?.focus({ preventScroll: true });
+    }
+  }
 </script>
 
 <Modal {open} title={i18n.t("agents.approvalInbox")} size="wide" {onClose}>
   <p>{i18n.t("agents.approvalInboxHelp")}</p>
-  <div class="status" aria-live="polite">{agentLibrary.error ?? ""}</div>
+  <div class="status" aria-live="polite" tabindex="-1" bind:this={status}>{agentLibrary.error ?? ""}</div>
   {#if approvals.length === 0}
     <p class="empty">{i18n.t("agents.noApprovals")}</p>
   {:else}
@@ -76,8 +90,8 @@
           {/if}
           {#if approval.state === "pending"}
             <div class="actions">
-              <Button size="sm" variant="primary" loading={agentLibrary.busy} onclick={() => agentLibrary.approveRequest(approval.id)}>{i18n.t("agents.approve")}</Button>
-              <Button size="sm" variant="danger" disabled={agentLibrary.busy} onclick={() => agentLibrary.rejectRequest(approval.id)}>{i18n.t("agents.reject")}</Button>
+              <Button size="sm" variant="primary" loading={agentLibrary.busy} onclick={() => void resolve(approval.id, "approve")}>{i18n.t("agents.approve")}</Button>
+              <Button size="sm" variant="danger" disabled={agentLibrary.busy} onclick={() => void resolve(approval.id, "reject")}>{i18n.t("agents.reject")}</Button>
             </div>
           {/if}
         </li>

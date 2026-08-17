@@ -1394,6 +1394,193 @@ describe("frontend test harness", () => {
     }
   });
 
+  async function mountLinkedAgentApprovalOwner(options: {
+    mutation?: "agent_approval_approve" | "agent_approval_reject";
+    failMutation?: boolean;
+  } = {}) {
+    const approval = {
+      id: "agent-owner-approval", submittedAt: "2026-08-17T02:00:00Z", state: "pending" as const,
+      requestedBy: "codex", request: { action: "draftPublish" as const, id: "agent-draft", planRevision: "revision" }, result: null,
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string, args) => {
+      if (command === "agent_library_list") return { ...emptyFolderState(), approvals: [approval] } as never;
+      if (command === options.mutation) {
+        expect(args).toEqual({ id: approval.id });
+        if (options.failMutation) throw { code: "io", message: "approval mutation offline" };
+        return { ...approval, state: command === "agent_approval_approve" ? "approved" : "rejected" } as never;
+      }
+      if (command === "skill_folders_list") return emptyFolderState() as never;
+      if (["agent_sources_inspect", "agent_drafts_list", "expert_creation_requests", "expert_runs_list",
+        "expert_activation_requests", "projects_list"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    agentLibrary.library = { ...emptyFolderState(), approvals: [approval] } as never;
+    agentLibrary.error = null;
+    agentLibrary.busy = false;
+    corpus.agents = [staleControlAgent];
+    ui.section = "activity";
+    ui.navStack = [];
+    ui.navIndex = -1;
+    ui.initNav();
+
+    const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+    const { default: AgentsWorkspace } = await import("$lib/components/AgentsWorkspace.svelte");
+    const activityTarget = document.createElement("div");
+    document.body.append(activityTarget);
+    const activityComponent = mount(ActivityHistory, { target: activityTarget });
+    const activityTrigger = await vi.waitFor(() => {
+      const candidate = activityTarget.querySelector<HTMLButtonElement>('[data-review-source="agent"]');
+      expect(candidate).toBeTruthy();
+      return candidate!;
+    });
+    const triggerId = activityTrigger.dataset.reviewTrigger!;
+    activityTrigger.click();
+    expect(ui.section).toBe("personas");
+    expect(ui.agentApprovalId).toBe(approval.id);
+    unmount(activityComponent);
+    activityTarget.remove();
+
+    const ownerTarget = document.createElement("div");
+    document.body.append(ownerTarget);
+    const ownerComponent = mount(AgentsWorkspace, { target: ownerTarget });
+    const dialog = await vi.waitFor(() => {
+      const candidate = ownerTarget.querySelector<HTMLElement>('[role="dialog"]');
+      expect(candidate?.querySelector("h1")?.textContent).toContain("Agent approval inbox");
+      expect((document.activeElement as HTMLElement | null)?.closest("[data-agent-approval-id]")
+        ?.getAttribute("data-agent-approval-id")).toBe(approval.id);
+      return candidate!;
+    });
+    const returnToActivity = async () => {
+      unmount(ownerComponent);
+      ownerTarget.remove();
+      const returnTarget = document.createElement("div");
+      document.body.append(returnTarget);
+      const returnComponent = mount(ActivityHistory, { target: returnTarget });
+      try {
+        await vi.waitFor(() => expect((document.activeElement as HTMLElement | null)?.dataset.reviewTrigger).toBe(triggerId));
+        expect(ui.reviewReturnId).toBeNull();
+      } finally {
+        unmount(returnComponent);
+        returnTarget.remove();
+      }
+    };
+    return { approval, dialog, ownerComponent, ownerTarget, returnToActivity };
+  }
+
+  it("returns a focused Agent approval through its real owner on Close without deciding it", async () => {
+    const owner = await mountLinkedAgentApprovalOwner();
+    try {
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command.startsWith("agent_approval_"))).toBe(false);
+      owner.dialog.querySelector<HTMLButtonElement>('button[aria-label="Close"]')!.click();
+      await vi.waitFor(() => expect(ui.section).toBe("activity"));
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command.startsWith("agent_approval_"))).toBe(false);
+      await owner.returnToActivity();
+    } catch (error) {
+      unmount(owner.ownerComponent);
+      owner.ownerTarget.remove();
+      throw error;
+    }
+  });
+
+  it.each([
+    ["Approve", "agent_approval_approve"],
+    ["Reject", "agent_approval_reject"],
+  ] as const)("returns a focused Agent approval through its real owner after successful %s", async (actionLabel, mutation) => {
+    const owner = await mountLinkedAgentApprovalOwner({ mutation });
+    try {
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command.startsWith("agent_approval_"))).toHaveLength(0);
+      [...owner.dialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === actionLabel)!.click();
+      await vi.waitFor(() => expect(ui.section).toBe("activity"));
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === mutation)).toHaveLength(1);
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command.startsWith("agent_approval_") && command !== mutation)).toHaveLength(0);
+      await owner.returnToActivity();
+    } catch (error) {
+      unmount(owner.ownerComponent);
+      owner.ownerTarget.remove();
+      throw error;
+    }
+  });
+
+  it("keeps a failed focused Agent approval open and moves focus to its announced error", async () => {
+    const owner = await mountLinkedAgentApprovalOwner({ mutation: "agent_approval_approve", failMutation: true });
+    try {
+      [...owner.dialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Approve")!.click();
+      const status = await vi.waitFor(() => {
+        const candidate = owner.dialog.querySelector<HTMLElement>('.status[aria-live="polite"]');
+        expect(candidate?.textContent).toContain("approval mutation offline");
+        expect(document.activeElement).toBe(candidate);
+        return candidate!;
+      });
+      expect(status.closest('[role="dialog"]')).toBe(owner.dialog);
+      expect(ui.section).toBe("personas");
+      expect(ui.agentApprovalId).toBe(owner.approval.id);
+      expect(ui.reviewReturnId).toBe(`agent:${owner.approval.id}`);
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_approval_approve")).toHaveLength(1);
+      expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "agent_approval_reject")).toBe(false);
+    } finally {
+      unmount(owner.ownerComponent);
+      owner.ownerTarget.remove();
+    }
+  });
+
+  it("keeps a successfully decided locally opened Agent approval inbox open", async () => {
+    const approval = {
+      id: "agent-local-approval", submittedAt: "2026-08-17T02:00:00Z", state: "pending" as const,
+      requestedBy: "codex", request: { action: "draftPublish" as const, id: "local-draft", planRevision: "revision" }, result: null,
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string, args) => {
+      if (command === "agent_library_list") return { ...emptyFolderState(), approvals: [approval] } as never;
+      if (command === "agent_approval_approve") {
+        expect(args).toEqual({ id: approval.id });
+        return { ...approval, state: "approved" } as never;
+      }
+      if (["agent_sources_inspect", "agent_drafts_list"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    agentLibrary.library = { ...emptyFolderState(), approvals: [approval] } as never;
+    agentLibrary.error = null;
+    agentLibrary.busy = false;
+    corpus.agents = [staleControlAgent];
+    ui.section = "personas";
+    ui.navStack = [];
+    ui.navIndex = -1;
+    ui.initNav();
+    const { default: AgentsWorkspace } = await import("$lib/components/AgentsWorkspace.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(AgentsWorkspace, { target });
+    try {
+      const open = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim().startsWith("Approvals"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      open.click();
+      const dialog = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLElement>('[role="dialog"]');
+        expect(candidate?.querySelector("h1")?.textContent).toContain("Agent approval inbox");
+        return candidate!;
+      });
+      [...dialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Approve")!.click();
+      await vi.waitFor(() => {
+        expect(vi.mocked(invoke).mock.calls
+          .filter(([command]) => command === "agent_approval_approve")).toHaveLength(1);
+        expect(agentLibrary.busy).toBe(false);
+      });
+      expect(target.querySelector('[role="dialog"]')).toBe(dialog);
+      expect(ui.section).toBe("personas");
+      expect(ui.reviewReturnId).toBeNull();
+      expect(ui.agentApprovalId).toBeNull();
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
   it.each([
     ["Approve", "skill_approval_approve"],
     ["Reject", "skill_approval_reject"],
