@@ -4,7 +4,7 @@
 
 ### 2026-08-17: Nightly Control Plane Program
 
-Implementing the approved eight-capability local control-plane program in an isolated worktree with sequential subagent implementation, independent spec review, code-quality review, and full regression/E2E validation. Task 1 Catalog Change Feed is accepted at `db9836e`; Task 2 Project Readiness and subscriptions is accepted at `4a51d43`. Current state is BUILD, Task 3 Unified Review and Recovery. See `docs/superpowers/plans/2026-08-17-nightly-control-plane.md`.
+Implementing the approved eight-capability local control-plane program in an isolated worktree with sequential subagent implementation, independent spec review, code-quality review, and full regression/E2E validation. Task 1 Catalog Change Feed is accepted at `db9836e`; Task 2 Project Readiness and subscriptions is accepted at `4a51d43`; Task 3 Unified Review and Recovery is accepted at `e5864d3`. Current state is BUILD, Task 4 Bounded Playbook Library. See `docs/superpowers/plans/2026-08-17-nightly-control-plane.md`.
 
 ## Completed
 
