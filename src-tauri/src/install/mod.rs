@@ -214,6 +214,9 @@ struct AgentRosterHistoryReference {
     snapshot_id: String,
     rendered_hash: String,
     retired_snapshot_ids: Vec<String>,
+    staging_path: String,
+    previous_index_hash: Option<String>,
+    next_index_hash: String,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -251,7 +254,7 @@ struct AgentRosterUninstallOperation {
 #[serde(rename_all = "camelCase")]
 struct AgentRosterRetentionOperation {
     previous: AgentRosterInstallRecord,
-    retired_snapshot_ids: Vec<String>,
+    history: AgentRosterHistoryReference,
 }
 
 // ---------- Ledger persistence ----------
@@ -1389,6 +1392,25 @@ async fn commit_roster_history(
     Ok(())
 }
 
+async fn publish_roster_history(
+    mutation: &mut Option<history::RosterHistoryMutation>,
+) -> Result<(), AppError> {
+    if let Some(mutation) = mutation.as_mut() {
+        mutation.publish().await?;
+    }
+    Ok(())
+}
+
+async fn publish_roster_history_if(
+    mutation: &mut Option<history::RosterHistoryMutation>,
+    should_publish: bool,
+) -> Result<(), AppError> {
+    if should_publish {
+        publish_roster_history(mutation).await?;
+    }
+    Ok(())
+}
+
 async fn prepare_roster_retention(
     database: Option<&crate::state_db::StateDatabase>,
     previous: &AgentRosterInstallRecord,
@@ -1397,16 +1419,12 @@ async fn prepare_roster_retention(
     let (Some(database), Some(mutation)) = (database, mutation) else {
         return Ok(None);
     };
-    let retired_snapshot_ids = mutation.retired_snapshot_ids();
-    if retired_snapshot_ids.is_empty() {
-        return Ok(None);
-    }
     database
         .prepare_filesystem_operation(
             "agent_roster_retention",
             &AgentRosterRetentionOperation {
                 previous: previous.clone(),
-                retired_snapshot_ids,
+                history: roster_history_reference(mutation),
             },
         )
         .await
@@ -1443,6 +1461,9 @@ fn roster_history_reference(
         snapshot_id: mutation.snapshot.id.clone(),
         rendered_hash: mutation.snapshot.rendered_hash.clone(),
         retired_snapshot_ids: mutation.retired_snapshot_ids(),
+        staging_path: mutation.staging_path(),
+        previous_index_hash: mutation.previous_index_hash(),
+        next_index_hash: mutation.next_index_hash(),
     }
 }
 
@@ -1515,6 +1536,19 @@ async fn validate_recovery_roster_history(
         });
     }
     let destination = destination.to_path_buf();
+    let mut expected = previous.clone();
+    expected.rendered_hash = prior_hash.into();
+    history::recover_roster_publication(
+        &state.app_data_dir,
+        &roster_identity(previous),
+        &reference.snapshot_id,
+        &reference.retired_snapshot_ids,
+        &reference.staging_path,
+        reference.previous_index_hash.as_deref(),
+        &reference.next_index_hash,
+        &expected,
+    )
+    .await?;
     let (snapshot, contents) = history::snapshot_contents(
         &state.app_data_dir,
         &roster_identity(previous),
@@ -1522,8 +1556,6 @@ async fn validate_recovery_roster_history(
         std::slice::from_ref(&destination),
     )
     .await?;
-    let mut expected = previous.clone();
-    expected.rendered_hash = prior_hash.into();
     if snapshot.rendered_hash != prior_hash
         || snapshot.roster_record.as_ref() != Some(&expected)
         || contents.len() != 1
@@ -1549,7 +1581,8 @@ async fn commit_recovered_roster_retention(
         &roster_identity(previous),
         &reference.retired_snapshot_ids,
     )
-    .await
+    .await?;
+    history::cleanup_roster_staging(&state.app_data_dir, &reference.staging_path).await
 }
 
 fn verify_roster_preimage(path: &Path, expected_hash: Option<&str>) -> Result<(), AppError> {
@@ -1571,6 +1604,25 @@ fn combine_roster_restoration(
         (Err(files), Err(history)) => Err(AppError::Internal {
             message: format!(
                 "Agent roster file restoration failed: {files}; history restoration failed: {history}"
+            ),
+        }),
+    }
+}
+
+async fn rollback_unjournaled_roster_success(
+    state: &AppState,
+    prior_files: &[BatchFileSnapshot],
+    prior_rosters: &[AgentRosterInstallRecord],
+    history_mutation: &mut Option<history::RosterHistoryMutation>,
+) -> Result<(), AppError> {
+    let files = restore_batch_files_verified(prior_files).await;
+    let ledger = save_rosters_for_state(state, prior_rosters).await;
+    let history = rollback_roster_history(history_mutation).await;
+    match (files, ledger, history) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (files, ledger, history) => Err(AppError::Internal {
+            message: format!(
+                "Agent roster unjournaled compensation failed: files={files:?}; ledger={ledger:?}; history={history:?}"
             ),
         }),
     }
@@ -3037,13 +3089,26 @@ async fn recover_roster_retention_operation(
                 message: "Agent roster retention recovery payload is invalid".into(),
             })?;
     validate_roster_record(&payload.previous)?;
-    canonical_registered_instruction_project(state, &payload.previous.project_path).await?;
+    let mut preserved = payload.previous.clone();
+    preserved.rendered_hash = payload.history.rendered_hash.clone();
+    history::recover_roster_publication(
+        &state.app_data_dir,
+        &roster_identity(&payload.previous),
+        &payload.history.snapshot_id,
+        &payload.history.retired_snapshot_ids,
+        &payload.history.staging_path,
+        payload.history.previous_index_hash.as_deref(),
+        &payload.history.next_index_hash,
+        &preserved,
+    )
+    .await?;
     history::commit_roster_retention(
         &state.app_data_dir,
         &roster_identity(&payload.previous),
-        &payload.retired_snapshot_ids,
+        &payload.history.retired_snapshot_ids,
     )
     .await?;
+    history::cleanup_roster_staging(&state.app_data_dir, &payload.history.staging_path).await?;
     if operation.phase == crate::state_db::FilesystemOperationPhase::Prepared {
         database.mark_filesystem_applied(&operation.id).await?;
     }
@@ -3053,11 +3118,96 @@ async fn recover_roster_retention_operation(
     Ok(())
 }
 
+fn pending_roster_staging_path(
+    operation: &crate::state_db::FilesystemOperation,
+) -> Result<Option<String>, AppError> {
+    let invalid = || AppError::StorageCorrupt {
+        message: "Agent roster recovery payload is invalid during staging cleanup".into(),
+    };
+    match operation.kind.as_str() {
+        "agent_install" | "agent_update"
+            if operation
+                .payload
+                .get("next")
+                .and_then(|next| next.get("members"))
+                .is_some() =>
+        {
+            let payload =
+                serde_json::from_value::<AgentRosterWriteOperation>(operation.payload.clone())
+                    .map_err(|_| invalid())?;
+            Ok(match payload.preservation {
+                AgentRosterPreservation::AbsentBeforeMutation => None,
+                AgentRosterPreservation::Snapshot(history) => Some(history.staging_path),
+            })
+        }
+        "agent_disable" | "agent_enable"
+            if operation
+                .payload
+                .get("next")
+                .and_then(|next| next.get("members"))
+                .is_some() =>
+        {
+            let payload =
+                serde_json::from_value::<AgentRosterMoveOperation>(operation.payload.clone())
+                    .map_err(|_| invalid())?;
+            Ok(Some(payload.history.staging_path))
+        }
+        "agent_uninstall"
+            if operation
+                .payload
+                .get("previous")
+                .and_then(|previous| previous.get("members"))
+                .is_some() =>
+        {
+            let payload =
+                serde_json::from_value::<AgentRosterUninstallOperation>(operation.payload.clone())
+                    .map_err(|_| invalid())?;
+            Ok(match payload.preservation {
+                AgentRosterPreservation::AbsentBeforeMutation => None,
+                AgentRosterPreservation::Snapshot(history) => Some(history.staging_path),
+            })
+        }
+        "agent_roster_retention" => {
+            let payload =
+                serde_json::from_value::<AgentRosterRetentionOperation>(operation.payload.clone())
+                    .map_err(|_| invalid())?;
+            Ok(Some(payload.history.staging_path))
+        }
+        _ => Ok(None),
+    }
+}
+
 async fn recover_agent_operations_locked(state: &AppState) -> Result<(), AppError> {
     let Some(database) = state.completed_state_database().await? else {
+        history::sweep_roster_staging(&state.app_data_dir, &[]).await?;
         return Ok(());
     };
-    for operation in database.pending_filesystem_operations().await? {
+    let pending = database.pending_filesystem_operations().await?;
+    let mut retained_staging_paths = Vec::new();
+    for operation in &pending {
+        let path = match pending_roster_staging_path(operation) {
+            Ok(path) => path,
+            Err(error) => {
+                database
+                    .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                    .await?;
+                return Err(error);
+            }
+        };
+        if let Some(path) = path {
+            if let Err(error) =
+                history::validate_roster_staging_reference(&state.app_data_dir, &path)
+            {
+                database
+                    .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                    .await?;
+                return Err(error);
+            }
+            retained_staging_paths.push(path);
+        }
+    }
+    history::sweep_roster_staging(&state.app_data_dir, &retained_staging_paths).await?;
+    for operation in pending {
         if !matches!(operation.kind.as_str(), "agent_install" | "agent_update") {
             continue;
         }
@@ -4278,6 +4428,19 @@ async fn apply_roster_plan(
     } else {
         None
     };
+    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_some()).await {
+        let history = rollback_roster_history(&mut history_mutation).await;
+        close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
+        let _ = tokio::fs::remove_file(&staged).await;
+        return match history {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "publish Agent roster history",
+                error,
+                rollback,
+            )),
+        };
+    }
     let write = async {
         backup_if_differs(
             &destination,
@@ -4330,6 +4493,24 @@ async fn apply_roster_plan(
         return match restored {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("save Agent roster", error, rollback)),
+        };
+    }
+    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_none()).await {
+        let rollback = rollback_unjournaled_roster_success(
+            state,
+            &prior,
+            &prior_rosters,
+            &mut history_mutation,
+        )
+        .await;
+        let _ = tokio::fs::remove_file(&staged).await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "publish unjournaled Agent roster history",
+                error,
+                rollback,
+            )),
         };
     }
     let retention = if let Some(previous) = &previous {
@@ -4535,6 +4716,18 @@ async fn move_roster(
     } else {
         None
     };
+    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_some()).await {
+        let history = rollback_roster_history(&mut history_mutation).await;
+        close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
+        return match history {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "publish Agent roster lifecycle history",
+                error,
+                rollback,
+            )),
+        };
+    }
     if let Err(error) = move_managed_artifacts(
         std::slice::from_ref(source),
         std::slice::from_ref(destination),
@@ -4562,6 +4755,23 @@ async fn move_roster(
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("move Agent roster", error, rollback)),
+        };
+    }
+    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_none()).await {
+        let rollback = rollback_unjournaled_roster_success(
+            state,
+            &prior,
+            &prior_rosters,
+            &mut history_mutation,
+        )
+        .await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "publish unjournaled Agent roster lifecycle history",
+                error,
+                rollback,
+            )),
         };
     }
     let retention =
@@ -4720,6 +4930,18 @@ async fn uninstall_roster(
     } else {
         None
     };
+    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_some()).await {
+        let history = rollback_roster_history(&mut history_mutation).await;
+        close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
+        return match history {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "publish Agent roster uninstall history",
+                error,
+                rollback,
+            )),
+        };
+    }
     if let Err(error) = verify_roster_preimage(&path, current_hash.as_deref()) {
         let history = rollback_roster_history(&mut history_mutation).await;
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
@@ -4762,6 +4984,23 @@ async fn uninstall_roster(
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("uninstall Agent roster", error, rollback)),
+        };
+    }
+    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_none()).await {
+        let rollback = rollback_unjournaled_roster_success(
+            state,
+            &prior,
+            &prior_rosters,
+            &mut history_mutation,
+        )
+        .await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "publish unjournaled Agent roster uninstall history",
+                error,
+                rollback,
+            )),
         };
     }
     let retention =
@@ -4922,6 +5161,19 @@ async fn rollback_roster(
     } else {
         None
     };
+    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_some()).await {
+        let history = rollback_roster_history(&mut history_mutation).await;
+        close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
+        let _ = tokio::fs::remove_file(&staged).await;
+        return match history {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "publish Agent roster rollback history",
+                error,
+                rollback,
+            )),
+        };
+    }
     if let Err(error) = verify_roster_preimage(&destination, prior_hash.as_deref()) {
         let history = rollback_roster_history(&mut history_mutation).await;
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
@@ -4961,6 +5213,24 @@ async fn rollback_roster(
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error(
                 "save Agent roster rollback",
+                error,
+                rollback,
+            )),
+        };
+    }
+    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_none()).await {
+        let rollback = rollback_unjournaled_roster_success(
+            state,
+            &prior,
+            &prior_rosters,
+            &mut history_mutation,
+        )
+        .await;
+        let _ = tokio::fs::remove_file(&staged).await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "publish unjournaled Agent roster rollback history",
                 error,
                 rollback,
             )),
@@ -12885,6 +13155,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_without_database_sweeps_orphaned_roster_history_staging() {
+        let app_data = tempfile::tempdir().unwrap();
+        let orphan = app_data
+            .path()
+            .join("state/roster-history-staging")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(orphan.join("snapshot/content")).unwrap();
+        std::fs::write(orphan.join("snapshot/content/0.bin"), b"orphan").unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        assert!(state.completed_state_database().await.unwrap().is_none());
+
+        recover_agent_operations(&state).await.unwrap();
+
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
     async fn prepared_roster_write_recovery_rolls_forward_bytes_and_ledger_once() {
         let app_data = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -12937,6 +13225,15 @@ mod tests {
             .await
             .unwrap();
         }
+        let history_directory =
+            history::history_directory(app_data.path(), &roster_identity(&previous));
+        let index_before_unjournaled_preservation =
+            std::fs::read(history_directory.join("index.json")).unwrap();
+        let physical_before_unjournaled_preservation = std::fs::read_dir(&history_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count();
         let staged = stage_roster_bytes(app_data.path(), b"new roster")
             .await
             .unwrap();
@@ -12944,14 +13241,27 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let history = roster_history_reference(&preservation);
-        let preservation_id = history.snapshot_id.clone();
+        let orphaned_staging = PathBuf::from(preservation.staging_path());
         drop(preservation);
+        assert_eq!(
+            std::fs::read(history_directory.join("index.json")).unwrap(),
+            index_before_unjournaled_preservation
+        );
+        assert_eq!(
+            std::fs::read_dir(&history_directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .count(),
+            physical_before_unjournaled_preservation
+        );
         assert!(database
             .pending_filesystem_operations()
             .await
             .unwrap()
             .is_empty());
+        recover_agent_operations(&state).await.unwrap();
+        assert!(!orphaned_staging.exists());
         assert_eq!(
             history::list_snapshots(app_data.path(), &roster_identity(&previous))
                 .await
@@ -12959,6 +13269,14 @@ mod tests {
                 .len(),
             MAX_AGENT_HISTORY_ENTRIES
         );
+        let preservation = begin_roster_preservation(&state, &destination, &previous, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let history = roster_history_reference(&preservation);
+        let preservation_id = history.snapshot_id.clone();
+        let staged_snapshot = PathBuf::from(&history.staging_path).join("snapshot");
+        drop(preservation);
         database
             .prepare_filesystem_operation(
                 "agent_update",
@@ -12972,15 +13290,8 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = history::list_snapshots(app_data.path(), &roster_identity(&previous))
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|snapshot| snapshot.id == preservation_id)
-            .unwrap();
-        let snapshot_path = PathBuf::from(&snapshot.content_path);
-        let hidden_snapshot = snapshot_path.with_extension("crash-test-hidden");
-        std::fs::rename(&snapshot_path, &hidden_snapshot).unwrap();
+        let hidden_snapshot = staged_snapshot.with_extension("crash-test-hidden");
+        std::fs::rename(&staged_snapshot, &hidden_snapshot).unwrap();
         assert!(recover_agent_operations(&state).await.is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), b"old roster");
         assert_eq!(
@@ -12995,7 +13306,7 @@ mod tests {
                 .len(),
             1
         );
-        std::fs::rename(hidden_snapshot, snapshot_path).unwrap();
+        std::fs::rename(hidden_snapshot, staged_snapshot).unwrap();
 
         recover_agent_operations(&state).await.unwrap();
         recover_agent_operations(&state).await.unwrap();
@@ -13078,23 +13389,32 @@ mod tests {
             .await
             .unwrap();
         }
-        let mutation = begin_roster_preservation(&state, &destination, &previous, None)
+        let mut mutation = begin_roster_preservation(&state, &destination, &previous, None)
             .await
             .unwrap()
             .unwrap();
-        let retired_snapshot_ids = mutation.retired_snapshot_ids();
-        assert_eq!(retired_snapshot_ids.len(), 1);
+        let history = roster_history_reference(&mutation);
+        assert_eq!(history.retired_snapshot_ids.len(), 1);
+        mutation.publish().await.unwrap();
         database
             .prepare_filesystem_operation(
                 "agent_roster_retention",
                 &AgentRosterRetentionOperation {
                     previous: previous.clone(),
-                    retired_snapshot_ids,
+                    history,
                 },
             )
             .await
             .unwrap();
         drop(mutation);
+
+        database
+            .mutate(projects_spec(), Vec::new(), |projects| {
+                projects.clear();
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         let directory = history::history_directory(app_data.path(), &roster_identity(&previous));
         let physical_before = std::fs::read_dir(&directory)
@@ -13263,6 +13583,9 @@ mod tests {
                                 snapshot_id: "unregistered".into(),
                                 rendered_hash: previous.rendered_hash.clone(),
                                 retired_snapshot_ids: Vec::new(),
+                                staging_path: "/unregistered".into(),
+                                previous_index_hash: None,
+                                next_index_hash: "0".repeat(64),
                             },
                         },
                     )
@@ -13279,6 +13602,9 @@ mod tests {
                                     snapshot_id: "unregistered".into(),
                                     rendered_hash: previous.rendered_hash.clone(),
                                     retired_snapshot_ids: Vec::new(),
+                                    staging_path: "/unregistered".into(),
+                                    previous_index_hash: None,
+                                    next_index_hash: "0".repeat(64),
                                 },
                             ),
                         },

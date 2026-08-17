@@ -27,12 +27,18 @@ struct SnapshotManifest {
 
 pub(super) struct RosterHistoryMutation {
     pub(super) snapshot: AgentVersionSnapshot,
+    identity_hash: String,
     directory: PathBuf,
     snapshot_directory: PathBuf,
+    staging_directory: PathBuf,
+    staged_snapshot_directory: PathBuf,
     index_path: PathBuf,
     previous_index: Option<Vec<u8>>,
+    next_index: Vec<u8>,
     directory_existed: bool,
     retired: Vec<PathBuf>,
+    snapshot_published: bool,
+    published: bool,
 }
 
 impl RosterHistoryMutation {
@@ -43,7 +49,82 @@ impl RosterHistoryMutation {
             .collect()
     }
 
+    pub(super) fn staging_path(&self) -> String {
+        self.staging_directory.to_string_lossy().into_owned()
+    }
+
+    pub(super) fn previous_index_hash(&self) -> Option<String> {
+        self.previous_index
+            .as_deref()
+            .map(crate::render::sha256_hex)
+    }
+
+    pub(super) fn next_index_hash(&self) -> String {
+        crate::render::sha256_hex(&self.next_index)
+    }
+
+    pub(super) async fn publish(&mut self) -> Result<(), AppError> {
+        if self.published {
+            return Ok(());
+        }
+        let current_index = match read_capped(&self.index_path, MAX_SNAPSHOT_BYTES).await {
+            Ok(bytes) => Some(bytes),
+            Err(AppError::Io { .. }) if !self.index_path.exists() => None,
+            Err(error) => return Err(error),
+        };
+        if current_index != self.previous_index {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster history changed before publication".into(),
+            });
+        }
+        validate_snapshot_directory(
+            &self.staged_snapshot_directory,
+            &self.identity_hash,
+            &self.snapshot,
+        )
+        .await?;
+        tokio::fs::create_dir_all(&self.directory)
+            .await
+            .map_err(|error| AppError::Io {
+                message: format!("create Agent history directory: {error}"),
+            })?;
+        match tokio::fs::rename(&self.staged_snapshot_directory, &self.snapshot_directory).await {
+            Ok(()) => {}
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("publish staged Agent roster snapshot: {error}"),
+                });
+            }
+        }
+        self.snapshot_published = true;
+        if let Err(error) = atomic_write(&self.index_path, &self.next_index).await {
+            return match tokio::fs::rename(
+                &self.snapshot_directory,
+                &self.staged_snapshot_directory,
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.snapshot_published = false;
+                    Err(error)
+                }
+                Err(rollback) => Err(AppError::Internal {
+                    message: format!(
+                        "publish Agent roster history index failed: {error}; restore staged snapshot failed: {rollback}"
+                    ),
+                }),
+            };
+        }
+        self.published = true;
+        Ok(())
+    }
+
     pub(super) async fn commit(self) -> Result<(), AppError> {
+        if !self.published || !self.snapshot_published {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster history was not published before commit".into(),
+            });
+        }
         for path in self.retired {
             if path.parent() != Some(self.directory.as_path()) {
                 return Err(AppError::StorageCorrupt {
@@ -60,32 +141,46 @@ impl RosterHistoryMutation {
                 }
             }
         }
+        match tokio::fs::remove_dir_all(&self.staging_directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("remove Agent roster history staging: {error}"),
+                });
+            }
+        }
         Ok(())
     }
 
     pub(super) async fn rollback(self) -> Result<(), AppError> {
         let history_was_absent = self.previous_index.is_none();
-        match &self.previous_index {
-            Some(bytes) => atomic_write(&self.index_path, bytes).await?,
-            None => match tokio::fs::remove_file(&self.index_path).await {
+        if self.published {
+            match &self.previous_index {
+                Some(bytes) => atomic_write(&self.index_path, bytes).await?,
+                None => match tokio::fs::remove_file(&self.index_path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AppError::Io {
+                            message: format!("remove Agent roster history index: {error}"),
+                        });
+                    }
+                },
+            }
+        }
+        if self.snapshot_published {
+            match tokio::fs::remove_dir_all(&self.snapshot_directory).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(AppError::Io {
-                        message: format!("remove Agent roster history index: {error}"),
+                        message: format!("remove failed Agent roster snapshot: {error}"),
                     });
                 }
-            },
-        }
-        match tokio::fs::remove_dir_all(&self.snapshot_directory).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(AppError::Io {
-                    message: format!("remove failed Agent roster snapshot: {error}"),
-                });
             }
         }
+        let _ = tokio::fs::remove_dir_all(&self.staging_directory).await;
         let restored_index = match read_capped(&self.index_path, MAX_SNAPSHOT_BYTES).await {
             Ok(bytes) => Some(bytes),
             Err(AppError::Io { .. }) if !self.index_path.exists() => None,
@@ -171,6 +266,363 @@ pub(super) async fn commit_roster_retention(
     Ok(())
 }
 
+fn validated_roster_staging_directory(
+    app_data_dir: &Path,
+    staging_path: &str,
+) -> Result<PathBuf, AppError> {
+    let path = PathBuf::from(staging_path);
+    let expected_parent = app_data_dir.join("state/roster-history-staging");
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| Uuid::parse_str(name).is_ok());
+    if path.parent() != Some(expected_parent.as_path()) || !valid_name {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster history staging path escaped app storage".into(),
+        });
+    }
+    Ok(path)
+}
+
+pub(super) fn validate_roster_staging_reference(
+    app_data_dir: &Path,
+    staging_path: &str,
+) -> Result<(), AppError> {
+    validated_roster_staging_directory(app_data_dir, staging_path).map(|_| ())
+}
+
+async fn optional_index_bytes(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+    match read_capped(path, MAX_SNAPSHOT_BYTES).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(AppError::Io { .. }) if !path.exists() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn index_hash(bytes: Option<&[u8]>) -> Option<String> {
+    bytes.map(crate::render::sha256_hex)
+}
+
+fn validate_publication_transition(
+    previous: &[AgentVersionSnapshot],
+    next: &[AgentVersionSnapshot],
+    snapshot_id: &str,
+    retired_snapshot_ids: &[String],
+    expected_record: &crate::types::AgentRosterInstallRecord,
+    expected_content_path: &Path,
+) -> Result<AgentVersionSnapshot, AppError> {
+    let snapshot = next
+        .iter()
+        .find(|snapshot| snapshot.id == snapshot_id)
+        .cloned()
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "Agent roster staged index lost its preservation snapshot".into(),
+        })?;
+    if snapshot.roster_record.as_ref() != Some(expected_record)
+        || snapshot.rendered_hash != expected_record.rendered_hash
+        || Path::new(&snapshot.content_path) != expected_content_path
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster staged preservation metadata changed".into(),
+        });
+    }
+    let retired = retired_snapshot_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let removed = previous
+        .iter()
+        .filter(|candidate| !next.iter().any(|next| next.id == candidate.id))
+        .map(|candidate| candidate.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if removed != retired
+        || next.len() + retired.len() != previous.len() + 1
+        || previous.iter().any(|candidate| {
+            !retired.contains(candidate.id.as_str()) && !next.iter().any(|next| next == candidate)
+        })
+        || next.iter().any(|candidate| {
+            candidate.id != snapshot_id && !previous.iter().any(|previous| previous == candidate)
+        })
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster staged history transition changed".into(),
+        });
+    }
+    Ok(snapshot)
+}
+
+async fn validate_snapshot_directory(
+    directory: &Path,
+    identity_hash: &str,
+    snapshot: &AgentVersionSnapshot,
+) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(directory).map_err(|error| AppError::Io {
+        message: format!("inspect staged Agent roster snapshot: {error}"),
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Staged Agent roster snapshot is not a regular directory".into(),
+        });
+    }
+    let manifest_bytes = read_capped(&directory.join("manifest.json"), MAX_SNAPSHOT_BYTES).await?;
+    let manifest: SnapshotManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| AppError::StorageCorrupt {
+            message: format!("parse staged Agent roster snapshot manifest: {error}"),
+        })?;
+    let expected_roster_record_hash = snapshot
+        .roster_record
+        .as_ref()
+        .map(roster_record_hash)
+        .transpose()?;
+    if manifest.identity_hash != identity_hash
+        || manifest.roster_record_hash != expected_roster_record_hash
+        || manifest.files.is_empty()
+        || manifest.files.len() != snapshot.artifact_hashes.len()
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Staged Agent roster snapshot manifest changed".into(),
+        });
+    }
+    for (index, file) in manifest.files.iter().enumerate() {
+        if file.name != format!("{index}.bin") {
+            return Err(AppError::StorageCorrupt {
+                message: "Staged Agent roster snapshot filename changed".into(),
+            });
+        }
+        let content = directory.join("content").join(&file.name);
+        regular_file(&content)?;
+        let bytes = read_capped(&content, MAX_SNAPSHOT_BYTES).await?;
+        let hash = crate::render::sha256_hex(&bytes);
+        if hash != file.sha256 || snapshot.artifact_hashes[index] != hash {
+            return Err(AppError::StorageCorrupt {
+                message: "Staged Agent roster snapshot content changed".into(),
+            });
+        }
+        if snapshot.roster_record.is_some()
+            && (manifest.files.len() != 1 || hash != snapshot.rendered_hash)
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Staged Agent roster snapshot rendered hash changed".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn recover_roster_publication(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    snapshot_id: &str,
+    retired_snapshot_ids: &[String],
+    staging_path: &str,
+    previous_index_hash: Option<&str>,
+    next_index_hash: &str,
+    expected_record: &crate::types::AgentRosterInstallRecord,
+) -> Result<(), AppError> {
+    if snapshot_id.is_empty()
+        || !snapshot_id.is_ascii()
+        || snapshot_id.len() <= 36
+        || Uuid::parse_str(&snapshot_id[snapshot_id.len() - 36..]).is_err()
+        || Path::new(snapshot_id).components().count() != 1
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster preservation snapshot id is invalid".into(),
+        });
+    }
+    let identity_hash = identity_hash(identity)?;
+    let directory = app_data_dir.join("agents/history").join(&identity_hash);
+    let index_path = directory.join("index.json");
+    let current = optional_index_bytes(&index_path).await?;
+    let current_hash = index_hash(current.as_deref());
+    let final_snapshot = directory.join(snapshot_id);
+    if final_snapshot.parent() != Some(directory.as_path()) {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster preservation escaped its history directory".into(),
+        });
+    }
+    if current_hash.as_deref() == Some(next_index_hash) {
+        let next: Vec<AgentVersionSnapshot> =
+            serde_json::from_slice(current.as_deref().ok_or_else(|| AppError::StorageCorrupt {
+                message: "Published Agent roster history index disappeared".into(),
+            })?)
+            .map_err(|error| AppError::StorageCorrupt {
+                message: format!("parse published Agent roster history: {error}"),
+            })?;
+        let snapshot = next
+            .into_iter()
+            .find(|snapshot| snapshot.id == snapshot_id)
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Published Agent roster history lost its snapshot".into(),
+            })?;
+        if snapshot.roster_record.as_ref() != Some(expected_record)
+            || Path::new(&snapshot.content_path) != final_snapshot
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Published Agent roster preservation changed".into(),
+            });
+        }
+        return validate_snapshot_directory(&final_snapshot, &identity_hash, &snapshot).await;
+    }
+    if current_hash.as_deref() != previous_index_hash {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster history changed before recovery publication".into(),
+        });
+    }
+    let staging = validated_roster_staging_directory(app_data_dir, staging_path)?;
+    let staged_index = read_capped(&staging.join("index.json"), MAX_SNAPSHOT_BYTES).await?;
+    if crate::render::sha256_hex(&staged_index) != next_index_hash {
+        return Err(AppError::StorageCorrupt {
+            message: "Staged Agent roster history index changed".into(),
+        });
+    }
+    let previous: Vec<AgentVersionSnapshot> = match current.as_deref() {
+        Some(bytes) => serde_json::from_slice(bytes).map_err(|error| AppError::StorageCorrupt {
+            message: format!("parse prior Agent roster history: {error}"),
+        })?,
+        None => Vec::new(),
+    };
+    let next: Vec<AgentVersionSnapshot> =
+        serde_json::from_slice(&staged_index).map_err(|error| AppError::StorageCorrupt {
+            message: format!("parse staged Agent roster history: {error}"),
+        })?;
+    let snapshot = validate_publication_transition(
+        &previous,
+        &next,
+        snapshot_id,
+        retired_snapshot_ids,
+        expected_record,
+        &final_snapshot,
+    )?;
+    let staged_snapshot = staging.join("snapshot");
+    let (source, must_move) = match (
+        std::fs::symlink_metadata(&staged_snapshot),
+        std::fs::symlink_metadata(&final_snapshot),
+    ) {
+        (Ok(_), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            (staged_snapshot.as_path(), true)
+        }
+        (Err(error), Ok(_)) if error.kind() == std::io::ErrorKind::NotFound => {
+            (final_snapshot.as_path(), false)
+        }
+        _ => {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster preservation staging state is ambiguous".into(),
+            });
+        }
+    };
+    validate_snapshot_directory(source, &identity_hash, &snapshot).await?;
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| AppError::Io {
+            message: format!("create Agent roster history directory: {error}"),
+        })?;
+    if must_move {
+        tokio::fs::rename(&staged_snapshot, &final_snapshot)
+            .await
+            .map_err(|error| AppError::Io {
+                message: format!("recover staged Agent roster snapshot: {error}"),
+            })?;
+    }
+    atomic_write(&index_path, &staged_index).await?;
+    let published = read_capped(&index_path, MAX_SNAPSHOT_BYTES).await?;
+    if crate::render::sha256_hex(&published) != next_index_hash {
+        return Err(AppError::StorageCorrupt {
+            message: "Recovered Agent roster history publication failed verification".into(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) async fn cleanup_roster_staging(
+    app_data_dir: &Path,
+    staging_path: &str,
+) -> Result<(), AppError> {
+    let path = validated_roster_staging_directory(app_data_dir, staging_path)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || crate::skills::metadata_is_reparse_point(&metadata) =>
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster history staging is not a regular directory".into(),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("inspect Agent roster history staging: {error}"),
+            });
+        }
+    }
+    tokio::fs::remove_dir_all(path)
+        .await
+        .map_err(|error| AppError::Io {
+            message: format!("remove Agent roster history staging: {error}"),
+        })
+}
+
+pub(super) async fn sweep_roster_staging(
+    app_data_dir: &Path,
+    retained_staging_paths: &[String],
+) -> Result<(), AppError> {
+    let retained = retained_staging_paths
+        .iter()
+        .map(|path| validated_roster_staging_directory(app_data_dir, path))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    let root = app_data_dir.join("state/roster-history-staging");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("read Agent roster history staging: {error}"),
+            });
+        }
+    };
+    for (index, entry) in entries.enumerate() {
+        if index >= 1024 {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster history staging exceeds its entry limit".into(),
+            });
+        }
+        let entry = entry.map_err(|error| AppError::Io {
+            message: format!("read Agent roster history staging entry: {error}"),
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let valid_name = name
+            .to_str()
+            .is_some_and(|name| Uuid::parse_str(name).is_ok());
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| AppError::Io {
+            message: format!("inspect Agent roster history staging entry: {error}"),
+        })?;
+        if !valid_name
+            || path.parent() != Some(root.as_path())
+            || !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || crate::skills::metadata_is_reparse_point(&metadata)
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster history staging contains an invalid entry".into(),
+            });
+        }
+        if !retained.contains(&path) {
+            tokio::fs::remove_dir_all(&path)
+                .await
+                .map_err(|error| AppError::Io {
+                    message: format!("remove orphaned Agent roster history staging: {error}"),
+                })?;
+        }
+    }
+    Ok(())
+}
+
 fn roster_record_hash(record: &crate::types::AgentRosterInstallRecord) -> Result<String, AppError> {
     let bytes = serde_json::to_vec(record).map_err(|error| AppError::Internal {
         message: format!("serialize Agent roster snapshot metadata: {error}"),
@@ -217,13 +669,6 @@ async fn load_index(path: &Path) -> Result<Vec<AgentVersionSnapshot>, AppError> 
         Err(AppError::Io { .. }) if !path.exists() => Ok(Vec::new()),
         Err(error) => Err(error),
     }
-}
-
-async fn save_index(path: &Path, snapshots: &[AgentVersionSnapshot]) -> Result<(), AppError> {
-    let bytes = serde_json::to_vec_pretty(snapshots).map_err(|error| AppError::Internal {
-        message: format!("serialize Agent version history: {error}"),
-    })?;
-    atomic_write(path, &bytes).await
 }
 
 fn regular_file(path: &Path) -> Result<(), AppError> {
@@ -279,7 +724,7 @@ pub(super) async fn create_snapshot_protected(
         regular_file(source)?;
         contents.push(read_capped(source, MAX_SNAPSHOT_BYTES).await?);
     }
-    let mutation = create_snapshot_from_bytes_protected(
+    let mut mutation = create_snapshot_from_bytes_protected(
         app_data_dir,
         identity,
         &contents,
@@ -291,6 +736,7 @@ pub(super) async fn create_snapshot_protected(
     )
     .await?;
     let snapshot = mutation.snapshot.clone();
+    mutation.publish().await?;
     mutation.commit().await?;
     Ok(snapshot)
 }
@@ -303,7 +749,7 @@ pub(super) async fn create_snapshot_from_bytes(
     rendered_hash: &str,
     created_at: &str,
 ) -> Result<AgentVersionSnapshot, AppError> {
-    let mutation = create_snapshot_from_bytes_protected(
+    let mut mutation = create_snapshot_from_bytes_protected(
         app_data_dir,
         identity,
         contents,
@@ -315,6 +761,7 @@ pub(super) async fn create_snapshot_from_bytes(
     )
     .await?;
     let snapshot = mutation.snapshot.clone();
+    mutation.publish().await?;
     mutation.commit().await?;
     Ok(snapshot)
 }
@@ -336,28 +783,25 @@ async fn create_snapshot_from_bytes_protected(
     let identity_hash = identity_hash(identity)?;
     let directory = app_data_dir.join("agents/history").join(&identity_hash);
     let directory_existed = directory.is_dir();
-    tokio::fs::create_dir_all(&directory)
-        .await
-        .map_err(|error| AppError::Io {
-            message: format!(
-                "create Agent history directory {}: {error}",
-                directory.display()
-            ),
-        })?;
     let index_path = directory.join("index.json");
     let previous_index = match read_capped(&index_path, MAX_SNAPSHOT_BYTES).await {
         Ok(bytes) => Some(bytes),
         Err(AppError::Io { .. }) if !index_path.exists() => None,
         Err(error) => return Err(error),
     };
-    let id = format!("{}-{}", created_at.replace([':', '/'], "-"), Uuid::new_v4());
-    let snapshot_directory = directory.join(&id);
-    let content_directory = snapshot_directory.join("content");
+    let staging_directory = app_data_dir
+        .join("state/roster-history-staging")
+        .join(Uuid::new_v4().to_string());
+    let staged_snapshot_directory = staging_directory.join("snapshot");
+    let staged_index_path = staging_directory.join("index.json");
+    let content_directory = staged_snapshot_directory.join("content");
     tokio::fs::create_dir_all(&content_directory)
         .await
         .map_err(|error| AppError::Io {
-            message: format!("create Agent snapshot directory: {error}"),
+            message: format!("create Agent snapshot staging directory: {error}"),
         })?;
+    let id = format!("{}-{}", created_at.replace([':', '/'], "-"), Uuid::new_v4());
+    let snapshot_directory = directory.join(&id);
 
     let result = async {
         let mut files = Vec::with_capacity(contents.len());
@@ -375,7 +819,7 @@ async fn create_snapshot_from_bytes_protected(
             files.push(SnapshotFile { name, sha256 });
         }
         let manifest = SnapshotManifest {
-            identity_hash,
+            identity_hash: identity_hash.clone(),
             files,
             roster_record_hash: roster_record.map(roster_record_hash).transpose()?,
         };
@@ -383,7 +827,11 @@ async fn create_snapshot_from_bytes_protected(
             serde_json::to_vec_pretty(&manifest).map_err(|error| AppError::Internal {
                 message: format!("serialize Agent snapshot manifest: {error}"),
             })?;
-        atomic_write(&snapshot_directory.join("manifest.json"), &manifest_bytes).await?;
+        atomic_write(
+            &staged_snapshot_directory.join("manifest.json"),
+            &manifest_bytes,
+        )
+        .await?;
 
         let snapshot = AgentVersionSnapshot {
             id,
@@ -397,7 +845,15 @@ async fn create_snapshot_from_bytes_protected(
             content_path: snapshot_directory.to_string_lossy().into_owned(),
             roster_record: roster_record.cloned(),
         };
-        let mut snapshots = load_index(&index_path).await?;
+        let mut snapshots: Vec<AgentVersionSnapshot> = match &previous_index {
+            Some(bytes) => serde_json::from_slice(bytes).map_err(|error| AppError::Io {
+                message: format!(
+                    "parse Agent version history {}: {error}",
+                    index_path.display()
+                ),
+            })?,
+            None => Vec::new(),
+        };
         if protected_snapshot_id
             .is_some_and(|protected| !snapshots.iter().any(|snapshot| snapshot.id == protected))
         {
@@ -433,24 +889,34 @@ async fn create_snapshot_from_bytes_protected(
             .map(|snapshot| snapshot.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         snapshots.retain(|snapshot| !retired_ids.contains(snapshot.id.as_str()));
-        save_index(&index_path, &snapshots).await?;
+        let next_index =
+            serde_json::to_vec_pretty(&snapshots).map_err(|error| AppError::Internal {
+                message: format!("serialize Agent version history: {error}"),
+            })?;
+        atomic_write(&staged_index_path, &next_index).await?;
         let retired = retired
             .into_iter()
             .map(|snapshot| PathBuf::from(snapshot.content_path))
             .collect();
         Ok(RosterHistoryMutation {
             snapshot,
+            identity_hash,
             directory,
             snapshot_directory: snapshot_directory.clone(),
+            staging_directory: staging_directory.clone(),
+            staged_snapshot_directory: staged_snapshot_directory.clone(),
             index_path,
             previous_index,
+            next_index,
             directory_existed,
             retired,
+            snapshot_published: false,
+            published: false,
         })
     }
     .await;
     if result.is_err() {
-        let _ = tokio::fs::remove_dir_all(&snapshot_directory).await;
+        let _ = tokio::fs::remove_dir_all(&staging_directory).await;
     }
     result
 }
@@ -464,7 +930,7 @@ pub(super) async fn create_roster_snapshot(
     created_at: &str,
     protected_snapshot_id: Option<&str>,
 ) -> Result<AgentVersionSnapshot, AppError> {
-    let mutation = begin_roster_snapshot(
+    let mut mutation = begin_roster_snapshot(
         app_data_dir,
         identity,
         source_paths,
@@ -474,6 +940,7 @@ pub(super) async fn create_roster_snapshot(
     )
     .await?;
     let snapshot = mutation.snapshot.clone();
+    mutation.publish().await?;
     mutation.commit().await?;
     Ok(snapshot)
 }
@@ -583,7 +1050,10 @@ pub(super) async fn snapshot_contents(
     }
 
     let mut contents = Vec::with_capacity(manifest.files.len());
-    for file in &manifest.files {
+    for (index, file) in manifest.files.iter().enumerate() {
+        if file.name != format!("{index}.bin") {
+            return Err(invalid("Agent version snapshot filename changed"));
+        }
         let path = snapshot_directory.join("content").join(&file.name);
         regular_file(&path)?;
         let bytes = read_capped(&path, MAX_SNAPSHOT_BYTES).await?;
@@ -739,6 +1209,127 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn roster_publication_rejects_tampered_staging_without_changing_live_history() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project.join("CONVENTIONS.md");
+        std::fs::write(&destination, b"roster bytes").unwrap();
+        let (identity, record) = roster_identity(&project);
+        create_roster_snapshot(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&destination),
+            &record,
+            "2026-08-17T00:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        let directory = history_directory(app_data.path(), &identity);
+        let index_before = std::fs::read(directory.join("index.json")).unwrap();
+        let snapshot_directories_before = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count();
+
+        let mut mutation = begin_roster_snapshot(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&destination),
+            &record,
+            "2026-08-17T00:01:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        let staging = mutation.staging_directory.clone();
+        std::fs::write(
+            mutation.staged_snapshot_directory.join("content/0.bin"),
+            b"tampered staging bytes",
+        )
+        .unwrap();
+
+        assert!(mutation.publish().await.is_err());
+        mutation.rollback().await.unwrap();
+
+        assert!(!staging.exists());
+        assert_eq!(
+            std::fs::read(directory.join("index.json")).unwrap(),
+            index_before
+        );
+        assert_eq!(
+            std::fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .count(),
+            snapshot_directories_before
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_snapshot_rejects_manifest_filename_escape() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project.join("CONVENTIONS.md");
+        std::fs::write(&destination, b"roster bytes").unwrap();
+        let (identity, record) = roster_identity(&project);
+        let snapshot = create_roster_snapshot(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&destination),
+            &record,
+            "2026-08-17T00:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        let manifest_path = PathBuf::from(&snapshot.content_path).join("manifest.json");
+        let mut manifest: SnapshotManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.files[0].name = destination.to_string_lossy().into_owned();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert!(snapshot_contents(
+            app_data.path(),
+            &identity,
+            &snapshot.id,
+            std::slice::from_ref(&destination),
+        )
+        .await
+        .is_err());
+        assert_eq!(std::fs::read(destination).unwrap(), b"roster bytes");
+    }
+
+    #[tokio::test]
+    async fn roster_publication_rejects_snapshot_id_escape_before_path_use() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let (identity, record) = roster_identity(&project);
+        assert!(recover_roster_publication(
+            app_data.path(),
+            &identity,
+            "../escape",
+            &[],
+            "/invalid",
+            None,
+            &"0".repeat(64),
+            &record,
+        )
+        .await
+        .is_err());
+        assert!(!app_data.path().join("agents/history/escape").exists());
     }
 
     #[tokio::test]
