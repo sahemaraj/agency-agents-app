@@ -16,7 +16,7 @@ The system SHALL expose stable source-relative provenance, title, kind, size, an
 
 #### Scenario: User searches playbooks
 - **WHEN** the user supplies a bounded local search term
-- **THEN** matching titles, paths, kinds, or plain-text content are returned deterministically without network access
+- **THEN** matching indexed title and source-relative path metadata are returned deterministically without network access
 
 ### Requirement: Catalog markup is inert
 The UI SHALL render playbook content as preformatted text and SHALL NOT interpret HTML, Markdown, script, image, or link markup.
@@ -25,10 +25,9 @@ The UI SHALL render playbook content as preformatted text and SHALL NOT interpre
 - **WHEN** content includes `<script>` or other executable-looking markup
 - **THEN** the exact characters are displayed as text and no executable DOM element is created
 
-### Requirement: Loading failures retain usable state
-The Playbook surface SHALL distinguish loading, empty, error, and ready states, preserve last-known usable data when safe, and offer Retry for failed inspection.
+### Requirement: Loading failures are honest and retryable
+The Playbook surface SHALL distinguish loading, empty, error, and ready states and offer Retry for failed inspection without representing an unavailable source as an empty successful result.
 
 #### Scenario: Refreshing the list fails
 - **WHEN** a previously loaded Playbook list cannot be refreshed
-- **THEN** the prior list remains visibly stale and the error can be retried
-
+- **THEN** the surface shows an explicit error with Retry and does not claim that the unavailable source contains zero playbooks

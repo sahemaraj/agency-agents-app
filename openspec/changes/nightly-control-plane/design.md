@@ -51,7 +51,7 @@ Alternative: render Markdown/HTML. Rejected because it adds an unnecessary depen
 
 ### Apply security presets through the existing settings transaction
 
-Preset classification and apply cover paranoid mode, all six mutation flags, and client overrides. Apply locks, reloads, changes the complete matrix, persists once, then refreshes cache while preserving unrelated settings and the allowlist.
+Preset classification and apply cover paranoid mode, all six mutation flags, client overrides, and Strict's three outbound-network opt-ins. Apply locks, reloads, changes the complete matrix, persists once, then refreshes cache while preserving unrelated settings and the allowlist. Strict disables GitHub access, automatic update checks, and drift notifications; Local Development preserves those existing consent choices.
 
 Alternative: invoke existing individual toggles. Rejected because partial writes could display a named posture that is not actually enforced.
 
