@@ -3445,7 +3445,36 @@ pub(crate) async fn recover_install_operations(state: &AppState) -> Result<(), A
         let result = match operation.phase {
             crate::state_db::FilesystemOperationPhase::Prepared => {
                 let destination_hash = skill_tree_hash(&destination)?;
-                if destination_hash.as_deref() == Some(&payload.next.installed_hash) {
+                let stage_hash = skill_tree_hash(&stage)?;
+                let retired_hash = skill_tree_hash(&retired)?;
+                let staged_compensation = payload.previous.as_ref().filter(|previous| {
+                    destination_hash.as_deref() == Some(&payload.next.installed_hash)
+                        && stage_hash.as_deref() == Some(&previous.installed_hash)
+                        && retired_hash.is_none()
+                });
+                let published_compensation = payload.previous.as_ref().filter(|previous| {
+                    destination_hash.as_deref() == Some(&previous.installed_hash)
+                        && stage_hash.is_none()
+                        && retired_hash.as_deref() == Some(&payload.next.installed_hash)
+                });
+                if let Some(previous) = staged_compensation {
+                    std::fs::rename(&destination, &retired).map_err(|error| AppError::Io {
+                        message: format!("retire compensated Skill rollback target: {error}"),
+                    })?;
+                    std::fs::rename(&stage, &destination).map_err(|error| AppError::Io {
+                        message: format!("finish compensated Skill rollback: {error}"),
+                    })?;
+                    if skill_tree_hash(&destination)?.as_deref() != Some(&previous.installed_hash) {
+                        return Err(AppError::StorageCorrupt {
+                            message: "Compensated Skill rollback restored changed content".into(),
+                        });
+                    }
+                    remove_recovery_directory(&retired, &payload.next.installed_hash)?;
+                    database.abort_filesystem_operation(&operation.id).await
+                } else if published_compensation.is_some() {
+                    remove_recovery_directory(&retired, &payload.next.installed_hash)?;
+                    database.abort_filesystem_operation(&operation.id).await
+                } else if destination_hash.as_deref() == Some(&payload.next.installed_hash) {
                     apply_recovered_install(state, &operation.id, &payload).await?;
                     if let Some(previous) = &payload.previous {
                         remove_recovery_directory(&retired, &previous.installed_hash)?;
@@ -3462,9 +3491,8 @@ pub(crate) async fn recover_install_operations(state: &AppState) -> Result<(), A
                         remove_recovery_directory(&stage, &payload.next.installed_hash)?;
                         database.abort_filesystem_operation(&operation.id).await
                     } else if destination_hash.is_none()
-                        && skill_tree_hash(&stage)?.as_deref() == Some(&previous.installed_hash)
-                        && skill_tree_hash(&retired)?.as_deref()
-                            == Some(&payload.next.installed_hash)
+                        && stage_hash.as_deref() == Some(&previous.installed_hash)
+                        && retired_hash.as_deref() == Some(&payload.next.installed_hash)
                     {
                         std::fs::rename(&stage, &destination).map_err(|error| AppError::Io {
                             message: format!("finish compensated Skill rollback: {error}"),
@@ -3480,7 +3508,7 @@ pub(crate) async fn recover_install_operations(state: &AppState) -> Result<(), A
                         remove_recovery_directory(&retired, &payload.next.installed_hash)?;
                         database.abort_filesystem_operation(&operation.id).await
                     } else if destination_hash.is_none()
-                        && skill_tree_hash(&retired)?.as_deref() == Some(&previous.installed_hash)
+                        && retired_hash.as_deref() == Some(&previous.installed_hash)
                     {
                         std::fs::rename(&retired, &destination).map_err(|error| AppError::Io {
                             message: format!("restore retired Skill install: {error}"),
@@ -5846,6 +5874,40 @@ mod tests {
             .exists());
     }
 
+    async fn stage_inverse_rollback_compensation(
+        fixture: &RollbackRecoveryFixture,
+        operation: &crate::state_db::FilesystemOperation,
+    ) -> (PathBuf, PathBuf) {
+        super::install::install_validated_directory_with_id(
+            &fixture.content,
+            &fixture.files,
+            &fixture.destination,
+            &fixture.state.app_data_dir.join("skill-backups"),
+            true,
+            &operation.id,
+        )
+        .unwrap();
+        let (_, safety_content, safety_files) = super::validate_skill_version_snapshot(
+            &fixture.state,
+            &fixture.identity,
+            Path::new(&fixture.safety.path),
+        )
+        .await
+        .unwrap();
+        let parent = fixture.destination.parent().unwrap();
+        let stage = parent.join(format!(".agency-skill-{}.stage", operation.id));
+        let retired = parent.join(format!(".agency-skill-{}.previous", operation.id));
+        super::install::install_validated_directory(
+            &safety_content,
+            &safety_files,
+            &stage,
+            &fixture.state.app_data_dir.join("skill-backups"),
+            false,
+        )
+        .unwrap();
+        (stage, retired)
+    }
+
     fn test_state(app_data_dir: &Path) -> AppState {
         let mut state = AppState::build().expect("build app state");
         state.app_data_dir = app_data_dir.to_path_buf();
@@ -6091,33 +6153,7 @@ mod tests {
             )
             .await
             .unwrap();
-        super::install::install_validated_directory_with_id(
-            &fixture.content,
-            &fixture.files,
-            &fixture.destination,
-            &fixture.state.app_data_dir.join("skill-backups"),
-            true,
-            &operation.id,
-        )
-        .unwrap();
-        let (_, safety_content, safety_files) = super::validate_skill_version_snapshot(
-            &fixture.state,
-            &fixture.identity,
-            Path::new(&fixture.safety.path),
-        )
-        .await
-        .unwrap();
-        let parent = fixture.destination.parent().unwrap();
-        let stage = parent.join(format!(".agency-skill-{}.stage", operation.id));
-        let retired = parent.join(format!(".agency-skill-{}.previous", operation.id));
-        super::install::install_validated_directory(
-            &safety_content,
-            &safety_files,
-            &stage,
-            &fixture.state.app_data_dir.join("skill-backups"),
-            false,
-        )
-        .unwrap();
+        let (stage, retired) = stage_inverse_rollback_compensation(&fixture, &operation).await;
         std::fs::rename(&fixture.destination, &retired).unwrap();
         assert!(!fixture.destination.exists());
         assert_eq!(
@@ -6135,6 +6171,111 @@ mod tests {
         super::recover_install_operations(&fixture.state)
             .await
             .expect("inverse compensation recovery is idempotent");
+
+        assert_eq!(
+            super::install::load_ledger_for_state(&fixture.state)
+                .await
+                .unwrap(),
+            std::slice::from_ref(&fixture.previous)
+        );
+        assert_eq!(
+            super::install::tree_hash(&fixture.destination).unwrap(),
+            fixture.previous.installed_hash
+        );
+        assert!(fixture
+            .database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_operation_recovery_paths_removed(&fixture.destination, &operation.id);
+        assert_recovery_snapshots_remain_exact(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_rollback_finishes_compensation_before_the_first_rename() {
+        let fixture = rollback_recovery_fixture().await;
+        let operation = fixture
+            .database
+            .prepare_filesystem_operation(
+                "skill_update",
+                &super::SkillInstallOperation {
+                    previous: Some(fixture.previous.clone()),
+                    next: fixture.next.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let (stage, retired) = stage_inverse_rollback_compensation(&fixture, &operation).await;
+        assert_eq!(
+            super::install::tree_hash(&fixture.destination).unwrap(),
+            fixture.next.installed_hash
+        );
+        assert_eq!(
+            super::install::tree_hash(&stage).unwrap(),
+            fixture.previous.installed_hash
+        );
+        assert!(!retired.exists());
+
+        super::recover_install_operations(&fixture.state)
+            .await
+            .expect("finish exact staged compensation");
+        super::recover_install_operations(&fixture.state)
+            .await
+            .expect("staged compensation recovery is idempotent");
+
+        assert_eq!(
+            super::install::load_ledger_for_state(&fixture.state)
+                .await
+                .unwrap(),
+            std::slice::from_ref(&fixture.previous)
+        );
+        assert_eq!(
+            super::install::tree_hash(&fixture.destination).unwrap(),
+            fixture.previous.installed_hash
+        );
+        assert!(fixture
+            .database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_operation_recovery_paths_removed(&fixture.destination, &operation.id);
+        assert_recovery_snapshots_remain_exact(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_rollback_cleans_compensation_after_the_second_rename() {
+        let fixture = rollback_recovery_fixture().await;
+        let operation = fixture
+            .database
+            .prepare_filesystem_operation(
+                "skill_update",
+                &super::SkillInstallOperation {
+                    previous: Some(fixture.previous.clone()),
+                    next: fixture.next.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let (stage, retired) = stage_inverse_rollback_compensation(&fixture, &operation).await;
+        std::fs::rename(&fixture.destination, &retired).unwrap();
+        std::fs::rename(&stage, &fixture.destination).unwrap();
+        assert_eq!(
+            super::install::tree_hash(&fixture.destination).unwrap(),
+            fixture.previous.installed_hash
+        );
+        assert_eq!(
+            super::install::tree_hash(&retired).unwrap(),
+            fixture.next.installed_hash
+        );
+
+        super::recover_install_operations(&fixture.state)
+            .await
+            .expect("clean exact published compensation");
+        super::recover_install_operations(&fixture.state)
+            .await
+            .expect("published compensation recovery is idempotent");
 
         assert_eq!(
             super::install::load_ledger_for_state(&fixture.state)
