@@ -5015,7 +5015,15 @@ pub(crate) async fn rollback_skill_authorized(
     };
     if let Err(error) = install_result {
         if let (Some(database), Some(operation)) = (&database, &operation) {
-            database.abort_filesystem_operation(&operation.id).await?;
+            if mutation_tree_hash(project_authorization, &destination)
+                .is_ok_and(|hash| hash.as_deref() == Some(record.installed_hash.as_str()))
+            {
+                database.abort_filesystem_operation(&operation.id).await?;
+            } else {
+                database
+                    .retain_filesystem_operation_error(&operation.id, &error.to_string())
+                    .await?;
+            }
         }
         return Err(error);
     }
@@ -5874,6 +5882,62 @@ mod tests {
             .exists());
     }
 
+    async fn assert_failed_rollback_remains_recoverable(
+        fixture: &RollbackRecoveryFixture,
+        error: AppError,
+    ) {
+        assert_eq!(
+            super::install::load_ledger_for_state(&fixture.state)
+                .await
+                .unwrap(),
+            std::slice::from_ref(&fixture.previous)
+        );
+        let pending = fixture
+            .database
+            .pending_filesystem_operations()
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "incomplete installer restoration must retain its recovery journal"
+        );
+        let expected_recovery_error = error.to_string();
+        assert_eq!(
+            pending[0].recovery_error.as_deref(),
+            Some(expected_recovery_error.as_str())
+        );
+        let parent = fixture.destination.parent().unwrap();
+        let stage = parent.join(format!(".agency-skill-{}.stage", pending[0].id));
+        let retired = parent.join(format!(".agency-skill-{}.previous", pending[0].id));
+        assert!(!fixture.destination.exists());
+        assert!(!stage.exists());
+        assert_eq!(
+            super::install::tree_hash(&retired).unwrap(),
+            fixture.previous.installed_hash
+        );
+
+        super::recover_install_operations(&fixture.state)
+            .await
+            .expect("startup restores the retained rollback operation");
+        super::recover_install_operations(&fixture.state)
+            .await
+            .expect("restored rollback recovery is idempotent");
+
+        assert_eq!(
+            super::install::tree_hash(&fixture.destination).unwrap(),
+            fixture.previous.installed_hash
+        );
+        assert!(fixture
+            .database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_operation_recovery_paths_removed(&fixture.destination, &pending[0].id);
+        assert_recovery_snapshots_remain_exact(fixture).await;
+    }
+
     async fn stage_inverse_rollback_compensation(
         fixture: &RollbackRecoveryFixture,
         operation: &crate::state_db::FilesystemOperation,
@@ -6038,6 +6102,66 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_ambient_installer_failure_retains_recoverable_operation() {
+        let fixture = rollback_recovery_fixture().await;
+        super::install::inject_journaled_publish_restore_rename_failures(&fixture.destination);
+
+        let error = super::rollback_skill_authorized(
+            &fixture.state,
+            &fixture.previous.source_id,
+            &fixture.previous.relative_path,
+            &fixture.previous.runtime,
+            fixture.previous.project_path.as_deref(),
+            &fixture.selected.path,
+            None,
+        )
+        .await
+        .expect_err("publish and restoration rename failures must fail rollback");
+
+        assert_failed_rollback_remains_recoverable(&fixture, error).await;
+    }
+
+    #[tokio::test]
+    async fn rollback_project_installer_failure_retains_recoverable_operation() {
+        let fixture = rollback_recovery_fixture().await;
+        let project = fixture.previous.project_path.as_deref().unwrap();
+        crate::commands::settings::persist(
+            fixture._app.path(),
+            Settings {
+                mcp_install_access: true,
+                mcp_project_allowlist: vec![project.to_owned()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .unwrap();
+        let authorization = fixture
+            .state
+            .authorize_mcp(crate::state::McpAction::Install, Some(project))
+            .await
+            .unwrap()
+            .unwrap();
+        let project_destination =
+            super::install::project_target_path(&fixture.previous.runtime, &fixture.previous.name)
+                .unwrap();
+        super::install::inject_journaled_publish_restore_rename_failures(&project_destination);
+
+        let error = super::rollback_skill_authorized(
+            &fixture.state,
+            &fixture.previous.source_id,
+            &fixture.previous.relative_path,
+            &fixture.previous.runtime,
+            Some(project),
+            &fixture.selected.path,
+            Some(&authorization),
+        )
+        .await
+        .expect_err("project publish and restoration rename failures must fail rollback");
+
+        assert_failed_rollback_remains_recoverable(&fixture, error).await;
     }
 
     #[tokio::test]

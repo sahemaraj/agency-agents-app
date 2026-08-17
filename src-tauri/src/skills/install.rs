@@ -13,6 +13,48 @@ use crate::state::AppState;
 use crate::types::{SkillInstallRecord, SkillInstallState, SkillPackageFile};
 use crate::util::fs::atomic_write;
 
+#[cfg(test)]
+std::thread_local! {
+    static JOURNALED_PUBLISH_RENAME_FAILURES: std::cell::RefCell<Option<(PathBuf, u8)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_journaled_publish_restore_rename_failures(destination: &Path) {
+    JOURNALED_PUBLISH_RENAME_FAILURES.with(|injection| {
+        let mut injection = injection.borrow_mut();
+        assert!(
+            injection.is_none(),
+            "rename failure injection is already armed"
+        );
+        *injection = Some((destination.to_path_buf(), 2));
+    });
+}
+
+fn maybe_fail_journaled_publish_rename(destination: &Path) -> Result<(), std::io::Error> {
+    #[cfg(not(test))]
+    let _ = destination;
+    #[cfg(test)]
+    {
+        let injected = JOURNALED_PUBLISH_RENAME_FAILURES.with(|injection| {
+            let mut injection = injection.borrow_mut();
+            match injection.as_mut() {
+                Some((expected, remaining)) if expected == destination => {
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        *injection = None;
+                    }
+                    true
+                }
+                _ => false,
+            }
+        });
+        if injected {
+            return Err(std::io::Error::other("injected journaled rename failure"));
+        }
+    }
+    Ok(())
+}
+
 pub fn ledger_path(app_data_dir: &Path) -> PathBuf {
     state_dir(app_data_dir).join("skill-installs.json")
 }
@@ -687,20 +729,24 @@ pub fn install_validated_directory_in_project_with_id(
         )
         .map_err(|error| cap_io("stage existing project skill", destination, error))?;
     }
-    if let Err(error) = cap_primitives::fs::rename(
-        &parent_dir,
-        &stage,
-        &parent_dir,
-        Path::new(destination_name),
-    ) {
+    if let Err(error) = maybe_fail_journaled_publish_rename(destination).and_then(|()| {
+        cap_primitives::fs::rename(
+            &parent_dir,
+            &stage,
+            &parent_dir,
+            Path::new(destination_name),
+        )
+    }) {
         let _ = remove_project_tree(&parent_dir, &stage);
         if had_destination {
-            if let Err(restore) = cap_primitives::fs::rename(
-                &parent_dir,
-                &retired,
-                &parent_dir,
-                Path::new(destination_name),
-            ) {
+            if let Err(restore) = maybe_fail_journaled_publish_rename(destination).and_then(|()| {
+                cap_primitives::fs::rename(
+                    &parent_dir,
+                    &retired,
+                    &parent_dir,
+                    Path::new(destination_name),
+                )
+            }) {
                 return Err(AppError::Internal {
                     message: format!(
                         "publish project skill {} failed: {error}; restore failed: {restore}; recovery retained at {}{}",
@@ -972,7 +1018,9 @@ fn publish_failure(
     had_destination: bool,
 ) -> AppError {
     if had_destination {
-        if let Err(restore) = fs::rename(retired, destination) {
+        if let Err(restore) = maybe_fail_journaled_publish_rename(destination)
+            .and_then(|()| fs::rename(retired, destination))
+        {
             return AppError::Internal {
                 message: format!(
                     "publish skill {} failed: {error}; restore {} -> {} failed: {restore}; recovery retained at {}{}",
@@ -1083,7 +1131,9 @@ pub fn install_validated_directory_with_id(
             message: format!("stage existing skill {}: {error}", destination.display()),
         })?;
     }
-    if let Err(error) = fs::rename(&stage, destination) {
+    if let Err(error) = maybe_fail_journaled_publish_rename(destination)
+        .and_then(|()| fs::rename(&stage, destination))
+    {
         let _ = fs::remove_dir_all(&stage);
         return Err(publish_failure(
             error,
