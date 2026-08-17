@@ -475,7 +475,7 @@ class InstallStore {
     this.busy = JSON.stringify(["roster", plan.tool, plan.projectPath]);
     try {
       const record = await agentRosterApply(plan);
-      await this.reconcile();
+      await this.reconcileRosters();
       activity.log({
         action: plan.operation,
         subject: "agentLibrary",
@@ -500,7 +500,7 @@ class InstallStore {
     const record = enable
       ? await agentRosterEnable(tool, projectPath)
       : await agentRosterDisable(tool, projectPath);
-    await this.reconcile();
+    await this.reconcileRosters();
     return record;
   }
 
@@ -514,7 +514,7 @@ class InstallStore {
     snapshotId: string,
   ): Promise<AgentRosterInstallRecord> {
     const record = await agentRosterVersionRollback(tool, projectPath, snapshotId);
-    await this.reconcile();
+    await this.reconcileRosters();
     return record;
   }
 

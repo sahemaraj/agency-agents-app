@@ -1292,6 +1292,16 @@ export interface InstalledAgentRoster {
   state: InstallState;
 }
 
+export interface AgentRosterPathObservation {
+  kind: "missing" | "file" | "symlink" | "other";
+  hash: string | null;
+}
+
+export interface AgentRosterDestinationObservation {
+  active: AgentRosterPathObservation;
+  disabled: AgentRosterPathObservation;
+}
+
 export interface AgentRosterMutationPlan {
   revision: string;
   operation: "install" | "update" | "uninstall";
@@ -1301,6 +1311,7 @@ export interface AgentRosterMutationPlan {
   destination: string;
   members: AgentRosterMember[];
   state: InstallState | null;
+  destinationObservation: AgentRosterDestinationObservation;
   warnings: string[];
   blockers: string[];
   rollbackAvailable: boolean;

@@ -558,13 +558,15 @@
   }
 
   async function toggle(tool: Tool, target: string | null) {
-    if (!installTruthFresh || busy) return;
+    if (busy) return;
     const cov = cover(tool, target);
     if (isRosterTool(tool)) {
+      if (!rosterTruthFresh) return;
       if (!target) return;
       await reviewRoster(cov.roster ? (cov.all ? "uninstall" : "update") : "install", tool, target);
       return;
     }
+    if (!installTruthFresh) return;
     if (cov.all) {
       if (collectionName) {
         await reviewCollection("uninstall", tool, target);

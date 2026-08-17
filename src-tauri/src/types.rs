@@ -1559,6 +1559,20 @@ pub struct InstalledAgentRoster {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentRosterPathObservation {
+    pub kind: String,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRosterDestinationObservation {
+    pub active: AgentRosterPathObservation,
+    pub disabled: AgentRosterPathObservation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentRosterMutationPlan {
     pub revision: String,
     pub operation: String,
@@ -1568,6 +1582,7 @@ pub struct AgentRosterMutationPlan {
     pub destination: String,
     pub members: Vec<AgentRosterMember>,
     pub state: Option<InstallState>,
+    pub destination_observation: AgentRosterDestinationObservation,
     pub warnings: Vec<String>,
     pub blockers: Vec<String>,
     pub rollback_available: bool,

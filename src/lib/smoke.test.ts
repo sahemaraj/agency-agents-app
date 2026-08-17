@@ -5402,6 +5402,162 @@ describe("frontend test harness", () => {
     expect(installStoreSource).toContain("agentRostersReconcile()");
   });
 
+  it("keeps roster install disable enable and rollback live while Agent truth is unavailable", async () => {
+    const projectPath = "/tmp/roster-project";
+    const packages = [
+      staleControlPackage,
+      {
+        ...staleControlPackage,
+        reference: { sourceId: "built-in", relativePath: "auditor.md" },
+        agent: { ...staleControlAgent, slug: "auditor", name: "Auditor" },
+      },
+    ];
+    agentLibrary.results = [{
+      source: { id: "built-in", label: "Built in", enabled: true, kind: { kind: "builtIn" } },
+      agents: packages,
+      errors: [],
+      revision: "roster-ui",
+    }];
+    const projectRows = [{ path: projectPath, label: "Roster project", installedCount: 0 }];
+    const aiderTool = {
+      ...staleControlTool,
+      tool: "aider" as const,
+      label: "Aider",
+      scope: "project" as const,
+      userDest: null,
+      installedCount: 0,
+    };
+    const members = packages.map((pkg) => ({
+      reference: pkg.reference,
+      name: pkg.agent!.name,
+      sourceHash: pkg.sourceHash,
+    }));
+    const record = {
+      tool: "aider" as const,
+      scope: "project" as const,
+      projectPath,
+      dest: `${projectPath}/CONVENTIONS.md`,
+      members,
+      renderedHash: "a".repeat(64),
+      disabledPath: null as string | null,
+      installedAt: "2026-08-17T00:00:00Z",
+    };
+    const plan = {
+      revision: "b".repeat(64),
+      operation: "install" as const,
+      tool: "aider" as const,
+      scope: "project" as const,
+      projectPath,
+      destination: record.dest,
+      members,
+      state: null,
+      destinationObservation: {
+        active: { kind: "missing" as const, hash: null },
+        disabled: { kind: "missing" as const, hash: null },
+      },
+      warnings: [],
+      blockers: [],
+      rollbackAvailable: false,
+    };
+    let rosterRows: Array<{ record: typeof record; state: "current" | "disabled" }> = [];
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "projects_list") return projectRows as never;
+      if (command === "tools_list") return [aiderTool] as never;
+      if (command === "installs_reconcile") throw new Error("Agent install truth unavailable");
+      if (command === "agent_rosters_reconcile") return structuredClone(rosterRows) as never;
+      if (command === "agent_roster_plan") {
+        expect(args).toMatchObject({ references: packages.map((pkg) => pkg.reference), operation: "install", tool: "aider", projectPath });
+        return plan as never;
+      }
+      if (command === "agent_roster_apply") {
+        rosterRows = [{ record, state: "current" }];
+        return record as never;
+      }
+      if (command === "agent_roster_disable") {
+        record.disabledPath = `${record.dest}.disabled`;
+        rosterRows = [{ record, state: "disabled" }];
+        return record as never;
+      }
+      if (command === "agent_roster_enable") {
+        record.disabledPath = null;
+        rosterRows = [{ record, state: "current" }];
+        return record as never;
+      }
+      if (command === "agent_roster_version_history") return [{
+        id: "roster-snapshot", createdAt: "2026-08-17T00:00:00Z",
+        sourceHash: "c".repeat(64), renderedHash: "d".repeat(64), contentPath: "/tmp/snapshot",
+      }] as never;
+      if (command === "agent_roster_version_rollback") {
+        rosterRows = [{ record, state: "current" }];
+        return record as never;
+      }
+      return [] as never;
+    });
+    projects.list = projectRows;
+    install.tools = [aiderTool];
+    install.reconciled = false;
+    install.reconcileError = "Agent install truth unavailable";
+    const { default: InstallModal } = await import("$lib/components/InstallModal.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(InstallModal, {
+      target,
+      props: {
+        title: "Install roster",
+        agentReferences: packages.map((pkg) => pkg.reference),
+        allowedTools: ["aider"],
+        onClose: vi.fn(),
+      },
+    });
+    const buttonNamed = (name: string) => [...target.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === name);
+    try {
+      const toggle = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLButtonElement>(".grid-wrap .toggle");
+        expect(candidate?.disabled).toBe(false);
+        return candidate!;
+      });
+      expect(install.reconciled).toBe(false);
+      const genericReconcilesAfterMount = invokeMock.mock.calls
+        .filter(([command]) => command === "installs_reconcile").length;
+      toggle.click();
+      const apply = await vi.waitFor(() => {
+        expect(invokeMock.mock.calls.filter(([command]) => command === "agent_roster_plan")).toHaveLength(1);
+        const candidate = buttonNamed("Apply plan");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      apply.click();
+      await vi.waitFor(() => expect(buttonNamed("Disable")).toBeTruthy());
+
+      buttonNamed("Disable")!.click();
+      await vi.waitFor(() => expect(buttonNamed("Enable")).toBeTruthy());
+      buttonNamed("Enable")!.click();
+      await vi.waitFor(() => expect(buttonNamed("Disable")).toBeTruthy());
+
+      buttonNamed("Version history")!.click();
+      const rollback = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLButtonElement>(".history .snapshot button");
+        expect(candidate?.textContent).toContain("Rollback");
+        return candidate!;
+      });
+      rollback.click();
+      await tick();
+      rollback.click();
+      await vi.waitFor(() => expect(invokeMock.mock.calls
+        .filter(([command]) => command === "agent_roster_version_rollback")).toHaveLength(1));
+      await vi.waitFor(() => expect(invokeMock.mock.calls
+        .filter(([command]) => command === "agent_rosters_reconcile").length).toBeGreaterThanOrEqual(5));
+      expect(invokeMock.mock.calls.filter(([command]) => command === "installs_reconcile"))
+        .toHaveLength(genericReconcilesAfterMount);
+      expect(install.reconciled).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
   it("pins every Phase 6 truth-aware install-ledger consumer and every deployment mutation control", () => {
     const consumers = new Map<string, { source: string; markers: RegExp[] }>([
       ["AgentsWorkspace", { source: agentsWorkspaceSource, markers: [
