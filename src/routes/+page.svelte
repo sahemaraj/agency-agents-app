@@ -577,7 +577,11 @@
       --titlebar-toggle-left: 84px;
       --titlebar-title-left: 124px;
     }
-    .titlebar-nav, .titlebar-title { display: none; }
+    .titlebar-nav { display: none; }
+    .titlebar-title {
+      width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
     .titlebar-right { right: var(--space-2); }
     .main :global(.handle) { display: none; }
     .main :global(.sidebar) {

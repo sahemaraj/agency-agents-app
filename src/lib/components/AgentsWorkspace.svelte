@@ -993,4 +993,8 @@
       background: rgba(0,0,0,0.28); border: 0; cursor: default;
     }
   }
+  @media (max-width: 600px) {
+    .lp-search-row { flex-wrap: wrap; }
+    .lp-search-row :global(.wrap) { flex: 1 1 160px; }
+  }
 </style>

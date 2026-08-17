@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import Check from "@lucide/svelte/icons/check";
   import Copy from "@lucide/svelte/icons/copy";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
@@ -30,6 +30,7 @@
   let policySaving = $state(false);
   let selectedPreset: SecurityPosturePreset = $state("strict");
   let presetAnnouncement = $state("");
+  let presetApplyButton: HTMLButtonElement | undefined = $state();
   let currentPosture = $derived(classifySecurityPosture(settings.effective));
   let presetPreview = $derived(previewSecurityPosture(settings.effective, selectedPreset));
 
@@ -57,11 +58,18 @@
   }
 
   async function applyPreset() {
+    const preset = selectedPreset;
     error = "";
     presetAnnouncement = "";
-    await settings.applySecurityPosture(selectedPreset);
-    if (settings.error) error = settings.error;
-    else presetAnnouncement = `${postureLabels[selectedPreset]} security posture applied`;
+    await settings.applySecurityPosture(preset);
+    if (settings.error) {
+      error = settings.error;
+      presetAnnouncement = `${postureLabels[preset]} security posture failed: ${settings.error}`;
+    } else {
+      presetAnnouncement = `${postureLabels[preset]} security posture applied`;
+    }
+    await tick();
+    presetApplyButton?.focus({ preventScroll: true });
   }
 
   function clientId(status: McpClientStatus): McpClient {
@@ -407,10 +415,10 @@
         <tr><th scope="row">Project allowlist</th><td>{settings.effective.mcpProjectAllowlist.length} retained</td><td>{presetPreview.mcpProjectAllowlist.length} retained</td></tr>
       </tbody>
     </table>
-    <button type="button" class="primary" data-security-posture-apply disabled={settings.loading} onclick={applyPreset}>
+    <button bind:this={presetApplyButton} type="button" class="primary" data-security-posture-apply disabled={settings.loading} onclick={applyPreset}>
       Apply {postureLabels[selectedPreset]}
     </button>
-    <span class="sr-only" aria-live="polite" data-security-posture-announcement>{presetAnnouncement}</span>
+    <span class="sr-only" role="status" aria-live="polite" aria-atomic="true" data-security-posture-announcement>{presetAnnouncement}</span>
   </section>
 
   <div class="policy" aria-busy={policySaving || settings.loading}>

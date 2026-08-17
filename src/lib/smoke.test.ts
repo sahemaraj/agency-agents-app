@@ -460,9 +460,14 @@ describe("frontend test harness", () => {
 
     expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.main :global\(\.handle\)[^]*?display:\s*none/);
     expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.app\.sidebar-collapsed \.main :global\(\.sidebar\)[^]*?display:\s*none/);
+    expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.titlebar-nav[^]*?display:\s*none/);
+    expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.titlebar-title[^]*?width:\s*1px[^]*?clip:\s*rect\(0, 0, 0, 0\)/);
+    expect(pageSource).not.toMatch(/@media \(max-width: 600px\)[^}]*?\.titlebar-title[^}]*?display:\s*none/);
     expect(settingsSource).toMatch(/@media \(max-width: 600px\)[^]*?grid-template-columns:\s*minmax\(0, 1fr\)/);
     expect(activityHistorySource).toMatch(/@media \(max-width: 600px\)[^]*?\.review-list li[^]*?flex-direction:\s*column/);
     expect(projectsSource).toMatch(/@media \(max-width: 600px\)[^]*?\.pr-head[^]*?flex-wrap:\s*wrap/);
+    expect(agentsWorkspaceSource).toMatch(/@media \(max-width: 600px\)[^]*?\.lp-search-row[^]*?flex-wrap:\s*wrap/);
+    expect(agentsWorkspaceSource).toMatch(/@media \(max-width: 600px\)[^]*?\.lp-search-row :global\(\.wrap\)[^]*?flex:\s*1 1 160px/);
   });
 
   it("uses right-to-left document direction for Persian", async () => {
@@ -6459,8 +6464,45 @@ describe("bounded playbook library", () => {
   it("filters locally in deterministic source-relative order", () => {
     expect(filterPlaybooks(entries, "workflow").map((entry) => entry.relativePath))
       .toEqual(["examples/alpha.md"]);
+    expect(filterPlaybooks(entries, "strategy").map((entry) => entry.relativePath))
+      .toEqual(["strategy/zeta.md"]);
+    expect(filterPlaybooks(entries, "20")).toEqual([]);
     expect(filterPlaybooks(entries.toReversed(), "").map((entry) => entry.relativePath))
       .toEqual(["examples/alpha.md", "strategy/zeta.md"]);
+  });
+
+  it("retains the last successful rows when refresh fails and exposes error plus Retry", async () => {
+    let listAttempts = 0;
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "playbooks_list") {
+        listAttempts += 1;
+        if (listAttempts === 2) throw { code: "io", message: "refresh unavailable" };
+        return entries as never;
+      }
+      return [] as never;
+    });
+
+    const component = mount(RunbooksView, { target: document.body });
+    await vi.waitFor(() => expect(runbooks.playbooks).toEqual(entries));
+    const modes = [...document.querySelectorAll<HTMLButtonElement>("[data-runbooks-mode]")];
+    modes[1].click();
+    await tick();
+    expect(document.body.textContent).toContain("Alpha workflow");
+    expect(document.body.textContent).toContain("Zeta");
+
+    await runbooks.retryPlaybooks();
+    await tick();
+    expect(runbooks.playbooks).toEqual(entries);
+    expect(document.querySelector('[role="status"]')?.textContent).toContain("refresh unavailable");
+    expect(document.querySelector("[data-playbooks-retry]")).not.toBeNull();
+    expect(document.body.textContent).not.toContain("No playbooks available");
+
+    document.querySelector<HTMLButtonElement>("[data-playbooks-retry]")?.click();
+    await vi.waitFor(() => expect(listAttempts).toBe(3));
+    await tick();
+    expect(document.body.textContent).toContain("Alpha workflow");
+    expect(document.body.textContent).toContain("Zeta");
+    unmount(component);
   });
 
   it("shows safe text, provenance, copy, empty/error retry, and accessible modes", async () => {
@@ -6670,7 +6712,8 @@ describe("security posture presets", () => {
     expect(rows["Project allowlist"]).toEqual(["1 retained", "1 retained"]);
     expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "security_posture_apply")).toBe(false);
 
-    document.querySelector<HTMLButtonElement>("[data-security-posture-apply]")?.click();
+    const apply = document.querySelector<HTMLButtonElement>("[data-security-posture-apply]")!;
+    apply.click();
     await Promise.resolve();
     await tick();
     await Promise.resolve();
@@ -6678,6 +6721,39 @@ describe("security posture presets", () => {
     expect(vi.mocked(invoke)).toHaveBeenCalledWith("security_posture_apply", { preset: "strict" });
     expect(document.querySelector("[data-security-posture-current]")?.textContent).toContain("Strict");
     expect(document.querySelector('[data-security-posture-announcement]')?.textContent).toContain("Strict");
+    await vi.waitFor(() => expect(document.activeElement).toBe(apply));
+    unmount(component);
+    settings.data = null;
+  });
+
+  it("announces a failed apply and restores focus to Apply without exposing a named posture", async () => {
+    settings.data = {
+      ...SETTINGS_DEFAULTS,
+      githubEnabled: true,
+      mcpSourceAccess: true,
+      mcpClientPolicies: {},
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "mcp_clients_status") return [] as never;
+      if (command === "mcp_inventory") return { servers: [], trustedTemplates: [], issues: [] } as never;
+      if (command === "security_posture_apply") throw { code: "io", message: "settings write failed" };
+      return [] as never;
+    });
+
+    const component = mount(SettingsSectionMcp, { target: document.body });
+    await Promise.resolve();
+    await tick();
+    await Promise.resolve();
+    await tick();
+    const apply = document.querySelector<HTMLButtonElement>("[data-security-posture-apply]")!;
+    apply.click();
+    await vi.waitFor(() => expect(settings.error).toContain("settings write failed"));
+    await tick();
+    const failureAnnouncement = document.querySelector('[data-security-posture-announcement]')?.textContent ?? "";
+    expect(failureAnnouncement).toContain("Strict security posture failed");
+    expect(failureAnnouncement).toContain("settings write failed");
+    await vi.waitFor(() => expect(document.activeElement).toBe(apply));
+    expect(document.querySelector("[data-security-posture-current]")?.textContent).toContain("Custom");
     unmount(component);
     settings.data = null;
   });
