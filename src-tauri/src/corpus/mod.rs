@@ -526,7 +526,7 @@ fn catalog_snapshot_revision(snapshot: &[CatalogSnapshotItem]) -> String {
     hex::encode(digest.finalize())
 }
 
-fn catalog_source_key(source: &CatalogSource) -> String {
+pub(crate) fn catalog_source_key(source: &CatalogSource) -> String {
     let mut digest = Sha256::new();
     match source {
         CatalogSource::Bundled => digest.update(b"bundled"),
