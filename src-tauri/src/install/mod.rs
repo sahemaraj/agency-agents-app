@@ -235,6 +235,22 @@ struct AgentRosterWriteOperation {
     preservation: AgentRosterPreservation,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum UnjournaledRosterWritePhase {
+    Prepared,
+    FilesystemApplied,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnjournaledRosterWriteIntent {
+    phase: UnjournaledRosterWritePhase,
+    previous: Option<AgentRosterInstallRecord>,
+    next: AgentRosterInstallRecord,
+    staged_path: String,
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRosterMoveOperation {
@@ -1415,8 +1431,24 @@ async fn publish_unjournaled_roster_history(
     mutation: &mut Option<history::RosterHistoryMutation>,
 ) -> Result<(), AppError> {
     if let Some(mutation) = mutation.as_mut() {
-        mutation.prepare_unjournaled_publication().await?;
+        mutation.mark_unjournaled_filesystem_applied().await?;
         mutation.publish().await?;
+    }
+    Ok(())
+}
+
+async fn prepare_unjournaled_roster_operation(
+    mutation: &mut Option<history::RosterHistoryMutation>,
+    should_prepare: bool,
+    previous: Option<&AgentRosterInstallRecord>,
+    next: Option<&AgentRosterInstallRecord>,
+) -> Result<(), AppError> {
+    if should_prepare {
+        if let (Some(mutation), Some(previous)) = (mutation.as_mut(), previous) {
+            mutation
+                .prepare_unjournaled_operation(previous, next)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -1978,7 +2010,31 @@ fn move_managed_artifacts(
         destinations,
         expected_hashes,
         |source, destination| std::fs::rename(source, destination),
-    )
+    )?;
+    for destination in destinations {
+        sync_parent_directory_entry(destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory_entry(path: &Path) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| AppError::Io {
+        message: format!("Agent filesystem target has no parent: {}", path.display()),
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| AppError::Io {
+            message: format!(
+                "sync Agent filesystem directory {}: {error}",
+                parent.display()
+            ),
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory_entry(_path: &Path) -> Result<(), AppError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2774,6 +2830,292 @@ fn validate_roster_staging_path(
     Ok(path)
 }
 
+fn unjournaled_roster_write_intent_path(
+    app_data_dir: &Path,
+    staged_path: &str,
+) -> Result<PathBuf, AppError> {
+    let staged = validate_roster_staging_path(app_data_dir, staged_path)?;
+    let id = staged
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "Unjournaled Agent roster staging identity is invalid".into(),
+        })?;
+    Ok(staged.with_file_name(format!("{id}.intent.json")))
+}
+
+async fn write_unjournaled_roster_write_intent(
+    state: &AppState,
+    intent: &UnjournaledRosterWriteIntent,
+) -> Result<PathBuf, AppError> {
+    validate_roster_record(&intent.next)?;
+    if intent.next.disabled_path.is_some()
+        || intent.previous.as_ref().is_some_and(|previous| {
+            validate_roster_record(previous).is_err()
+                || !same_roster_install(previous, &intent.next)
+        })
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Unjournaled Agent roster write identity changed".into(),
+        });
+    }
+    let staged = validate_roster_staging_path(&state.app_data_dir, &intent.staged_path)?;
+    let staged_hash = recovery_file_hash(&staged)?;
+    if staged_hash.as_deref() != Some(intent.next.rendered_hash.as_str()) {
+        return Err(AppError::StorageCorrupt {
+            message: "Unjournaled Agent roster staged bytes changed".into(),
+        });
+    }
+    let path = unjournaled_roster_write_intent_path(&state.app_data_dir, &intent.staged_path)?;
+    let bytes = serde_json::to_vec_pretty(intent).map_err(|error| AppError::Internal {
+        message: format!("serialize unjournaled Agent roster write intent: {error}"),
+    })?;
+    atomic_write(&path, &bytes).await?;
+    Ok(path)
+}
+
+async fn prepare_unjournaled_roster_write(
+    state: &AppState,
+    should_prepare: bool,
+    previous: Option<&AgentRosterInstallRecord>,
+    next: &AgentRosterInstallRecord,
+    staged: &Path,
+) -> Result<(), AppError> {
+    if !should_prepare {
+        return Ok(());
+    }
+    let (active, disabled) = validated_recovery_roster_paths(state, next).await?;
+    if recovery_file_hash(&active)?.is_some() || recovery_file_hash(&disabled)?.is_some() {
+        return Err(AppError::StorageCorrupt {
+            message: "Unjournaled Agent roster write expected an absent destination".into(),
+        });
+    }
+    write_unjournaled_roster_write_intent(
+        state,
+        &UnjournaledRosterWriteIntent {
+            phase: UnjournaledRosterWritePhase::Prepared,
+            previous: previous.cloned(),
+            next: next.clone(),
+            staged_path: staged.to_string_lossy().into_owned(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn mark_unjournaled_roster_write_applied(
+    state: &AppState,
+    should_mark: bool,
+    staged: &Path,
+) -> Result<(), AppError> {
+    if !should_mark {
+        return Ok(());
+    }
+    let staged_path = staged.to_string_lossy().into_owned();
+    let path = unjournaled_roster_write_intent_path(&state.app_data_dir, &staged_path)?;
+    let bytes = read_capped(&path, MAX_LEDGER_BYTES).await?;
+    let mut intent: UnjournaledRosterWriteIntent =
+        serde_json::from_slice(&bytes).map_err(|error| AppError::StorageCorrupt {
+            message: format!("parse unjournaled Agent roster write intent: {error}"),
+        })?;
+    if intent.phase != UnjournaledRosterWritePhase::Prepared || intent.staged_path != staged_path {
+        return Err(AppError::StorageCorrupt {
+            message: "Unjournaled Agent roster write phase changed".into(),
+        });
+    }
+    intent.phase = UnjournaledRosterWritePhase::FilesystemApplied;
+    write_unjournaled_roster_write_intent(state, &intent).await?;
+    Ok(())
+}
+
+async fn cleanup_roster_staging_artifacts(state: &AppState, staged: &Path) {
+    let _ = cleanup_roster_staging_artifacts_durable(state, staged).await;
+}
+
+async fn cleanup_roster_staging_artifacts_durable(
+    state: &AppState,
+    staged: &Path,
+) -> Result<(), AppError> {
+    let staged_path = staged.to_string_lossy().into_owned();
+    if let Ok(intent) = unjournaled_roster_write_intent_path(&state.app_data_dir, &staged_path) {
+        match tokio::fs::remove_file(&intent).await {
+            Ok(()) => sync_parent_directory_entry(&intent)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("remove Agent roster write intent: {error}"),
+                });
+            }
+        }
+    }
+    match tokio::fs::remove_file(staged).await {
+        Ok(()) => sync_parent_directory_entry(staged)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("remove Agent roster staging bytes: {error}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn recover_unjournaled_roster_writes(state: &AppState) -> Result<(), AppError> {
+    let root = state.app_data_dir.join("state/roster-staging");
+    for directory in [state.app_data_dir.join("state"), root.clone()] {
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect Agent roster write staging root: {error}"),
+                });
+            }
+        };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || crate::skills::metadata_is_reparse_point(&metadata)
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster write staging root is not a regular directory".into(),
+            });
+        }
+    }
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("read unjournaled Agent roster write staging: {error}"),
+            });
+        }
+    };
+    let entries = entries
+        .take(1025)
+        .map(|entry| {
+            entry.map_err(|error| AppError::Io {
+                message: format!("read unjournaled Agent roster write entry: {error}"),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if entries.len() > 1024 {
+        return Err(AppError::StorageCorrupt {
+            message: "Unjournaled Agent roster write staging exceeds its entry limit".into(),
+        });
+    }
+    let mut intents = entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".intent.json"))
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    intents.sort();
+    for path in intents {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| AppError::Io {
+            message: format!("inspect unjournaled Agent roster write intent: {error}"),
+        })?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || crate::skills::metadata_is_reparse_point(&metadata)
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster write intent is not a regular file".into(),
+            });
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_suffix(".intent.json"))
+            .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster write intent name is invalid".into(),
+            })?;
+        let staged = root.join(format!("{name}.bin"));
+        let bytes = read_capped(&path, MAX_LEDGER_BYTES).await?;
+        let intent: UnjournaledRosterWriteIntent =
+            serde_json::from_slice(&bytes).map_err(|error| AppError::StorageCorrupt {
+                message: format!("parse unjournaled Agent roster write intent: {error}"),
+            })?;
+        if intent.staged_path != staged.to_string_lossy() {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster write staging path changed".into(),
+            });
+        }
+        write_unjournaled_roster_write_intent(state, &intent).await?;
+        let (active, disabled) = validated_recovery_roster_paths(state, &intent.next).await?;
+        let active_hash = recovery_file_hash(&active)?;
+        if recovery_file_hash(&disabled)?.is_some() {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster write found an occupied disabled destination"
+                    .into(),
+            });
+        }
+        let files_are_previous = active_hash.is_none();
+        let files_are_next = active_hash.as_deref() == Some(intent.next.rendered_hash.as_str());
+        let mut rosters = load_rosters_for_state(state).await?;
+        let matching = rosters
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| same_roster_install(record, &intent.next))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster write found duplicate ledger rows".into(),
+            });
+        }
+        let ledger_is_previous = match (&intent.previous, matching.first()) {
+            (Some(previous), Some(index)) => exact_roster_install(&rosters[*index], previous),
+            (None, None) => true,
+            _ => false,
+        };
+        let ledger_is_next = matching
+            .first()
+            .is_some_and(|index| exact_roster_install(&rosters[*index], &intent.next));
+        if intent.phase == UnjournaledRosterWritePhase::Prepared
+            && files_are_previous
+            && ledger_is_previous
+        {
+            cleanup_roster_staging_artifacts_durable(state, &staged).await?;
+            continue;
+        }
+        if !files_are_next && files_are_previous && ledger_is_next {
+            let staged_bytes = read_capped(&staged, MAX_INSTALLED_BYTES).await?;
+            publish_roster_bytes(&active, &staged_bytes, intent.previous.is_some()).await?;
+            sync_parent_directory_entry(&active)?;
+        } else if !files_are_next {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster write found changed destination bytes".into(),
+            });
+        }
+        if ledger_is_previous {
+            match matching.first() {
+                Some(index) => rosters[*index] = intent.next.clone(),
+                None => rosters.push(intent.next.clone()),
+            }
+            rosters.sort_by(|left, right| {
+                left.project_path
+                    .cmp(&right.project_path)
+                    .then_with(|| left.tool.cmp(&right.tool))
+            });
+            save_rosters_for_state(state, &rosters).await?;
+        } else if !ledger_is_next {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster write found changed ledger metadata".into(),
+            });
+        }
+        let mut applied = intent;
+        applied.phase = UnjournaledRosterWritePhase::FilesystemApplied;
+        write_unjournaled_roster_write_intent(state, &applied).await?;
+        cleanup_roster_staging_artifacts_durable(state, &staged).await?;
+    }
+    Ok(())
+}
+
 async fn apply_recovered_roster_write(
     state: &AppState,
     operation_id: &str,
@@ -2872,6 +3214,7 @@ async fn recover_roster_write_operation(
                 }
                 publish_roster_bytes(&destination, &bytes, payload.previous.is_some()).await?;
             }
+            sync_parent_directory_entry(&destination)?;
             apply_recovered_roster_write(state, &operation.id, &payload).await?;
             if let Some(previous) = &payload.previous {
                 commit_recovered_roster_retention(state, previous, &payload.preservation).await?;
@@ -3053,6 +3396,7 @@ async fn recover_roster_uninstall_operation(
                     message: format!("recover Agent roster uninstall: {error}"),
                 })?;
         }
+        sync_parent_directory_entry(&path)?;
         let mut rosters = load_rosters_for_state(state).await?;
         if let Some(index) = rosters
             .iter()
@@ -3188,7 +3532,8 @@ fn pending_roster_staging_path(
 }
 
 async fn recover_agent_operations_locked(state: &AppState) -> Result<(), AppError> {
-    history::recover_unjournaled_roster_publications(&state.app_data_dir).await?;
+    recover_unjournaled_roster_writes(state).await?;
+    history::recover_unjournaled_roster_operations(state).await?;
     let Some(database) = state.completed_state_database().await? else {
         history::sweep_roster_staging(&state.app_data_dir, &[]).await?;
         return Ok(());
@@ -4049,7 +4394,11 @@ async fn build_roster_plan(
     if operation != "install" && existing.is_none() {
         blockers.push(format!("Agent roster is not tracked for {operation}"));
     }
-    if operation == "update" && state_value == Some(InstallState::Disabled) {
+    if operation == "update"
+        && existing
+            .as_ref()
+            .is_some_and(|record| record.disabled_path.is_some())
+    {
         blockers.push("Enable the Agent roster before updating it".into());
     }
 
@@ -4220,6 +4569,7 @@ async fn stage_roster_bytes(app_data_dir: &Path, bytes: &[u8]) -> Result<PathBuf
         .map_err(|error| AppError::Io {
             message: format!("create Agent roster staging directory: {error}"),
         })?;
+    sync_parent_directory_entry(path.parent().expect("roster staging path has parent"))?;
     atomic_write(&path, bytes).await?;
     let stored = read_capped(&path, MAX_INSTALLED_BYTES).await?;
     if stored != bytes {
@@ -4439,10 +4789,29 @@ async fn apply_roster_plan(
     } else {
         None
     };
-    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_some()).await {
+    let history_ready = async {
+        publish_roster_history_if(&mut history_mutation, database.is_some()).await?;
+        prepare_unjournaled_roster_operation(
+            &mut history_mutation,
+            database.is_none(),
+            previous.as_ref(),
+            Some(&next),
+        )
+        .await?;
+        prepare_unjournaled_roster_write(
+            state,
+            database.is_none() && history_mutation.is_none(),
+            previous.as_ref(),
+            &next,
+            &staged,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = history_ready {
         let history = rollback_roster_history(&mut history_mutation).await;
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match history {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error(
@@ -4467,6 +4836,7 @@ async fn apply_roster_plan(
                 message: "verify Agent roster destination failed".into(),
             });
         }
+        sync_parent_directory_entry(&destination)?;
         Ok(())
     }
     .await;
@@ -4475,7 +4845,7 @@ async fn apply_roster_plan(
         let history = rollback_roster_history(&mut history_mutation).await;
         let restored = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &restored).await?;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match restored {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("write Agent roster", error, rollback)),
@@ -4500,13 +4870,14 @@ async fn apply_roster_plan(
         let history = rollback_roster_history(&mut history_mutation).await;
         let restored = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &restored).await?;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match restored {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("save Agent roster", error, rollback)),
         };
     }
     if let Err(error) = if database.is_none() {
+        mark_unjournaled_roster_write_applied(state, history_mutation.is_none(), &staged).await?;
         publish_unjournaled_roster_history(&mut history_mutation).await
     } else {
         Ok(())
@@ -4518,7 +4889,7 @@ async fn apply_roster_plan(
             &mut history_mutation,
         )
         .await;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error(
@@ -4548,7 +4919,7 @@ async fn apply_roster_plan(
                 } else {
                     error
                 };
-                let _ = tokio::fs::remove_file(&staged).await;
+                cleanup_roster_staging_artifacts(state, &staged).await;
                 return Err(error);
             }
         }
@@ -4559,7 +4930,7 @@ async fn apply_roster_plan(
         if let Err(error) = database.commit_filesystem_operation(&operation.id).await {
             if let Err(rollback) = abort_roster_retention(Some(database), retention.as_ref()).await
             {
-                let _ = tokio::fs::remove_file(&staged).await;
+                cleanup_roster_staging_artifacts(state, &staged).await;
                 return Err(rollback_error(
                     "abort Agent roster retention",
                     error,
@@ -4577,14 +4948,14 @@ async fn apply_roster_plan(
                 error,
             )
             .await;
-            let _ = tokio::fs::remove_file(&staged).await;
+            cleanup_roster_staging_artifacts(state, &staged).await;
             return Err(error);
         }
     }
     let finalized =
         finalize_roster_history(database.as_ref(), retention.as_ref(), &mut history_mutation).await;
-    let _ = tokio::fs::remove_file(&staged).await;
     finalized?;
+    cleanup_roster_staging_artifacts_durable(state, &staged).await?;
     Ok(next)
 }
 
@@ -4731,7 +5102,18 @@ async fn move_roster(
     } else {
         None
     };
-    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_some()).await {
+    let history_ready = async {
+        publish_roster_history_if(&mut history_mutation, database.is_some()).await?;
+        prepare_unjournaled_roster_operation(
+            &mut history_mutation,
+            database.is_none(),
+            Some(&previous),
+            Some(&next),
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = history_ready {
         let history = rollback_roster_history(&mut history_mutation).await;
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
         return match history {
@@ -4949,7 +5331,18 @@ async fn uninstall_roster(
     } else {
         None
     };
-    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_some()).await {
+    let history_ready = async {
+        publish_roster_history_if(&mut history_mutation, database.is_some()).await?;
+        prepare_unjournaled_roster_operation(
+            &mut history_mutation,
+            database.is_none(),
+            Some(&previous),
+            None,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = history_ready {
         let history = rollback_roster_history(&mut history_mutation).await;
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
         return match history {
@@ -4987,6 +5380,20 @@ async fn uninstall_roster(
             return match restored {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(rollback_error("uninstall Agent roster", error, rollback)),
+            };
+        }
+        if let Err(error) = sync_parent_directory_entry(&path) {
+            let files = restore_batch_files_verified(&prior).await;
+            let history = rollback_roster_history(&mut history_mutation).await;
+            let restored = combine_roster_restoration(files, history);
+            close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &restored).await?;
+            return match restored {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error(
+                    "sync Agent roster uninstall",
+                    error,
+                    rollback,
+                )),
             };
         }
     }
@@ -5184,10 +5591,29 @@ async fn rollback_roster(
     } else {
         None
     };
-    if let Err(error) = publish_roster_history_if(&mut history_mutation, database.is_some()).await {
+    let history_ready = async {
+        publish_roster_history_if(&mut history_mutation, database.is_some()).await?;
+        prepare_unjournaled_roster_operation(
+            &mut history_mutation,
+            database.is_none(),
+            Some(&previous),
+            Some(&next),
+        )
+        .await?;
+        prepare_unjournaled_roster_write(
+            state,
+            database.is_none() && history_mutation.is_none(),
+            Some(&previous),
+            &next,
+            &staged,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = history_ready {
         let history = rollback_roster_history(&mut history_mutation).await;
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match history {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error(
@@ -5200,7 +5626,7 @@ async fn rollback_roster(
     if let Err(error) = verify_roster_preimage(&destination, prior_hash.as_deref()) {
         let history = rollback_roster_history(&mut history_mutation).await;
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &history).await?;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match history {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error(
@@ -5215,10 +5641,25 @@ async fn rollback_roster(
         let history = rollback_roster_history(&mut history_mutation).await;
         let rollback = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &rollback).await?;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("rollback Agent roster", error, rollback)),
+        };
+    }
+    if let Err(error) = sync_parent_directory_entry(&destination) {
+        let files = restore_batch_files_verified(&prior).await;
+        let history = rollback_roster_history(&mut history_mutation).await;
+        let rollback = combine_roster_restoration(files, history);
+        close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &rollback).await?;
+        cleanup_roster_staging_artifacts(state, &staged).await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback_error(
+                "sync Agent roster rollback",
+                error,
+                rollback,
+            )),
         };
     }
     rosters[index] = next.clone();
@@ -5231,7 +5672,7 @@ async fn rollback_roster(
         let history = rollback_roster_history(&mut history_mutation).await;
         let rollback = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &rollback).await?;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error(
@@ -5242,6 +5683,7 @@ async fn rollback_roster(
         };
     }
     if let Err(error) = if database.is_none() {
+        mark_unjournaled_roster_write_applied(state, history_mutation.is_none(), &staged).await?;
         publish_unjournaled_roster_history(&mut history_mutation).await
     } else {
         Ok(())
@@ -5253,7 +5695,7 @@ async fn rollback_roster(
             &mut history_mutation,
         )
         .await;
-        let _ = tokio::fs::remove_file(&staged).await;
+        cleanup_roster_staging_artifacts(state, &staged).await;
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error(
@@ -5284,7 +5726,7 @@ async fn rollback_roster(
                 } else {
                     error
                 };
-                let _ = tokio::fs::remove_file(&staged).await;
+                cleanup_roster_staging_artifacts(state, &staged).await;
                 return Err(error);
             }
         };
@@ -5292,7 +5734,7 @@ async fn rollback_roster(
         if let Err(error) = database.commit_filesystem_operation(&operation.id).await {
             if let Err(rollback) = abort_roster_retention(Some(database), retention.as_ref()).await
             {
-                let _ = tokio::fs::remove_file(&staged).await;
+                cleanup_roster_staging_artifacts(state, &staged).await;
                 return Err(rollback_error(
                     "abort Agent roster retention",
                     error,
@@ -5310,14 +5752,14 @@ async fn rollback_roster(
                 error,
             )
             .await;
-            let _ = tokio::fs::remove_file(&staged).await;
+            cleanup_roster_staging_artifacts(state, &staged).await;
             return Err(error);
         }
     }
     let finalized =
         finalize_roster_history(database.as_ref(), retention.as_ref(), &mut history_mutation).await;
-    let _ = tokio::fs::remove_file(&staged).await;
     finalized?;
+    cleanup_roster_staging_artifacts_durable(state, &staged).await?;
     Ok(next)
 }
 
@@ -12802,6 +13244,43 @@ mod tests {
             std::fs::read(&blocked.destination).unwrap(),
             b"foreign project rules\n"
         );
+
+        let disabled = disabled_destination(Path::new(&plan.destination)).unwrap();
+        let managed = b"managed disabled roster\n";
+        std::fs::write(&disabled, managed).unwrap();
+        let disabled_record = AgentRosterInstallRecord {
+            tool: "aider".into(),
+            scope: crate::types::Scope::Project,
+            project_path: canonical_project.to_string_lossy().into_owned(),
+            dest: plan.destination.clone(),
+            members: plan.members.clone(),
+            rendered_hash: render::sha256_hex(managed),
+            disabled_path: Some(disabled.to_string_lossy().into_owned()),
+            installed_at: "2026-08-17T00:00:00Z".into(),
+        };
+        save_rosters_for_state(&state, std::slice::from_ref(&disabled_record))
+            .await
+            .unwrap();
+        let disabled_drift = build_roster_plan(
+            &state,
+            plan.members
+                .iter()
+                .map(|member| member.reference.clone())
+                .collect(),
+            "aider".into(),
+            canonical_project.to_string_lossy().into_owned(),
+            "update",
+        )
+        .await
+        .unwrap();
+        assert!(disabled_drift
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("Enable")));
+        assert_eq!(
+            std::fs::read(&disabled_drift.destination).unwrap(),
+            b"foreign project rules\n"
+        );
     }
 
     #[tokio::test]
@@ -13197,6 +13676,296 @@ mod tests {
         recover_agent_operations(&state).await.unwrap();
 
         assert!(!orphan.exists());
+    }
+
+    #[derive(Clone, Copy)]
+    enum UnjournaledRosterCrashPoint {
+        AfterPrepare,
+        AfterFilesystem,
+        AfterLedger,
+        MixedState,
+        TamperedIntent,
+    }
+
+    async fn assert_unjournaled_roster_operation_recovers_exactly(
+        crash_point: UnjournaledRosterCrashPoint,
+    ) {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project.join("CONVENTIONS.md");
+        let previous_bytes = b"old roster";
+        let next_bytes = b"new roster";
+        std::fs::write(&destination, previous_bytes).unwrap();
+        let mut previous = roster_record(2);
+        previous.project_path = project.to_string_lossy().into_owned();
+        previous.dest = destination.to_string_lossy().into_owned();
+        previous.rendered_hash = render::sha256_hex(previous_bytes);
+        let mut next = previous.clone();
+        next.rendered_hash = render::sha256_hex(next_bytes);
+        next.members[0].source_hash = "c".repeat(64);
+        next.installed_at = "2026-08-17T01:00:00Z".into();
+        let identity = roster_identity(&previous);
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        std::fs::create_dir_all(app_data.path().join("state")).unwrap();
+        save_registered_projects(app_data.path(), std::slice::from_ref(&project))
+            .await
+            .unwrap();
+        save_rosters_for_state(&state, std::slice::from_ref(&previous))
+            .await
+            .unwrap();
+        assert!(state.completed_state_database().await.unwrap().is_none());
+        for index in 0..MAX_AGENT_HISTORY_ENTRIES {
+            history::create_roster_snapshot(
+                app_data.path(),
+                &identity,
+                std::slice::from_ref(&destination),
+                &previous,
+                &format!("2026-08-17T00:00:{index:02}Z"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let history_before = history_tree_bytes(app_data.path());
+        let mutation = history::begin_roster_snapshot(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&destination),
+            &previous,
+            "2026-08-17T02:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        let staging = PathBuf::from(mutation.staging_path());
+        mutation
+            .prepare_unjournaled_operation(&previous, Some(&next))
+            .await
+            .unwrap();
+        if matches!(
+            crash_point,
+            UnjournaledRosterCrashPoint::AfterFilesystem | UnjournaledRosterCrashPoint::AfterLedger
+        ) {
+            atomic_write(&destination, next_bytes).await.unwrap();
+        }
+        if matches!(crash_point, UnjournaledRosterCrashPoint::AfterLedger) {
+            save_rosters_for_state(&state, std::slice::from_ref(&next))
+                .await
+                .unwrap();
+        }
+        if matches!(crash_point, UnjournaledRosterCrashPoint::MixedState) {
+            atomic_write(&destination, b"foreign roster edit")
+                .await
+                .unwrap();
+        }
+        if matches!(crash_point, UnjournaledRosterCrashPoint::TamperedIntent) {
+            let intent_path = staging.join("unjournaled-intent.json");
+            let mut intent: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&intent_path).unwrap()).unwrap();
+            intent["phase"] = serde_json::Value::String("committed".into());
+            atomic_write(&intent_path, &serde_json::to_vec_pretty(&intent).unwrap())
+                .await
+                .unwrap();
+        }
+        drop(mutation);
+
+        if matches!(
+            crash_point,
+            UnjournaledRosterCrashPoint::MixedState | UnjournaledRosterCrashPoint::TamperedIntent
+        ) {
+            assert!(recover_agent_operations(&state).await.is_err());
+            assert!(recover_agent_operations(&state).await.is_err());
+            let expected = if matches!(crash_point, UnjournaledRosterCrashPoint::MixedState) {
+                b"foreign roster edit".as_slice()
+            } else {
+                previous_bytes.as_slice()
+            };
+            assert_eq!(std::fs::read(&destination).unwrap(), expected);
+            assert_eq!(
+                load_rosters_for_state(&state).await.unwrap(),
+                vec![previous.clone()]
+            );
+            assert!(staging.exists());
+            assert_eq!(history_tree_bytes(app_data.path()), history_before);
+            return;
+        }
+        recover_agent_operations(&state).await.unwrap();
+        recover_agent_operations(&state).await.unwrap();
+
+        assert!(!staging.exists());
+        let aborted = matches!(crash_point, UnjournaledRosterCrashPoint::AfterPrepare);
+        let expected_record = if aborted { &previous } else { &next };
+        let expected_bytes: &[u8] = if aborted { previous_bytes } else { next_bytes };
+        assert_eq!(std::fs::read(&destination).unwrap(), expected_bytes);
+        assert_eq!(
+            load_rosters_for_state(&state).await.unwrap(),
+            vec![expected_record.clone()]
+        );
+        let snapshots = history::list_snapshots(app_data.path(), &identity)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.len(), MAX_AGENT_HISTORY_ENTRIES);
+        if aborted {
+            assert_eq!(history_tree_bytes(app_data.path()), history_before);
+        } else {
+            assert_eq!(snapshots[0].roster_record.as_ref(), Some(&previous));
+        }
+        let indexed = snapshots
+            .iter()
+            .map(|snapshot| PathBuf::from(&snapshot.content_path))
+            .collect::<std::collections::BTreeSet<_>>();
+        let directory = history::history_directory(app_data.path(), &identity);
+        let physical = std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(physical, indexed);
+    }
+
+    #[tokio::test]
+    async fn unjournaled_roster_crash_after_prepare_aborts_without_history() {
+        assert_unjournaled_roster_operation_recovers_exactly(
+            UnjournaledRosterCrashPoint::AfterPrepare,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unjournaled_roster_crash_after_filesystem_finishes_ledger_and_history() {
+        assert_unjournaled_roster_operation_recovers_exactly(
+            UnjournaledRosterCrashPoint::AfterFilesystem,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unjournaled_roster_crash_after_ledger_finishes_history_once() {
+        assert_unjournaled_roster_operation_recovers_exactly(
+            UnjournaledRosterCrashPoint::AfterLedger,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unjournaled_roster_recovery_fails_closed_on_mixed_state() {
+        assert_unjournaled_roster_operation_recovers_exactly(
+            UnjournaledRosterCrashPoint::MixedState,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unjournaled_roster_recovery_fails_closed_on_tampered_phase() {
+        assert_unjournaled_roster_operation_recovers_exactly(
+            UnjournaledRosterCrashPoint::TamperedIntent,
+        )
+        .await;
+    }
+
+    async fn assert_unjournaled_missing_roster_write_recovers(
+        previous_exists: bool,
+        crash_point: UnjournaledRosterCrashPoint,
+    ) {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project.join("CONVENTIONS.md");
+        let mut previous = roster_record(2);
+        previous.project_path = project.to_string_lossy().into_owned();
+        previous.dest = destination.to_string_lossy().into_owned();
+        previous.rendered_hash = render::sha256_hex(b"missing old roster");
+        let mut next = previous.clone();
+        next.rendered_hash = render::sha256_hex(b"new roster");
+        next.members[0].source_hash = "c".repeat(64);
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        std::fs::create_dir_all(app_data.path().join("state")).unwrap();
+        save_registered_projects(app_data.path(), std::slice::from_ref(&project))
+            .await
+            .unwrap();
+        if previous_exists {
+            save_rosters_for_state(&state, std::slice::from_ref(&previous))
+                .await
+                .unwrap();
+        }
+        let staged = stage_roster_bytes(app_data.path(), b"new roster")
+            .await
+            .unwrap();
+        prepare_unjournaled_roster_write(
+            &state,
+            true,
+            previous_exists.then_some(&previous),
+            &next,
+            &staged,
+        )
+        .await
+        .unwrap();
+        let intent =
+            unjournaled_roster_write_intent_path(app_data.path(), &staged.to_string_lossy())
+                .unwrap();
+        if matches!(
+            crash_point,
+            UnjournaledRosterCrashPoint::AfterFilesystem | UnjournaledRosterCrashPoint::AfterLedger
+        ) {
+            publish_roster_bytes(&destination, b"new roster", previous_exists)
+                .await
+                .unwrap();
+            sync_parent_directory_entry(&destination).unwrap();
+        }
+        if matches!(crash_point, UnjournaledRosterCrashPoint::AfterLedger) {
+            save_rosters_for_state(&state, std::slice::from_ref(&next))
+                .await
+                .unwrap();
+        }
+
+        recover_agent_operations(&state).await.unwrap();
+        recover_agent_operations(&state).await.unwrap();
+
+        assert!(!intent.exists());
+        assert!(!staged.exists());
+        if matches!(crash_point, UnjournaledRosterCrashPoint::AfterPrepare) {
+            assert!(!destination.exists());
+            let expected = if previous_exists {
+                vec![previous]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(load_rosters_for_state(&state).await.unwrap(), expected);
+        } else {
+            assert_eq!(std::fs::read(destination).unwrap(), b"new roster");
+            assert_eq!(load_rosters_for_state(&state).await.unwrap(), vec![next]);
+        }
+    }
+
+    #[tokio::test]
+    async fn unjournaled_new_roster_crash_after_prepare_aborts_cleanly() {
+        assert_unjournaled_missing_roster_write_recovers(
+            false,
+            UnjournaledRosterCrashPoint::AfterPrepare,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unjournaled_new_roster_crash_after_filesystem_finishes_ledger() {
+        assert_unjournaled_missing_roster_write_recovers(
+            false,
+            UnjournaledRosterCrashPoint::AfterFilesystem,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unjournaled_missing_update_crash_after_ledger_finishes_once() {
+        assert_unjournaled_missing_roster_write_recovers(
+            true,
+            UnjournaledRosterCrashPoint::AfterLedger,
+        )
+        .await;
     }
 
     #[tokio::test]

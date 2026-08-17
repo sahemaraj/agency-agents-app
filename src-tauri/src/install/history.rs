@@ -26,15 +26,43 @@ struct SnapshotManifest {
     roster_record_hash: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum UnjournaledRosterOperationPhase {
+    Prepared,
+    FilesystemApplied,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UnjournaledRosterHistoryIntent {
+    phase: UnjournaledRosterOperationPhase,
     identity: AgentInstallIdentity,
     snapshot_id: String,
     retired_snapshot_ids: Vec<String>,
     previous_index_hash: Option<String>,
     next_index_hash: String,
     expected_record: AgentRosterInstallRecord,
+    previous_record: AgentRosterInstallRecord,
+    next_record: Option<AgentRosterInstallRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyUnjournaledRosterHistoryIntent {
+    identity: AgentInstallIdentity,
+    snapshot_id: String,
+    retired_snapshot_ids: Vec<String>,
+    previous_index_hash: Option<String>,
+    next_index_hash: String,
+    expected_record: AgentRosterInstallRecord,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UnjournaledRosterHistoryDocument {
+    Current(Box<UnjournaledRosterHistoryIntent>),
+    Legacy(Box<LegacyUnjournaledRosterHistoryIntent>),
 }
 
 pub(super) struct RosterHistoryMutation {
@@ -103,7 +131,11 @@ impl RosterHistoryMutation {
         crate::render::sha256_hex(&self.next_index)
     }
 
-    pub(super) async fn prepare_unjournaled_publication(&self) -> Result<(), AppError> {
+    pub(super) async fn prepare_unjournaled_operation(
+        &self,
+        previous_record: &AgentRosterInstallRecord,
+        next_record: Option<&AgentRosterInstallRecord>,
+    ) -> Result<(), AppError> {
         self.validate_owned_paths()?;
         let expected_record =
             self.snapshot
@@ -113,23 +145,50 @@ impl RosterHistoryMutation {
                     message: "Unjournaled Agent roster history lost its roster metadata".into(),
                 })?;
         let intent = UnjournaledRosterHistoryIntent {
+            phase: UnjournaledRosterOperationPhase::Prepared,
             identity: self.identity.clone(),
             snapshot_id: self.snapshot.id.clone(),
             retired_snapshot_ids: self.retired_snapshot_ids(),
             previous_index_hash: self.previous_index_hash(),
             next_index_hash: self.next_index_hash(),
             expected_record,
+            previous_record: previous_record.clone(),
+            next_record: next_record.cloned(),
         };
-        let bytes = serde_json::to_vec_pretty(&intent).map_err(|error| AppError::Internal {
-            message: format!("serialize unjournaled Agent roster history intent: {error}"),
-        })?;
-        atomic_write(
-            &self.staging_directory.join(UNJOURNALED_INTENT_FILE),
-            &bytes,
-        )
-        .await
+        validate_unjournaled_intent(&intent)?;
+        write_unjournaled_intent(&self.staging_directory, &intent).await
     }
 
+    pub(super) async fn mark_unjournaled_filesystem_applied(&self) -> Result<(), AppError> {
+        self.validate_owned_paths()?;
+        let intent_path = self.staging_directory.join(UNJOURNALED_INTENT_FILE);
+        let bytes = read_capped(&intent_path, MAX_SNAPSHOT_BYTES).await?;
+        let mut intent: UnjournaledRosterHistoryIntent =
+            serde_json::from_slice(&bytes).map_err(|error| AppError::StorageCorrupt {
+                message: format!("parse unjournaled Agent roster history intent: {error}"),
+            })?;
+        validate_unjournaled_intent(&intent)?;
+        if intent.phase != UnjournaledRosterOperationPhase::Prepared {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster operation phase changed".into(),
+            });
+        }
+        intent.phase = UnjournaledRosterOperationPhase::FilesystemApplied;
+        write_unjournaled_intent(&self.staging_directory, &intent).await
+    }
+}
+
+async fn write_unjournaled_intent(
+    staging_directory: &Path,
+    intent: &UnjournaledRosterHistoryIntent,
+) -> Result<(), AppError> {
+    let bytes = serde_json::to_vec_pretty(&intent).map_err(|error| AppError::Internal {
+        message: format!("serialize unjournaled Agent roster history intent: {error}"),
+    })?;
+    atomic_write(&staging_directory.join(UNJOURNALED_INTENT_FILE), &bytes).await
+}
+
+impl RosterHistoryMutation {
     pub(super) async fn publish(&mut self) -> Result<(), AppError> {
         if self.published {
             return Ok(());
@@ -650,17 +709,20 @@ pub(super) async fn cleanup_roster_staging(
             });
         }
     }
-    tokio::fs::remove_dir_all(path)
+    tokio::fs::remove_dir_all(&path)
         .await
         .map_err(|error| AppError::Io {
             message: format!("remove Agent roster history staging: {error}"),
-        })
+        })?;
+    sync_parent_directory_entry(&path)
 }
 
-fn validate_unjournaled_intent(intent: &UnjournaledRosterHistoryIntent) -> Result<(), AppError> {
+fn validate_unjournaled_identity(
+    identity: &AgentInstallIdentity,
+    expected_record: &AgentRosterInstallRecord,
+) -> Result<(), AppError> {
     let project_path =
-        intent
-            .identity
+        identity
             .project_path
             .as_deref()
             .ok_or_else(|| AppError::StorageCorrupt {
@@ -668,13 +730,13 @@ fn validate_unjournaled_intent(intent: &UnjournaledRosterHistoryIntent) -> Resul
             })?;
     let expected_relative_path = format!(
         "projects/{}.md",
-        crate::render::sha256_hex(intent.expected_record.project_path.as_bytes())
+        crate::render::sha256_hex(expected_record.project_path.as_bytes())
     );
-    if intent.identity.scope != Scope::Project
-        || project_path != intent.expected_record.project_path
-        || intent.identity.tool != intent.expected_record.tool
-        || intent.identity.reference.source_id != format!("roster:{}", intent.expected_record.tool)
-        || intent.identity.reference.relative_path != expected_relative_path
+    if identity.scope != Scope::Project
+        || project_path != expected_record.project_path
+        || identity.tool != expected_record.tool
+        || identity.reference.source_id != format!("roster:{}", expected_record.tool)
+        || identity.reference.relative_path != expected_relative_path
     {
         return Err(AppError::StorageCorrupt {
             message: "Unjournaled Agent roster history identity changed".into(),
@@ -683,9 +745,74 @@ fn validate_unjournaled_intent(intent: &UnjournaledRosterHistoryIntent) -> Resul
     Ok(())
 }
 
-pub(super) async fn recover_unjournaled_roster_publications(
+fn validate_unjournaled_intent(intent: &UnjournaledRosterHistoryIntent) -> Result<(), AppError> {
+    validate_unjournaled_identity(&intent.identity, &intent.expected_record)?;
+    if intent.expected_record.tool != intent.previous_record.tool
+        || intent.expected_record.scope != intent.previous_record.scope
+        || intent.expected_record.project_path != intent.previous_record.project_path
+        || intent.expected_record.dest != intent.previous_record.dest
+        || intent.expected_record.members != intent.previous_record.members
+        || intent.expected_record.disabled_path != intent.previous_record.disabled_path
+        || intent.expected_record.installed_at != intent.previous_record.installed_at
+        || intent.next_record.as_ref().is_some_and(|next| {
+            next.tool != intent.previous_record.tool
+                || next.project_path != intent.previous_record.project_path
+        })
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Unjournaled Agent roster history identity changed".into(),
+        });
+    }
+    Ok(())
+}
+
+fn roster_file_state_matches(
+    record: Option<&AgentRosterInstallRecord>,
+    active_hash: Option<&str>,
+    disabled_hash: Option<&str>,
+) -> bool {
+    match record {
+        Some(record) if record.disabled_path.is_some() => {
+            active_hash.is_none() && disabled_hash == Some(record.rendered_hash.as_str())
+        }
+        Some(record) => {
+            active_hash == Some(record.rendered_hash.as_str()) && disabled_hash.is_none()
+        }
+        None => active_hash.is_none() && disabled_hash.is_none(),
+    }
+}
+
+async fn recover_unjournaled_roster_publication(
     app_data_dir: &Path,
+    staging_path: &str,
+    intent: &UnjournaledRosterHistoryIntent,
 ) -> Result<(), AppError> {
+    recover_roster_publication(
+        app_data_dir,
+        &intent.identity,
+        &intent.snapshot_id,
+        &intent.retired_snapshot_ids,
+        staging_path,
+        intent.previous_index_hash.as_deref(),
+        &intent.next_index_hash,
+        &intent.expected_record,
+    )
+    .await
+}
+
+async fn finalize_recovered_unjournaled_roster(
+    app_data_dir: &Path,
+    staging_path: &str,
+    intent: &UnjournaledRosterHistoryIntent,
+) -> Result<(), AppError> {
+    commit_roster_retention(app_data_dir, &intent.identity, &intent.retired_snapshot_ids).await?;
+    cleanup_roster_staging(app_data_dir, staging_path).await
+}
+
+pub(super) async fn recover_unjournaled_roster_operations(
+    state: &crate::state::AppState,
+) -> Result<(), AppError> {
+    let app_data_dir = &state.app_data_dir;
     let root = app_owned_directory(app_data_dir, &["state", "roster-history-staging"], false)?;
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -747,25 +874,140 @@ pub(super) async fn recover_unjournaled_roster_publications(
             Ok(_) => {}
         }
         let bytes = read_capped(&intent_path, MAX_SNAPSHOT_BYTES).await?;
-        let intent: UnjournaledRosterHistoryIntent =
+        let document: UnjournaledRosterHistoryDocument =
             serde_json::from_slice(&bytes).map_err(|error| AppError::StorageCorrupt {
                 message: format!("parse unjournaled Agent roster history intent: {error}"),
             })?;
+        let intent = match document {
+            UnjournaledRosterHistoryDocument::Current(intent) => *intent,
+            UnjournaledRosterHistoryDocument::Legacy(intent) => {
+                let intent = *intent;
+                validate_unjournaled_identity(&intent.identity, &intent.expected_record)?;
+                recover_roster_publication(
+                    app_data_dir,
+                    &intent.identity,
+                    &intent.snapshot_id,
+                    &intent.retired_snapshot_ids,
+                    &staging_path,
+                    intent.previous_index_hash.as_deref(),
+                    &intent.next_index_hash,
+                    &intent.expected_record,
+                )
+                .await?;
+                commit_roster_retention(
+                    app_data_dir,
+                    &intent.identity,
+                    &intent.retired_snapshot_ids,
+                )
+                .await?;
+                cleanup_roster_staging(app_data_dir, &staging_path).await?;
+                continue;
+            }
+        };
         validate_unjournaled_intent(&intent)?;
-        recover_roster_publication(
-            app_data_dir,
-            &intent.identity,
-            &intent.snapshot_id,
-            &intent.retired_snapshot_ids,
-            &staging_path,
-            intent.previous_index_hash.as_deref(),
-            &intent.next_index_hash,
-            &intent.expected_record,
-        )
-        .await?;
-        commit_roster_retention(app_data_dir, &intent.identity, &intent.retired_snapshot_ids)
-            .await?;
-        cleanup_roster_staging(app_data_dir, &staging_path).await?;
+        super::validate_roster_record(&intent.previous_record).map_err(|_| {
+            AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster previous metadata is invalid".into(),
+            }
+        })?;
+        if let Some(next) = &intent.next_record {
+            super::validate_roster_record(next).map_err(|_| AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster next metadata is invalid".into(),
+            })?;
+        }
+        let (active, disabled) =
+            super::validated_recovery_roster_paths(state, &intent.previous_record).await?;
+        if let Some(next) = &intent.next_record {
+            let next_paths = super::validated_recovery_roster_paths(state, next).await?;
+            if next_paths != (active.clone(), disabled.clone()) {
+                return Err(AppError::StorageCorrupt {
+                    message: "Unjournaled Agent roster destinations changed".into(),
+                });
+            }
+        }
+        let active_hash = super::recovery_file_hash(&active)?;
+        let disabled_hash = super::recovery_file_hash(&disabled)?;
+        let files_are_previous = roster_file_state_matches(
+            Some(&intent.expected_record),
+            active_hash.as_deref(),
+            disabled_hash.as_deref(),
+        );
+        let files_are_next = roster_file_state_matches(
+            intent.next_record.as_ref(),
+            active_hash.as_deref(),
+            disabled_hash.as_deref(),
+        );
+        let mut rosters = super::load_rosters_for_state(state).await?;
+        let matching = rosters
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| super::same_roster_install(record, &intent.previous_record))
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            return Err(AppError::StorageCorrupt {
+                message: "Unjournaled Agent roster ledger contains duplicate identity rows".into(),
+            });
+        }
+        let ledger_is_previous = matching.first().is_some_and(|(_, record)| {
+            super::exact_roster_install(record, &intent.previous_record)
+        });
+        let ledger_is_next = match (&intent.next_record, matching.first()) {
+            (Some(next), Some((_, record))) => super::exact_roster_install(record, next),
+            (None, None) => true,
+            _ => false,
+        };
+
+        match intent.phase {
+            UnjournaledRosterOperationPhase::Prepared
+                if files_are_previous && ledger_is_previous =>
+            {
+                cleanup_roster_staging(app_data_dir, &staging_path).await?;
+            }
+            UnjournaledRosterOperationPhase::Prepared if files_are_next && ledger_is_previous => {
+                recover_unjournaled_roster_publication(app_data_dir, &staging_path, &intent)
+                    .await?;
+                let index = matching[0].0;
+                match &intent.next_record {
+                    Some(next) => rosters[index] = next.clone(),
+                    None => {
+                        rosters.remove(index);
+                    }
+                }
+                rosters.sort_by(|left, right| {
+                    left.project_path
+                        .cmp(&right.project_path)
+                        .then_with(|| left.tool.cmp(&right.tool))
+                });
+                super::save_rosters_for_state(state, &rosters).await?;
+                let mut applied = intent.clone();
+                applied.phase = UnjournaledRosterOperationPhase::FilesystemApplied;
+                write_unjournaled_intent(&staging, &applied).await?;
+                finalize_recovered_unjournaled_roster(app_data_dir, &staging_path, &applied)
+                    .await?;
+            }
+            UnjournaledRosterOperationPhase::Prepared if files_are_next && ledger_is_next => {
+                recover_unjournaled_roster_publication(app_data_dir, &staging_path, &intent)
+                    .await?;
+                let mut applied = intent.clone();
+                applied.phase = UnjournaledRosterOperationPhase::FilesystemApplied;
+                write_unjournaled_intent(&staging, &applied).await?;
+                finalize_recovered_unjournaled_roster(app_data_dir, &staging_path, &applied)
+                    .await?;
+            }
+            UnjournaledRosterOperationPhase::FilesystemApplied
+                if files_are_next && ledger_is_next =>
+            {
+                recover_unjournaled_roster_publication(app_data_dir, &staging_path, &intent)
+                    .await?;
+                finalize_recovered_unjournaled_roster(app_data_dir, &staging_path, &intent).await?;
+            }
+            _ => {
+                return Err(AppError::StorageCorrupt {
+                    message: "Unjournaled Agent roster operation found mixed or changed state"
+                        .into(),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -890,6 +1132,23 @@ fn app_owned_directory(
         current = candidate;
     }
     Ok(current)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory_entry(path: &Path) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| AppError::Io {
+        message: format!("Agent history path has no parent: {}", path.display()),
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| AppError::Io {
+            message: format!("sync Agent history directory {}: {error}", parent.display()),
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory_entry(_path: &Path) -> Result<(), AppError> {
+    Ok(())
 }
 
 fn identity_hash(identity: &AgentInstallIdentity) -> Result<String, AppError> {
@@ -1057,6 +1316,7 @@ async fn create_snapshot_from_bytes_protected(
         &["state", "roster-history-staging", &staging_id],
         true,
     )?;
+    sync_parent_directory_entry(&staging_directory)?;
     let staged_snapshot_directory = app_owned_directory(
         app_data_dir,
         &["state", "roster-history-staging", &staging_id, "snapshot"],
@@ -1670,7 +1930,10 @@ mod tests {
         assert_eq!(tree(&directory), before);
     }
 
-    async fn assert_unjournaled_crash_recovery_is_exact(publish_index_before_crash: bool) {
+    async fn assert_unjournaled_crash_recovery_is_exact(
+        publish_index_before_crash: bool,
+        legacy_intent: bool,
+    ) {
         let app_data = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(project.path()).unwrap();
@@ -1700,8 +1963,27 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(mutation.retired_snapshot_ids().len(), 1);
-        mutation.prepare_unjournaled_publication().await.unwrap();
+        mutation
+            .prepare_unjournaled_operation(&record, Some(&record))
+            .await
+            .unwrap();
         let staging = mutation.staging_directory.clone();
+        if legacy_intent {
+            let path = staging.join(UNJOURNALED_INTENT_FILE);
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            for field in ["phase", "previousRecord", "nextRecord"] {
+                document.as_object_mut().unwrap().remove(field);
+            }
+            atomic_write(&path, &serde_json::to_vec_pretty(&document).unwrap())
+                .await
+                .unwrap();
+        } else {
+            mutation
+                .mark_unjournaled_filesystem_applied()
+                .await
+                .unwrap();
+        }
         std::fs::rename(
             &mutation.staged_snapshot_directory,
             &mutation.snapshot_directory,
@@ -1716,6 +1998,12 @@ mod tests {
 
         let mut state = crate::state::AppState::build().unwrap();
         state.app_data_dir = app_data.path().to_path_buf();
+        super::super::save_registered_projects(app_data.path(), std::slice::from_ref(&project))
+            .await
+            .unwrap();
+        super::super::save_rosters_for_state(&state, std::slice::from_ref(&record))
+            .await
+            .unwrap();
         super::super::recover_agent_operations(&state)
             .await
             .unwrap();
@@ -1742,12 +2030,17 @@ mod tests {
 
     #[tokio::test]
     async fn unjournaled_crash_after_snapshot_rename_recovers_index_and_retention_twice() {
-        assert_unjournaled_crash_recovery_is_exact(false).await;
+        assert_unjournaled_crash_recovery_is_exact(false, false).await;
     }
 
     #[tokio::test]
     async fn unjournaled_crash_after_index_publish_recovers_retention_twice() {
-        assert_unjournaled_crash_recovery_is_exact(true).await;
+        assert_unjournaled_crash_recovery_is_exact(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_unjournaled_intent_recovers_after_upgrade() {
+        assert_unjournaled_crash_recovery_is_exact(false, true).await;
     }
 
     #[cfg(unix)]
