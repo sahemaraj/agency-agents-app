@@ -30,6 +30,7 @@
 pub(crate) mod parse;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -152,6 +153,8 @@ const MAX_CATALOG_ACTIVATION_JOURNAL_BYTES: u64 = 32 * 1024;
 const MAX_CATALOG_ACTIVATION_ENTRIES: usize = 16_384;
 const MAX_CATALOG_ACTIVATION_DEPTH: usize = 32;
 const MAX_CATALOG_ACTIVATION_BYTES: u64 = MAX_TARBALL_BYTES * 8;
+const MANAGED_OWNERSHIP_MARKER: &str = ".agency-agents-app-owned";
+const MANAGED_OWNERSHIP_BYTES: &[u8] = b"agency-agents-app managed catalog v1\n";
 
 /// Version string recorded for the bundled baseline before any refresh
 /// has resolved a commit SHA.
@@ -2191,6 +2194,30 @@ fn validate_catalog_activation_sibling(
     Ok(())
 }
 
+fn validate_managed_activation_tree_if_present(path: &Path) -> Result<(), AppError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("inspect managed activation tree: {error}"),
+            });
+        }
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "managed activation tree must be a real directory".into(),
+        });
+    }
+    validate_managed_ownership_marker(path).map_err(|error| AppError::StorageCorrupt {
+        message: format!("managed activation ownership is invalid: {error}"),
+    })?;
+    Ok(())
+}
+
 fn validate_catalog_activation_record(
     app_data_dir: &Path,
     record: &CatalogActivationRecord,
@@ -2204,6 +2231,13 @@ fn validate_catalog_activation_record(
         return Err(AppError::StorageCorrupt {
             message: "catalog activation record has an invalid schema or source".into(),
         });
+    }
+    if let CatalogSource::Managed { path } = &record.source {
+        validate_managed_source_path(Path::new(path)).map_err(|error| {
+            AppError::StorageCorrupt {
+                message: format!("managed activation source is not app-owned: {error}"),
+            }
+        })?;
     }
     let expected_catalog = catalog_root(app_data_dir, &record.source);
     let expected_index = index_path(app_data_dir);
@@ -2230,6 +2264,15 @@ fn validate_catalog_activation_record(
         }
         validate_catalog_activation_sibling(live, staged, "staging")?;
         validate_catalog_activation_sibling(live, backup, "backup")?;
+    }
+    if matches!(record.source, CatalogSource::Managed { .. }) {
+        for path in [
+            Path::new(&record.catalog.live),
+            Path::new(&record.catalog.staged),
+            Path::new(&record.catalog.backup),
+        ] {
+            validate_managed_activation_tree_if_present(path)?;
+        }
     }
     let paths = record
         .artifacts()
@@ -2328,6 +2371,18 @@ fn validate_snapshot_replacement_source(
             message: "a user clone can only be updated with git; snapshot replacement is disabled"
                 .into(),
         });
+    }
+    if let CatalogSource::Managed { path } = source {
+        let configured = Path::new(path);
+        validate_managed_source_path(configured)?;
+        if configured != root {
+            return Err(AppError::InvalidArgument {
+                message: "managed catalog source and replacement target do not match".into(),
+            });
+        }
+        if root.exists() && !is_empty_dir(root) {
+            validate_managed_ownership_marker(root)?;
+        }
     }
     if has_git_dir(root) {
         return Err(AppError::InvalidArgument {
@@ -2622,6 +2677,10 @@ fn recover_catalog_activation(app_data_dir: &Path) -> Result<bool, AppError> {
     Ok(true)
 }
 
+pub(crate) fn recover_catalog_activation_at_startup(app_data_dir: &Path) -> Result<bool, AppError> {
+    recover_catalog_activation(app_data_dir)
+}
+
 async fn apply_catalog_activation(
     app_data_dir: &Path,
     record: &mut CatalogActivationRecord,
@@ -2709,6 +2768,18 @@ async fn refresh_from_tarball(
             return Err(error);
         }
     };
+    if matches!(source, CatalogSource::Managed { .. }) {
+        if !looks_like_catalog(&staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(AppError::InvalidArgument {
+                message: "staged managed catalog is missing required tooling".into(),
+            });
+        }
+        if let Err(error) = write_managed_ownership_marker(&staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
+    }
     let fetched_at = chrono::Utc::now().to_rfc3339();
     corpus.meta.fetched_at = fetched_at.clone();
 
@@ -3113,6 +3184,91 @@ fn home_agency_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".agency-agents"))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_MANAGED_ROOT: PathBuf;
+}
+
+fn managed_root_authority() -> Result<PathBuf, AppError> {
+    #[cfg(test)]
+    if let Ok(path) = TEST_MANAGED_ROOT.try_with(Clone::clone) {
+        return Ok(path);
+    }
+    home_agency_dir().ok_or_else(|| AppError::Io {
+        message: "cannot resolve managed catalog directory".into(),
+    })
+}
+
+#[cfg(test)]
+async fn with_test_managed_root<F>(root: PathBuf, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEST_MANAGED_ROOT.scope(root, future).await
+}
+
+fn validate_managed_source_path(path: &Path) -> Result<(), AppError> {
+    let expected = managed_root_authority()?;
+    if path != expected {
+        return Err(AppError::InvalidArgument {
+            message: format!(
+                "managed catalog path must be the app-owned location {}",
+                expected.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn managed_ownership_marker(root: &Path) -> PathBuf {
+    root.join(MANAGED_OWNERSHIP_MARKER)
+}
+
+fn validate_managed_ownership_marker(root: &Path) -> Result<(), AppError> {
+    validate_real_directory(root, "managed catalog root")?;
+    let marker = managed_ownership_marker(root);
+    let metadata =
+        std::fs::symlink_metadata(&marker).map_err(|error| AppError::InvalidArgument {
+            message: format!("managed catalog ownership marker is unavailable: {error}"),
+        })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+        || metadata.len() != MANAGED_OWNERSHIP_BYTES.len() as u64
+    {
+        return Err(AppError::InvalidArgument {
+            message: "managed catalog ownership marker must be an exact regular file".into(),
+        });
+    }
+    let bytes = std::fs::read(&marker).map_err(|error| AppError::Io {
+        message: format!("read managed catalog ownership marker: {error}"),
+    })?;
+    if bytes != MANAGED_OWNERSHIP_BYTES {
+        return Err(AppError::InvalidArgument {
+            message: "managed catalog ownership marker has invalid content".into(),
+        });
+    }
+    Ok(())
+}
+
+fn write_managed_ownership_marker(root: &Path) -> Result<(), AppError> {
+    validate_real_directory(root, "managed catalog root")?;
+    let marker = managed_ownership_marker(root);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|error| AppError::Io {
+            message: format!("create managed catalog ownership marker: {error}"),
+        })?;
+    file.write_all(MANAGED_OWNERSHIP_BYTES)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| AppError::Io {
+            message: format!("write managed catalog ownership marker: {error}"),
+        })?;
+    validate_managed_ownership_marker(root)
+}
+
 /// Is a `git` binary on PATH? Determines clone/pull vs tarball-snapshot.
 async fn git_available() -> bool {
     run_git(&["--version"], None).await.is_ok()
@@ -3202,11 +3358,12 @@ async fn detect_catalogs(scan: bool) -> CatalogDetection {
     };
 
     if let Some(managed) = home_agency_dir() {
-        push(
-            candidate_for(&managed, "managed"),
-            &mut candidates,
-            &mut seen,
-        );
+        let kind = if validate_managed_ownership_marker(&managed).is_ok() {
+            "managed"
+        } else {
+            "userClone"
+        };
+        push(candidate_for(&managed, kind), &mut candidates, &mut seen);
     }
 
     if scan {
@@ -3268,13 +3425,16 @@ fn validate_managed_provision_target(path: &Path) -> Result<(), AppError> {
             ),
         });
     }
-    if !is_empty_dir(path) && !looks_like_catalog(path) {
-        return Err(AppError::InvalidArgument {
-            message: format!(
-                "refusing to provision into non-empty unowned target {}",
-                path.display()
-            ),
-        });
+    if !is_empty_dir(path) {
+        validate_managed_ownership_marker(path)?;
+        if !looks_like_catalog(path) {
+            return Err(AppError::InvalidArgument {
+                message: format!(
+                    "refusing to provision into non-catalog owned target {}",
+                    path.display()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -3284,7 +3444,11 @@ async fn provision_managed_from_tarball(
     path: &Path,
     bytes: &[u8],
 ) -> Result<(), AppError> {
+    validate_managed_source_path(path)?;
     validate_managed_provision_target(path)?;
+    if path.exists() && is_empty_dir(path) {
+        write_managed_ownership_marker(path)?;
+    }
     let source = CatalogSource::Managed {
         path: path.to_string_lossy().into_owned(),
     };
@@ -3298,7 +3462,7 @@ async fn provision_managed(app_data_dir: &Path) -> Result<PathBuf, AppError> {
         message: "cannot resolve home directory".into(),
     })?;
     validate_managed_provision_target(&path)?;
-    if looks_like_catalog(&path) {
+    if looks_like_catalog(&path) && validate_managed_ownership_marker(&path).is_ok() {
         return Ok(path); // already provisioned
     }
 
@@ -3308,10 +3472,22 @@ async fn provision_managed(app_data_dir: &Path) -> Result<PathBuf, AppError> {
         // Full clone (not shallow) so commit history is available for accurate
         // behind/ahead counts and diff stats in the Catalog status panel.
         run_git(&["clone", CATALOG_GIT_URL, &path.to_string_lossy()], None).await?;
+        if !looks_like_catalog(&path) {
+            return Err(AppError::InvalidArgument {
+                message: "cloned managed catalog is missing required tooling".into(),
+            });
+        }
+        write_managed_ownership_marker(&path)?;
     } else if git_available().await && empty {
         // Full clone (not shallow) so commit history is available for accurate
         // behind/ahead counts and diff stats in the Catalog status panel.
         run_git(&["clone", CATALOG_GIT_URL, &path.to_string_lossy()], None).await?;
+        if !looks_like_catalog(&path) {
+            return Err(AppError::InvalidArgument {
+                message: "cloned managed catalog is missing required tooling".into(),
+            });
+        }
+        write_managed_ownership_marker(&path)?;
     } else {
         // No git (or a non-empty target): validate a complete snapshot in a
         // sibling staging directory before replacing the managed root.
@@ -3416,6 +3592,18 @@ pub(crate) async fn ensure_corpus(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<Arc<Corpus>, AppError> {
+    let adir = app_data_dir(app)?;
+    let bdir = baseline_dir(app)?;
+    ensure_corpus_at(&adir, &bdir, state).await
+}
+
+async fn ensure_corpus_at(
+    app_data_dir: &Path,
+    baseline_dir: &Path,
+    state: &AppState,
+) -> Result<Arc<Corpus>, AppError> {
+    let _flight = state.corpus_refresh_in_flight.lock().await;
+    recover_catalog_activation(app_data_dir)?;
     // Hold the cache lock across the ENTIRE init — check, seed, parse, store.
     // The frontend fires corpus_list + corpus_categories (+ corpus_status)
     // concurrently on mount; a released-lock double-check would let each run
@@ -3426,9 +3614,7 @@ pub(crate) async fn ensure_corpus(
     if let Some(c) = cached.as_ref() {
         return Ok(Arc::clone(c));
     }
-    let adir = app_data_dir(app)?;
-    let bdir = baseline_dir(app)?;
-    let corpus = Arc::new(resolve_active(&adir, &bdir).await);
+    let corpus = Arc::new(resolve_active(app_data_dir, baseline_dir).await);
     *cached = Some(Arc::clone(&corpus));
     Ok(corpus)
 }
@@ -3474,28 +3660,36 @@ pub async fn catalog_configured(app: AppHandle) -> Result<bool, AppError> {
 /// rebuild + swap the in-memory corpus so every view reflects the new source.
 /// Validates that a `Managed`/`UserClone` path exists and looks like a catalog
 /// (has at least one known category dir or `scripts/convert.sh`).
+fn validate_catalog_source_selection(source: &CatalogSource) -> Result<(), AppError> {
+    // Managed is an app-owned identity, never a caller-selected synonym for
+    // UserClone.
+    if let CatalogSource::Managed { path } = source {
+        let root = PathBuf::from(path);
+        validate_managed_source_path(&root)?;
+        validate_managed_ownership_marker(&root)?;
+        if !looks_like_catalog(&root) {
+            return Err(AppError::InvalidArgument {
+                message: format!("{path} is missing required agency-agents tooling"),
+            });
+        }
+    } else if let CatalogSource::UserClone { path, .. } = source {
+        let root = PathBuf::from(path);
+        if !looks_like_catalog(&root) {
+            return Err(AppError::InvalidArgument {
+                message: format!("{path} is not a real agency-agents checkout"),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn catalog_source_set(
     app: AppHandle,
     state: State<'_, AppState>,
     source: CatalogSource,
 ) -> Result<CorpusMeta, AppError> {
-    // Validate non-bundled roots before committing to them.
-    if let CatalogSource::Managed { path } | CatalogSource::UserClone { path, .. } = &source {
-        let root = PathBuf::from(path);
-        if !root.is_dir() {
-            return Err(AppError::InvalidArgument {
-                message: format!("catalog path is not a directory: {path}"),
-            });
-        }
-        if !looks_like_catalog(&root) {
-            return Err(AppError::InvalidArgument {
-                message: format!(
-                    "{path} doesn't look like an agency-agents catalog (no scripts/convert.sh or category dirs)"
-                ),
-            });
-        }
-    }
+    validate_catalog_source_selection(&source)?;
 
     let _flight =
         state
@@ -4217,19 +4411,53 @@ fn playbook_catalog(root: &Path) -> Result<Vec<PlaybookCatalogEntry>, AppError> 
     Ok(documents)
 }
 
+fn validate_catalog_source_for_direct_read(source: &CatalogSource) -> Result<(), AppError> {
+    match source {
+        CatalogSource::Bundled => Ok(()),
+        CatalogSource::Managed { path } => {
+            let root = Path::new(path);
+            validate_managed_source_path(root)?;
+            validate_managed_ownership_marker(root)?;
+            if !looks_like_catalog(root) {
+                return Err(AppError::InvalidArgument {
+                    message: "managed catalog is missing required tooling".into(),
+                });
+            }
+            Ok(())
+        }
+        CatalogSource::UserClone { path, .. } => {
+            if !looks_like_catalog(Path::new(path)) {
+                return Err(AppError::InvalidArgument {
+                    message: "user catalog is not a real agency-agents checkout".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 /// `runbooks_list()` — the NEXUS runbook manifest from the active catalog's
 /// `strategy/runbooks.json`. Empty when the catalog is the bundled snapshot or an
 /// unsynced/pre-#664 clone (no `strategy/` on disk) — the UI treats empty as
 /// "sync to unlock", not an error. Local-only (no network).
-#[tauri::command]
-pub async fn runbooks_list(app: AppHandle) -> Result<Vec<Runbook>, AppError> {
-    let adir = app_data_dir(&app)?;
-    let source = load_catalog_source(&adir).await;
-    let root = catalog_root(&adir, &source);
+async fn runbooks_list_from_app_data(
+    app_data_dir: &Path,
+    state: &AppState,
+) -> Result<Vec<Runbook>, AppError> {
+    let _flight = state.corpus_refresh_in_flight.lock().await;
+    recover_catalog_activation(app_data_dir)?;
+    let source = load_catalog_source_checked(app_data_dir).await?;
+    validate_catalog_source_for_direct_read(&source)?;
+    let root = catalog_root(app_data_dir, &source);
     let path = root.join("strategy").join("runbooks.json");
     let raw = match tokio::fs::read_to_string(&path).await {
         Ok(r) => r,
-        Err(_) => return Ok(Vec::new()), // no strategy/ (bundled / unsynced) → empty
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("read strategy/runbooks.json: {error}"),
+            });
+        }
     };
     let file: RunbooksFile = serde_json::from_str(&raw).map_err(|e| AppError::Io {
         message: format!("parse strategy/runbooks.json: {e}"),
@@ -4237,15 +4465,54 @@ pub async fn runbooks_list(app: AppHandle) -> Result<Vec<Runbook>, AppError> {
     Ok(file.runbooks)
 }
 
+pub(crate) async fn runbooks_list_for_state(state: &AppState) -> Result<Vec<Runbook>, AppError> {
+    runbooks_list_from_app_data(&state.app_data_dir, state).await
+}
+
 #[tauri::command]
-pub async fn playbooks_list(app: AppHandle) -> Result<Vec<PlaybookCatalogEntry>, AppError> {
+pub async fn runbooks_list(app: AppHandle) -> Result<Vec<Runbook>, AppError> {
     let adir = app_data_dir(&app)?;
-    let source = load_catalog_source_checked(&adir).await?;
-    let root = catalog_root(&adir, &source);
+    let state = app.state::<AppState>();
+    runbooks_list_from_app_data(&adir, &state).await
+}
+
+async fn playbooks_list_from_app_data(
+    app_data_dir: &Path,
+    state: &AppState,
+) -> Result<Vec<PlaybookCatalogEntry>, AppError> {
+    let _flight = state.corpus_refresh_in_flight.lock().await;
+    recover_catalog_activation(app_data_dir)?;
+    let source = load_catalog_source_checked(app_data_dir).await?;
+    validate_catalog_source_for_direct_read(&source)?;
+    let root = catalog_root(app_data_dir, &source);
     tauri::async_runtime::spawn_blocking(move || playbook_catalog(&root))
         .await
         .map_err(|error| AppError::Internal {
             message: format!("playbook catalog task failed: {error}"),
+        })?
+}
+
+#[tauri::command]
+pub async fn playbooks_list(app: AppHandle) -> Result<Vec<PlaybookCatalogEntry>, AppError> {
+    let adir = app_data_dir(&app)?;
+    let state = app.state::<AppState>();
+    playbooks_list_from_app_data(&adir, &state).await
+}
+
+async fn playbook_read_from_app_data(
+    app_data_dir: &Path,
+    state: &AppState,
+    relative_path: String,
+) -> Result<PlaybookDocument, AppError> {
+    let _flight = state.corpus_refresh_in_flight.lock().await;
+    recover_catalog_activation(app_data_dir)?;
+    let source = load_catalog_source_checked(app_data_dir).await?;
+    validate_catalog_source_for_direct_read(&source)?;
+    let root = catalog_root(app_data_dir, &source);
+    tauri::async_runtime::spawn_blocking(move || read_playbook(&root, &relative_path))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("playbook read task failed: {error}"),
         })?
 }
 
@@ -4255,24 +4522,41 @@ pub async fn playbook_read(
     relative_path: String,
 ) -> Result<PlaybookDocument, AppError> {
     let adir = app_data_dir(&app)?;
-    let source = load_catalog_source_checked(&adir).await?;
-    let root = catalog_root(&adir, &source);
-    tauri::async_runtime::spawn_blocking(move || read_playbook(&root, &relative_path))
-        .await
-        .map_err(|error| AppError::Internal {
-            message: format!("playbook read task failed: {error}"),
-        })?
+    let state = app.state::<AppState>();
+    playbook_read_from_app_data(&adir, &state, relative_path).await
 }
 
 /// Heuristic: does `root` hold an agency-agents catalog? True if it has the
 /// repo tooling or at least one of the canonical category dirs with agents.
 fn looks_like_catalog(root: &Path) -> bool {
-    if root.join("scripts").join("convert.sh").exists() {
-        return true;
+    let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
+        return false;
+    };
+    if !root_metadata.is_dir()
+        || root_metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&root_metadata)
+    {
+        return false;
     }
-    bundled_division_meta()
-        .keys()
-        .any(|c| root.join(c).is_dir())
+    let scripts = root.join("scripts");
+    let Ok(scripts_metadata) = std::fs::symlink_metadata(&scripts) else {
+        return false;
+    };
+    if !scripts_metadata.is_dir()
+        || scripts_metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&scripts_metadata)
+    {
+        return false;
+    }
+    let converter = scripts.join("convert.sh");
+    let Ok(converter_metadata) = std::fs::symlink_metadata(converter) else {
+        return false;
+    };
+    converter_metadata.is_file()
+        && !converter_metadata.file_type().is_symlink()
+        && !crate::skills::metadata_is_reparse_point(&converter_metadata)
+        && converter_metadata.len() > 0
+        && converter_metadata.len() <= MAX_AGENT_BYTES
 }
 
 /// `corpus_list(category?)` — list view (bodies omitted).
@@ -6046,16 +6330,16 @@ echo done
     }
 
     #[test]
-    fn looks_like_catalog_detects_tooling_or_categories() {
+    fn catalog_identity_requires_real_conversion_tooling_not_a_category_heuristic() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(
             !looks_like_catalog(tmp.path()),
             "empty dir is not a catalog"
         );
-        // A category dir is enough.
+        // A category-looking directory is foreign content, not catalog identity.
         std::fs::create_dir_all(tmp.path().join("engineering")).unwrap();
-        assert!(looks_like_catalog(tmp.path()));
-        // …or the tooling.
+        assert!(!looks_like_catalog(tmp.path()));
+        // The repository's real conversion tooling establishes catalog shape.
         let tmp2 = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp2.path().join("scripts")).unwrap();
         std::fs::write(
@@ -6064,6 +6348,136 @@ echo done
         )
         .unwrap();
         assert!(looks_like_catalog(tmp2.path()));
+    }
+
+    fn write_catalog_tooling(root: &Path) {
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(
+            root.join("scripts/convert.sh"),
+            "AGENT_DIRS=(engineering)\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_target_rejects_missing_ownership_marker() {
+        let app_data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_catalog_tooling(root.path());
+        let source = CatalogSource::Managed {
+            path: root.path().to_string_lossy().into_owned(),
+        };
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/replacement.md",
+            b"---\nname: Replacement\n---\nReplacement\n",
+        )]);
+
+        let error = with_test_managed_root(root.path().to_path_buf(), async {
+            refresh_from_tarball(app_data.path(), &source, &tar).await
+        })
+        .await
+        .expect_err("conversion tooling alone must not establish app ownership");
+        assert!(error.to_string().contains("ownership"));
+        assert_eq!(
+            std::fs::read(root.path().join("scripts/convert.sh")).unwrap(),
+            b"AGENT_DIRS=(engineering)\n"
+        );
+        assert!(!root.path().join("engineering/replacement.md").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_target_rejects_tampered_ownership_marker() {
+        let app_data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_catalog_tooling(root.path());
+        std::fs::write(
+            root.path().join(".agency-agents-app-owned"),
+            b"attacker-controlled\n",
+        )
+        .unwrap();
+        let source = CatalogSource::Managed {
+            path: root.path().to_string_lossy().into_owned(),
+        };
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/replacement.md",
+            b"---\nname: Replacement\n---\nReplacement\n",
+        )]);
+
+        let error = with_test_managed_root(root.path().to_path_buf(), async {
+            refresh_from_tarball(app_data.path(), &source, &tar).await
+        })
+        .await
+        .expect_err("marker bytes must match the exact ownership contract");
+        assert!(error.to_string().contains("ownership"));
+        assert_eq!(
+            std::fs::read(root.path().join(".agency-agents-app-owned")).unwrap(),
+            b"attacker-controlled\n"
+        );
+        assert!(!root.path().join("engineering/replacement.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_target_rejects_a_linked_ownership_marker() {
+        use std::os::unix::fs::symlink;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_catalog_tooling(root.path());
+        std::fs::write(
+            outside.path().join("marker"),
+            b"agency-agents-app managed catalog v1\n",
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("marker"),
+            root.path().join(".agency-agents-app-owned"),
+        )
+        .unwrap();
+        let source = CatalogSource::Managed {
+            path: root.path().to_string_lossy().into_owned(),
+        };
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/replacement.md",
+            b"---\nname: Replacement\n---\nReplacement\n",
+        )]);
+
+        let error = with_test_managed_root(root.path().to_path_buf(), async {
+            refresh_from_tarball(app_data.path(), &source, &tar).await
+        })
+        .await
+        .expect_err("ownership markers must be regular non-link files");
+        assert!(error.to_string().contains("ownership"));
+        assert_eq!(
+            std::fs::read(outside.path().join("marker")).unwrap(),
+            b"agency-agents-app managed catalog v1\n"
+        );
+        assert!(!root.path().join("engineering/replacement.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_ownership_rejects_a_linked_catalog_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        write_catalog_tooling(target.path());
+        std::fs::write(
+            target.path().join(MANAGED_OWNERSHIP_MARKER),
+            MANAGED_OWNERSHIP_BYTES,
+        )
+        .unwrap();
+        let linked_root = parent.path().join(".agency-agents");
+        symlink(target.path(), &linked_root).unwrap();
+
+        validate_managed_ownership_marker(&linked_root)
+            .expect_err("a linked managed root must never establish destructive ownership");
+        assert_eq!(
+            std::fs::read(target.path().join(MANAGED_OWNERSHIP_MARKER)).unwrap(),
+            MANAGED_OWNERSHIP_BYTES
+        );
     }
 
     #[test]
@@ -6077,6 +6491,7 @@ echo done
         write_agent(root, "engineering", "b", "B", "y");
         write_agent(root, "design", "c", "C", "z");
         std::fs::write(root.join("engineering/README.md"), "# readme").unwrap();
+        write_catalog_tooling(root);
 
         assert_eq!(quick_agent_count(root), 3, "README excluded; 3 real agents");
         let cand = candidate_for(root, "userClone").unwrap();
@@ -6277,6 +6692,11 @@ echo done
         )
         .unwrap();
         std::fs::write(managed.path().join("keep.txt"), b"original user content\n").unwrap();
+        std::fs::write(
+            managed.path().join(MANAGED_OWNERSHIP_MARKER),
+            MANAGED_OWNERSHIP_BYTES,
+        )
+        .unwrap();
         let source = CatalogSource::Managed {
             path: managed.path().to_string_lossy().into_owned(),
         };
@@ -6285,9 +6705,11 @@ echo done
             b"---\nname: Reviewer\n---\nReplacement\n",
         )]);
 
-        let error = refresh_from_tarball(app_data.path(), &source, &tar)
-            .await
-            .expect_err("a git checkout must never fall back to snapshot replacement");
+        let error = with_test_managed_root(managed.path().to_path_buf(), async {
+            refresh_from_tarball(app_data.path(), &source, &tar).await
+        })
+        .await
+        .expect_err("a git checkout must never fall back to snapshot replacement");
 
         assert!(error.to_string().contains("git checkout"));
         assert_eq!(
@@ -6299,6 +6721,56 @@ echo done
             b"original user content\n"
         );
         assert!(!managed.path().join("engineering/reviewer.md").exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_refresh_rejects_an_arbitrary_managed_path_without_mutation() {
+        let app_data = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        write_catalog_tooling(victim.path());
+        std::fs::write(
+            victim.path().join("keep.txt"),
+            b"arbitrary path stays byte exact\n",
+        )
+        .unwrap();
+        let source = CatalogSource::Managed {
+            path: victim.path().to_string_lossy().into_owned(),
+        };
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nReplacement\n",
+        )]);
+
+        let error = refresh_from_tarball(app_data.path(), &source, &tar)
+            .await
+            .expect_err("Managed must be bound to the app's canonical managed root");
+
+        assert!(error.to_string().contains("managed"));
+        assert_eq!(
+            std::fs::read(victim.path().join("keep.txt")).unwrap(),
+            b"arbitrary path stays byte exact\n"
+        );
+        assert!(!victim.path().join("engineering/reviewer.md").exists());
+    }
+
+    #[test]
+    fn arbitrary_catalog_paths_must_be_selected_as_user_clones_not_managed() {
+        let root = tempfile::tempdir().unwrap();
+        write_catalog_tooling(root.path());
+        std::fs::write(
+            root.path().join(MANAGED_OWNERSHIP_MARKER),
+            MANAGED_OWNERSHIP_BYTES,
+        )
+        .unwrap();
+        let path = root.path().to_string_lossy().into_owned();
+
+        let managed = CatalogSource::Managed { path: path.clone() };
+        assert!(validate_catalog_source_selection(&managed).is_err());
+        let user_clone = CatalogSource::UserClone {
+            path,
+            manage: false,
+        };
+        assert!(validate_catalog_source_selection(&user_clone).is_ok());
     }
 
     #[tokio::test]
@@ -6345,19 +6817,29 @@ echo done
             ("agency-agents-main/examples/oversized.md", &oversized),
         ]);
 
-        provision_managed_from_tarball(app_data.path(), &managed, &invalid_tar)
-            .await
-            .expect_err("a late invalid entry must reject the complete provision");
+        with_test_managed_root(managed.clone(), async {
+            provision_managed_from_tarball(app_data.path(), &managed, &invalid_tar).await
+        })
+        .await
+        .expect_err("a late invalid entry must reject the complete provision");
         assert!(!looks_like_catalog(&managed));
         assert!(!managed.join("engineering/reviewer.md").exists());
 
-        let valid_tar = test_catalog_tar(&[(
-            "agency-agents-main/engineering/reviewer.md",
-            b"---\nname: Reviewer\n---\nComplete\n",
-        )]);
-        provision_managed_from_tarball(app_data.path(), &managed, &valid_tar)
-            .await
-            .unwrap();
+        let valid_tar = test_catalog_tar(&[
+            (
+                "agency-agents-main/engineering/reviewer.md",
+                b"---\nname: Reviewer\n---\nComplete\n",
+            ),
+            (
+                "agency-agents-main/scripts/convert.sh",
+                b"AGENT_DIRS=(engineering)\n",
+            ),
+        ]);
+        with_test_managed_root(managed.clone(), async {
+            provision_managed_from_tarball(app_data.path(), &managed, &valid_tar).await
+        })
+        .await
+        .unwrap();
 
         let source = CatalogSource::Managed {
             path: managed.to_string_lossy().into_owned(),
@@ -6366,6 +6848,10 @@ echo done
             .await
             .unwrap();
         assert!(looks_like_catalog(&managed));
+        assert_eq!(
+            std::fs::read(managed.join(MANAGED_OWNERSHIP_MARKER)).unwrap(),
+            MANAGED_OWNERSHIP_BYTES
+        );
         assert_eq!(selected.count(), 1);
         assert_eq!(selected.agents[0].body, "Complete\n");
     }
@@ -6382,11 +6868,13 @@ echo done
             b"---\nname: Reviewer\n---\nComplete\n",
         )]);
 
-        let error = provision_managed_from_tarball(app_data.path(), &managed, &valid_tar)
-            .await
-            .expect_err("a nonempty non-catalog target must not be claimed by provisioning");
+        let error = with_test_managed_root(managed.clone(), async {
+            provision_managed_from_tarball(app_data.path(), &managed, &valid_tar).await
+        })
+        .await
+        .expect_err("a nonempty non-catalog target must not be claimed by provisioning");
 
-        assert!(error.to_string().contains("non-empty"));
+        assert!(error.to_string().contains("ownership"));
         assert_eq!(
             std::fs::read(managed.join("foreign.txt")).unwrap(),
             b"foreign bytes stay exact\n"
@@ -6461,7 +6949,6 @@ echo done
     #[tokio::test]
     async fn startup_recovers_a_crash_between_catalog_backup_and_publish_idempotently() {
         let app_data = tempfile::tempdir().unwrap();
-        let baseline = tempfile::tempdir().unwrap();
         let live = corpus_dir(app_data.path());
         std::fs::create_dir_all(live.join("engineering")).unwrap();
         std::fs::write(
@@ -6483,18 +6970,14 @@ echo done
             .expect_err("the test must stop after preserving the previous catalog");
         assert!(!live.exists());
 
-        let first = resolve_active(app_data.path(), baseline.path()).await;
-        assert_eq!(first.count(), 1);
-        assert_eq!(first.agents[0].name, "Original");
+        assert!(recover_catalog_activation_at_startup(app_data.path()).unwrap());
         assert_eq!(
             std::fs::read(live.join("engineering/original.md")).unwrap(),
             b"---\nname: Original\n---\nOriginal\n"
         );
         assert!(!live.join("engineering/reviewer.md").exists());
 
-        let second = resolve_active(app_data.path(), baseline.path()).await;
-        assert_eq!(second.count(), 1);
-        assert_eq!(second.agents[0].name, "Original");
+        assert!(!recover_catalog_activation_at_startup(app_data.path()).unwrap());
         assert!(std::fs::read_dir(app_data.path()).unwrap().all(|entry| {
             entry
                 .ok()
@@ -6503,6 +6986,275 @@ echo done
                     !name.starts_with(".corpus.backup-") && !name.starts_with(".corpus.staging-")
                 })
         }));
+    }
+
+    #[tokio::test]
+    async fn cached_corpus_reader_recovers_pending_activation_before_returning() {
+        let app_data = tempfile::tempdir().unwrap();
+        let baseline = tempfile::tempdir().unwrap();
+        let live = corpus_dir(app_data.path());
+        std::fs::create_dir_all(live.join("engineering")).unwrap();
+        std::fs::write(
+            live.join("engineering/original.md"),
+            b"---\nname: Original\n---\nOriginal\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(state_dir(app_data.path())).unwrap();
+        std::fs::write(index_path(app_data.path()), b"old index\n").unwrap();
+        std::fs::write(meta_path(app_data.path()), b"old meta\n").unwrap();
+        let tar = test_catalog_tar(&[(
+            "agency-agents-main/engineering/reviewer.md",
+            b"---\nname: Reviewer\n---\nReplacement\n",
+        )]);
+        inject_catalog_crash_after_backup();
+        refresh_from_tarball(app_data.path(), &CatalogSource::Bundled, &tar)
+            .await
+            .expect_err("the fixture must retain a pending backup-gap journal");
+        assert!(!live.exists());
+
+        let state = test_app_state(app_data.path(), false);
+        let cached = Arc::new(empty_corpus(BASELINE_VERSION, &bundled_division_slugs()));
+        *state.corpus_cache.lock().await = Some(Arc::clone(&cached));
+
+        let selected = ensure_corpus_at(app_data.path(), baseline.path(), &state)
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&selected, &cached));
+        assert_eq!(
+            std::fs::read(live.join("engineering/original.md")).unwrap(),
+            b"---\nname: Original\n---\nOriginal\n"
+        );
+        assert!(!catalog_activation_path(app_data.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn runbook_and_playbook_readers_wait_for_recovery_and_see_only_the_old_snapshot() {
+        let app_data = tempfile::tempdir().unwrap();
+        let live = corpus_dir(app_data.path());
+        std::fs::create_dir_all(live.join("engineering")).unwrap();
+        std::fs::create_dir_all(live.join("strategy")).unwrap();
+        std::fs::write(
+            live.join("engineering/original.md"),
+            b"---\nname: Original\n---\nOriginal\n",
+        )
+        .unwrap();
+        std::fs::write(live.join("strategy/original.md"), b"# Original playbook\n").unwrap();
+        std::fs::write(
+            live.join("strategy/runbooks.json"),
+            br#"{"runbooks":[{"slug":"original","title":"Original","mode":"safe","duration":"now","summary":"old","doc":"strategy/original.md","roster":[]}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(state_dir(app_data.path())).unwrap();
+        std::fs::write(index_path(app_data.path()), b"old index\n").unwrap();
+        std::fs::write(meta_path(app_data.path()), b"old meta\n").unwrap();
+        let tar = test_catalog_tar(&[
+            (
+                "agency-agents-main/engineering/reviewer.md",
+                b"---\nname: Reviewer\n---\nReplacement\n",
+            ),
+            (
+                "agency-agents-main/strategy/replacement.md",
+                b"# Replacement playbook\n",
+            ),
+            (
+                "agency-agents-main/strategy/runbooks.json",
+                br#"{"runbooks":[]}"#,
+            ),
+        ]);
+        inject_catalog_crash_after_backup();
+        refresh_from_tarball(app_data.path(), &CatalogSource::Bundled, &tar)
+            .await
+            .expect_err("the fixture must retain a pending backup-gap journal");
+        assert!(!live.exists());
+
+        let state = Arc::new(test_app_state(app_data.path(), false));
+        let writer = Arc::clone(&state.corpus_refresh_in_flight)
+            .lock_owned()
+            .await;
+        let runbook_path = app_data.path().to_path_buf();
+        let runbook_state = Arc::clone(&state);
+        let mut runbook_reader = tokio::spawn(async move {
+            runbooks_list_from_app_data(&runbook_path, &runbook_state).await
+        });
+        let playbook_path = app_data.path().to_path_buf();
+        let playbook_state = Arc::clone(&state);
+        let mut playbook_reader = tokio::spawn(async move {
+            playbooks_list_from_app_data(&playbook_path, &playbook_state).await
+        });
+        let document_path = app_data.path().to_path_buf();
+        let document_state = Arc::clone(&state);
+        let mut document_reader = tokio::spawn(async move {
+            playbook_read_from_app_data(
+                &document_path,
+                &document_state,
+                "strategy/original.md".into(),
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut runbook_reader)
+                .await
+                .is_err(),
+            "runbook reader must wait while the catalog writer owns the lock"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut playbook_reader)
+                .await
+                .is_err(),
+            "playbook reader must wait while the catalog writer owns the lock"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut document_reader)
+                .await
+                .is_err(),
+            "playbook document reader must wait while the catalog writer owns the lock"
+        );
+        drop(writer);
+
+        let runbooks = runbook_reader.await.unwrap().unwrap();
+        assert_eq!(runbooks.len(), 1);
+        assert_eq!(runbooks[0].slug, "original");
+        let playbooks = playbook_reader.await.unwrap().unwrap();
+        assert_eq!(playbooks.len(), 1);
+        assert_eq!(playbooks[0].relative_path, "strategy/original.md");
+        let document = document_reader.await.unwrap().unwrap();
+        assert_eq!(document.content, "# Original playbook\n");
+        assert!(!catalog_activation_path(app_data.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn runbook_and_playbook_readers_fail_closed_on_a_corrupt_recovery_record() {
+        let app_data = tempfile::tempdir().unwrap();
+        let live = corpus_dir(app_data.path());
+        std::fs::create_dir_all(live.join("strategy")).unwrap();
+        std::fs::write(live.join("strategy/visible.md"), b"# Must stay hidden\n").unwrap();
+        std::fs::write(live.join("strategy/runbooks.json"), br#"{"runbooks":[]}"#).unwrap();
+        std::fs::create_dir_all(state_dir(app_data.path())).unwrap();
+        std::fs::write(catalog_activation_path(app_data.path()), b"{forged").unwrap();
+        let state = test_app_state(app_data.path(), false);
+
+        assert!(runbooks_list_from_app_data(app_data.path(), &state)
+            .await
+            .is_err());
+        assert!(playbooks_list_from_app_data(app_data.path(), &state)
+            .await
+            .is_err());
+        assert!(
+            playbook_read_from_app_data(app_data.path(), &state, "strategy/visible.md".into(),)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(live.join("strategy/visible.md")).unwrap(),
+            b"# Must stay hidden\n"
+        );
+        assert!(catalog_activation_path(app_data.path()).exists());
+    }
+
+    #[test]
+    fn forged_managed_journal_cannot_mutate_an_arbitrary_catalog_path() {
+        let app_data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(state_dir(app_data.path())).unwrap();
+        std::fs::write(index_path(app_data.path()), b"old index\n").unwrap();
+        std::fs::write(meta_path(app_data.path()), b"old meta\n").unwrap();
+        let index_staged = staged_catalog_path(&index_path(app_data.path()), "staging").unwrap();
+        let meta_staged = staged_catalog_path(&meta_path(app_data.path()), "staging").unwrap();
+        std::fs::write(&index_staged, b"new index\n").unwrap();
+        std::fs::write(&meta_staged, b"new meta\n").unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let victim = parent.path().join("foreign-catalog");
+        std::fs::create_dir_all(victim.join("engineering")).unwrap();
+        write_catalog_tooling(&victim);
+        std::fs::write(
+            victim.join(MANAGED_OWNERSHIP_MARKER),
+            MANAGED_OWNERSHIP_BYTES,
+        )
+        .unwrap();
+        std::fs::write(victim.join("engineering/original.md"), b"original bytes\n").unwrap();
+        let staged = staged_catalog_path(&victim, "staging").unwrap();
+        std::fs::create_dir_all(staged.join("engineering")).unwrap();
+        write_catalog_tooling(&staged);
+        std::fs::write(
+            staged.join(MANAGED_OWNERSHIP_MARKER),
+            MANAGED_OWNERSHIP_BYTES,
+        )
+        .unwrap();
+        std::fs::write(
+            staged.join("engineering/replacement.md"),
+            b"replacement bytes\n",
+        )
+        .unwrap();
+
+        let mut record = CatalogActivationRecord {
+            schema_version: CATALOG_ACTIVATION_SCHEMA_VERSION,
+            phase: CatalogActivationPhase::Prepared,
+            source: CatalogSource::Managed {
+                path: victim.to_string_lossy().into_owned(),
+            },
+            catalog: plan_catalog_activation_artifact(
+                CatalogActivationArtifactKind::Directory,
+                &victim,
+                &staged,
+            )
+            .unwrap(),
+            index: plan_catalog_activation_artifact(
+                CatalogActivationArtifactKind::File,
+                &index_path(app_data.path()),
+                &index_staged,
+            )
+            .unwrap(),
+            meta: plan_catalog_activation_artifact(
+                CatalogActivationArtifactKind::File,
+                &meta_path(app_data.path()),
+                &meta_staged,
+            )
+            .unwrap(),
+        };
+        let backup = PathBuf::from(&record.catalog.backup);
+        std::fs::rename(&victim, &backup).unwrap();
+        std::fs::rename(&staged, &victim).unwrap();
+        record.phase = CatalogActivationPhase::CatalogActivated;
+        std::fs::write(
+            catalog_activation_path(app_data.path()),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+
+        recover_catalog_activation(app_data.path())
+            .expect_err("a forged Managed source must fail before recovery mutates any path");
+
+        assert_eq!(
+            std::fs::read(victim.join("engineering/replacement.md")).unwrap(),
+            b"replacement bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(backup.join("engineering/original.md")).unwrap(),
+            b"original bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(index_path(app_data.path())).unwrap(),
+            b"old index\n"
+        );
+        assert_eq!(
+            std::fs::read(meta_path(app_data.path())).unwrap(),
+            b"old meta\n"
+        );
+        assert!(index_staged.exists());
+        assert!(meta_staged.exists());
+        assert!(catalog_activation_path(app_data.path()).exists());
+    }
+
+    #[test]
+    fn managed_activation_journal_rejects_an_existing_unmarked_directory() {
+        let empty = tempfile::tempdir().unwrap();
+
+        validate_managed_activation_tree_if_present(empty.path())
+            .expect_err("an existing Managed journal tree must carry exact app ownership");
+        assert!(empty.path().is_dir());
+        assert!(is_empty_dir(empty.path()));
     }
 
     #[tokio::test]

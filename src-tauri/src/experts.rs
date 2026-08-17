@@ -969,32 +969,13 @@ async fn catalog_agents(state: &AppState) -> Result<Vec<crate::types::CorpusEntr
 }
 
 async fn catalog_runbooks(state: &AppState) -> Result<Vec<ExpertContextRunbook>, AppError> {
-    #[derive(Deserialize)]
-    struct File {
-        #[serde(default)]
-        runbooks: Vec<Row>,
-    }
-    #[derive(Deserialize)]
-    struct Row {
-        slug: String,
-        title: String,
-        summary: String,
-    }
-    let root = crate::corpus::active_catalog_root_at(&state.app_data_dir).await;
-    let path = root.join("strategy").join("runbooks.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = read_capped(&path, MAX_FILE_BYTES).await?;
-    let file: File = serde_json::from_slice(&raw)
-        .map_err(|error| invalid(format!("parse runbooks: {error}")))?;
-    Ok(file
-        .runbooks
+    Ok(crate::corpus::runbooks_list_for_state(state)
+        .await?
         .into_iter()
-        .map(|row| ExpertContextRunbook {
-            slug: row.slug,
-            title: row.title,
-            summary: row.summary,
+        .map(|runbook| ExpertContextRunbook {
+            slug: runbook.slug,
+            title: runbook.title,
+            summary: runbook.summary,
         })
         .collect())
 }

@@ -1069,6 +1069,10 @@ pub(crate) async fn recover_filesystem_operations(
     app: &tauri::AppHandle,
     state: &AppState,
 ) -> Result<(), AppError> {
+    {
+        let _catalog = state.corpus_refresh_in_flight.lock().await;
+        crate::corpus::recover_catalog_activation_at_startup(&state.app_data_dir)?;
+    }
     if state.completed_state_database().await?.is_none() {
         return Ok(());
     }
