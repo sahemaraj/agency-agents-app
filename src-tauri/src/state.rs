@@ -380,12 +380,26 @@ impl AppState {
         if action == McpAction::Read && project_path.is_none() {
             return Ok(None);
         }
-        let loaded = settings::load_async(&self.app_data_dir).await;
-        {
-            let mut guard = self.settings.write().await;
-            *guard = loaded.clone();
-        }
-        let identity = match &loaded {
+        self.authorize_mcp_client_with_load(client, action, project_path, || {
+            settings::load_async(&self.app_data_dir)
+        })
+        .await
+    }
+
+    async fn authorize_mcp_client_with_load<F, Fut>(
+        &self,
+        client: &str,
+        action: McpAction,
+        project_path: Option<&str>,
+        load: F,
+    ) -> Result<Option<AuthorizedMcpProject>, AppError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = SettingsLoadState>,
+    {
+        let mut guard = self.settings.write().await;
+        *guard = load().await;
+        let identity = match &*guard {
             SettingsLoadState::Loaded(policy) => {
                 authorize_mcp_for_client(policy, client, action, project_path)
             }
@@ -397,6 +411,7 @@ impl AppState {
             ),
             SettingsLoadState::Corrupt { .. } => Err(mcp_denied(action)),
         }?;
+        drop(guard);
         identity.map(open_authorized_mcp_project).transpose()
     }
 }
@@ -1805,6 +1820,75 @@ mcp_audit|state/mcp-audit.jsonl|1|1048576|jsonl|mcp_audit"
             SettingsLoadState::Corrupt { .. }
         ));
         assert!(state.authorize_mcp(McpAction::Read, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn completed_strict_cannot_be_followed_by_stale_mcp_authority() {
+        let app = tempfile::tempdir().expect("app data");
+        let permissive = Settings {
+            mcp_source_access: true,
+            ..Settings::default()
+        };
+        settings::persist(app.path(), permissive.clone())
+            .await
+            .expect("seed permissive policy");
+        let state = Arc::new(AppState {
+            app_data_dir: app.path().to_path_buf(),
+            corpus_cache: Arc::new(Mutex::new(None)),
+            corpus_refresh_in_flight: Arc::new(Mutex::new(())),
+            skill_sources_write_lock: Arc::new(Mutex::new(())),
+            skill_installs_write_lock: Arc::new(Mutex::new(())),
+            skill_folders_write_lock: Arc::new(Mutex::new(())),
+            settings: Arc::new(RwLock::new(SettingsLoadState::Loaded(permissive.clone()))),
+            updater_state: crate::commands::updater::empty_state(),
+        });
+        let load_started = Arc::new(tokio::sync::Notify::new());
+        let release_load = Arc::new(tokio::sync::Notify::new());
+        let authorize_state = Arc::clone(&state);
+        let started = Arc::clone(&load_started);
+        let release = Arc::clone(&release_load);
+        let authorize = tokio::spawn(async move {
+            authorize_state
+                .authorize_mcp_client_with_load(
+                    "claude",
+                    McpAction::Source,
+                    None,
+                    move || async move {
+                        started.notify_one();
+                        release.notified().await;
+                        SettingsLoadState::Loaded(permissive)
+                    },
+                )
+                .await
+        });
+
+        load_started.notified().await;
+        assert!(
+            state.settings.try_write().is_err(),
+            "authorization must hold the settings write lock before loading policy"
+        );
+        let strict_state = Arc::clone(&state);
+        let strict = tokio::spawn(async move {
+            crate::commands::settings::security_posture_apply_inner(
+                &strict_state,
+                crate::commands::settings::SecurityPosturePreset::Strict,
+            )
+            .await
+        });
+        release_load.notify_one();
+        authorize.await.unwrap().expect("pre-Strict authorization");
+        strict.await.unwrap().expect("apply Strict");
+
+        assert!(state.require_network("race_regression").await.is_err());
+        assert!(state
+            .authorize_mcp_client("claude", McpAction::Source, None)
+            .await
+            .is_err());
+        assert!(matches!(
+            &*state.settings.read().await,
+            SettingsLoadState::Loaded(settings)
+                if settings.paranoid_mode && !settings.mcp_source_access
+        ));
     }
 
     #[cfg(unix)]
