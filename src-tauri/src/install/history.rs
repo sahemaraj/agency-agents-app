@@ -185,11 +185,36 @@ async fn write_unjournaled_intent(
     let bytes = serde_json::to_vec_pretty(&intent).map_err(|error| AppError::Internal {
         message: format!("serialize unjournaled Agent roster history intent: {error}"),
     })?;
-    atomic_write(&staging_directory.join(UNJOURNALED_INTENT_FILE), &bytes).await
+    let path = staging_directory.join(UNJOURNALED_INTENT_FILE);
+    atomic_write(&path, &bytes).await?;
+    sync_parent_directory_entry(&path)
+}
+
+async fn publish_history_index_after_snapshot_move_with<F>(
+    staged_snapshot: &Path,
+    live_snapshot: &Path,
+    index_path: &Path,
+    index_bytes: &[u8],
+    mut sync_parent: F,
+) -> Result<(), AppError>
+where
+    F: FnMut(&Path) -> Result<(), AppError>,
+{
+    sync_parent(staged_snapshot)?;
+    sync_parent(live_snapshot)?;
+    atomic_write(index_path, index_bytes).await?;
+    sync_parent(index_path)
 }
 
 impl RosterHistoryMutation {
     pub(super) async fn publish(&mut self) -> Result<(), AppError> {
+        self.publish_with_sync(sync_parent_directory_entry).await
+    }
+
+    async fn publish_with_sync<F>(&mut self, mut sync_parent: F) -> Result<(), AppError>
+    where
+        F: FnMut(&Path) -> Result<(), AppError>,
+    {
         if self.published {
             return Ok(());
         }
@@ -229,26 +254,122 @@ impl RosterHistoryMutation {
             }
         }
         self.snapshot_published = true;
-        if let Err(error) = atomic_write(&self.index_path, &self.next_index).await {
-            return match tokio::fs::rename(
-                &self.snapshot_directory,
-                &self.staged_snapshot_directory,
-            )
-            .await
+        let published = publish_history_index_after_snapshot_move_with(
+            &self.staged_snapshot_directory,
+            &self.snapshot_directory,
+            &self.index_path,
+            &self.next_index,
+            |path| sync_parent(path),
+        )
+        .await;
+        match published {
+            Ok(()) => {
+                self.published = true;
+                Ok(())
+            }
+            Err(error) => match self
+                .restore_publication_with_sync(true, &mut sync_parent)
+                .await
             {
-                Ok(()) => {
-                    self.snapshot_published = false;
-                    Err(error)
-                }
+                Ok(()) => Err(error),
                 Err(rollback) => Err(AppError::Internal {
                     message: format!(
-                        "publish Agent roster history index failed: {error}; restore staged snapshot failed: {rollback}"
+                        "publish Agent roster history failed: {error}; restore prior publication failed: {rollback}"
                     ),
                 }),
-            };
+            },
         }
-        self.published = true;
-        Ok(())
+    }
+
+    async fn restore_publication_with_sync<F>(
+        &mut self,
+        restore_index: bool,
+        sync_parent: &mut F,
+    ) -> Result<(), AppError>
+    where
+        F: FnMut(&Path) -> Result<(), AppError>,
+    {
+        let mut failures = Vec::new();
+        if self.published || restore_index {
+            let restored_index = async {
+                match &self.previous_index {
+                    Some(bytes) => atomic_write(&self.index_path, bytes).await?,
+                    None => match tokio::fs::remove_file(&self.index_path).await {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(AppError::Io {
+                                message: format!("remove Agent roster history index: {error}"),
+                            });
+                        }
+                    },
+                }
+                sync_parent(&self.index_path)
+            }
+            .await;
+            match restored_index {
+                Ok(()) => self.published = false,
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if self.snapshot_published {
+            let restored_snapshot = async {
+                let staged = std::fs::symlink_metadata(&self.staged_snapshot_directory);
+                let live = std::fs::symlink_metadata(&self.snapshot_directory);
+                match (staged, live) {
+                    (Err(staged), Ok(_))
+                        if staged.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        tokio::fs::rename(
+                            &self.snapshot_directory,
+                            &self.staged_snapshot_directory,
+                        )
+                        .await
+                        .map_err(|error| AppError::Io {
+                            message: format!(
+                                "restore staged Agent roster snapshot after publication failure: {error}"
+                            ),
+                        })?;
+                    }
+                    (Ok(_), Err(live)) if live.kind() == std::io::ErrorKind::NotFound => {}
+                    (Err(staged), Err(live))
+                        if staged.kind() == std::io::ErrorKind::NotFound
+                            && live.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Err(AppError::StorageCorrupt {
+                            message: "Agent roster publication rollback lost its snapshot".into(),
+                        });
+                    }
+                    (Ok(_), Ok(_)) => {
+                        return Err(AppError::StorageCorrupt {
+                            message: "Agent roster publication rollback found duplicate snapshots"
+                                .into(),
+                        });
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        return Err(AppError::Io {
+                            message: format!(
+                                "inspect Agent roster publication rollback snapshot: {error}"
+                            ),
+                        });
+                    }
+                }
+                sync_parent(&self.snapshot_directory)?;
+                sync_parent(&self.staged_snapshot_directory)
+            }
+            .await;
+            match restored_snapshot {
+                Ok(()) => self.snapshot_published = false,
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Internal {
+                message: failures.join("; "),
+            })
+        }
     }
 
     pub(super) async fn commit(self) -> Result<(), AppError> {
@@ -273,39 +394,17 @@ impl RosterHistoryMutation {
                     });
                 }
             }
+            sync_parent_directory_entry(path)?;
         }
         cleanup_roster_staging(&self.app_data_dir, &self.staging_path()).await?;
         Ok(())
     }
 
-    pub(super) async fn rollback(self) -> Result<(), AppError> {
+    pub(super) async fn rollback(mut self) -> Result<(), AppError> {
         self.validate_owned_paths()?;
         let history_was_absent = self.previous_index.is_none();
-        if self.published {
-            match &self.previous_index {
-                Some(bytes) => atomic_write(&self.index_path, bytes).await?,
-                None => match tokio::fs::remove_file(&self.index_path).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(AppError::Io {
-                            message: format!("remove Agent roster history index: {error}"),
-                        });
-                    }
-                },
-            }
-        }
-        if self.snapshot_published {
-            match tokio::fs::remove_dir_all(&self.snapshot_directory).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(AppError::Io {
-                        message: format!("remove failed Agent roster snapshot: {error}"),
-                    });
-                }
-            }
-        }
+        self.restore_publication_with_sync(false, &mut sync_parent_directory_entry)
+            .await?;
         cleanup_roster_staging(&self.app_data_dir, &self.staging_path()).await?;
         let restored_index = match read_capped(&self.index_path, MAX_SNAPSHOT_BYTES).await {
             Ok(bytes) => Some(bytes),
@@ -337,6 +436,24 @@ pub(super) async fn commit_roster_retention(
     identity: &AgentInstallIdentity,
     retired_snapshot_ids: &[String],
 ) -> Result<(), AppError> {
+    commit_roster_retention_with_sync(
+        app_data_dir,
+        identity,
+        retired_snapshot_ids,
+        sync_parent_directory_entry,
+    )
+    .await
+}
+
+async fn commit_roster_retention_with_sync<F>(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    retired_snapshot_ids: &[String],
+    mut sync_parent: F,
+) -> Result<(), AppError>
+where
+    F: FnMut(&Path) -> Result<(), AppError>,
+{
     if retired_snapshot_ids.is_empty() {
         return Ok(());
     }
@@ -372,7 +489,10 @@ pub(super) async fn commit_roster_retention(
                 });
             }
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                sync_parent(&path)?;
+                continue;
+            }
             Err(error) => {
                 return Err(AppError::Io {
                     message: format!("inspect retired Agent roster snapshot: {error}"),
@@ -388,6 +508,7 @@ pub(super) async fn commit_roster_retention(
                 });
             }
         }
+        sync_parent(&path)?;
     }
     Ok(())
 }
@@ -583,6 +704,8 @@ pub(super) async fn recover_roster_publication(
     let directory =
         app_owned_directory(app_data_dir, &["agents", "history", &identity_hash], false)?;
     let index_path = directory.join("index.json");
+    let staging = validated_roster_staging_directory(app_data_dir, staging_path)?;
+    let staged_snapshot = staging.join("snapshot");
     let current = optional_index_bytes(&index_path).await?;
     let current_hash = index_hash(current.as_deref());
     let final_snapshot = directory.join(snapshot_id);
@@ -612,14 +735,17 @@ pub(super) async fn recover_roster_publication(
                 message: "Published Agent roster preservation changed".into(),
             });
         }
-        return validate_snapshot_directory(&final_snapshot, &identity_hash, &snapshot).await;
+        validate_snapshot_directory(&final_snapshot, &identity_hash, &snapshot).await?;
+        sync_parent_directory_entry(&staged_snapshot)?;
+        sync_parent_directory_entry(&final_snapshot)?;
+        sync_parent_directory_entry(&index_path)?;
+        return Ok(());
     }
     if current_hash.as_deref() != previous_index_hash {
         return Err(AppError::StorageCorrupt {
             message: "Agent roster history changed before recovery publication".into(),
         });
     }
-    let staging = validated_roster_staging_directory(app_data_dir, staging_path)?;
     let staged_index = read_capped(&staging.join("index.json"), MAX_SNAPSHOT_BYTES).await?;
     if crate::render::sha256_hex(&staged_index) != next_index_hash {
         return Err(AppError::StorageCorrupt {
@@ -644,7 +770,6 @@ pub(super) async fn recover_roster_publication(
         expected_record,
         &final_snapshot,
     )?;
-    let staged_snapshot = staging.join("snapshot");
     let (source, must_move) = match (
         std::fs::symlink_metadata(&staged_snapshot),
         std::fs::symlink_metadata(&final_snapshot),
@@ -676,7 +801,14 @@ pub(super) async fn recover_roster_publication(
                 message: format!("recover staged Agent roster snapshot: {error}"),
             })?;
     }
-    atomic_write(&index_path, &staged_index).await?;
+    publish_history_index_after_snapshot_move_with(
+        &staged_snapshot,
+        &final_snapshot,
+        &index_path,
+        &staged_index,
+        sync_parent_directory_entry,
+    )
+    .await?;
     let published = read_capped(&index_path, MAX_SNAPSHOT_BYTES).await?;
     if crate::render::sha256_hex(&published) != next_index_hash {
         return Err(AppError::StorageCorrupt {
@@ -690,6 +822,17 @@ pub(super) async fn cleanup_roster_staging(
     app_data_dir: &Path,
     staging_path: &str,
 ) -> Result<(), AppError> {
+    cleanup_roster_staging_with_sync(app_data_dir, staging_path, sync_parent_directory_entry).await
+}
+
+async fn cleanup_roster_staging_with_sync<F>(
+    app_data_dir: &Path,
+    staging_path: &str,
+    mut sync_parent: F,
+) -> Result<(), AppError>
+where
+    F: FnMut(&Path) -> Result<(), AppError>,
+{
     let path = validated_roster_staging_directory(app_data_dir, staging_path)?;
     match std::fs::symlink_metadata(&path) {
         Ok(metadata)
@@ -709,12 +852,40 @@ pub(super) async fn cleanup_roster_staging(
             });
         }
     }
+    let intent = path.join(UNJOURNALED_INTENT_FILE);
+    let intent_bytes = match read_capped(&intent, MAX_SNAPSHOT_BYTES).await {
+        Ok(bytes) => Some(bytes),
+        Err(AppError::Io { .. }) if !intent.exists() => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(intent_bytes) = intent_bytes {
+        tokio::fs::remove_file(&intent)
+            .await
+            .map_err(|error| AppError::Io {
+                message: format!("remove Agent roster history intent: {error}"),
+            })?;
+        if let Err(error) = sync_parent(&intent) {
+            let restored = async {
+                atomic_write(&intent, &intent_bytes).await?;
+                sync_parent(&intent)
+            }
+            .await;
+            return match restored {
+                Ok(()) => Err(error),
+                Err(restore) => Err(AppError::Internal {
+                    message: format!(
+                        "sync Agent roster history intent deletion failed: {error}; restore intent failed: {restore}"
+                    ),
+                }),
+            };
+        }
+    }
     tokio::fs::remove_dir_all(&path)
         .await
         .map_err(|error| AppError::Io {
             message: format!("remove Agent roster history staging: {error}"),
         })?;
-    sync_parent_directory_entry(&path)
+    sync_parent(&path)
 }
 
 fn validate_unjournaled_identity(
@@ -1662,6 +1833,151 @@ mod tests {
     use crate::types::{
         AgentInstallIdentity, AgentReference, AgentRosterInstallRecord, AgentRosterMember, Scope,
     };
+
+    #[tokio::test]
+    async fn cleanup_sync_failure_restores_history_intent_and_preserves_payload() {
+        let app_data = tempfile::tempdir().unwrap();
+        let app_data_path = std::fs::canonicalize(app_data.path()).unwrap();
+        let staging = app_data_path
+            .join("state/roster-history-staging")
+            .join(Uuid::new_v4().to_string());
+        let payload = staging.join("snapshot/content/0.bin");
+        let intent = staging.join(UNJOURNALED_INTENT_FILE);
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"snapshot").unwrap();
+        std::fs::write(&intent, b"intent").unwrap();
+        let mut sync_attempts = 0;
+
+        let result =
+            cleanup_roster_staging_with_sync(&app_data_path, &staging.to_string_lossy(), |_| {
+                sync_attempts += 1;
+                if sync_attempts == 1 {
+                    Err(AppError::Io {
+                        message: "injected marker parent sync failure".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&intent).unwrap(), b"intent");
+        assert_eq!(std::fs::read(&payload).unwrap(), b"snapshot");
+        assert_eq!(sync_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn history_index_publish_syncs_move_parents_before_index_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let history = root.path().join("history");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&history).unwrap();
+        let staged_snapshot = staging.join("snapshot");
+        let live_snapshot = history.join("snapshot-id");
+        let index = history.join("index.json");
+        let mut events = Vec::new();
+
+        publish_history_index_after_snapshot_move_with(
+            &staged_snapshot,
+            &live_snapshot,
+            &index,
+            b"[]",
+            |path| {
+                events.push((path.to_path_buf(), index.exists()));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                (staged_snapshot, false),
+                (live_snapshot, false),
+                (index.clone(), true),
+            ]
+        );
+        assert_eq!(std::fs::read(index).unwrap(), b"[]");
+    }
+
+    #[tokio::test]
+    async fn retention_retry_syncs_history_parent_when_snapshot_is_already_absent() {
+        let app_data = tempfile::tempdir().unwrap();
+        let app_data_path = std::fs::canonicalize(app_data.path()).unwrap();
+        let identity = identity("builtin:agency-agents");
+        let identity_hash = identity_hash(&identity).unwrap();
+        let history =
+            app_owned_directory(&app_data_path, &["agents", "history", &identity_hash], true)
+                .unwrap();
+        std::fs::write(history.join("index.json"), b"[]").unwrap();
+        let retired = format!("retired-{}", Uuid::new_v4());
+        let retired_path = history.join(&retired);
+        let mut synced = Vec::new();
+
+        commit_roster_retention_with_sync(&app_data_path, &identity, &[retired], |path| {
+            synced.push(path.to_path_buf());
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(synced, vec![retired_path]);
+    }
+
+    #[tokio::test]
+    async fn direct_publish_sync_failures_restore_exact_history_and_staging() {
+        for fail_at in 1..=3 {
+            let app_data = tempfile::tempdir().unwrap();
+            let app_data_path = std::fs::canonicalize(app_data.path()).unwrap();
+            let identity = identity("builtin:agency-agents");
+            let mut mutation = create_snapshot_from_bytes_protected(
+                &app_data_path,
+                &identity,
+                &[b"agent".to_vec()],
+                &crate::render::sha256_hex(b"source"),
+                &crate::render::sha256_hex(b"agent"),
+                "2026-08-18T00:00:00Z",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let staging = mutation.staging_directory.clone();
+            let staged_snapshot = mutation.staged_snapshot_directory.clone();
+            let live_snapshot = mutation.snapshot_directory.clone();
+            let index = mutation.index_path.clone();
+            let mut sync_attempts = 0;
+
+            let result = mutation
+                .publish_with_sync(|_| {
+                    sync_attempts += 1;
+                    if sync_attempts == fail_at {
+                        Err(AppError::Io {
+                            message: format!("injected publish sync failure {fail_at}"),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+
+            assert!(result.is_err(), "sync failure {fail_at} must propagate");
+            assert!(!index.exists(), "sync failure {fail_at} changed the index");
+            assert!(
+                !live_snapshot.exists(),
+                "sync failure {fail_at} left an unindexed live snapshot"
+            );
+            assert!(
+                staged_snapshot.is_dir(),
+                "sync failure {fail_at} lost the recoverable staged snapshot"
+            );
+            mutation.rollback().await.unwrap();
+            assert!(!staging.exists());
+        }
+    }
 
     fn identity(source: &str) -> AgentInstallIdentity {
         AgentInstallIdentity {

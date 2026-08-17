@@ -2871,6 +2871,7 @@ async fn write_unjournaled_roster_write_intent(
         message: format!("serialize unjournaled Agent roster write intent: {error}"),
     })?;
     atomic_write(&path, &bytes).await?;
+    sync_parent_directory_entry(&path)?;
     Ok(path)
 }
 
@@ -2936,20 +2937,49 @@ async fn cleanup_roster_staging_artifacts_durable(
     state: &AppState,
     staged: &Path,
 ) -> Result<(), AppError> {
+    cleanup_roster_staging_artifacts_durable_with_sync(state, staged, sync_parent_directory_entry)
+        .await
+}
+
+async fn cleanup_roster_staging_artifacts_durable_with_sync<F>(
+    state: &AppState,
+    staged: &Path,
+    mut sync_parent: F,
+) -> Result<(), AppError>
+where
+    F: FnMut(&Path) -> Result<(), AppError>,
+{
     let staged_path = staged.to_string_lossy().into_owned();
-    if let Ok(intent) = unjournaled_roster_write_intent_path(&state.app_data_dir, &staged_path) {
-        match tokio::fs::remove_file(&intent).await {
-            Ok(()) => sync_parent_directory_entry(&intent)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(AppError::Io {
-                    message: format!("remove Agent roster write intent: {error}"),
-                });
+    let intent = unjournaled_roster_write_intent_path(&state.app_data_dir, &staged_path)?;
+    let intent_bytes = match read_capped(&intent, MAX_LEDGER_BYTES).await {
+        Ok(bytes) => Some(bytes),
+        Err(AppError::Io { .. }) if !intent.exists() => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(intent_bytes) = intent_bytes {
+        tokio::fs::remove_file(&intent)
+            .await
+            .map_err(|error| AppError::Io {
+                message: format!("remove Agent roster write intent: {error}"),
+            })?;
+        if let Err(error) = sync_parent(&intent) {
+            let restored = async {
+                atomic_write(&intent, &intent_bytes).await?;
+                sync_parent(&intent)
             }
+            .await;
+            return match restored {
+                Ok(()) => Err(error),
+                Err(restore) => Err(AppError::Internal {
+                    message: format!(
+                        "sync Agent roster write intent deletion failed: {error}; restore intent failed: {restore}"
+                    ),
+                }),
+            };
         }
     }
     match tokio::fs::remove_file(staged).await {
-        Ok(()) => sync_parent_directory_entry(staged)?,
+        Ok(()) => sync_parent(staged)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(AppError::Io {
@@ -12693,6 +12723,38 @@ pub async fn loadout_apply(
 mod tests {
     use super::*;
     use crate::types::CatalogSnapshotItem;
+
+    #[tokio::test]
+    async fn cleanup_sync_failure_restores_write_intent_and_preserves_payload() {
+        let app_data = tempfile::tempdir().unwrap();
+        let root = app_data.path().join("state/roster-staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let staged = root.join(format!("{id}.bin"));
+        let intent = root.join(format!("{id}.intent.json"));
+        std::fs::write(&staged, b"roster").unwrap();
+        std::fs::write(&intent, b"intent").unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let mut sync_attempts = 0;
+
+        let result = cleanup_roster_staging_artifacts_durable_with_sync(&state, &staged, |_| {
+            sync_attempts += 1;
+            if sync_attempts == 1 {
+                Err(AppError::Io {
+                    message: "injected marker parent sync failure".into(),
+                })
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&intent).unwrap(), b"intent");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"roster");
+        assert_eq!(sync_attempts, 2);
+    }
 
     fn roster_record(member_count: usize) -> AgentRosterInstallRecord {
         AgentRosterInstallRecord {
