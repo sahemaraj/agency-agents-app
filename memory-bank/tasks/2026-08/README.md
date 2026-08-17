@@ -4,7 +4,7 @@
 
 ### 2026-08-17: Nightly Control Plane Program
 
-Implementing the approved eight-capability local control-plane program in an isolated worktree with sequential subagent implementation, independent spec review, code-quality review, and full regression/E2E validation. Tasks 1-6 are accepted at `db9836e`, `4a51d43`, `e5864d3`, `cb2b883`, `15e9d5e`, and `c6337af`; Task 7 Aider/Windsurf roster targets and Antigravity proof is accepted at `423f284`. All eight capabilities are implemented. Current state is QA, Task 8 whole-app validation. See `docs/superpowers/plans/2026-08-17-nightly-control-plane.md`.
+Implementing the approved eight-capability local control-plane program in an isolated worktree with independent implementation, security, integration, accessibility, and E2E review. Tasks 1-6 are implemented at `db9836e`, `4a51d43`, `e5864d3`, `cb2b883`, `15e9d5e`, and `c6337af`; Task 7's accepted base is `423f284`. Current state returned from QA to BUILD after Task 8 found roster integration/project-removal and accessibility/reflow defects. Security corrections are committed at `b08df45`, `8da8cb0`, and `751ebfa`; the eight-capability OpenSpec change is valid at `ff98ea1`. Roster and accessibility corrections plus complete regression/browser validation remain active. See `docs/superpowers/plans/2026-08-17-nightly-control-plane.md` and `openspec/changes/nightly-control-plane/`.
 
 ## Completed
 
