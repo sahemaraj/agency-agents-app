@@ -45,6 +45,7 @@ use subtle::ConstantTimeEq;
 
 const MIN_HTTP_TOKEN_BYTES: usize = 43;
 const MAX_RESOURCE_SUBSCRIPTIONS: usize = 128;
+const MAX_MCP_PROJECT_PATHS: usize = 64;
 
 #[derive(Clone)]
 struct HttpAuth([u8; 32]);
@@ -933,6 +934,41 @@ fn requested_project_path<'a>(
                 .then(|| arguments.get("request")?.get("projectPath")?.as_str())
                 .flatten()
         })
+}
+
+fn requested_project_paths<'a>(
+    tool: &str,
+    arguments: Option<&'a serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<Vec<&'a str>>, &'static str> {
+    if tool != "skills_installed" {
+        return Ok(None);
+    }
+    let Some(value) = arguments.and_then(|arguments| arguments.get("project_paths")) else {
+        return Ok(None);
+    };
+    let paths = value
+        .as_array()
+        .ok_or("project_paths must be an array of strings")?;
+    if paths.len() > MAX_MCP_PROJECT_PATHS {
+        return Err("project_paths cannot contain more than 64 entries");
+    }
+    paths
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .ok_or("project_paths must be an array of strings")
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn set_authorized_project_paths(
+    arguments: &mut Option<serde_json::Map<String, serde_json::Value>>,
+    projects: Vec<String>,
+) {
+    arguments
+        .get_or_insert_default()
+        .insert("project_paths".into(), projects.into());
 }
 
 fn set_authorized_project(
@@ -2988,6 +3024,50 @@ impl ServerHandler for SkillMcpServer {
                 }
             }
         };
+        let requested_projects = match requested_project_paths(&tool, request.arguments.as_ref()) {
+            Ok(projects) => projects,
+            Err(error) => {
+                let id = uuid::Uuid::new_v4().to_string();
+                self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
+                    .await?;
+                self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                    .await?;
+                return Err(ErrorData::invalid_params(error, None));
+            }
+        };
+        if let Some(projects) = requested_projects {
+            let mut authorized = Vec::with_capacity(projects.len());
+            for project in projects {
+                let authorization = self
+                    .state
+                    .authorize_mcp_client(&self.client_identity, action, Some(project))
+                    .await;
+                match authorization {
+                    Ok(Some(project)) => authorized.push(project.identity().to_owned()),
+                    Ok(None) => {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
+                            .await?;
+                        self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                            .await?;
+                        return Err(ErrorData::invalid_params(
+                            "project path authorization returned no project",
+                            None,
+                        ));
+                    }
+                    Err(error) => {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
+                            .await?;
+                        self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                            .await?;
+                        return Err(ErrorData::invalid_params(error.to_string(), None));
+                    }
+                }
+            }
+            set_authorized_project_paths(&mut request.arguments, authorized);
+        }
+
         let requested_project = requested_project_path(&tool, request.arguments.as_ref());
         let authorization = self
             .state
@@ -4512,6 +4592,74 @@ mod tests {
         let raw =
             std::fs::read_to_string(app.path().join("state/mcp-audit.jsonl")).expect("audit JSONL");
         assert!(!raw.contains(&denied), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn skills_installed_rejects_any_project_outside_the_allowlist() {
+        let app = tempfile::tempdir().expect("app data");
+        let allowed = tempfile::tempdir().expect("allowed project");
+        let denied = tempfile::tempdir().expect("denied project");
+        let allowed = std::fs::canonicalize(allowed.path())
+            .expect("canonical allowed project")
+            .to_string_lossy()
+            .into_owned();
+        let denied = std::fs::canonicalize(denied.path())
+            .expect("canonical denied project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_project_allowlist: vec![allowed.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist MCP settings");
+
+        let responses = call_tools_over_stdio(
+            test_state(app.path()),
+            vec![serde_json::json!({
+                "name": "skills_installed",
+                "arguments": {"project_paths": [allowed, denied.clone()]},
+            })],
+        )
+        .await;
+
+        assert!(responses[0]["error"].is_object(), "{}", responses[0]);
+        let raw =
+            std::fs::read_to_string(app.path().join("state/mcp-audit.jsonl")).expect("audit JSONL");
+        assert!(!raw.contains(&denied), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn skills_installed_rejects_more_than_sixty_four_project_paths() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist MCP settings");
+
+        let responses = call_tools_over_stdio(
+            test_state(app.path()),
+            vec![serde_json::json!({
+                "name": "skills_installed",
+                "arguments": {"project_paths": vec![project; 65]},
+            })],
+        )
+        .await;
+
+        assert!(responses[0]["error"].is_object(), "{}", responses[0]);
     }
 
     #[tokio::test]
