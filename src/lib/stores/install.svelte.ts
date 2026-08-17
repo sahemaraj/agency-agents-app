@@ -83,6 +83,14 @@ function failedPlanReceiptItems(plan: AgentMutationPlan, error: unknown): Activi
   }));
 }
 
+function mutationDeploymentNotice(value: unknown): string | undefined {
+  const records = Array.isArray(value) ? value : [value];
+  const notice = records.find((record) =>
+    record && typeof record === "object" && typeof (record as { deploymentNotice?: unknown }).deploymentNotice === "string",
+  ) as { deploymentNotice?: string } | undefined;
+  return notice?.deploymentNotice ? safeActivityDetail(notice.deploymentNotice) : undefined;
+}
+
 /** The tools Phase 2 can install to. Mirrors the Rust `SUPPORTED` set and the
     `supports_user()`/`supports_project()` capabilities in `render/mod.rs`.
     Order = install-menu order.
@@ -306,6 +314,7 @@ class InstallStore {
       const result = await run();
       await this.reconcile();
       void this.loadTools();
+      const detail = mutationDeploymentNotice(result);
       activity.log({
         action,
         subject: "agent",
@@ -315,6 +324,7 @@ class InstallStore {
         scope: this.scopeOf(projectPath),
         projectPath: projectPath ?? undefined,
         outcome: "ok",
+        ...(detail ? { detail } : {}),
       });
       return result;
     } catch (error) {

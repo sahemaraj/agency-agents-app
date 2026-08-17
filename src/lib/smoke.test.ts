@@ -2567,6 +2567,85 @@ describe("frontend test harness", () => {
     },
   );
 
+  it("surfaces a sanitized OpenClaw activation notice through the mounted exact install path", async () => {
+    const notice = "Workspace files installed; OpenClaw registration and restart remain required.\napi_key=secret123";
+    const plan: AgentMutationPlan = {
+      revision: "openclaw-plan", operation: "install", tool: "openclaw", scope: "user", projectPath: null,
+      agents: [{
+        reference: staleControlPackage.reference,
+        name: "Reviewer",
+        sourceHash: "source",
+        dependency: false,
+        destination: "/tmp/.openclaw/agency-agents/reviewer/SOUL.md",
+        renderedFileCount: 3,
+        capabilities: [],
+      }],
+      warnings: [], blockers: [], rollbackAvailable: true,
+    };
+    const record = {
+      ...installRecord("reviewer", plan.agents[0].destination),
+      tool: "openclaw",
+      deploymentNotice: notice,
+    } as InstallRecord;
+    const openclawTool = {
+      ...staleControlTool,
+      tool: "openclaw" as const,
+      label: "OpenClaw",
+      userDest: "/tmp/.openclaw/agency-agents",
+      installedCount: 0,
+    };
+    install.installed = [];
+    install.tools = [openclawTool];
+    install.reconciled = true;
+    projects.list = [];
+    const priorIds = new Set(activity.entries.map((entry) => entry.id));
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "projects_list") return [] as never;
+      if (command === "tools_list") return [openclawTool] as never;
+      if (command === "installs_reconcile") return [] as never;
+      if (command === "agent_install_plan") return plan as never;
+      if (command === "agent_install_with_dependencies") return [record] as never;
+      return [] as never;
+    });
+    const { default: InstallModal } = await import("$lib/components/InstallModal.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(InstallModal, {
+      target,
+      props: {
+        title: "Install Reviewer",
+        agentPackage: staleControlPackage,
+        allowedTools: ["openclaw"],
+        onClose: vi.fn(),
+      },
+    });
+    try {
+      await vi.waitFor(() => expect(target.querySelector<HTMLButtonElement>(".grid-wrap .toggle")?.disabled).toBe(false));
+      target.querySelector<HTMLButtonElement>(".grid-wrap .toggle")!.click();
+      const apply = await vi.waitFor(() => {
+        const button = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((candidate) => candidate.textContent?.trim() === "Apply plan");
+        expect(button).toBeTruthy();
+        return button!;
+      });
+      apply.click();
+      await vi.waitFor(() => expect(invokeMock.mock.calls
+        .filter(([command]) => command === "agent_install_with_dependencies")).toHaveLength(1));
+
+      const entry = await vi.waitFor(() => {
+        const candidate = activity.entries.find((item) => !priorIds.has(item.id));
+        expect(candidate?.detail).toBe("Workspace files installed; OpenClaw registration and restart remain required. api_key=[redacted]");
+        return candidate!;
+      });
+      expect(toast.items.at(-1)?.body).toBe(entry?.detail);
+      expect(toast.items.at(-1)?.body).not.toContain("secret123");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
   it("links every Agent bulk completion surface to its exact Activity receipt", () => {
     for (const source of [agentsWorkspaceSource, toolsViewSource, deployBrowserSource, installModalSource]) {
       expect(source).toContain("ui.openActivityReceipt(receiptId)");
@@ -5290,7 +5369,7 @@ describe("frontend test harness", () => {
     for (const [name, marker] of propagationEdges) {
       expect(installSource.match(marker) ?? [], name).toHaveLength(1);
     }
-    expect(installSource.match(/safeActivityDetail\(/g) ?? []).toHaveLength(10); // seven live edges + legacy install() + Workspace Pack retained-result and receipt boundaries
+    expect(installSource.match(/safeActivityDetail\(/g) ?? []).toHaveLength(11); // seven live edges + legacy install() + Workspace Pack retained-result, receipt, and success-notice boundaries
 
     const rawFallbacks = Object.entries(rel01Sources).flatMap(([path, source]) =>
       [...source.matchAll(/^\s*toast\.error\([^\n]*,\s*String\((?:e|error)\)\);?$/gm)]

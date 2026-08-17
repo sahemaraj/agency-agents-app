@@ -29,6 +29,7 @@
   import { install, SUPPORTED_TOOLS, type ToolDef } from "$lib/stores/install.svelte";
   import { projects } from "$lib/stores/projects.svelte";
   import { toast } from "$lib/stores/toast.svelte";
+  import { safeActivityDetail } from "$lib/stores/activity.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
@@ -340,14 +341,17 @@
     actionError = null;
     try {
       let receiptId: string | null = null;
+      let deploymentNotice: string | undefined;
       if (pendingCollection) {
         ({ receiptId } = await install.applyCollection(pendingCollection, plan));
       } else if (batchReferences.length) {
         ({ receiptId } = await install.applyBatch(plan));
       } else if (operation === "install" && reference) {
-        await install.installReference(reference, plan.tool, plan.projectPath, true);
+        const records = await install.installReference(reference, plan.tool, plan.projectPath, true);
+        deploymentNotice = records.find((record) => record.deploymentNotice)?.deploymentNotice ?? undefined;
       } else if (operation === "update" && reference) {
-        await install.updateReference(reference, plan.tool, plan.projectPath, true);
+        const record = await install.updateReference(reference, plan.tool, plan.projectPath, true);
+        deploymentNotice = record.deploymentNotice ?? undefined;
       } else if (reference) {
         await install.uninstallReference(reference, plan.tool, plan.projectPath);
       } else {
@@ -356,7 +360,11 @@
       const receiptAction = receiptId
         ? { label: i18n.t("activity.viewReceipt"), onClick: () => ui.openActivityReceipt(receiptId) }
         : undefined;
-      toast.success(i18n.t("agents.lifecycleApplied", { operation }), undefined, receiptAction);
+      toast.success(
+        i18n.t("agents.lifecycleApplied", { operation }),
+        deploymentNotice ? safeActivityDetail(deploymentNotice) : undefined,
+        receiptAction,
+      );
       pending = null;
       onApplied?.(plan);
     } catch (error) {

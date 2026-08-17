@@ -632,6 +632,7 @@ pub(crate) async fn do_install(
 ) -> Result<InstallRecord, AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
     do_install_locked(app, state, reference, tool, project_path, confirmed).await
 }
 
@@ -721,17 +722,10 @@ async fn do_install_locked(
             });
         }
     }
-    let existing_dest = existing_record
-        .as_ref()
-        .map(|record| PathBuf::from(&record.dest));
-    let targets = install_target_paths(
-        &agent,
-        Some(&raw),
-        &tool,
-        &home,
-        proot.as_deref(),
-        existing_dest.as_deref(),
-    )?;
+    let targets = match existing_record.as_ref() {
+        Some(record) => resolved_record_paths(state, record).await?,
+        None => install_target_paths(&agent, Some(&raw), &tool, &home, proot.as_deref(), None)?,
+    };
     ensure_destinations_available(
         &ledger,
         &reference,
@@ -806,18 +800,17 @@ async fn do_install_locked(
         (Some(record), false) => Some(snapshot_record(state, record, &prior_paths).await?),
         _ => None,
     };
-    let write_result = write_agent_files_to(
+    let write_result = write_agent_files_at(
         &agent,
         &raw,
         &tool,
-        &home,
         proot.as_deref(),
         Some(&backups),
         &package.source_hash,
         &package.body_hash,
         &revision,
         &installed_at,
-        existing_dest.as_deref(),
+        &targets,
     )
     .await;
     let mut record = match write_result {
@@ -1016,6 +1009,7 @@ async fn do_track(
 ) -> Result<InstallRecord, AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
     corpus::ensure_corpus(app, state).await?;
     let package = crate::agents::resolve_agent_package(&state.app_data_dir, &reference).await?;
     if !package.installable {
@@ -1465,7 +1459,6 @@ async fn resolved_record_paths(
             .iter()
             .map(|artifact| PathBuf::from(&artifact.dest))
             .collect::<Vec<_>>();
-        let root = project.unwrap_or(&home);
         let templates = crate::registry::get(&record.tool)
             .and_then(|meta| meta.dest.as_ref())
             .map(|dest| {
@@ -1478,14 +1471,35 @@ async fn resolved_record_paths(
             .ok_or_else(|| AppError::InvalidArgument {
                 message: "tracked Agent tool has no destinations".into(),
             })?;
-        let slug = templates
-            .first()
-            .and_then(|template| destination_template_slug(root, template, &recorded[0]))
-            .ok_or_else(|| AppError::InvalidArgument {
-                message: "tracked Agent artifact destination does not match its registry template"
-                    .into(),
-            })?;
-        let expected = render::dests(&record.tool, &slug, &home, project)?;
+        let first = recorded.first().ok_or_else(|| AppError::InvalidArgument {
+            message: "tracked Agent artifact manifest is empty".into(),
+        })?;
+        let first_template = templates.first().ok_or_else(|| AppError::InvalidArgument {
+            message: "tracked Agent tool has no destinations".into(),
+        })?;
+        let candidate_roots = if let Some(project) = project {
+            vec![project.to_path_buf()]
+        } else {
+            first.ancestors().map(Path::to_path_buf).collect()
+        };
+        let matches = candidate_roots
+            .into_iter()
+            .filter_map(|root| {
+                let slug = destination_template_slug(&root, first_template, first)?;
+                let expected = templates
+                    .iter()
+                    .map(|template| root.join(template.replace("{slug}", &slug)))
+                    .collect::<Vec<_>>();
+                (expected == recorded).then_some((root, slug))
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 || templates.len() != recorded.len() {
+            return Err(AppError::InvalidArgument {
+                message:
+                    "tracked Agent artifact manifest does not match one exact registry topology"
+                        .into(),
+            });
+        }
         let disabled_paths_match = if record.disabled_path.is_some() {
             let expected_disabled = recorded
                 .iter()
@@ -1502,8 +1516,7 @@ async fn resolved_record_paths(
                 .iter()
                 .all(|artifact| artifact.disabled_path.is_none())
         };
-        if recorded != expected
-            || record.artifacts.len() > 8
+        if record.artifacts.len() > 8
             || record.artifacts[0].dest != record.dest
             || record.artifacts[0].rendered_hash != record.rendered_hash
             || record.artifacts[0].disabled_path != record.disabled_path
@@ -2015,7 +2028,7 @@ async fn recover_agent_uninstall_operation(
     }
 }
 
-pub(crate) async fn recover_agent_operations(state: &AppState) -> Result<(), AppError> {
+async fn recover_agent_operations_locked(state: &AppState) -> Result<(), AppError> {
     let Some(database) = state.completed_state_database().await? else {
         return Ok(());
     };
@@ -2048,6 +2061,12 @@ pub(crate) async fn recover_agent_operations(state: &AppState) -> Result<(), App
         }
     }
     Ok(())
+}
+
+pub(crate) async fn recover_agent_operations(state: &AppState) -> Result<(), AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await
 }
 
 fn rollback_error(action: &str, original: AppError, rollback: AppError) -> AppError {
@@ -2096,6 +2115,7 @@ async fn write_agent_files(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn write_agent_files_to(
     agent: &crate::types::Agent,
     raw: &str,
@@ -2109,10 +2129,38 @@ async fn write_agent_files_to(
     installed_at: &str,
     preferred_dest: Option<&Path>,
 ) -> Result<InstallRecord, AppError> {
-    let rendered = render::render_artifacts(agent, raw, tool)?;
     let paths = install_target_paths(agent, Some(raw), tool, home, project_root, preferred_dest)?;
-    let manifest = artifact_manifest(&paths, &rendered)?;
-    let prior = capture_batch_files(&paths).await?;
+    write_agent_files_at(
+        agent,
+        raw,
+        tool,
+        project_root,
+        backup_dir,
+        source_hash,
+        body_hash,
+        corpus_version,
+        installed_at,
+        &paths,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_agent_files_at(
+    agent: &crate::types::Agent,
+    raw: &str,
+    tool: &str,
+    project_root: Option<&Path>,
+    backup_dir: Option<&Path>,
+    source_hash: &str,
+    body_hash: &str,
+    corpus_version: &str,
+    installed_at: &str,
+    paths: &[PathBuf],
+) -> Result<InstallRecord, AppError> {
+    let rendered = render::render_artifacts(agent, raw, tool)?;
+    let manifest = artifact_manifest(paths, &rendered)?;
+    let prior = capture_batch_files(paths).await?;
     for ((dest, artifact), entry) in paths.iter().zip(&rendered).zip(&manifest) {
         if let Some(bdir) = backup_dir {
             backup_if_differs(dest, artifact.content.as_bytes(), bdir, installed_at).await?;
@@ -2570,9 +2618,11 @@ async fn build_mutation_plan(
                 continue;
             }
         };
-        let preferred = existing.map(|record| Path::new(&record.dest));
-        let paths = match install_target_paths(agent, Some(&raw), &tool, &home, project, preferred)
-        {
+        let paths = match existing {
+            Some(record) => resolved_record_paths(state, record).await,
+            None => install_target_paths(agent, Some(&raw), &tool, &home, project, None),
+        };
+        let paths = match paths {
             Ok(paths) => paths,
             Err(error) => {
                 blockers.push(error.to_string());
@@ -2679,6 +2729,7 @@ async fn execute_install_plan(
     }
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
     let original_ledger = load_ledger(app, state).await?;
     let sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
     let home = tool_home(state, &plan.tool).await?;
@@ -2705,14 +2756,10 @@ async fn execute_install_plan(
                 && record.tool == plan.tool
                 && record.project_path == plan.project_path
         });
-        paths.extend(install_target_paths(
-            agent,
-            None,
-            &plan.tool,
-            &home,
-            project,
-            existing.map(|record| Path::new(&record.dest)),
-        )?);
+        paths.extend(match existing {
+            Some(record) => resolved_record_paths(state, record).await?,
+            None => install_target_paths(agent, None, &plan.tool, &home, project, None)?,
+        });
     }
     let files = capture_batch_files(&paths).await?;
     let mut installed = Vec::with_capacity(plan.agents.len());
@@ -2763,6 +2810,7 @@ async fn execute_uninstall_plan(
     }
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
     let original_ledger = load_ledger(app, state).await?;
     let mut paths = Vec::new();
     let mut removed = Vec::with_capacity(plan.agents.len());
@@ -2963,6 +3011,7 @@ pub(crate) async fn mcp_install_agent_clean(
     let authorization = authorized_agent_project(project_path.as_deref(), authorization)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
     let package = crate::agents::resolve_agent_package(&state.app_data_dir, &reference).await?;
     if !package.installable {
         return Err(AppError::InvalidArgument {
@@ -3103,6 +3152,7 @@ pub(crate) async fn mcp_move_agent_install(
     let authorization = authorized_agent_project(project_path.as_deref(), authorization)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
     let mut records = load_ledger_for_state(state).await?;
     let index = install_record_index(
         &records,
@@ -3891,6 +3941,7 @@ async fn rollback_agent_version(
 ) -> Result<InstallRecord, AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
     let mut records = load_ledger_for_state(state).await?;
     let index = install_record_index(
         &records,
@@ -4286,6 +4337,7 @@ async fn do_uninstall(
 ) -> Result<(), AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
     do_uninstall_locked(state, reference, tool, project_path).await
 }
 
@@ -12170,6 +12222,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_tool_base_change_preserves_recorded_manifest_across_lifecycle() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+
+        let (_app, _old_home, database, state, record, paths, _contents) =
+            completed_sqlite_kimi_install(false).await;
+        let new_home = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "kimi".into(),
+            std::fs::canonicalize(new_home.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let new_paths = render::dests("kimi", "frontend-developer", new_home.path(), None).unwrap();
+
+        assert_eq!(resolved_record_paths(&state, &record).await.unwrap(), paths);
+        let mut tampered = record.clone();
+        tampered.artifacts[1].dest = new_paths[1].to_string_lossy().into_owned();
+        assert!(resolved_record_paths(&state, &tampered).await.is_err());
+        let (expected, active, disabled) = record_reconcile_hashes(&state, &record).await.unwrap();
+        assert_eq!(
+            active,
+            expected.iter().cloned().map(Some).collect::<Vec<_>>()
+        );
+        assert!(disabled.iter().all(Option::is_none));
+        assert_eq!(
+            classify_artifact_install(
+                &active.iter().map(Option::as_deref).collect::<Vec<_>>(),
+                &disabled.iter().map(Option::as_deref).collect::<Vec<_>>(),
+                &expected.iter().map(String::as_str).collect::<Vec<_>>(),
+                false,
+                &record.source_snapshot_hash,
+                Some(&record.source_snapshot_hash),
+            ),
+            InstallState::Current
+        );
+
+        let disabled = mcp_move_agent_install(
+            &state,
+            install_reference(&record),
+            record.tool.clone(),
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(disabled.disabled_path.is_some());
+        let enabled = mcp_move_agent_install(
+            &state,
+            install_reference(&record),
+            record.tool.clone(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            enabled
+                .artifacts
+                .iter()
+                .map(|artifact| PathBuf::from(&artifact.dest))
+                .collect::<Vec<_>>(),
+            paths
+        );
+
+        let rollback_contents = vec![b"old agent yaml".to_vec(), b"old system".to_vec()];
+        let snapshot = history::create_snapshot_from_bytes(
+            &state.app_data_dir,
+            &install_identity(&enabled),
+            &rollback_contents,
+            &"d".repeat(64),
+            &render::sha256_hex(&rollback_contents[0]),
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        rollback_agent_version(
+            &state,
+            install_reference(&record),
+            record.tool.clone(),
+            None,
+            snapshot.id,
+        )
+        .await
+        .unwrap();
+        for (path, expected) in paths.iter().zip(&rollback_contents) {
+            assert_eq!(std::fs::read(path).unwrap(), *expected);
+        }
+        assert!(new_paths.iter().all(|path| !path.exists()));
+
+        do_uninstall(
+            &state,
+            install_reference(&record),
+            record.tool.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(new_paths.iter().all(|path| !path.exists()));
+        assert!(load_ledger_for_state(&state).await.unwrap().is_empty());
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_ledger_commit_failure_is_finished_before_same_identity_mutates_again() {
+        let (app, _home, database, state, record, paths, contents) =
+            completed_sqlite_kimi_install(false).await;
+        let connection =
+            rusqlite::Connection::open(app.path().join("state/agency-agents.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_agent_journal_commit \
+                 BEFORE UPDATE ON filesystem_operations \
+                 WHEN OLD.phase = 'filesystem_applied' AND NEW.phase = 'committed' \
+                 BEGIN SELECT RAISE(FAIL, 'injected Agent journal commit failure'); END;",
+            )
+            .unwrap();
+
+        let first = mcp_move_agent_install(
+            &state,
+            install_reference(&record),
+            record.tool.clone(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(first.is_err());
+        assert_eq!(
+            database.pending_filesystem_operations().await.unwrap()[0].phase,
+            crate::state_db::FilesystemOperationPhase::FilesystemApplied
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_agent_journal_commit;")
+            .unwrap();
+
+        mcp_move_agent_install(
+            &state,
+            install_reference(&record),
+            record.tool.clone(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        recover_agent_operations(&state).await.unwrap();
+        recover_agent_operations(&state).await.unwrap();
+
+        assert_exact_kimi_lifecycle_state(&state, &database, &record, &paths, &contents, false)
+            .await;
+    }
+
+    #[tokio::test]
     async fn prepared_agent_install_recovery_rolls_forward_exact_content_once() {
         let app = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -13770,6 +13985,50 @@ mod tests {
                 .exists(),
             "update must not create a duplicate source-slug file"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_artifact_update_keeps_recorded_base_when_tool_base_changes() {
+        let old_home = tempfile::tempdir().unwrap();
+        let new_home = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let agent = sample_agent();
+        let raw = "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\nUPDATED\n";
+        let old_paths = render::dests("kimi", "frontend-developer", old_home.path(), None).unwrap();
+        for path in &old_paths {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"older managed bytes").unwrap();
+        }
+        let new_paths = render::dests("kimi", "frontend-developer", new_home.path(), None).unwrap();
+
+        let updated = write_agent_files_at(
+            &agent,
+            raw,
+            "kimi",
+            None,
+            Some(backups.path()),
+            "src-2",
+            "body-2",
+            "v2",
+            "2026-08-17T02:00:00Z",
+            &old_paths,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            updated
+                .artifacts
+                .iter()
+                .map(|artifact| PathBuf::from(&artifact.dest))
+                .collect::<Vec<_>>(),
+            old_paths
+        );
+        let rendered = render::render_artifacts(&agent, raw, "kimi").unwrap();
+        for (path, artifact) in old_paths.iter().zip(rendered) {
+            assert_eq!(std::fs::read(path).unwrap(), artifact.content.as_bytes());
+        }
+        assert!(new_paths.iter().all(|path| !path.exists()));
     }
 
     #[tokio::test]
