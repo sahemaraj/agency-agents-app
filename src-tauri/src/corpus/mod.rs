@@ -3527,12 +3527,12 @@ async fn pull_active(app_data_dir: &Path, source: &CatalogSource) -> Result<(), 
 // =====================================================================
 
 use crate::state::AppState;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 /// Resolve the bundled baseline dir from the Tauri resource dir. In dev
 /// the resources live under the crate; in a bundled app they're inside
 /// the `.app`. Tauri's `resource_dir()` resolves both.
-fn baseline_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
+fn baseline_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, AppError> {
     let res = app.path().resource_dir().map_err(|e| AppError::Internal {
         message: format!("resolve resource_dir: {e}"),
     })?;
@@ -3541,7 +3541,7 @@ fn baseline_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
 
 /// Resolve the per-app data dir via Tauri's path resolver (honors the
 /// bundle id `com.zerologic.agency-agents-app`).
-pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
+pub(crate) fn app_data_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, AppError> {
     app.path().app_data_dir().map_err(|e| AppError::Internal {
         message: format!("resolve app_data_dir: {e}"),
     })
@@ -3562,8 +3562,8 @@ pub(crate) async fn active_catalog_root_at(adir: &Path) -> PathBuf {
 /// installs (claude-code, copilot) ship this verbatim, and provenance
 /// reconciliation re-renders against it. Path is derived from app data +
 /// the agent's own category/slug — never from IPC input.
-pub(crate) async fn read_source(
-    app: &AppHandle,
+pub(crate) async fn read_source<R: Runtime>(
+    app: &AppHandle<R>,
     category: &str,
     slug: &str,
 ) -> Result<String, AppError> {
@@ -3588,8 +3588,8 @@ pub(crate) async fn read_source(
 /// Ensure the in-memory corpus is built + memoized on `AppState`, then
 /// return the shared `Arc`. First call seeds (if needed), parses, and
 /// persists the index; subsequent calls are a cheap cache read.
-pub(crate) async fn ensure_corpus(
-    app: &AppHandle,
+pub(crate) async fn ensure_corpus<R: Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
 ) -> Result<Arc<Corpus>, AppError> {
     let adir = app_data_dir(app)?;

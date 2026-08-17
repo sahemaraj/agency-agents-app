@@ -16,7 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Runtime, State};
 use tokio::io::AsyncWriteExt;
 
 use crate::corpus;
@@ -232,7 +232,7 @@ struct AgentRosterUninstallOperation {
 
 // ---------- Ledger persistence ----------
 
-fn ledger_path(app: &AppHandle) -> Result<PathBuf, AppError> {
+fn ledger_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, AppError> {
     let adir = corpus::app_data_dir(app)?;
     Ok(ledger_path_for(&adir))
 }
@@ -269,8 +269,8 @@ async fn lock_agent_installs_async(app_data_dir: PathBuf) -> Result<File, AppErr
         })?
 }
 
-pub(crate) async fn load_ledger(
-    app: &AppHandle,
+pub(crate) async fn load_ledger<R: Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
 ) -> Result<Vec<InstallRecord>, AppError> {
     corpus::ensure_corpus(app, state).await?;
@@ -377,7 +377,10 @@ async fn load_ledger_read_only_at(path: &Path) -> Result<Vec<InstallRecord>, App
     }
 }
 
-async fn save_ledger(app: &AppHandle, records: &[InstallRecord]) -> Result<(), AppError> {
+async fn save_ledger<R: Runtime>(
+    app: &AppHandle<R>,
+    records: &[InstallRecord],
+) -> Result<(), AppError> {
     save_ledger_for(&corpus::app_data_dir(app)?, records).await
 }
 
@@ -705,7 +708,7 @@ async fn load_migrated_ledger_path(
     Ok(records)
 }
 
-async fn prune_migration_backups(app: &AppHandle) -> Result<(), AppError> {
+async fn prune_migration_backups<R: Runtime>(app: &AppHandle<R>) -> Result<(), AppError> {
     let path = ledger_path(app)?;
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -790,7 +793,7 @@ fn now_iso() -> String {
 /// under app data, NOT inside any tool's agent dir — so the Foreign sweep never
 /// mistakes a backup for an installed agent. Every destructive write copies the
 /// prior bytes here first, making install/update/restore reversible.
-fn backups_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
+fn backups_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, AppError> {
     Ok(backups_dir_for(&corpus::app_data_dir(app)?))
 }
 
@@ -911,8 +914,8 @@ async fn backup_if_differs(
 
 // ---------- Install / update (shared core) ----------
 
-pub(crate) async fn do_install(
-    app: &AppHandle,
+pub(crate) async fn do_install<R: Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     reference: AgentReference,
     tool: Tool,
@@ -936,8 +939,8 @@ pub(crate) async fn do_install_legacy(
     do_install(app, state, reference, tool, project_path, false).await
 }
 
-async fn do_install_locked(
-    app: &AppHandle,
+async fn do_install_locked<R: Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     reference: AgentReference,
     tool: Tool,
@@ -1333,12 +1336,43 @@ async fn close_prepared_roster_failure(
     Ok(())
 }
 
+async fn rollback_roster_history(
+    mutation: &mut Option<history::RosterHistoryMutation>,
+) -> Result<(), AppError> {
+    match mutation.take() {
+        Some(mutation) => mutation.rollback().await,
+        None => Ok(()),
+    }
+}
+
+async fn commit_roster_history(mutation: &mut Option<history::RosterHistoryMutation>) {
+    if let Some(mutation) = mutation.take() {
+        mutation.commit().await;
+    }
+}
+
+fn combine_roster_restoration(
+    files: Result<(), AppError>,
+    history: Result<(), AppError>,
+) -> Result<(), AppError> {
+    match (files, history) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(files), Err(history)) => Err(AppError::Internal {
+            message: format!(
+                "Agent roster file restoration failed: {files}; history restoration failed: {history}"
+            ),
+        }),
+    }
+}
+
 async fn compensate_roster_commit_failure(
     state: &AppState,
     database: &crate::state_db::StateDatabase,
     operation: &crate::state_db::FilesystemOperation,
     prior_files: &[BatchFileSnapshot],
     prior_rosters: &[AgentRosterInstallRecord],
+    history: Result<(), AppError>,
     commit_error: AppError,
 ) -> AppError {
     let files = restore_batch_files_verified(prior_files).await;
@@ -1354,20 +1388,22 @@ async fn compensate_roster_commit_failure(
         },
         Err(error) => Err(error),
     };
-    let detail = match (&files, &ledger) {
-        (Ok(()), Ok(())) => format!("journal commit failed after exact compensation: {commit_error}"),
-        (files, ledger) => format!(
-            "journal commit failed: {commit_error}; file compensation: {files:?}; ledger compensation: {ledger:?}"
+    let detail = match (&files, &ledger, &history) {
+        (Ok(()), Ok(()), Ok(())) => {
+            format!("journal commit failed after exact compensation: {commit_error}")
+        }
+        (files, ledger, history) => format!(
+            "journal commit failed: {commit_error}; file compensation: {files:?}; ledger compensation: {ledger:?}; history compensation: {history:?}"
         ),
     };
     let retained = database
         .retain_filesystem_operation_error(&operation.id, &detail)
         .await;
-    match (files, ledger, retained) {
-        (Ok(()), Ok(()), Ok(())) => commit_error,
-        (files, ledger, retained) => AppError::Internal {
+    match (files, ledger, history, retained) {
+        (Ok(()), Ok(()), Ok(()), Ok(())) => commit_error,
+        (files, ledger, history, retained) => AppError::Internal {
             message: format!(
-                "Agent roster journal commit failed: {commit_error}; file compensation: {files:?}; ledger compensation: {ledger:?}; retain recovery error: {retained:?}"
+                "Agent roster journal commit failed: {commit_error}; file compensation: {files:?}; ledger compensation: {ledger:?}; history compensation: {history:?}; retain recovery error: {retained:?}"
             ),
         },
     }
@@ -2416,6 +2452,37 @@ fn exact_roster_install(left: &AgentRosterInstallRecord, right: &AgentRosterInst
     left == right
 }
 
+async fn validated_recovery_roster_paths(
+    state: &AppState,
+    record: &AgentRosterInstallRecord,
+) -> Result<(PathBuf, PathBuf), AppError> {
+    validate_roster_record(record)?;
+    let project = canonical_registered_instruction_project(state, &record.project_path).await?;
+    let expected = render::dests(&record.tool, "roster", Path::new("/"), Some(&project))?;
+    let active = expected
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::StorageCorrupt {
+            message: "Agent roster recovery target registry is empty".into(),
+        })?;
+    if active != Path::new(&record.dest) {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster recovery destination changed from the tool registry".into(),
+        });
+    }
+    let disabled = disabled_destination(&active)?;
+    if record
+        .disabled_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path) != disabled)
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster recovery disabled destination changed".into(),
+        });
+    }
+    Ok((active, disabled))
+}
+
 fn validate_roster_staging_path(
     app_data_dir: &Path,
     staged_path: &str,
@@ -2546,8 +2613,10 @@ async fn recover_roster_move_operation(
         .map_err(|_| AppError::StorageCorrupt {
             message: "Agent roster move recovery payload is invalid".into(),
         })?;
-    validate_roster_record(&payload.previous)?;
-    validate_roster_record(&payload.next)?;
+    let (previous_active, previous_disabled) =
+        validated_recovery_roster_paths(state, &payload.previous).await?;
+    let (next_active, next_disabled) =
+        validated_recovery_roster_paths(state, &payload.next).await?;
     if !same_roster_install(&payload.previous, &payload.next)
         || payload.previous.members != payload.next.members
         || payload.previous.rendered_hash != payload.next.rendered_hash
@@ -2556,8 +2625,13 @@ async fn recover_roster_move_operation(
             message: "Agent roster move recovery identity changed".into(),
         });
     }
-    let active = PathBuf::from(&payload.next.dest);
-    let disabled = disabled_destination(&active)?;
+    if previous_active != next_active || previous_disabled != next_disabled {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster move recovery destinations disagree".into(),
+        });
+    }
+    let active = next_active;
+    let disabled = next_disabled;
     let (source, destination) = match operation.kind.as_str() {
         "agent_disable"
             if payload.previous.disabled_path.is_none() && payload.next.disabled_path.is_some() =>
@@ -2637,18 +2711,17 @@ async fn recover_roster_uninstall_operation(
             .map_err(|_| AppError::StorageCorrupt {
                 message: "Agent roster uninstall recovery payload is invalid".into(),
             })?;
-    validate_roster_record(&payload.previous)?;
+    let (active, disabled) = validated_recovery_roster_paths(state, &payload.previous).await?;
     if !valid_sha256(&payload.current_hash) {
         return Err(AppError::StorageCorrupt {
             message: "Agent roster uninstall recovery hash is invalid".into(),
         });
     }
-    let path = payload
-        .previous
-        .disabled_path
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&payload.previous.dest));
+    let path = if payload.previous.disabled_path.is_some() {
+        disabled
+    } else {
+        active
+    };
     let current_hash = recovery_file_hash(&path)?;
     if operation.phase == crate::state_db::FilesystemOperationPhase::Prepared {
         if let Some(hash) = current_hash {
@@ -3105,8 +3178,8 @@ fn resolve_reference_request(
     }
 }
 
-async fn resolve_command_reference(
-    app: &AppHandle,
+async fn resolve_command_reference<R: Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     source_id: Option<&str>,
     relative_path: Option<&str>,
@@ -3838,19 +3911,6 @@ async fn apply_roster_plan(
         }
     }
     let prior = capture_batch_files(std::slice::from_ref(&destination)).await?;
-    if let Some(record) = &previous {
-        if destination.exists() {
-            history::create_roster_snapshot(
-                &state.app_data_dir,
-                &roster_identity(record),
-                std::slice::from_ref(&destination),
-                record,
-                &now_iso(),
-                None,
-            )
-            .await?;
-        }
-    }
     let next = AgentRosterInstallRecord {
         tool: current.tool.clone(),
         scope: crate::types::Scope::Project,
@@ -3901,6 +3961,38 @@ async fn apply_roster_plan(
             Err(error) => Err(error),
         };
     }
+    let mut history_mutation = None;
+    if let Some(record) = &previous {
+        if prior[0]
+            .bytes
+            .as_deref()
+            .is_some_and(|bytes| render::sha256_hex(bytes) == record.rendered_hash)
+        {
+            match history::begin_roster_snapshot(
+                &state.app_data_dir,
+                &roster_identity(record),
+                std::slice::from_ref(&destination),
+                record,
+                &now_iso(),
+                None,
+            )
+            .await
+            {
+                Ok(mutation) => history_mutation = Some(mutation),
+                Err(error) => {
+                    let unchanged = verify_batch_files(&prior).await;
+                    close_prepared_roster_failure(
+                        database.as_ref(),
+                        operation.as_ref(),
+                        &unchanged,
+                    )
+                    .await?;
+                    let _ = tokio::fs::remove_file(&staged).await;
+                    return Err(error);
+                }
+            }
+        }
+    }
     let write = async {
         backup_if_differs(
             &destination,
@@ -3920,7 +4012,9 @@ async fn apply_roster_plan(
     }
     .await;
     if let Err(error) = write {
-        let restored = restore_batch_files_verified(&prior).await;
+        let files = restore_batch_files_verified(&prior).await;
+        let history = rollback_roster_history(&mut history_mutation).await;
+        let restored = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &restored).await?;
         let _ = tokio::fs::remove_file(&staged).await;
         return match restored {
@@ -3943,7 +4037,9 @@ async fn apply_roster_plan(
         None => save_rosters_for_state(state, &rosters).await,
     };
     if let Err(error) = saved {
-        let restored = restore_batch_files_verified(&prior).await;
+        let files = restore_batch_files_verified(&prior).await;
+        let history = rollback_roster_history(&mut history_mutation).await;
+        let restored = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &restored).await?;
         let _ = tokio::fs::remove_file(&staged).await;
         return match restored {
@@ -3953,12 +4049,14 @@ async fn apply_roster_plan(
     }
     if let (Some(database), Some(operation)) = (&database, &operation) {
         if let Err(error) = database.commit_filesystem_operation(&operation.id).await {
+            let history = rollback_roster_history(&mut history_mutation).await;
             let error = compensate_roster_commit_failure(
                 state,
                 database,
                 operation,
                 &prior,
                 &prior_rosters,
+                history,
                 error,
             )
             .await;
@@ -3966,6 +4064,7 @@ async fn apply_roster_plan(
             return Err(error);
         }
     }
+    commit_roster_history(&mut history_mutation).await;
     let _ = tokio::fs::remove_file(&staged).await;
     Ok(next)
 }
@@ -4061,15 +4160,6 @@ async fn move_roster(
         });
     }
     let prior = capture_batch_files(&[active.clone(), disabled.clone()]).await?;
-    history::create_roster_snapshot(
-        &state.app_data_dir,
-        &roster_identity(&previous),
-        std::slice::from_ref(source),
-        &previous,
-        &now_iso(),
-        None,
-    )
-    .await?;
     let mut next = previous.clone();
     next.disabled_path = (!enable).then(|| disabled.to_string_lossy().into_owned());
     let database = state.completed_state_database().await?;
@@ -4092,12 +4182,32 @@ async fn move_roster(
     } else {
         None
     };
+    let mut history_mutation = match history::begin_roster_snapshot(
+        &state.app_data_dir,
+        &roster_identity(&previous),
+        std::slice::from_ref(source),
+        &previous,
+        &now_iso(),
+        None,
+    )
+    .await
+    {
+        Ok(mutation) => Some(mutation),
+        Err(error) => {
+            let unchanged = verify_batch_files(&prior).await;
+            close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &unchanged)
+                .await?;
+            return Err(error);
+        }
+    };
     if let Err(error) = move_managed_artifacts(
         std::slice::from_ref(source),
         std::slice::from_ref(destination),
         std::slice::from_ref(&previous.rendered_hash),
     ) {
-        let restored = restore_batch_files_verified(&prior).await;
+        let files = restore_batch_files_verified(&prior).await;
+        let history = rollback_roster_history(&mut history_mutation).await;
+        let restored = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &restored).await?;
         return match restored {
             Ok(()) => Err(error),
@@ -4110,7 +4220,9 @@ async fn move_roster(
         None => save_rosters_for_state(state, &rosters).await,
     };
     if let Err(error) = saved {
-        let rollback = restore_batch_files_verified(&prior).await;
+        let files = restore_batch_files_verified(&prior).await;
+        let history = rollback_roster_history(&mut history_mutation).await;
+        let rollback = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &rollback).await?;
         return match rollback {
             Ok(()) => Err(error),
@@ -4119,17 +4231,20 @@ async fn move_roster(
     }
     if let (Some(database), Some(operation)) = (&database, &operation) {
         if let Err(error) = database.commit_filesystem_operation(&operation.id).await {
+            let history = rollback_roster_history(&mut history_mutation).await;
             return Err(compensate_roster_commit_failure(
                 state,
                 database,
                 operation,
                 &prior,
                 &prior_rosters,
+                history,
                 error,
             )
             .await);
         }
     }
+    commit_roster_history(&mut history_mutation).await;
     Ok(next)
 }
 
@@ -4184,15 +4299,6 @@ async fn uninstall_roster(
         .map(render::sha256_hex)
         .unwrap_or_else(|| previous.rendered_hash.clone());
     if prior[0].bytes.is_some() {
-        history::create_roster_snapshot(
-            &state.app_data_dir,
-            &roster_identity(&previous),
-            std::slice::from_ref(&path),
-            &previous,
-            &now_iso(),
-            None,
-        )
-        .await?;
         backup_if_differs(
             &path,
             &[],
@@ -4228,6 +4334,31 @@ async fn uninstall_roster(
             Err(error) => Err(error),
         };
     }
+    let mut history_mutation = None;
+    if prior[0]
+        .bytes
+        .as_deref()
+        .is_some_and(|bytes| render::sha256_hex(bytes) == previous.rendered_hash)
+    {
+        match history::begin_roster_snapshot(
+            &state.app_data_dir,
+            &roster_identity(&previous),
+            std::slice::from_ref(&path),
+            &previous,
+            &now_iso(),
+            None,
+        )
+        .await
+        {
+            Ok(mutation) => history_mutation = Some(mutation),
+            Err(error) => {
+                let unchanged = verify_batch_files(&prior).await;
+                close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &unchanged)
+                    .await?;
+                return Err(error);
+            }
+        }
+    }
     if path.exists() {
         if let Err(error) = tokio::fs::remove_file(&path)
             .await
@@ -4235,7 +4366,9 @@ async fn uninstall_roster(
                 message: format!("remove Agent roster {}: {error}", path.display()),
             })
         {
-            let restored = restore_batch_files_verified(&prior).await;
+            let files = restore_batch_files_verified(&prior).await;
+            let history = rollback_roster_history(&mut history_mutation).await;
+            let restored = combine_roster_restoration(files, history);
             close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &restored).await?;
             return match restored {
                 Ok(()) => Err(error),
@@ -4249,7 +4382,9 @@ async fn uninstall_roster(
         None => save_rosters_for_state(state, &rosters).await,
     };
     if let Err(error) = saved {
-        let rollback = restore_batch_files_verified(&prior).await;
+        let files = restore_batch_files_verified(&prior).await;
+        let history = rollback_roster_history(&mut history_mutation).await;
+        let rollback = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &rollback).await?;
         return match rollback {
             Ok(()) => Err(error),
@@ -4258,17 +4393,20 @@ async fn uninstall_roster(
     }
     if let (Some(database), Some(operation)) = (&database, &operation) {
         if let Err(error) = database.commit_filesystem_operation(&operation.id).await {
+            let history = rollback_roster_history(&mut history_mutation).await;
             return Err(compensate_roster_commit_failure(
                 state,
                 database,
                 operation,
                 &prior,
                 &prior_rosters,
+                history,
                 error,
             )
             .await);
         }
     }
+    commit_roster_history(&mut history_mutation).await;
     Ok(previous)
 }
 
@@ -4313,6 +4451,9 @@ async fn rollback_roster(
             message: "Agent roster snapshot identity changed".into(),
         });
     }
+    // Rollback publishes into the required active destination. Historical
+    // lifecycle state must not point the restored ledger at a disabled path.
+    next.disabled_path = None;
     validate_roster_record(&next)?;
     let rendered = contents
         .into_iter()
@@ -4325,15 +4466,6 @@ async fn rollback_roster(
             message: "Agent roster snapshot hash changed".into(),
         });
     }
-    history::create_roster_snapshot(
-        &state.app_data_dir,
-        &identity,
-        std::slice::from_ref(&destination),
-        &previous,
-        &now_iso(),
-        Some(snapshot_id),
-    )
-    .await?;
     next.installed_at = now_iso();
     let prior = capture_batch_files(std::slice::from_ref(&destination)).await?;
     let staged = stage_roster_bytes(&state.app_data_dir, &rendered).await?;
@@ -4354,8 +4486,29 @@ async fn rollback_roster(
     } else {
         None
     };
+    let mut history_mutation = match history::begin_roster_snapshot(
+        &state.app_data_dir,
+        &identity,
+        std::slice::from_ref(&destination),
+        &previous,
+        &now_iso(),
+        Some(snapshot_id),
+    )
+    .await
+    {
+        Ok(mutation) => Some(mutation),
+        Err(error) => {
+            let unchanged = verify_batch_files(&prior).await;
+            close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &unchanged)
+                .await?;
+            let _ = tokio::fs::remove_file(&staged).await;
+            return Err(error);
+        }
+    };
     if let Err(error) = publish_roster_bytes(&destination, &rendered, true).await {
-        let rollback = restore_batch_files_verified(&prior).await;
+        let files = restore_batch_files_verified(&prior).await;
+        let history = rollback_roster_history(&mut history_mutation).await;
+        let rollback = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &rollback).await?;
         let _ = tokio::fs::remove_file(&staged).await;
         return match rollback {
@@ -4369,7 +4522,9 @@ async fn rollback_roster(
         None => save_rosters_for_state(state, &rosters).await,
     };
     if let Err(error) = saved {
-        let rollback = restore_batch_files_verified(&prior).await;
+        let files = restore_batch_files_verified(&prior).await;
+        let history = rollback_roster_history(&mut history_mutation).await;
+        let rollback = combine_roster_restoration(files, history);
         close_prepared_roster_failure(database.as_ref(), operation.as_ref(), &rollback).await?;
         let _ = tokio::fs::remove_file(&staged).await;
         return match rollback {
@@ -4383,12 +4538,14 @@ async fn rollback_roster(
     }
     if let (Some(database), Some(operation)) = (&database, &operation) {
         if let Err(error) = database.commit_filesystem_operation(&operation.id).await {
+            let history = rollback_roster_history(&mut history_mutation).await;
             let error = compensate_roster_commit_failure(
                 state,
                 database,
                 operation,
                 &prior,
                 &prior_rosters,
+                history,
                 error,
             )
             .await;
@@ -4396,6 +4553,7 @@ async fn rollback_roster(
             return Err(error);
         }
     }
+    commit_roster_history(&mut history_mutation).await;
     let _ = tokio::fs::remove_file(&staged).await;
     Ok(next)
 }
@@ -5158,8 +5316,8 @@ fn supported() -> Vec<&'static str> {
 /// the project root in `project_path`. Returns the ledger record.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // ponytail: flat Tauri args preserve the existing command ABI.
-pub async fn install_agent(
-    app: AppHandle,
+pub async fn install_agent<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     source_id: Option<String>,
     relative_path: Option<String>,
@@ -5439,8 +5597,8 @@ pub async fn agent_rosters_reconcile(
 }
 
 #[tauri::command]
-pub async fn agent_roster_plan(
-    app: AppHandle,
+pub async fn agent_roster_plan<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     references: Vec<AgentReference>,
     tool: Tool,
@@ -5453,8 +5611,8 @@ pub async fn agent_roster_plan(
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // ponytail: flat Tauri args preserve the command ABI.
-pub async fn agent_roster_apply(
-    app: AppHandle,
+pub async fn agent_roster_apply<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     references: Vec<AgentReference>,
     tool: Tool,
@@ -6110,8 +6268,8 @@ pub async fn agent_diff(
 
 /// Uninstall: remove the written file(s) and the ledger row.
 #[tauri::command]
-pub async fn uninstall_agent(
-    app: AppHandle,
+pub async fn uninstall_agent<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     source_id: Option<String>,
     relative_path: Option<String>,
@@ -6406,8 +6564,8 @@ async fn reconcile_agent_installs_locked(
 /// The reconciled Library view — every ledger row resolved against disk +
 /// Agent sources into one of the seven states.
 #[tauri::command]
-pub async fn installs_reconcile(
-    app: AppHandle,
+pub async fn installs_reconcile<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     mut project_roots: Vec<String>,
 ) -> Result<Vec<InstalledAgent>, AppError> {
@@ -11465,6 +11623,291 @@ mod tests {
         );
     }
 
+    fn history_tree_bytes(app_data_dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn collect(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => panic!("read history tree {}: {error}", directory.display()),
+            };
+            for entry in entries {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    collect(root, &path, files);
+                } else if metadata.is_file() {
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let root = app_data_dir.join("agents/history");
+        let mut files = Vec::new();
+        collect(&root, &root, &mut files);
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    fn command_test_app(app_data_dir: &Path) -> tauri::App<tauri::test::MockRuntime> {
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data_dir.to_path_buf();
+        let mut context: tauri::Context<tauri::test::MockRuntime> =
+            tauri::test::mock_context(tauri::test::noop_assets());
+        context.config_mut().identifier = app_data_dir.to_string_lossy().into_owned();
+        tauri::test::mock_builder()
+            .manage(state)
+            .build(context)
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn roster_production_commands_cover_all_boundaries_and_uninstall_route() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for path in ["agent.md", "reviewer.md"] {
+            std::fs::write(
+                source_root.path().join(path),
+                format!("---\nname: {path}\ndescription: Test.\n---\nOriginal {path}.\n"),
+            )
+            .unwrap();
+        }
+        let source = crate::agents::add_local_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let references = ["agent.md", "reviewer.md"]
+            .into_iter()
+            .map(|relative_path| AgentReference {
+                source_id: source.id.clone(),
+                relative_path: relative_path.into(),
+            })
+            .collect::<Vec<_>>();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let handle = app.handle().clone();
+        assert_eq!(corpus::app_data_dir(&handle).unwrap(), app_data.path());
+
+        assert!(agent_roster_plan(
+            handle.clone(),
+            app.state(),
+            references.clone(),
+            "aider".into(),
+            project_path.clone(),
+            "install".into(),
+        )
+        .await
+        .is_err());
+        project_register(app.state(), project_path.clone())
+            .await
+            .unwrap();
+        let plan = agent_roster_plan(
+            handle.clone(),
+            app.state(),
+            references.clone(),
+            "aider".into(),
+            project_path.clone(),
+            "install".into(),
+        )
+        .await
+        .unwrap();
+        assert!(!Path::new(&plan.destination).exists());
+        assert!(agent_roster_apply(
+            handle.clone(),
+            app.state(),
+            references.clone(),
+            "aider".into(),
+            project_path.clone(),
+            "install".into(),
+            plan.revision.clone(),
+            None,
+        )
+        .await
+        .is_err());
+        assert!(agent_roster_apply(
+            handle.clone(),
+            app.state(),
+            references.clone(),
+            "aider".into(),
+            project_path.clone(),
+            "install".into(),
+            "stale-revision".into(),
+            Some(true),
+        )
+        .await
+        .is_err());
+        assert!(!Path::new(&plan.destination).exists());
+        project_unregister(app.state(), project_path.clone())
+            .await
+            .unwrap();
+        assert!(agent_roster_apply(
+            handle.clone(),
+            app.state(),
+            references.clone(),
+            "aider".into(),
+            project_path.clone(),
+            "install".into(),
+            plan.revision.clone(),
+            Some(true),
+        )
+        .await
+        .is_err());
+        assert!(!Path::new(&plan.destination).exists());
+        project_register(app.state(), project_path.clone())
+            .await
+            .unwrap();
+        let plan = agent_roster_plan(
+            handle.clone(),
+            app.state(),
+            references.clone(),
+            "aider".into(),
+            project_path.clone(),
+            "install".into(),
+        )
+        .await
+        .unwrap();
+        let installed = agent_roster_apply(
+            handle.clone(),
+            app.state(),
+            references.clone(),
+            "aider".into(),
+            project_path.clone(),
+            "install".into(),
+            plan.revision,
+            Some(true),
+        )
+        .await
+        .unwrap();
+        let reconciled = agent_rosters_reconcile(app.state()).await.unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].state, InstallState::Current);
+
+        assert!(
+            agent_roster_disable(app.state(), "aider".into(), project_path.clone(), None,)
+                .await
+                .is_err()
+        );
+        agent_roster_disable(
+            app.state(),
+            "aider".into(),
+            project_path.clone(),
+            Some(true),
+        )
+        .await
+        .unwrap();
+        agent_roster_enable(
+            app.state(),
+            "aider".into(),
+            project_path.clone(),
+            Some(true),
+        )
+        .await
+        .unwrap();
+        let history =
+            agent_roster_version_history(app.state(), "aider".into(), project_path.clone())
+                .await
+                .unwrap();
+        agent_roster_version_rollback(
+            app.state(),
+            "aider".into(),
+            project_path.clone(),
+            history[0].id.clone(),
+            Some(true),
+        )
+        .await
+        .unwrap();
+
+        let uninstall = agent_roster_plan(
+            handle.clone(),
+            app.state(),
+            references.clone(),
+            "aider".into(),
+            project_path.clone(),
+            "uninstall".into(),
+        )
+        .await
+        .unwrap();
+        agent_roster_apply(
+            handle.clone(),
+            app.state(),
+            references,
+            "aider".into(),
+            project_path.clone(),
+            "uninstall".into(),
+            uninstall.revision,
+            Some(true),
+        )
+        .await
+        .unwrap();
+        assert!(!Path::new(&installed.dest).exists());
+        assert!(agent_rosters_reconcile(app.state())
+            .await
+            .unwrap()
+            .is_empty());
+
+        let reference = AgentReference {
+            source_id: source.id.clone(),
+            relative_path: "agent.md".into(),
+        };
+        let package = crate::agents::resolve_agent_package(app_data.path(), &reference)
+            .await
+            .unwrap();
+        let raw = crate::agents::read_agent_text(app_data.path(), &reference)
+            .await
+            .unwrap();
+        let antigravity = install_agent(
+            handle.clone(),
+            app.state(),
+            Some(reference.source_id.clone()),
+            Some(reference.relative_path.clone()),
+            None,
+            "antigravity".into(),
+            Some(project_path.clone()),
+            Some(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&antigravity.dest).unwrap(),
+            render::render(package.agent.as_ref().unwrap(), &raw, "antigravity").unwrap()
+        );
+        let reconciled =
+            installs_reconcile(handle.clone(), app.state(), vec![project_path.clone()])
+                .await
+                .unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].state, InstallState::Current);
+        uninstall_agent(
+            handle,
+            app.state(),
+            Some(reference.source_id),
+            Some(reference.relative_path),
+            None,
+            "antigravity".into(),
+            Some(project_path),
+        )
+        .await
+        .unwrap();
+        let leaf = Path::new(&antigravity.dest);
+        assert!(!leaf.exists());
+        assert!(!leaf.parent().unwrap().exists());
+        assert!(
+            installs_reconcile(app.handle().clone(), app.state(), Vec::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn roster_ledger_is_distinct_bounded_and_exactly_ordered() {
         let first = roster_record(2);
@@ -11925,83 +12368,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_install_reconcile_uninstall_round_trip_is_exact() {
-        let app_data = tempfile::tempdir().unwrap();
-        let source_root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let backups = tempfile::tempdir().unwrap();
-        let raw = "---\nname: Frontend Developer\ndescription: Builds UIs.\n---\nOwn the UI.\n";
-        std::fs::write(source_root.path().join("frontend.md"), raw).unwrap();
-        let source = crate::agents::add_local_source(app_data.path(), source_root.path())
-            .await
-            .unwrap();
-        let reference = AgentReference {
-            source_id: source.id,
-            relative_path: "frontend.md".into(),
-        };
-        let package = crate::agents::resolve_agent_package(app_data.path(), &reference)
-            .await
-            .unwrap();
-        let agent = package.agent.clone().unwrap();
-        let project = std::fs::canonicalize(project.path()).unwrap();
-        let mut record = write_agent_files(
-            &agent,
-            raw,
-            "antigravity",
-            home.path(),
-            Some(&project),
-            None,
-            &package.source_hash,
-            &package.body_hash,
-            "test",
-            "2026-08-17T00:00:00Z",
-        )
-        .await
-        .unwrap();
-        record.source_id = reference.source_id.clone();
-        record.relative_path = reference.relative_path.clone();
-        record.source_snapshot_hash = package.source_hash.clone();
-        save_ledger_for(app_data.path(), std::slice::from_ref(&record))
-            .await
-            .unwrap();
-        assert_eq!(
-            Path::new(&record.dest),
-            project.join(".agents/skills/agency-frontend-developer/SKILL.md")
-        );
-        assert_eq!(
-            std::fs::read_to_string(&record.dest).unwrap(),
-            render::render(&agent, raw, "antigravity").unwrap()
-        );
-
-        let mut state = AppState::build().unwrap();
-        state.app_data_dir = app_data.path().to_path_buf();
-        let reconciled = mcp_reconcile_agent_installs(&state).await.unwrap();
-        assert_eq!(reconciled.len(), 1);
-        assert_eq!(reconciled[0].state, InstallState::Current);
-
-        remove_agent_files(
-            &agent,
-            raw,
-            "antigravity",
-            home.path(),
-            Some(&project),
-            Some(Path::new(&record.dest)),
-            backups.path(),
-            "2026-08-17T00:00:01Z",
-        )
-        .await
-        .unwrap();
-        save_ledger_for(app_data.path(), &[]).await.unwrap();
-        assert!(!Path::new(&record.dest).exists());
-        assert!(!Path::new(&record.dest).parent().unwrap().exists());
-        assert!(mcp_reconcile_agent_installs(&state)
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
     async fn prepared_roster_write_recovery_rolls_forward_bytes_and_ledger_once() {
         let app_data = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -12154,6 +12520,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roster_recovery_rejects_unregistered_move_and_uninstall_paths_without_mutation() {
+        for kind in ["agent_disable", "agent_uninstall"] {
+            let app_data = tempfile::tempdir().unwrap();
+            let unregistered = tempfile::tempdir().unwrap();
+            let project = std::fs::canonicalize(unregistered.path()).unwrap();
+            let active = project.join("CONVENTIONS.md");
+            let disabled = disabled_destination(&active).unwrap();
+            std::fs::write(&active, b"unregistered roster").unwrap();
+            let mut previous = roster_record(2);
+            previous.project_path = project.to_string_lossy().into_owned();
+            previous.dest = active.to_string_lossy().into_owned();
+            previous.rendered_hash = render::sha256_hex(b"unregistered roster");
+            let mut state = AppState::build().unwrap();
+            state.app_data_dir = app_data.path().to_path_buf();
+            let database = crate::state_db::StateDatabase::open(app_data.path()).unwrap();
+            database
+                .mutate(installs_spec(), Vec::new(), {
+                    let previous = previous.clone();
+                    move |entries| {
+                        entries.push(InstallLedgerEntry::Roster(previous));
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap();
+            database
+                .mutate(projects_spec(), Vec::new(), |_| Ok(()))
+                .await
+                .unwrap();
+            database
+                .set_migration_state(crate::types::StorageMigrationState::Complete)
+                .await
+                .unwrap();
+            if kind == "agent_disable" {
+                let mut next = previous.clone();
+                next.disabled_path = Some(disabled.to_string_lossy().into_owned());
+                database
+                    .prepare_filesystem_operation(
+                        kind,
+                        &AgentRosterMoveOperation {
+                            previous: previous.clone(),
+                            next,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                database
+                    .prepare_filesystem_operation(
+                        kind,
+                        &AgentRosterUninstallOperation {
+                            previous: previous.clone(),
+                            current_hash: previous.rendered_hash.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            assert!(recover_agent_operations(&state).await.is_err());
+            assert_eq!(std::fs::read(&active).unwrap(), b"unregistered roster");
+            assert!(!disabled.exists());
+            assert_eq!(
+                load_rosters_for_state(&state).await.unwrap(),
+                vec![previous]
+            );
+            let pending = database.pending_filesystem_operations().await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].recovery_error.is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn roster_sqlite_ledger_failure_restores_file_row_and_journal() {
         let app_data = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -12193,6 +12632,7 @@ mod tests {
             .await
             .unwrap();
         let connection = inject_agent_ledger_failure(app_data.path());
+        let history_before = history_tree_bytes(app_data.path());
 
         assert!(
             move_roster(&state, "aider", project.to_str().unwrap(), false)
@@ -12212,6 +12652,7 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        assert_eq!(history_tree_bytes(app_data.path()), history_before);
     }
 
     #[cfg(unix)]
@@ -12220,8 +12661,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         // Update: the reviewed replacement cannot create its sibling temp file.
-        let (_app, source_root, project, database, state, references, record, bytes) =
+        let (app, source_root, project, database, state, references, record, bytes) =
             completed_sqlite_roster_install().await;
+        let history_before = history_tree_bytes(app.path());
         std::fs::write(
             source_root.path().join("agent.md"),
             "---\nname: agent.md\ndescription: Test.\n---\nUpdated.\n",
@@ -12244,6 +12686,7 @@ mod tests {
         std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert_exact_roster_state(&state, &database, &record, &bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
 
         // Move: rename requires write permission on the project directory.
         std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -12251,6 +12694,7 @@ mod tests {
         std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert_exact_roster_state(&state, &database, &record, &bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
 
         // Uninstall: reads remain available but directory mutation is denied.
         let plan = build_roster_plan(
@@ -12271,6 +12715,7 @@ mod tests {
         std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert_exact_roster_state(&state, &database, &record, &bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
     }
 
     #[cfg(unix)]
@@ -12280,6 +12725,7 @@ mod tests {
 
         let (app, _source, _project, database, state, references, record, bytes) =
             completed_sqlite_roster_install().await;
+        let history_before = history_tree_bytes(app.path());
         let filesystem_project = tempfile::tempdir().unwrap();
         let ledger_project = tempfile::tempdir().unwrap();
         let filesystem_project_path = std::fs::canonicalize(filesystem_project.path()).unwrap();
@@ -12320,6 +12766,7 @@ mod tests {
         assert!(result.is_err());
         assert!(!Path::new(&plan.destination).exists());
         assert_exact_roster_state(&state, &database, &record, &bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
 
         let plan = build_roster_plan(
             &state,
@@ -12338,6 +12785,7 @@ mod tests {
         assert!(result.is_err());
         assert!(!Path::new(&plan.destination).exists());
         assert_exact_roster_state(&state, &database, &record, &bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
     }
 
     #[cfg(unix)]
@@ -12372,12 +12820,14 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let history_before = history_tree_bytes(app.path());
 
         std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = rollback_roster(&state, "aider", &updated.project_path, &snapshot.id).await;
         std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert_exact_roster_state(&state, &database, &updated, &updated_bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
 
         let connection = inject_agent_ledger_failure(app.path());
         let result = rollback_roster(&state, "aider", &updated.project_path, &snapshot.id).await;
@@ -12386,12 +12836,14 @@ mod tests {
             .unwrap();
         assert!(result.is_err());
         assert_exact_roster_state(&state, &database, &updated, &updated_bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
     }
 
     #[tokio::test]
     async fn roster_update_and_uninstall_ledger_failures_restore_exact_truth() {
         let (app, source_root, _project, database, state, references, record, bytes) =
             completed_sqlite_roster_install().await;
+        let history_before = history_tree_bytes(app.path());
         std::fs::write(
             source_root.path().join("agent.md"),
             "---\nname: agent.md\ndescription: Test.\n---\nUpdated.\n",
@@ -12413,6 +12865,7 @@ mod tests {
             .unwrap();
         assert!(result.is_err());
         assert_exact_roster_state(&state, &database, &record, &bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
 
         let uninstall = build_roster_plan(
             &state,
@@ -12435,12 +12888,14 @@ mod tests {
             .unwrap();
         assert!(result.is_err());
         assert_exact_roster_state(&state, &database, &record, &bytes, 0).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
     }
 
     #[tokio::test]
     async fn roster_commit_failure_compensates_and_recovery_never_silently_completes() {
         let (app, _source, _project, database, state, _references, record, bytes) =
             completed_sqlite_roster_install().await;
+        let history_before = history_tree_bytes(app.path());
         let connection =
             rusqlite::Connection::open(app.path().join("state/agency-agents.sqlite3")).unwrap();
         connection
@@ -12455,6 +12910,7 @@ mod tests {
         let result = move_roster(&state, "aider", &record.project_path, false).await;
         assert!(result.is_err());
         assert_exact_roster_state(&state, &database, &record, &bytes, 1).await;
+        assert_eq!(history_tree_bytes(app.path()), history_before);
         let pending = database.pending_filesystem_operations().await.unwrap();
         assert_eq!(
             pending[0].phase,

@@ -21,6 +21,82 @@ struct SnapshotFile {
 struct SnapshotManifest {
     identity_hash: String,
     files: Vec<SnapshotFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    roster_record_hash: Option<String>,
+}
+
+pub(super) struct RosterHistoryMutation {
+    pub(super) snapshot: AgentVersionSnapshot,
+    directory: PathBuf,
+    snapshot_directory: PathBuf,
+    index_path: PathBuf,
+    previous_index: Option<Vec<u8>>,
+    directory_existed: bool,
+    retired: Vec<PathBuf>,
+}
+
+impl RosterHistoryMutation {
+    pub(super) async fn commit(self) {
+        for path in self.retired {
+            if path.parent() == Some(self.directory.as_path()) {
+                let _ = tokio::fs::remove_dir_all(&path).await;
+            }
+        }
+    }
+
+    pub(super) async fn rollback(self) -> Result<(), AppError> {
+        let history_was_absent = self.previous_index.is_none();
+        match &self.previous_index {
+            Some(bytes) => atomic_write(&self.index_path, bytes).await?,
+            None => match tokio::fs::remove_file(&self.index_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::Io {
+                        message: format!("remove Agent roster history index: {error}"),
+                    });
+                }
+            },
+        }
+        match tokio::fs::remove_dir_all(&self.snapshot_directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("remove failed Agent roster snapshot: {error}"),
+                });
+            }
+        }
+        let restored_index = match read_capped(&self.index_path, MAX_SNAPSHOT_BYTES).await {
+            Ok(bytes) => Some(bytes),
+            Err(AppError::Io { .. }) if !self.index_path.exists() => None,
+            Err(error) => return Err(error),
+        };
+        if restored_index != self.previous_index {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster history rollback did not restore its exact index".into(),
+            });
+        }
+        if history_was_absent && !self.directory_existed {
+            let _ = tokio::fs::remove_dir(&self.directory).await;
+            let _ = tokio::fs::remove_dir(self.directory.parent().unwrap_or(&self.directory)).await;
+        }
+        for retired in &self.retired {
+            if !retired.is_dir() {
+                return Err(AppError::StorageCorrupt {
+                    message: "Agent roster history rollback lost a retained snapshot".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn roster_record_hash(record: &crate::types::AgentRosterInstallRecord) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(record).map_err(|error| AppError::Internal {
+        message: format!("serialize Agent roster snapshot metadata: {error}"),
+    })?;
+    Ok(crate::render::sha256_hex(&bytes))
 }
 
 fn invalid(message: impl Into<String>) -> AppError {
@@ -124,7 +200,7 @@ pub(super) async fn create_snapshot_protected(
         regular_file(source)?;
         contents.push(read_capped(source, MAX_SNAPSHOT_BYTES).await?);
     }
-    create_snapshot_from_bytes_protected(
+    let mutation = create_snapshot_from_bytes_protected(
         app_data_dir,
         identity,
         &contents,
@@ -134,7 +210,10 @@ pub(super) async fn create_snapshot_protected(
         protected_snapshot_id,
         None,
     )
-    .await
+    .await?;
+    let snapshot = mutation.snapshot.clone();
+    mutation.commit().await;
+    Ok(snapshot)
 }
 
 pub(super) async fn create_snapshot_from_bytes(
@@ -145,7 +224,7 @@ pub(super) async fn create_snapshot_from_bytes(
     rendered_hash: &str,
     created_at: &str,
 ) -> Result<AgentVersionSnapshot, AppError> {
-    create_snapshot_from_bytes_protected(
+    let mutation = create_snapshot_from_bytes_protected(
         app_data_dir,
         identity,
         contents,
@@ -155,7 +234,10 @@ pub(super) async fn create_snapshot_from_bytes(
         None,
         None,
     )
-    .await
+    .await?;
+    let snapshot = mutation.snapshot.clone();
+    mutation.commit().await;
+    Ok(snapshot)
 }
 
 #[allow(clippy::too_many_arguments)] // ponytail: one internal primitive keeps Agent and roster history atomic.
@@ -168,12 +250,13 @@ async fn create_snapshot_from_bytes_protected(
     created_at: &str,
     protected_snapshot_id: Option<&str>,
     roster_record: Option<&crate::types::AgentRosterInstallRecord>,
-) -> Result<AgentVersionSnapshot, AppError> {
+) -> Result<RosterHistoryMutation, AppError> {
     if contents.is_empty() {
         return Err(invalid("Agent version snapshot requires at least one file"));
     }
     let identity_hash = identity_hash(identity)?;
     let directory = app_data_dir.join("agents/history").join(&identity_hash);
+    let directory_existed = directory.is_dir();
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(|error| AppError::Io {
@@ -182,6 +265,12 @@ async fn create_snapshot_from_bytes_protected(
                 directory.display()
             ),
         })?;
+    let index_path = directory.join("index.json");
+    let previous_index = match read_capped(&index_path, MAX_SNAPSHOT_BYTES).await {
+        Ok(bytes) => Some(bytes),
+        Err(AppError::Io { .. }) if !index_path.exists() => None,
+        Err(error) => return Err(error),
+    };
     let id = format!("{}-{}", created_at.replace([':', '/'], "-"), Uuid::new_v4());
     let snapshot_directory = directory.join(&id);
     let content_directory = snapshot_directory.join("content");
@@ -209,6 +298,7 @@ async fn create_snapshot_from_bytes_protected(
         let manifest = SnapshotManifest {
             identity_hash,
             files,
+            roster_record_hash: roster_record.map(roster_record_hash).transpose()?,
         };
         let manifest_bytes =
             serde_json::to_vec_pretty(&manifest).map_err(|error| AppError::Internal {
@@ -228,7 +318,6 @@ async fn create_snapshot_from_bytes_protected(
             content_path: snapshot_directory.to_string_lossy().into_owned(),
             roster_record: roster_record.cloned(),
         };
-        let index_path = directory.join("index.json");
         let mut snapshots = load_index(&index_path).await?;
         if protected_snapshot_id
             .is_some_and(|protected| !snapshots.iter().any(|snapshot| snapshot.id == protected))
@@ -266,13 +355,19 @@ async fn create_snapshot_from_bytes_protected(
             .collect::<std::collections::BTreeSet<_>>();
         snapshots.retain(|snapshot| !retired_ids.contains(snapshot.id.as_str()));
         save_index(&index_path, &snapshots).await?;
-        for retired_snapshot in retired {
-            let path = PathBuf::from(retired_snapshot.content_path);
-            if path.parent() == Some(directory.as_path()) {
-                let _ = tokio::fs::remove_dir_all(path).await;
-            }
-        }
-        Ok(snapshot)
+        let retired = retired
+            .into_iter()
+            .map(|snapshot| PathBuf::from(snapshot.content_path))
+            .collect();
+        Ok(RosterHistoryMutation {
+            snapshot,
+            directory,
+            snapshot_directory: snapshot_directory.clone(),
+            index_path,
+            previous_index,
+            directory_existed,
+            retired,
+        })
     }
     .await;
     if result.is_err() {
@@ -281,6 +376,7 @@ async fn create_snapshot_from_bytes_protected(
     result
 }
 
+#[cfg(test)]
 pub(super) async fn create_roster_snapshot(
     app_data_dir: &Path,
     identity: &AgentInstallIdentity,
@@ -289,6 +385,28 @@ pub(super) async fn create_roster_snapshot(
     created_at: &str,
     protected_snapshot_id: Option<&str>,
 ) -> Result<AgentVersionSnapshot, AppError> {
+    let mutation = begin_roster_snapshot(
+        app_data_dir,
+        identity,
+        source_paths,
+        record,
+        created_at,
+        protected_snapshot_id,
+    )
+    .await?;
+    let snapshot = mutation.snapshot.clone();
+    mutation.commit().await;
+    Ok(snapshot)
+}
+
+pub(super) async fn begin_roster_snapshot(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    source_paths: &[PathBuf],
+    record: &crate::types::AgentRosterInstallRecord,
+    created_at: &str,
+    protected_snapshot_id: Option<&str>,
+) -> Result<RosterHistoryMutation, AppError> {
     if source_paths.is_empty() {
         return Err(invalid("Agent roster snapshot requires its aggregate file"));
     }
@@ -296,6 +414,11 @@ pub(super) async fn create_roster_snapshot(
     for source in source_paths {
         regular_file(source)?;
         contents.push(read_capped(source, MAX_SNAPSHOT_BYTES).await?);
+    }
+    if contents.len() != 1 || crate::render::sha256_hex(&contents[0]) != record.rendered_hash {
+        return Err(invalid(
+            "Agent roster snapshot content does not match its roster metadata",
+        ));
     }
     let source_hash =
         crate::render::sha256_hex(&serde_json::to_vec(&record.members).map_err(|error| {
@@ -364,6 +487,20 @@ pub(super) async fn snapshot_contents(
         return Err(invalid(
             "Agent version snapshot identity or file count changed",
         ));
+    }
+    match (&snapshot.roster_record, &manifest.roster_record_hash) {
+        (Some(record), Some(expected)) if roster_record_hash(record)? == *expected => {}
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err(invalid(
+                "Legacy Agent roster snapshot metadata is not cryptographically bound",
+            ));
+        }
+        _ => {
+            return Err(invalid(
+                "Agent roster snapshot metadata failed verification",
+            ));
+        }
     }
 
     let mut contents = Vec::with_capacity(manifest.files.len());
@@ -436,7 +573,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::types::{AgentInstallIdentity, AgentReference, Scope};
+    use crate::types::{
+        AgentInstallIdentity, AgentReference, AgentRosterInstallRecord, AgentRosterMember, Scope,
+    };
 
     fn identity(source: &str) -> AgentInstallIdentity {
         AgentInstallIdentity {
@@ -448,6 +587,140 @@ mod tests {
             scope: Scope::User,
             project_path: None,
         }
+    }
+
+    fn roster_identity(project: &Path) -> (AgentInstallIdentity, AgentRosterInstallRecord) {
+        let project_path = project.to_string_lossy().into_owned();
+        let record = AgentRosterInstallRecord {
+            tool: "aider".into(),
+            scope: Scope::Project,
+            project_path: project_path.clone(),
+            dest: project
+                .join("CONVENTIONS.md")
+                .to_string_lossy()
+                .into_owned(),
+            members: ["agent.md", "reviewer.md"]
+                .into_iter()
+                .map(|relative_path| AgentRosterMember {
+                    reference: AgentReference {
+                        source_id: "builtin:agency-agents".into(),
+                        relative_path: relative_path.into(),
+                    },
+                    name: relative_path.into(),
+                    source_hash: "a".repeat(64),
+                })
+                .collect(),
+            rendered_hash: crate::render::sha256_hex(b"roster bytes"),
+            disabled_path: None,
+            installed_at: "2026-08-17T00:00:00Z".into(),
+        };
+        let identity = AgentInstallIdentity {
+            reference: AgentReference {
+                source_id: "roster:aider".into(),
+                relative_path: format!(
+                    "projects/{}.md",
+                    crate::render::sha256_hex(project_path.as_bytes())
+                ),
+            },
+            tool: "aider".into(),
+            scope: Scope::Project,
+            project_path: Some(project_path),
+        };
+        (identity, record)
+    }
+
+    #[tokio::test]
+    async fn roster_snapshot_rejects_index_metadata_changed_after_manifest_commit() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project.join("CONVENTIONS.md");
+        std::fs::write(&destination, b"roster bytes").unwrap();
+        let (identity, record) = roster_identity(&project);
+        let snapshot = create_roster_snapshot(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&destination),
+            &record,
+            "2026-08-17T00:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        let index = history_directory(app_data.path(), &identity).join("index.json");
+        let mut entries = list_snapshots(app_data.path(), &identity).await.unwrap();
+        entries[0].roster_record.as_mut().unwrap().members[0].name = "Tampered".into();
+        std::fs::write(&index, serde_json::to_vec_pretty(&entries).unwrap()).unwrap();
+
+        assert!(snapshot_contents(
+            app_data.path(),
+            &identity,
+            &snapshot.id,
+            std::slice::from_ref(&destination),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn roster_history_rollback_at_retention_cap_restores_exact_bytes() {
+        fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+            fn collect(root: &Path, path: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.metadata().unwrap().is_dir() {
+                        collect(root, &path, files);
+                    } else {
+                        files.push((
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            std::fs::read(path).unwrap(),
+                        ));
+                    }
+                }
+            }
+            let mut files = Vec::new();
+            collect(root, root, &mut files);
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            files
+        }
+
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project.join("CONVENTIONS.md");
+        std::fs::write(&destination, b"roster bytes").unwrap();
+        let (identity, record) = roster_identity(&project);
+        for index in 0..super::super::MAX_AGENT_HISTORY_ENTRIES {
+            create_roster_snapshot(
+                app_data.path(),
+                &identity,
+                std::slice::from_ref(&destination),
+                &record,
+                &format!("2026-08-17T00:00:{index:02}Z"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let directory = history_directory(app_data.path(), &identity);
+        let before = tree(&directory);
+
+        begin_roster_snapshot(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&destination),
+            &record,
+            "2026-08-17T01:00:00Z",
+            None,
+        )
+        .await
+        .unwrap()
+        .rollback()
+        .await
+        .unwrap();
+
+        assert_eq!(tree(&directory), before);
     }
 
     #[tokio::test]

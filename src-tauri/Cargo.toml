@@ -121,6 +121,7 @@ keyring = { version = "3", features = ["windows-native"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 # Reserved for future integration tests that need a sandbox dir
 # (e.g. brewfile_export / brewfile_import) — currently unused by the
 # Wave 3 test pass but kept here so Reality Checker can wire in tests
