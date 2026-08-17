@@ -564,6 +564,13 @@ fn copy_project_tree_to_ambient(
     Ok(())
 }
 
+pub fn copy_project_capability_snapshot(
+    capability: &ProjectDirectoryCapability,
+    destination: &Path,
+) -> Result<(), AppError> {
+    copy_project_tree_to_ambient(&capability.parent, Path::new(&capability.name), destination)
+}
+
 #[cfg(not(windows))]
 fn remove_project_tree(parent: &fs::File, name: &Path) -> Result<(), AppError> {
     cap_primitives::fs::remove_dir_all(parent, name)

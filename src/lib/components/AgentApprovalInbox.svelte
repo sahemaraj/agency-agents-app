@@ -5,6 +5,7 @@
   import { agentApprovalFacts } from "$lib/agents/libraryModel";
   import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
+  import { ui } from "$lib/stores/ui.svelte";
   import type { MessageKey } from "$lib/i18n/messages";
   import type { AgentApprovalAction } from "$lib/types";
 
@@ -31,9 +32,14 @@
     Date.parse(right.submittedAt) - Date.parse(left.submittedAt)
   ));
   let status: HTMLDivElement | undefined = $state();
+  let loadedFocusId = $state<string | null>(null);
 
   $effect(() => {
-    if (open) untrack(() => void agentLibrary.load(true));
+    if (!open) return;
+    const requestedFocusId = focusId;
+    untrack(() => void agentLibrary.load(true).then(() => {
+      if (open && focusId === requestedFocusId) loadedFocusId = requestedFocusId;
+    }));
   });
 
   $effect(() => {
@@ -43,12 +49,18 @@
       ?.querySelector<HTMLElement>("button")?.focus({ preventScroll: true }));
   });
 
+  $effect(() => {
+    if (!open || !focusId || loadedFocusId !== focusId) return;
+    if (approvals.some((approval) => approval.id === focusId)) return;
+    onClose();
+  });
+
   function stale(result: string | null): boolean {
     return !!result && /stale|revision|changed since/i.test(result);
   }
 
   async function resolve(id: string, decision: "approve" | "reject"): Promise<void> {
-    const linked = !!focusId;
+    const linked = ui.isReviewIntent("agent", id);
     const succeeded = decision === "approve"
       ? await agentLibrary.approveRequest(id)
       : await agentLibrary.rejectRequest(id);

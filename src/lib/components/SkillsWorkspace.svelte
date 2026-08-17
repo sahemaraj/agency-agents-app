@@ -58,6 +58,7 @@
   let searchInput: HTMLInputElement | undefined = $state();
   let sourceManager: HTMLDetailsElement | undefined = $state();
   let approvalInbox: HTMLDetailsElement | undefined = $state();
+  let resolvingLinkedApprovalId = $state<string | null>(null);
   let statusFilter: StatusFilter = $state("all");
   let sourceFilter = $state("all");
   let libraryFilter = $state("all");
@@ -242,21 +243,33 @@
       [...(approvalInbox?.querySelectorAll<HTMLElement>("[data-skill-approval-id]") ?? [])]
         .find((candidate) => candidate.dataset.skillApprovalId === id)
         ?.querySelector<HTMLElement>("button")?.focus({ preventScroll: true });
-      ui.skillApprovalId = null;
     });
   });
 
-  function closeLinkedSkillApproval(): void {
-    if (!ui.reviewReturnId) return;
+  $effect(() => {
+    const id = ui.skillApprovalId;
+    if (!id || resolvingLinkedApprovalId === id || !catalogLoaded || skillSources.loading) return;
+    if (pendingApprovals.some((approval) => approval.id === id)) return;
     ui.skillApprovalId = null;
-    ui.returnToActivityReview();
+    ui.returnToActivityReview("skill", id);
+  });
+
+  function closeLinkedSkillApproval(): void {
+    const id = ui.skillApprovalId;
+    if (!id) return;
+    ui.skillApprovalId = null;
+    ui.returnToActivityReview("skill", id);
   }
 
   async function resolveLinkedSkillApproval(id: string, decision: "approve" | "reject"): Promise<void> {
+    const linked = ui.isReviewIntent("skill", id);
+    if (linked) resolvingLinkedApprovalId = id;
     const succeeded = decision === "approve"
       ? await skillSources.approveRequest(id)
       : await skillSources.rejectRequest(id);
-    if (succeeded) closeLinkedSkillApproval();
+    if (resolvingLinkedApprovalId === id) resolvingLinkedApprovalId = null;
+    if (succeeded && linked) closeLinkedSkillApproval();
+    else if (succeeded && ui.reviewIntent) ui.clearReviewIntent();
   }
 
   $effect(() => {
@@ -502,6 +515,7 @@
   }
 
   let startedRecovery = $state("");
+  let startedRecoveryExactId = $state("");
   $effect(() => {
     const recovery = ui.skillRecovery;
     if (!recovery || !selected || !installTruthFresh) return;
@@ -512,6 +526,7 @@
     const key = lifecycleKey(installed);
     if (startedRecovery === key) return;
     startedRecovery = key;
+    startedRecoveryExactId = ui.recoveryExactId("skill", recovery);
     void tick().then(async () => {
       const details = [...document.querySelectorAll<HTMLDetailsElement>("details[data-skill-history]")]
         .find((candidate) => candidate.dataset.skillHistory === key);
@@ -525,14 +540,39 @@
     });
   });
 
+  $effect(() => {
+    const recovery = ui.skillRecovery;
+    if (!recovery || !catalogLoaded || !installTruthFresh) return;
+    const matchesSelection = selected?.pkg.sourceId === recovery.reference.sourceId
+      && selected.pkg.relativePath === recovery.reference.relativePath;
+    const installed = matchesSelection && selectedInstalls.some((item) => item.runtime === recovery.runtime
+      && (item.projectPath ?? null) === recovery.projectPath);
+    if (installed) return;
+    const exactId = ui.recoveryExactId("skill", recovery);
+    ui.skillRecovery = null;
+    ui.returnToSettingsRecovery("skill", exactId);
+  });
+
   function toggleSkillHistory(event: Event, installed: InstalledSkill): void {
     const details = event.currentTarget as HTMLDetailsElement;
     const key = lifecycleKey(installed);
     if (details.open) {
+      const exactId = ui.recoveryExactId("skill", {
+        reference: { sourceId: installed.sourceId, relativePath: installed.relativePath },
+        runtime: installed.runtime,
+        projectPath: installed.projectPath,
+      });
+      if (!ui.isRecoveryIntent("skill", exactId)) {
+        ui.clearRecoveryIntent();
+        startedRecovery = "";
+        startedRecoveryExactId = "";
+      }
       if (!versionHistory[key] && startedRecovery !== key) void loadVersionHistory(installed);
-    } else if (ui.recoveryReturnId && startedRecovery === key) {
+    } else if (startedRecoveryExactId && startedRecovery === key) {
       startedRecovery = "";
-      ui.returnToSettingsRecovery();
+      const exactId = startedRecoveryExactId;
+      startedRecoveryExactId = "";
+      ui.returnToSettingsRecovery("skill", exactId);
     }
   }
 
@@ -548,7 +588,11 @@
       : skillSources.addError ?? i18n.t("skills.rollbackFailed");
     if (succeeded) {
       await loadVersionHistory(installed);
-      if (ui.recoveryReturnId) ui.returnToSettingsRecovery();
+      if (startedRecoveryExactId) {
+        const exactId = startedRecoveryExactId;
+        startedRecoveryExactId = "";
+        ui.returnToSettingsRecovery("skill", exactId);
+      }
     }
   }
 
@@ -968,10 +1012,12 @@
       </div>
     </details>
     <details class="draft-inbox" bind:this={approvalInbox} ontoggle={(event) => {
-      if (event.currentTarget.open) void skillSources.load();
+      if (event.currentTarget.open) {
+        void skillSources.load();
+      }
       else closeLinkedSkillApproval();
     }}>
-      <summary>{i18n.t("skills.approvalInbox")} <span>{pendingDrafts.length + pendingApprovals.length}</span></summary>
+      <summary onclick={() => { if (!ui.skillApprovalId) ui.clearReviewIntent(); }}>{i18n.t("skills.approvalInbox")} <span>{pendingDrafts.length + pendingApprovals.length}</span></summary>
       <div class="draft-popover" aria-label={i18n.t("skills.draftInboxAria")}>
         {#if pendingDrafts.length === 0 && pendingApprovals.length === 0}
           <p class="quiet">{i18n.t("skills.noDrafts")}</p>

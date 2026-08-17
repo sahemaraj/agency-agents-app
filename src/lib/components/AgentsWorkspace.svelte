@@ -328,10 +328,10 @@
     setTimeout(() => organizerButton?.focus());
   }
   function closeApprovals() {
-    const returnToReview = !!ui.reviewReturnId;
+    const approvalId = ui.agentApprovalId;
     ui.agentApprovalId = null;
     approvalsOpen = false;
-    if (returnToReview) ui.returnToActivityReview();
+    if (approvalId && ui.returnToActivityReview("agent", approvalId)) return;
     else setTimeout(() => approvalsButton?.focus());
   }
 
@@ -342,6 +342,7 @@
   // ── Install modal (the shared destinations × tools grid) for the open agent ──
   let installOpen = $state(false);
   let ollamaOpen = $state(false);
+  let recoveryReconcileRequested = $state(false);
 
   $effect(() => {
     if (ui.agentApprovalId) approvalsOpen = true;
@@ -349,17 +350,43 @@
 
   $effect(() => {
     const recovery = ui.agentRecovery;
+    if (!recovery) {
+      recoveryReconcileRequested = false;
+      return;
+    }
+    if (!install.reconciled) {
+      if (!install.reconciling && !recoveryReconcileRequested) {
+        recoveryReconcileRequested = true;
+        void install.reconcile();
+      }
+      if (!install.reconcileError || install.reconciling) return;
+      const exactId = ui.recoveryExactId("agent", recovery);
+      ui.agentRecovery = null;
+      ui.returnToSettingsRecovery("agent", exactId);
+      return;
+    }
     if (!recovery || !panelPackage || !install.reconciled) return;
     if (panelPackage.reference.sourceId !== recovery.reference.sourceId
       || panelPackage.reference.relativePath !== recovery.reference.relativePath) return;
     installOpen = true;
   });
 
+  $effect(() => {
+    const recovery = ui.agentRecovery;
+    if (!recovery || !agentCatalogLoaded || !install.reconciled) return;
+    if (panelPackage?.reference.sourceId === recovery.reference.sourceId
+      && panelPackage.reference.relativePath === recovery.reference.relativePath) return;
+    const exactId = ui.recoveryExactId("agent", recovery);
+    ui.agentRecovery = null;
+    ui.returnToSettingsRecovery("agent", exactId);
+  });
+
   function closeInstall(): void {
-    const returnToRecovery = !!ui.agentRecovery && !!ui.recoveryReturnId;
+    const recovery = ui.agentRecovery;
+    const exactId = recovery ? ui.recoveryExactId("agent", recovery) : null;
     installOpen = false;
     ui.agentRecovery = null;
-    if (returnToRecovery) ui.returnToSettingsRecovery();
+    if (exactId) ui.returnToSettingsRecovery("agent", exactId);
   }
 
   // ── Bulk select (lifted from the old Library, now over the unified list) ──
@@ -481,7 +508,7 @@
         <button class="ghost" bind:this={sourceButton} onclick={() => (sourceManagerOpen = true)}>{i18n.t("agents.sources")}</button>
         <button class="ghost" bind:this={creatorButton} onclick={() => { creatorInitial = null; creatorOpen = true; }}><PlusIcon size={14} /> {i18n.t("agents.create")}</button>
         <button class="ghost" bind:this={organizerButton} onclick={() => (organizerOpen = true)}>{i18n.t("agents.organize")}</button>
-        <button class="ghost" bind:this={approvalsButton} onclick={() => (approvalsOpen = true)}>
+        <button class="ghost" bind:this={approvalsButton} onclick={() => { ui.clearReviewIntent(); approvalsOpen = true; }}>
           {i18n.t("agents.approvals")}{#if pendingApprovals > 0}<span class="badge" aria-label={i18n.t("agents.pendingApprovals", { count: pendingApprovals })}>{pendingApprovals}</span>{/if}
         </button>
         <div class="cat-wrap">
@@ -691,7 +718,7 @@
           loading={detailLoading}
           catalogDeployment={!libraryPackage}
           onCategory={(slug) => ui.openDivision(slug)}
-          onInstall={() => (installOpen = true)}
+          onInstall={() => { ui.clearRecoveryIntent(); installOpen = true; }}
           onLocalModel={() => (ollamaOpen = true)}
           onEdit={panelPackage ? editLibraryAgent : undefined}
           onDuplicate={panelPackage ? () => agentLibrary.duplicateDraft(panelPackage!.reference) : undefined}

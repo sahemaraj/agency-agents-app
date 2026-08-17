@@ -175,10 +175,21 @@
       const button = [...(projectsRoot?.querySelectorAll<HTMLButtonElement>("button[data-recommendation-id]") ?? [])]
         .find((candidate) => candidate.dataset.recommendationId === id);
       if (!button) return;
+      recommendationTriggerId = id;
       ui.projectRecommendationId = null;
       button.scrollIntoView?.({ block: "nearest" });
       button.focus({ preventScroll: true });
     });
+  });
+
+  $effect(() => {
+    const id = ui.projectRecommendationId;
+    if (!id || !projectInventoryReady || readinessBusy) return;
+    if (recommendations.some((recommendation) => recommendation.id === id)) return;
+    const projectPath = selected?.path ?? ui.projectsSelected;
+    if (!projectPath) return;
+    ui.projectRecommendationId = null;
+    ui.returnToActivityReview("project", ui.projectReviewExactId(projectPath, id));
   });
 
   function readinessCategoryLabel(category: ProjectReadinessReport["categories"][number]["category"]): string {
@@ -291,6 +302,7 @@
   async function openRecommendation(event: MouseEvent, recommendation: ProjectRecommendation): Promise<void> {
     if (!selected || readinessBusy) return;
     const projectPath = selected.path;
+    if (!ui.isReviewIntent("project", ui.projectReviewExactId(projectPath, recommendation.id))) ui.clearReviewIntent();
     const generation = readinessGeneration;
     recommendationTrigger = event.currentTarget as HTMLButtonElement;
     recommendationTriggerId = recommendation.id;
@@ -330,6 +342,7 @@
   async function finishRename(event: MouseEvent, recommendation: ProjectRecommendation): Promise<void> {
     if (!selected || readinessBusy || !recommendation.finalizeOnly) return;
     const projectPath = selected.path;
+    if (!ui.isReviewIntent("project", ui.projectReviewExactId(projectPath, recommendation.id))) ui.clearReviewIntent();
     const generation = readinessGeneration;
     recommendationTrigger = event.currentTarget as HTMLButtonElement;
     recommendationTriggerId = recommendation.id;
@@ -350,20 +363,24 @@
     }
     if (generation === readinessGeneration && selected?.path === projectPath) {
       await refreshReadiness();
-      if (ui.reviewReturnId) ui.returnToActivityReview();
-      else await restoreRecommendationFocus();
+      if (!ui.returnToActivityReview("project", ui.projectReviewExactId(projectPath, recommendation.id))) await restoreRecommendationFocus();
     }
   }
 
   async function dismissRecommendation(recommendation: ProjectRecommendation): Promise<void> {
     if (!selected || readinessBusy) return;
     const projectPath = selected.path;
+    const exactId = ui.projectReviewExactId(projectPath, recommendation.id);
+    const linked = ui.isReviewIntent("project", exactId);
+    if (!linked) ui.clearReviewIntent();
     const generation = readinessGeneration;
+    let dismissed = false;
     readinessBusy = true;
     readinessError = null;
     try {
       await projects.dismissRecommendation(projectPath, recommendation.id);
       if (generation !== readinessGeneration || selected?.path !== projectPath) return;
+      dismissed = true;
       readinessAnnouncement = "Recommendation dismissed.";
     } catch (error) {
       if (generation === readinessGeneration) {
@@ -373,7 +390,10 @@
     } finally {
       if (generation === readinessGeneration) readinessBusy = false;
     }
-    if (generation === readinessGeneration && selected?.path === projectPath) await refreshReadiness();
+    if (generation === readinessGeneration && selected?.path === projectPath) {
+      await refreshReadiness();
+      if (linked && dismissed) ui.returnToActivityReview("project", exactId);
+    }
   }
 
   async function restoreRecommendationFocus(): Promise<void> {
@@ -387,10 +407,15 @@
   }
 
   async function closeRecommendation(): Promise<void> {
+    const recommendationId = recommendationPlan?.id ?? recommendationTriggerId;
+    const projectPath = recommendationPlan?.projectPath ?? selected?.path ?? null;
     recommendationPlan = null;
     recommendationPackage = null;
-    if (ui.reviewReturnId) ui.returnToActivityReview();
-    else await restoreRecommendationFocus();
+    if (!projectPath || !recommendationId
+      || !ui.returnToActivityReview("project", ui.projectReviewExactId(projectPath, recommendationId))) {
+      if (ui.reviewIntent) ui.clearReviewIntent();
+      await restoreRecommendationFocus();
+    }
   }
 
   async function recommendationApplied(): Promise<void> {
@@ -427,8 +452,7 @@
           : "Recommendation applied. Readiness refreshed.";
       }
     }
-    if (ui.reviewReturnId) ui.returnToActivityReview();
-    else await restoreRecommendationFocus();
+    if (!ui.returnToActivityReview("project", ui.projectReviewExactId(projectPath, completed.id))) await restoreRecommendationFocus();
   }
 
   function readinessRepairLabel(

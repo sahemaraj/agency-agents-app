@@ -151,6 +151,7 @@
   $effect(() => {
     const id = ui.activityReceiptId;
     if (!id) return;
+    if (mode !== "history") setMode("history");
     void tick().then(() => {
       if (ui.activityReceiptId !== id) return;
       const details = [...(root?.querySelectorAll<HTMLDetailsElement>("details[data-activity-id]") ?? [])]
@@ -169,21 +170,22 @@
   });
 
   $effect(() => {
-    if (ui.section !== "activity" || !ui.reviewReturnId) return;
-    const id = ui.reviewReturnId;
+    const intent = ui.reviewIntent;
+    if (ui.section !== "activity" || !intent) return;
     const allSettled = Object.values(review).every((state) => state.status !== "loading");
     void tick().then(() => {
+      if (ui.reviewIntent !== intent || ui.section !== "activity" || !root?.isConnected) return;
       const trigger = [...(root?.querySelectorAll<HTMLButtonElement>("[data-review-trigger]") ?? [])]
-        .find((candidate) => candidate.dataset.reviewTrigger === id);
-      const source = id.slice(0, id.indexOf(":")) as ReviewSource;
+        .find((candidate) => candidate.dataset.reviewTrigger === intent.triggerId);
+      const source = intent.kind === "project" ? "recommendation" : intent.kind as ReviewSource;
       const fallback = [...(root?.querySelectorAll<HTMLElement>("[data-review-group]") ?? [])]
         .find((candidate) => candidate.dataset.reviewGroup === source)
         ?.querySelector<HTMLElement>("h2");
       const target = trigger ?? (allSettled ? fallback : null);
       if (!target) return;
       target.focus({ preventScroll: true });
-      ui.consumeReviewReturn();
-      receiptAnnouncement = "Returned to Review.";
+      ui.consumeReviewIntent();
+      receiptAnnouncement = trigger ? "Returned to Review." : "Review item is no longer available.";
     });
   });
 

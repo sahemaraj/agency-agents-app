@@ -22,7 +22,7 @@ use crate::types::{
     SkillTrustedExecutable, SkillType, SkillValidationCode, SkillValidationError,
     SkillVersionSnapshot,
 };
-use crate::util::fs::atomic_write;
+use crate::util::fs::{atomic_write, read_capped};
 
 pub mod drafts;
 pub(crate) mod install;
@@ -37,6 +37,9 @@ const MAX_SKILL_TAGS: usize = 12;
 const MAX_SKILL_DEPENDENCIES: usize = 32;
 const MAX_SKILL_TAXONOMY_SEGMENT_BYTES: usize = 32;
 const SKILL_TRUST_KEY_ACCOUNT: &str = "skill-trust-hmac-v1";
+const MAX_SKILL_HISTORY_ENTRIES: usize = 10;
+const MAX_SKILL_HISTORY_SCAN_ENTRIES: usize = 64;
+const MAX_SKILL_HISTORY_MANIFEST_BYTES: u64 = 64 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -81,6 +84,24 @@ struct SkillUninstallOperation {
     previous: SkillInstallRecord,
     target_hash: String,
     quarantine: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SkillVersionIdentity {
+    source_id: String,
+    relative_path: String,
+    runtime: String,
+    project_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillVersionManifest {
+    version: u32,
+    identity: SkillVersionIdentity,
+    content_hash: String,
+    created_at: String,
 }
 
 #[cfg(test)]
@@ -3029,6 +3050,19 @@ pub(crate) async fn install_skill_authorized(
     } else {
         false
     };
+    if replace_managed {
+        let previous = &records[existing_index.expect("managed replacement has an install")];
+        let project_capability = project_authorization
+            .map(|authorization| {
+                install::project_directory_capability(
+                    authorization.root(),
+                    &install::project_target_path(runtime, &previous.name)?,
+                )
+            })
+            .transpose()?;
+        create_skill_version_snapshot(state, previous, &destination, project_capability.as_ref())
+            .await?;
+    }
 
     let installed_hash = source_hash.clone();
     let record = SkillInstallRecord {
@@ -4332,6 +4366,324 @@ pub async fn skill_backups_list(state: State<'_, AppState>) -> Result<Vec<String
     Ok(backups)
 }
 
+fn skill_version_identity(
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<String>,
+) -> Result<SkillVersionIdentity, AppError> {
+    crate::library::validate_reference(source_id, relative_path)?;
+    let relative_path = crate::library::normalize_relative_path(relative_path)?;
+    install::project_target_path(runtime, "history")?;
+    Ok(SkillVersionIdentity {
+        source_id: source_id.into(),
+        relative_path,
+        runtime: runtime.into(),
+        project_path,
+    })
+}
+
+fn skill_version_identity_for_record(
+    record: &SkillInstallRecord,
+) -> Result<SkillVersionIdentity, AppError> {
+    let canonical_project = canonical_project_string(record.project_path.as_deref())?;
+    if canonical_project != record.project_path {
+        return Err(AppError::InvalidArgument {
+            message: "tracked Skill project identity is not canonical".into(),
+        });
+    }
+    skill_version_identity(
+        &record.source_id,
+        &record.relative_path,
+        &record.runtime,
+        canonical_project,
+    )
+}
+
+fn skill_version_identity_hash(identity: &SkillVersionIdentity) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(identity).map_err(|error| AppError::Internal {
+        message: format!("serialize Skill version identity: {error}"),
+    })?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn skill_history_root(state: &AppState) -> PathBuf {
+    state.app_data_dir.join("skills/history")
+}
+
+fn skill_history_directory(
+    state: &AppState,
+    identity: &SkillVersionIdentity,
+) -> Result<PathBuf, AppError> {
+    Ok(skill_history_root(state).join(skill_version_identity_hash(identity)?))
+}
+
+fn require_real_directory(path: &Path, label: &str) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| AppError::Io {
+        message: format!("inspect {label} {}: {error}", path.display()),
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: format!("{label} must be a real directory"),
+        });
+    }
+    Ok(())
+}
+
+fn require_regular_file(path: &Path, label: &str) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| AppError::Io {
+        message: format!("inspect {label} {}: {error}", path.display()),
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::InvalidArgument {
+            message: format!("{label} must be a regular file"),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_skill_history_directory(
+    state: &AppState,
+    identity: &SkillVersionIdentity,
+) -> Result<PathBuf, AppError> {
+    let root = skill_history_root(state);
+    std::fs::create_dir_all(&root).map_err(|error| AppError::Io {
+        message: format!("create Skill history directory {}: {error}", root.display()),
+    })?;
+    require_real_directory(&root, "Skill history root")?;
+    let canonical_app =
+        std::fs::canonicalize(&state.app_data_dir).map_err(|error| AppError::Io {
+            message: format!("resolve app data directory: {error}"),
+        })?;
+    let canonical_root = std::fs::canonicalize(&root).map_err(|error| AppError::Io {
+        message: format!("resolve Skill history root: {error}"),
+    })?;
+    if !canonical_root.starts_with(&canonical_app) {
+        return Err(AppError::InvalidArgument {
+            message: "Skill history root escaped app data".into(),
+        });
+    }
+    let directory = skill_history_directory(state, identity)?;
+    std::fs::create_dir_all(&directory).map_err(|error| AppError::Io {
+        message: format!(
+            "create Skill identity history {}: {error}",
+            directory.display()
+        ),
+    })?;
+    require_real_directory(&directory, "Skill identity history")?;
+    let canonical_directory = std::fs::canonicalize(&directory).map_err(|error| AppError::Io {
+        message: format!("resolve Skill identity history: {error}"),
+    })?;
+    if canonical_directory.parent() != Some(canonical_root.as_path()) {
+        return Err(AppError::InvalidArgument {
+            message: "Skill identity history escaped its root".into(),
+        });
+    }
+    Ok(directory)
+}
+
+fn validated_skill_snapshot_inventory(
+    content: &Path,
+) -> Result<(Vec<SkillPackageFile>, String), AppError> {
+    require_real_directory(content, "Skill snapshot content")?;
+    let mut errors = Vec::new();
+    let files = inventory_package(content, &mut errors);
+    if files.is_empty()
+        || errors
+            .iter()
+            .any(|error| error.code != SkillValidationCode::TrustRequired)
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Skill snapshot contains an unsafe, oversized, or unreadable entry".into(),
+        });
+    }
+    let hash = install::validated_tree_hash(content, &files)?;
+    Ok((files, hash))
+}
+
+async fn validate_skill_version_snapshot(
+    state: &AppState,
+    identity: &SkillVersionIdentity,
+    snapshot_path: &Path,
+) -> Result<(SkillVersionSnapshot, PathBuf, Vec<SkillPackageFile>), AppError> {
+    require_real_directory(snapshot_path, "Skill version snapshot")?;
+    let directory = skill_history_directory(state, identity)?;
+    require_real_directory(&directory, "Skill identity history")?;
+    let canonical_directory = std::fs::canonicalize(&directory).map_err(|error| AppError::Io {
+        message: format!("resolve Skill identity history: {error}"),
+    })?;
+    let canonical_snapshot =
+        std::fs::canonicalize(snapshot_path).map_err(|error| AppError::Io {
+            message: format!("resolve Skill version snapshot: {error}"),
+        })?;
+    if canonical_snapshot.parent() != Some(canonical_directory.as_path())
+        || canonical_snapshot
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| Uuid::parse_str(name).ok())
+            .is_none()
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Skill version snapshot does not belong to this exact install".into(),
+        });
+    }
+    let manifest_path = canonical_snapshot.join("manifest.json");
+    require_regular_file(&manifest_path, "Skill version manifest")?;
+    let manifest_bytes = read_capped(&manifest_path, MAX_SKILL_HISTORY_MANIFEST_BYTES).await?;
+    let manifest: SkillVersionManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| AppError::InvalidArgument {
+            message: format!("Skill version manifest is invalid: {error}"),
+        })?;
+    if manifest.version != 1
+        || manifest.identity != *identity
+        || manifest.content_hash.len() != 64
+        || !manifest
+            .content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || chrono::DateTime::parse_from_rfc3339(&manifest.created_at).is_err()
+    {
+        return Err(AppError::InvalidArgument {
+            message: "Skill version manifest identity or metadata changed".into(),
+        });
+    }
+    let content = canonical_snapshot.join("content");
+    let (files, content_hash) = validated_skill_snapshot_inventory(&content)?;
+    if content_hash != manifest.content_hash {
+        return Err(AppError::InvalidArgument {
+            message: "Skill version snapshot content failed verification".into(),
+        });
+    }
+    Ok((
+        SkillVersionSnapshot {
+            path: canonical_snapshot.to_string_lossy().into_owned(),
+            created_at: manifest.created_at,
+            content_hash,
+        },
+        content,
+        files,
+    ))
+}
+
+async fn exact_skill_version_snapshots(
+    state: &AppState,
+    identity: &SkillVersionIdentity,
+) -> Result<Vec<SkillVersionSnapshot>, AppError> {
+    let directory = skill_history_directory(state, identity)?;
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Io {
+                message: format!("read Skill identity history: {error}"),
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("read Skill identity history: {error}"),
+            })
+        }
+    };
+    if entries.len() > MAX_SKILL_HISTORY_SCAN_ENTRIES {
+        return Err(AppError::InvalidArgument {
+            message: "Skill identity history exceeds its bounded entry limit".into(),
+        });
+    }
+    let mut snapshots = Vec::new();
+    for entry in entries {
+        if let Ok((snapshot, _, _)) =
+            validate_skill_version_snapshot(state, identity, &entry.path()).await
+        {
+            snapshots.push(snapshot);
+        }
+    }
+    snapshots.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+    Ok(snapshots)
+}
+
+async fn create_skill_version_snapshot(
+    state: &AppState,
+    record: &SkillInstallRecord,
+    source: &Path,
+    project_capability: Option<&install::ProjectDirectoryCapability>,
+) -> Result<SkillVersionSnapshot, AppError> {
+    let identity = skill_version_identity_for_record(record)?;
+    let directory = ensure_skill_history_directory(state, &identity)?;
+    let snapshot_directory = directory.join(Uuid::new_v4().to_string());
+    std::fs::create_dir(&snapshot_directory).map_err(|error| AppError::Io {
+        message: format!("create Skill version snapshot: {error}"),
+    })?;
+    let content = snapshot_directory.join("content");
+    let result = async {
+        match project_capability {
+            Some(capability) => install::copy_project_capability_snapshot(capability, &content)?,
+            None => {
+                let (files, _) = validated_skill_snapshot_inventory(source)?;
+                install::install_validated_directory(
+                    source,
+                    &files,
+                    &content,
+                    &state.app_data_dir.join("skill-backups"),
+                    false,
+                )?;
+            }
+        }
+        let (_, content_hash) = validated_skill_snapshot_inventory(&content)?;
+        if content_hash != record.installed_hash {
+            return Err(AppError::InvalidArgument {
+                message: "Skill changed before its version snapshot was created".into(),
+            });
+        }
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let manifest = SkillVersionManifest {
+            version: 1,
+            identity: identity.clone(),
+            content_hash: content_hash.clone(),
+            created_at: created_at.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| AppError::Internal {
+            message: format!("serialize Skill version manifest: {error}"),
+        })?;
+        if bytes.len() as u64 > MAX_SKILL_HISTORY_MANIFEST_BYTES {
+            return Err(AppError::Internal {
+                message: "Skill version manifest exceeds its bounded size".into(),
+            });
+        }
+        atomic_write(&snapshot_directory.join("manifest.json"), &bytes).await?;
+        Ok(SkillVersionSnapshot {
+            path: snapshot_directory.to_string_lossy().into_owned(),
+            created_at,
+            content_hash,
+        })
+    }
+    .await;
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&snapshot_directory);
+            return Err(error);
+        }
+    };
+    let snapshots = exact_skill_version_snapshots(state, &identity).await?;
+    for retired in snapshots.into_iter().skip(MAX_SKILL_HISTORY_ENTRIES) {
+        let retired = PathBuf::from(retired.path);
+        if retired.parent() == Some(directory.as_path()) {
+            let _ = std::fs::remove_dir_all(retired);
+        }
+    }
+    Ok(snapshot)
+}
+
 pub(crate) async fn skill_version_history(
     state: &AppState,
     source_id: &str,
@@ -4343,33 +4695,9 @@ pub(crate) async fn skill_version_history(
     let records = install::load_ledger_for_state(state).await?;
     let record =
         &records[skill_record_index(&records, source_id, relative_path, runtime, &project)?];
-    let directory = state.app_data_dir.join("skill-backups");
-    let prefix = format!("{}-", record.name);
-    let mut snapshots = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(&prefix))
-            })
-            .filter_map(|entry| {
-                let modified = entry.metadata().ok()?.modified().ok()?;
-                Some(SkillVersionSnapshot {
-                    path: entry.path().to_string_lossy().into_owned(),
-                    created_at: chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339(),
-                })
-            })
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(AppError::Io {
-                message: format!("read skill backups {}: {error}", directory.display()),
-            })
-        }
-    };
-    snapshots.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    let identity = skill_version_identity_for_record(record)?;
+    let mut snapshots = exact_skill_version_snapshots(state, &identity).await?;
+    snapshots.truncate(MAX_SKILL_HISTORY_ENTRIES);
     Ok(snapshots)
 }
 
@@ -4389,58 +4717,41 @@ pub(crate) async fn rollback_skill_authorized(
     let index = skill_record_index(&records, source_id, relative_path, runtime, &project)?;
     let old_records = records.clone();
     let record = records[index].clone();
-    record_destination_authorized(&record, project_authorization)?;
+    let (_, destination) = record_destination_authorized(&record, project_authorization)?;
+    let identity = skill_version_identity_for_record(&record)?;
+    let selected_path = PathBuf::from(snapshot_path);
+    validate_skill_version_snapshot(state, &identity, &selected_path).await?;
+    let project_capability = project_authorization
+        .map(|authorization| {
+            install::project_directory_capability(
+                authorization.root(),
+                &install::project_target_path(runtime, &record.name)?,
+            )
+        })
+        .transpose()?;
+    create_skill_version_snapshot(state, &record, &destination, project_capability.as_ref())
+        .await?;
+    let (selected, content, files) =
+        validate_skill_version_snapshot(state, &identity, &selected_path).await?;
 
     let backup_root = state.app_data_dir.join("skill-backups");
-    let canonical_root = std::fs::canonicalize(&backup_root).map_err(|error| AppError::Io {
-        message: format!("open skill backup root {}: {error}", backup_root.display()),
-    })?;
-    let snapshot = std::fs::canonicalize(snapshot_path).map_err(|error| AppError::Io {
-        message: format!("open skill version snapshot {snapshot_path}: {error}"),
-    })?;
-    if snapshot.parent() != Some(canonical_root.as_path())
-        || !snapshot
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&format!("{}-", record.name)))
-    {
-        return Err(AppError::InvalidArgument {
-            message: "snapshot does not belong to this tracked skill".into(),
-        });
-    }
-    let mut errors = Vec::new();
-    let files = inventory_package(&snapshot, &mut errors);
-    if errors
-        .iter()
-        .any(|error| error.code != SkillValidationCode::TrustRequired)
-    {
-        return Err(AppError::InvalidArgument {
-            message: "snapshot contains an unsafe or unreadable entry".into(),
-        });
-    }
-    let source_hash = install::validated_tree_hash(&snapshot, &files)?;
-    records[index].source_hash = source_hash.clone();
-    records[index].installed_hash = source_hash;
+    records[index].source_hash = selected.content_hash.clone();
+    records[index].installed_hash = selected.content_hash;
     records[index].installed_at = chrono::Utc::now().to_rfc3339();
     install::save_ledger_for_state(state, &records).await?;
 
-    let destination = PathBuf::from(&record.dest);
     let install_result = match project_authorization {
         Some(authorization) => install::install_validated_directory_in_project(
             authorization.root(),
-            &snapshot,
+            &content,
             &files,
             &install::project_target_path(runtime, &record.name)?,
             &backup_root,
             true,
         ),
-        None => install::install_validated_directory(
-            &snapshot,
-            &files,
-            &destination,
-            &backup_root,
-            true,
-        ),
+        None => {
+            install::install_validated_directory(&content, &files, &destination, &backup_root, true)
+        }
     };
     if let Err(error) = install_result {
         return match install::save_ledger_for_state(state, &old_records).await {
@@ -5102,6 +5413,354 @@ mod tests {
             format!("---\n{frontmatter}---\n\n# Skill\n"),
         )
         .expect("write SKILL.md");
+    }
+
+    fn snapshot_skill_file(snapshot: &Path) -> PathBuf {
+        let content = snapshot.join("content/SKILL.md");
+        if content.exists() {
+            content
+        } else {
+            snapshot.join("SKILL.md")
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_version_history_is_exact_across_same_name_install_identities() {
+        let app = tempdir().expect("app data");
+        let first_source = tempdir().expect("first source");
+        let second_source = tempdir().expect("second source");
+        let first_project = tempdir().expect("first project");
+        let second_project = tempdir().expect("second project");
+        let state = test_state(app.path());
+        write_skill(
+            first_source.path(),
+            "reviewer",
+            "reviewer",
+            "First source v1",
+        );
+        write_skill(
+            second_source.path(),
+            "reviewer",
+            "reviewer",
+            "Second source v1",
+        );
+        let first = add_local_source(&state, first_source.path()).await.unwrap();
+        let second = add_local_source(&state, second_source.path())
+            .await
+            .unwrap();
+        let first_project_path = first_project.path().to_string_lossy().into_owned();
+        let second_project_path = second_project.path().to_string_lossy().into_owned();
+
+        super::install_skill(
+            &state,
+            &first.id,
+            "reviewer",
+            "codex",
+            Some(&first_project_path),
+        )
+        .await
+        .unwrap();
+        super::install_skill(
+            &state,
+            &first.id,
+            "reviewer",
+            "claudeCode",
+            Some(&first_project_path),
+        )
+        .await
+        .unwrap();
+        super::install_skill(
+            &state,
+            &second.id,
+            "reviewer",
+            "codex",
+            Some(&second_project_path),
+        )
+        .await
+        .unwrap();
+
+        write_skill(
+            first_source.path(),
+            "reviewer",
+            "reviewer",
+            "First source v2",
+        );
+        super::update_skill(
+            &state,
+            &first.id,
+            "reviewer",
+            "codex",
+            Some(&first_project_path),
+        )
+        .await
+        .unwrap();
+        super::update_skill(
+            &state,
+            &first.id,
+            "reviewer",
+            "claudeCode",
+            Some(&first_project_path),
+        )
+        .await
+        .unwrap();
+        write_skill(
+            second_source.path(),
+            "reviewer",
+            "reviewer",
+            "Second source v2",
+        );
+        super::update_skill(
+            &state,
+            &second.id,
+            "reviewer",
+            "codex",
+            Some(&second_project_path),
+        )
+        .await
+        .unwrap();
+
+        let first_codex = super::skill_version_history(
+            &state,
+            &first.id,
+            "reviewer",
+            "codex",
+            Some(&first_project_path),
+        )
+        .await
+        .unwrap();
+        let first_claude = super::skill_version_history(
+            &state,
+            &first.id,
+            "reviewer",
+            "claudeCode",
+            Some(&first_project_path),
+        )
+        .await
+        .unwrap();
+        let second_codex = super::skill_version_history(
+            &state,
+            &second.id,
+            "reviewer",
+            "codex",
+            Some(&second_project_path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_codex.len(), 1);
+        assert_eq!(first_claude.len(), 1);
+        assert_eq!(second_codex.len(), 1);
+        assert_ne!(first_codex[0].path, first_claude[0].path);
+        assert_ne!(first_codex[0].path, second_codex[0].path);
+
+        let cross_identity = super::rollback_skill_authorized(
+            &state,
+            &first.id,
+            "reviewer",
+            "codex",
+            Some(&first_project_path),
+            &second_codex[0].path,
+            None,
+        )
+        .await;
+        assert!(cross_identity.is_err());
+
+        let restored = super::rollback_skill_authorized(
+            &state,
+            &first.id,
+            "reviewer",
+            "codex",
+            Some(&first_project_path),
+            &first_codex[0].path,
+            None,
+        )
+        .await
+        .expect("rollback exact snapshot");
+        assert!(
+            std::fs::read_to_string(Path::new(&restored.path).join("SKILL.md"))
+                .unwrap()
+                .contains("First source v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_version_history_rejects_tampered_snapshot_content() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Version one");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        write_skill(source.path(), "reviewer", "reviewer", "Version two");
+        super::update_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let snapshot = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap()
+        .pop()
+        .expect("version snapshot");
+        std::fs::write(snapshot_skill_file(Path::new(&snapshot.path)), b"tampered")
+            .expect("tamper snapshot");
+
+        assert!(super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert!(super::rollback_skill_authorized(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+            &snapshot.path,
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_version_history_rejects_linked_snapshot_content() {
+        use std::os::unix::fs::symlink;
+
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let outside = tempdir().expect("outside");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Version one");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        write_skill(source.path(), "reviewer", "reviewer", "Version two");
+        super::update_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let snapshot = super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap()
+        .pop()
+        .expect("version snapshot");
+        let content = snapshot_skill_file(Path::new(&snapshot.path));
+        std::fs::write(outside.path().join("SKILL.md"), b"outside").unwrap();
+        std::fs::remove_file(&content).unwrap();
+        symlink(outside.path().join("SKILL.md"), &content).unwrap();
+
+        assert!(super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert!(super::rollback_skill_authorized(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+            &snapshot.path,
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_name_only_skill_backups_are_not_version_candidates() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Version one");
+        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let legacy = app.path().join("skill-backups/reviewer-legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("SKILL.md"), b"legacy").unwrap();
+
+        assert!(super::skill_version_history(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert!(super::rollback_skill_authorized(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+            legacy.to_string_lossy().as_ref(),
+            None,
+        )
+        .await
+        .is_err());
     }
 
     fn validate_fixture(source: &Path, relative_dir: &str) -> crate::types::SkillPackageResult {

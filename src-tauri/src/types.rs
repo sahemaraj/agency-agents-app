@@ -522,6 +522,7 @@ pub struct SkillDestinationPresence {
 pub struct SkillVersionSnapshot {
     pub path: String,
     pub created_at: String,
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

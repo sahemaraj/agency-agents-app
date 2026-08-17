@@ -275,6 +275,12 @@ beforeEach(async () => {
   corpus.loading = false;
   corpus.error = null;
   experts.error = null;
+  experts.list = [];
+  experts.requests = [];
+  experts.creationRequests = [];
+  experts.history = [];
+  experts.runs = [];
+  experts.loading = false;
   install.installed = [];
   install.tools = [];
   install.reconciling = false;
@@ -309,14 +315,8 @@ beforeEach(async () => {
   ui.teamsSelected = null;
   ui.toolsSelected = null;
   ui.activityReceiptId = null;
-  ui.reviewReturnId = null;
-  ui.agentApprovalId = null;
-  ui.skillApprovalId = null;
-  ui.expertReview = null;
-  ui.projectRecommendationId = null;
-  ui.recoveryReturnId = null;
-  ui.agentRecovery = null;
-  ui.skillRecovery = null;
+  ui.clearReviewIntent();
+  ui.clearRecoveryIntent();
   ui.agentsReference = null;
   ui.skillsSelected = null;
   ui.paletteOpen = false;
@@ -1017,6 +1017,222 @@ describe("frontend test harness", () => {
     }
   });
 
+  it("switches an already-mounted Activity Review to History before opening an exact receipt", async () => {
+    const id = activity.log({
+      action: "bulk",
+      outcome: "ok",
+      receipt: {
+        operation: "repair",
+        succeeded: 1,
+        failed: 0,
+        items: [{ kind: "agent", name: "Reviewer", destination: "/tmp/reviewer.md", outcome: "ok" }],
+      },
+    });
+    ui.section = "activity";
+    const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(ActivityHistory, { target });
+    try {
+      const review = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Review")!;
+      const history = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "History")!;
+      expect(review.getAttribute("aria-pressed")).toBe("true");
+      ui.openActivityReceipt(id);
+      await vi.waitFor(() => {
+        const details = target.querySelector<HTMLDetailsElement>(`details[data-activity-id="${id}"]`);
+        expect(history.getAttribute("aria-pressed")).toBe("true");
+        expect(details?.open).toBe(true);
+        expect(document.activeElement).toBe(details?.querySelector("summary"));
+      });
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("bounds structured return intents, rejects unrelated owners, and clears them on local navigation", () => {
+    ui.section = "activity";
+    ui.navStack = [];
+    ui.navIndex = -1;
+    ui.initNav();
+    ui.openAgentApproval("agent-exact", "agent:agent-exact");
+    expect(ui.reviewIntent).toMatchObject({ kind: "agent", exactId: "agent-exact", triggerId: "agent:agent-exact" });
+    expect(ui.returnToActivityReview("skill", "agent-exact")).toBe(false);
+    expect(ui.returnToActivityReview("agent", "another-agent")).toBe(false);
+    expect(ui.section).toBe("personas");
+    ui.setSection("tools");
+    expect(ui.reviewIntent).toBeNull();
+
+    const section = ui.section;
+    ui.openSkillApproval("x".repeat(2049), "skill:oversized");
+    expect(ui.section).toBe(section);
+    expect(ui.reviewIntent).toBeNull();
+
+    ui.openProjectRecommendation("/tmp/project-a", "same-id", "recommendation:same-id");
+    expect(ui.isReviewIntent("project", ui.projectReviewExactId("/tmp/project-b", "same-id"))).toBe(false);
+    expect(ui.isReviewIntent("project", ui.projectReviewExactId("/tmp/project-a", "same-id"))).toBe(true);
+  });
+
+  it("falls back safely when exact Agent, Skill, every Expert, or Project review target disappeared", async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_library_list" || command === "skill_folders_list") return emptyFolderState() as never;
+      if (["expert_creation_requests", "expert_runs_list", "expert_activation_requests", "projects_list"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    ui.section = "activity";
+    ui.navStack = [];
+    ui.navIndex = -1;
+    ui.initNav();
+    const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(ActivityHistory, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain("Subscription Recommendations 0"));
+      const cases = [
+        { kind: "agent" as const, exactId: "missing-agent", group: "agent", open: () => ui.openAgentApproval("missing-agent", "agent:missing-agent") },
+        { kind: "skill" as const, exactId: "missing-skill", group: "skill", open: () => ui.openSkillApproval("missing-skill", "skill:missing-skill") },
+        { kind: "expert-change" as const, exactId: "missing-change", group: "expert-change", open: () => ui.openExpertReview("change", "missing-change", "expert-change:missing-change") },
+        { kind: "expert-run" as const, exactId: "missing-run", group: "expert-run", open: () => ui.openExpertReview("run", "missing-run", "expert-run:missing-run") },
+        { kind: "expert-activation" as const, exactId: "missing-activation", group: "expert-activation", open: () => ui.openExpertReview("activation", "missing-activation", "expert-activation:missing-activation") },
+        {
+          kind: "project" as const,
+          exactId: ui.projectReviewExactId("/tmp/missing-project", "missing-project-review"),
+          group: "recommendation",
+          open: () => ui.openProjectRecommendation("/tmp/missing-project", "missing-project-review", "recommendation:missing-project-review"),
+        },
+      ];
+      for (const item of cases) {
+        item.open();
+        expect(ui.returnToActivityReview(item.kind, item.exactId)).toBe(true);
+        await vi.waitFor(() => {
+          const group = target.querySelector<HTMLElement>(`[data-review-group="${item.group}"]`)!;
+          expect(group.contains(document.activeElement)).toBe(true);
+          expect(target.querySelector('[role="status"]')?.textContent).toContain("Review item is no longer available");
+          expect(ui.reviewIntent).toBeNull();
+        });
+      }
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it.each([
+    ["agent", "missing-agent-owner"],
+    ["skill", "missing-skill-owner"],
+    ["expert-change", "missing-change-owner"],
+    ["expert-run", "missing-run-owner"],
+    ["expert-activation", "missing-activation-owner"],
+    ["project", "missing-project-owner"],
+  ] as const)("returns safely when the %s owner cannot find its exact target", async (kind, id) => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_library_list" || command === "skill_folders_list") return emptyFolderState() as never;
+      if (command === "project_readiness_get") return readinessFixture("/tmp/missing-owner", true) as never;
+      if (["agent_sources_inspect", "agent_drafts_list", "skill_sources_inspect", "skill_drafts_list",
+        "experts_list", "expert_creation_requests", "expert_runs_list", "expert_activation_requests",
+        "expert_activation_history", "projects_list", "project_recommendations_list", "installs_reconcile",
+        "skill_installs_reconcile", "skill_backups_list", "project_instructions_inspect"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    ui.section = "activity";
+    ui.navStack = [];
+    ui.navIndex = -1;
+    ui.initNav();
+    let ownerName: "AgentsWorkspace" | "SkillsWorkspace" | "Experts" | "Projects";
+    if (kind === "agent") { ui.openAgentApproval(id, `agent:${id}`); ownerName = "AgentsWorkspace"; }
+    else if (kind === "skill") { ui.openSkillApproval(id, `skill:${id}`); ownerName = "SkillsWorkspace"; }
+    else if (kind === "project") {
+      ui.openProjectRecommendation("/tmp/missing-owner", id, `recommendation:${id}`);
+      ownerName = "Projects";
+    } else {
+      ui.openExpertReview(kind.slice("expert-".length) as "change" | "run" | "activation", id, `${kind}:${id}`);
+      ownerName = "Experts";
+    }
+    const Owner = (await import(`$lib/components/${ownerName}.svelte`)).default;
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Owner, { target });
+    try {
+      await vi.waitFor(() => expect(ui.section).toBe("activity"));
+      expect(ui.reviewIntent).toMatchObject({ kind, exactId: kind === "project" ? ui.projectReviewExactId("/tmp/missing-owner", id) : id });
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it.each(["agent", "skill"] as const)("returns safely when the %s rollback owner cannot find its exact install", async (kind) => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_library_list" || command === "skill_folders_list") return emptyFolderState() as never;
+      if (["agent_sources_inspect", "agent_drafts_list", "skill_sources_inspect", "skill_drafts_list",
+        "projects_list", "installs_reconcile", "skill_installs_reconcile", "skill_backups_list"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    ui.settingsOpen = false;
+    ui.section = "activity";
+    ui.navStack = [];
+    ui.navIndex = -1;
+    ui.initNav();
+    const link = kind === "agent"
+      ? { reference: { sourceId: "missing", relativePath: "agent.md" }, tool: "claudeCode" as const, projectPath: null }
+      : { reference: { sourceId: "missing", relativePath: "skill" }, runtime: "codex" as const, projectPath: null };
+    if (kind === "agent") ui.openAgentRecovery(link as Parameters<typeof ui.openAgentRecovery>[0], "agent-recovery-missing-owner");
+    else ui.openSkillRecovery(link as Parameters<typeof ui.openSkillRecovery>[0], "skill-recovery-missing-owner");
+    const Owner = kind === "agent"
+      ? (await import("$lib/components/AgentsWorkspace.svelte")).default
+      : (await import("$lib/components/SkillsWorkspace.svelte")).default;
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Owner, { target });
+    try {
+      await vi.waitFor(() => expect(ui.settingsOpen).toBe(true));
+      expect(ui.recoveryIntent).toMatchObject({ kind, exactId: ui.recoveryExactId(kind, link) });
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it.each(["agent", "skill"] as const)("falls back safely when an exact %s Recovery target disappeared", async (kind) => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "doctor_report") return {
+        generatedAt: "2026-08-17T00:00:00Z", overall: "healthy",
+        counts: { healthy: 0, needsAttention: 0, unavailable: 0 }, copyText: "healthy", checks: [],
+      } as never;
+      if (command === "storage_migration_status") return { state: "complete" } as never;
+      if (["installs_reconcile", "skill_installs_reconcile", "projects_list"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    ui.settingsOpen = true;
+    ui.settingsInitialSection = "doctor";
+    const { default: SettingsSectionDoctor } = await import("$lib/components/SettingsSectionDoctor.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionDoctor, { target });
+    try {
+      await vi.waitFor(() => expect(target.textContent).toContain("Showing 0 of 0 installs checked"));
+      const link = kind === "agent"
+        ? { reference: { sourceId: "missing", relativePath: "agent.md" }, tool: "claudeCode" as const, projectPath: null }
+        : { reference: { sourceId: "missing", relativePath: "skill" }, runtime: "codex" as const, projectPath: null };
+      if (kind === "agent") ui.openAgentRecovery(link as Parameters<typeof ui.openAgentRecovery>[0], "agent-recovery-missing");
+      else ui.openSkillRecovery(link as Parameters<typeof ui.openSkillRecovery>[0], "skill-recovery-missing");
+      const exactId = ui.recoveryExactId(kind, link);
+      expect(ui.returnToSettingsRecovery(kind, exactId)).toBe(true);
+      await vi.waitFor(() => {
+        const group = target.querySelector<HTMLElement>(`[data-recovery-source="${kind === "agent" ? "agents" : "skills"}"]`)!;
+        expect(group.contains(document.activeElement)).toBe(true);
+        expect(target.querySelector('.recovery [role="status"]')?.textContent).toContain("Recovery item is no longer available");
+        expect(ui.recoveryIntent).toBeNull();
+      });
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
   it("aggregates five review groups, separates recommendations, and deep-links without mutation authority", async () => {
     const projectPath = "/private/work/review-project";
     const recommendation = updatedProjectRecommendation(projectPath);
@@ -1092,26 +1308,26 @@ describe("frontend test harness", () => {
       deepLink("agent").click();
       expect(ui.section).toBe("personas");
       expect((ui as unknown as { agentApprovalId: string | null }).agentApprovalId).toBe("agent-approval");
-      ui.back();
+      expect(ui.returnToActivityReview("agent", "agent-approval")).toBe(true);
       await vi.waitFor(() => expect(document.activeElement).toBe(deepLink("agent")));
 
       deepLink("skill").click();
       expect(ui.section).toBe("skills");
       expect((ui as unknown as { skillApprovalId: string | null }).skillApprovalId).toBe("skill-approval");
-      ui.back();
+      expect(ui.returnToActivityReview("skill", "skill-approval")).toBe(true);
 
       deepLink("expert-change").click();
       expect(ui.section).toBe("experts");
       expect((ui as unknown as { expertReview: unknown }).expertReview).toEqual({ kind: "change", id: "expert-change" });
-      ui.back();
+      expect(ui.returnToActivityReview("expert-change", "expert-change")).toBe(true);
 
       deepLink("expert-run").click();
       expect((ui as unknown as { expertReview: unknown }).expertReview).toEqual({ kind: "run", id: "expert-run" });
-      ui.back();
+      expect(ui.returnToActivityReview("expert-run", "expert-run")).toBe(true);
 
       deepLink("expert-activation").click();
       expect((ui as unknown as { expertReview: unknown }).expertReview).toEqual({ kind: "activation", id: "expert-activation" });
-      ui.back();
+      expect(ui.returnToActivityReview("expert-activation", "expert-activation")).toBe(true);
 
       deepLink("recommendation").click();
       expect(ui.section).toBe("projects");
@@ -1291,7 +1507,7 @@ describe("frontend test harness", () => {
         expect(group.textContent).toContain("Ready");
         expect(group.contains(document.activeElement)).toBe(true);
       });
-      expect(ui.reviewReturnId).toBeNull();
+      expect(ui.reviewIntent).toBeNull();
     } finally {
       unmount(returnComponent);
       returnTarget.remove();
@@ -1387,7 +1603,7 @@ describe("frontend test harness", () => {
     const returned = mount(ActivityHistory, { target: returnTarget });
     try {
       await vi.waitFor(() => expect((document.activeElement as HTMLElement | null)?.dataset.reviewTrigger).toBe(triggerId));
-      expect(ui.reviewReturnId).toBeNull();
+      expect(ui.reviewIntent).toBeNull();
     } finally {
       unmount(returned);
       returnTarget.remove();
@@ -1458,7 +1674,7 @@ describe("frontend test harness", () => {
       const returnComponent = mount(ActivityHistory, { target: returnTarget });
       try {
         await vi.waitFor(() => expect((document.activeElement as HTMLElement | null)?.dataset.reviewTrigger).toBe(triggerId));
-        expect(ui.reviewReturnId).toBeNull();
+        expect(ui.reviewIntent).toBeNull();
       } finally {
         unmount(returnComponent);
         returnTarget.remove();
@@ -1516,7 +1732,7 @@ describe("frontend test harness", () => {
       expect(status.closest('[role="dialog"]')).toBe(owner.dialog);
       expect(ui.section).toBe("personas");
       expect(ui.agentApprovalId).toBe(owner.approval.id);
-      expect(ui.reviewReturnId).toBe(`agent:${owner.approval.id}`);
+      expect(ui.reviewIntent).toMatchObject({ kind: "agent", exactId: owner.approval.id });
       expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_approval_approve")).toHaveLength(1);
       expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "agent_approval_reject")).toBe(false);
     } finally {
@@ -1573,7 +1789,7 @@ describe("frontend test harness", () => {
       });
       expect(target.querySelector('[role="dialog"]')).toBe(dialog);
       expect(ui.section).toBe("personas");
-      expect(ui.reviewReturnId).toBeNull();
+      expect(ui.reviewIntent).toBeNull();
       expect(ui.agentApprovalId).toBeNull();
     } finally {
       unmount(component);
@@ -1669,6 +1885,7 @@ describe("frontend test harness", () => {
       });
       action.click();
       await vi.waitFor(() => expect(ui.section).toBe("activity"));
+      expect(ui.reviewIntent).toMatchObject({ kind: "skill", exactId: approval.id });
       expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === mutationCommand)).toHaveLength(1);
     } finally {
       unmount(resolver);
@@ -1684,7 +1901,7 @@ describe("frontend test harness", () => {
         expect(group.textContent).toContain("Ready");
         expect(group.contains(document.activeElement)).toBe(true);
       });
-      expect(ui.reviewReturnId).toBeNull();
+      expect(ui.reviewIntent).toBeNull();
     } finally {
       unmount(finalActivity);
       finalTarget.remove();
@@ -1818,7 +2035,7 @@ describe("frontend test harness", () => {
         expect(group.textContent).toContain("Ready");
         expect(group.contains(document.activeElement)).toBe(true);
       });
-      expect(ui.reviewReturnId).toBeNull();
+      expect(ui.reviewIntent).toBeNull();
     } finally {
       unmount(finalActivity);
       finalTarget.remove();
@@ -1939,6 +2156,61 @@ describe("frontend test harness", () => {
       expect(target.querySelector('[data-recovery-source="agents"]')?.textContent).toContain("0 rollback points");
       expect(target.querySelector('[data-recovery-source="skills"]')?.textContent).toContain("0 rollback points");
       expect(target.querySelector('[aria-live="polite"]')?.textContent).toBeTruthy();
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("pages Recovery inventories without hiding version history after the first 100 installs", async () => {
+    const skills = Array.from({ length: 101 }, (_, index): InstalledSkill => ({
+      sourceId: `skills-${String(index).padStart(3, "0")}`,
+      relativePath: `skill-${String(index).padStart(3, "0")}`,
+      name: index === 100 ? "Late history" : `Skill ${index}`,
+      runtime: "codex",
+      scope: "user",
+      projectPath: null,
+      path: `/private/skills/${index}`,
+      state: "current",
+      tracked: true,
+    })).reverse();
+    vi.mocked(invoke).mockImplementation(async (command: string, args) => {
+      if (command === "doctor_report") return {
+        generatedAt: "2026-08-17T00:00:00Z", overall: "healthy",
+        counts: { healthy: 0, needsAttention: 0, unavailable: 0 }, copyText: "healthy", checks: [],
+      } as never;
+      if (command === "installs_reconcile" || command === "projects_list") return [] as never;
+      if (command === "skill_installs_reconcile") return skills as never;
+      if (command === "skill_version_history_list") {
+        const exact = args as { sourceId: string };
+        return exact.sourceId === "skills-100"
+          ? [{ path: "/private/exact-skill-snapshot", createdAt: "2026-08-17T00:00:00Z", contentHash: "c".repeat(64) }] as never
+          : [] as never;
+      }
+      if (command === "storage_migration_status") return { state: "complete", stage: null, detail: null, legacyConflicts: [] } as never;
+      return [] as never;
+    });
+    const { default: SettingsSectionDoctor } = await import("$lib/components/SettingsSectionDoctor.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(SettingsSectionDoctor, { target });
+    try {
+      const group = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLElement>('[data-recovery-source="skills"]')!;
+        expect(candidate.textContent).toContain("Partial");
+        expect(candidate.textContent).toContain("Showing 100 of 101 installs checked");
+        return candidate;
+      });
+      expect(group.textContent).not.toContain("Late history");
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "skill_version_history_list")).toHaveLength(100);
+      group.querySelector<HTMLButtonElement>("[data-recovery-load-more]")!.click();
+      await vi.waitFor(() => {
+        expect(group.textContent).toContain("Ready");
+        expect(group.textContent).toContain("Showing 101 of 101 installs checked");
+        expect(group.textContent).toContain("Late history");
+      });
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "skill_version_history_list")).toHaveLength(101);
+      expect(target.querySelector('.recovery [role="status"]')?.textContent).toContain("Skill recovery ready");
     } finally {
       unmount(component);
       target.remove();
@@ -2115,7 +2387,7 @@ describe("frontend test harness", () => {
       sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user",
       projectPath: null, path: "/private/.codex/skills/audit", state: "current", tracked: true,
     };
-    const snapshot = { path: "/private/skill-backup", createdAt: "2026-08-17T00:00:00Z" };
+    const snapshot = { path: "/private/skill-backup", createdAt: "2026-08-17T00:00:00Z", contentHash: "a".repeat(64) };
     vi.mocked(invoke).mockImplementation(async (command: string, args) => {
       if (command === "doctor_report") return {
         generatedAt: "2026-08-17T00:00:00Z", overall: "healthy",
@@ -5077,7 +5349,7 @@ describe("frontend test harness", () => {
     }
 
     const mutationControls = new Map<string, { source: string; freshnessUses: number; markers: RegExp[] }>([
-      ["SkillsWorkspace", { source: skillsWorkspaceSource, freshnessUses: 18, markers: [
+      ["SkillsWorkspace", { source: skillsWorkspaceSource, freshnessUses: 19, markers: [
         /disabled: !installTruthFresh \|\| !selected\.pkg\.installable \|\| !canInstall,/,
         /size="sm" disabled=\{!installTruthFresh\}[^\n]*runLifecycle\("disable", installed\)/,
         /size="sm" variant="danger" disabled=\{!installTruthFresh\}[^\n]*uninstallCandidate = installed/,

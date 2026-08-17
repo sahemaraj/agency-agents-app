@@ -8,6 +8,16 @@ import type { AgentReference, SettingsSection, SidebarSection, SkillReference, T
 type ExpertReviewLink = { kind: "change" | "run" | "activation"; id: string };
 type AgentRecoveryLink = { reference: AgentReference; tool: Tool; projectPath: string | null };
 type SkillRecoveryLink = { reference: SkillReference; runtime: "claudeCode" | "codex"; projectPath: string | null };
+export type ReviewIntentKind = "agent" | "skill" | "expert-change" | "expert-run" | "expert-activation" | "project";
+export type RecoveryIntentKind = "agent" | "skill";
+export type ReviewIntent = { origin: "activity-review"; kind: ReviewIntentKind; exactId: string; triggerId: string };
+export type RecoveryIntent = { origin: "settings-recovery"; kind: RecoveryIntentKind; exactId: string; triggerId: string };
+const MAX_INTENT_ID_BYTES = 2 * 1024;
+const MAX_INTENT_TRIGGER_BYTES = 512;
+
+function boundedIntentField(value: string, maxBytes: number): boolean {
+  return value.length > 0 && new TextEncoder().encode(value).length <= maxBytes;
+}
 
 /** A navigable app location — the unit of back/forward history. Captures the
     section plus the full Agents workspace view-state so a back/forward jump
@@ -114,13 +124,13 @@ class UiStore {
   activityReceiptId: string | null = $state(null);
   /** Transient Review Center targets. Domain surfaces consume these; Activity
       never owns approval or review mutations. */
-  reviewReturnId: string | null = $state(null);
+  reviewIntent: ReviewIntent | null = $state(null);
   agentApprovalId: string | null = $state(null);
   skillApprovalId: string | null = $state(null);
   expertReview: ExpertReviewLink | null = $state(null);
   projectRecommendationId: string | null = $state(null);
   /** Transient Recovery targets consumed by existing exact rollback controls. */
-  recoveryReturnId: string | null = $state(null);
+  recoveryIntent: RecoveryIntent | null = $state(null);
   agentRecovery: AgentRecoveryLink | null = $state(null);
   skillRecovery: SkillRecoveryLink | null = $state(null);
   paletteOpen: boolean = $state(false);
@@ -205,6 +215,8 @@ class UiStore {
   sidebarWidth: number = $state(SIDEBAR_DEFAULT_WIDTH);
 
   setSection(s: SidebarSection) {
+    this.clearReviewIntent();
+    this.clearRecoveryIntent();
     this.section = s;
     // Navigating to ANY section closes the package detail slide-over and resets
     // the Projects detail to its list (a fresh sidebar click lands on the list).
@@ -221,79 +233,143 @@ class UiStore {
     this.setSection("activity");
   }
 
-  private rememberReviewTrigger(triggerId: string) { this.reviewReturnId = triggerId; }
+  private setReviewIntent(kind: ReviewIntentKind, exactId: string, triggerId: string) {
+    if (!boundedIntentField(exactId, MAX_INTENT_ID_BYTES)
+      || !boundedIntentField(triggerId, MAX_INTENT_TRIGGER_BYTES)) return;
+    this.reviewIntent = { origin: "activity-review", kind, exactId, triggerId };
+  }
+
+  private validIntent(exactId: string, triggerId: string): boolean {
+    return boundedIntentField(exactId, MAX_INTENT_ID_BYTES)
+      && boundedIntentField(triggerId, MAX_INTENT_TRIGGER_BYTES);
+  }
+
+  clearReviewIntent() {
+    this.reviewIntent = null;
+    this.agentApprovalId = null;
+    this.skillApprovalId = null;
+    this.expertReview = null;
+    this.projectRecommendationId = null;
+  }
+
+  clearRecoveryIntent() {
+    this.recoveryIntent = null;
+    this.agentRecovery = null;
+    this.skillRecovery = null;
+  }
+
+  isReviewIntent(kind: ReviewIntentKind, exactId: string): boolean {
+    return this.reviewIntent?.origin === "activity-review"
+      && this.reviewIntent.kind === kind
+      && this.reviewIntent.exactId === exactId;
+  }
 
   openAgentApproval(id: string, triggerId: string) {
-    this.rememberReviewTrigger(triggerId);
+    if (!this.validIntent(id, triggerId)) return;
     this.openAgents();
     this.agentApprovalId = id;
+    this.setReviewIntent("agent", id, triggerId);
   }
 
   openSkillApproval(id: string, triggerId: string) {
-    this.rememberReviewTrigger(triggerId);
+    if (!this.validIntent(id, triggerId)) return;
     this.setSection("skills");
     this.skillApprovalId = id;
+    this.setReviewIntent("skill", id, triggerId);
   }
 
   openExpertReview(kind: ExpertReviewLink["kind"], id: string, triggerId: string) {
-    this.rememberReviewTrigger(triggerId);
+    if (!this.validIntent(id, triggerId)) return;
     this.setSection("experts");
     this.expertReview = { kind, id };
+    this.setReviewIntent(`expert-${kind}`, id, triggerId);
   }
 
   openProjectRecommendation(projectPath: string, id: string, triggerId: string) {
-    this.rememberReviewTrigger(triggerId);
+    const exactId = this.projectReviewExactId(projectPath, id);
+    if (!this.validIntent(exactId, triggerId)) return;
     this.selectProject(projectPath);
     this.projectRecommendationId = id;
+    this.setReviewIntent("project", exactId, triggerId);
   }
 
-  returnToActivityReview() {
-    if (!this.reviewReturnId) return;
-    if (this.canBack) this.back();
-    else this.setSection("activity");
+  projectReviewExactId(projectPath: string, id: string): string {
+    return JSON.stringify([projectPath, id]);
   }
 
-  consumeReviewReturn(): string | null {
-    const id = this.reviewReturnId;
-    this.reviewReturnId = null;
-    return id;
+  returnToActivityReview(kind: ReviewIntentKind, exactId: string): boolean {
+    if (!this.isReviewIntent(kind, exactId)) return false;
+    if (this.canBack) this.back(true);
+    else {
+      this.section = "activity";
+      this.commitNav();
+    }
+    return true;
+  }
+
+  consumeReviewIntent(): ReviewIntent | null {
+    const intent = this.reviewIntent;
+    this.reviewIntent = null;
+    return intent;
   }
 
   openAgentRecovery(link: AgentRecoveryLink, triggerId: string) {
-    this.recoveryReturnId = triggerId;
-    this.agentRecovery = { ...link, reference: { ...link.reference } };
+    const exactId = this.recoveryExactId("agent", link);
+    if (!this.validIntent(exactId, triggerId)) return;
     this.openAgentReference(link.reference);
+    this.agentRecovery = { ...link, reference: { ...link.reference } };
+    this.setRecoveryIntent("agent", exactId, triggerId);
   }
 
   openSkillRecovery(link: SkillRecoveryLink, triggerId: string) {
-    this.recoveryReturnId = triggerId;
-    this.skillRecovery = { ...link, reference: { ...link.reference } };
+    const exactId = this.recoveryExactId("skill", link);
+    if (!this.validIntent(exactId, triggerId)) return;
     this.openSkill(link.reference);
+    this.skillRecovery = { ...link, reference: { ...link.reference } };
+    this.setRecoveryIntent("skill", exactId, triggerId);
   }
 
-  returnToSettingsRecovery() {
-    if (!this.recoveryReturnId) return;
+  private setRecoveryIntent(kind: RecoveryIntentKind, exactId: string, triggerId: string) {
+    if (!boundedIntentField(exactId, MAX_INTENT_ID_BYTES)
+      || !boundedIntentField(triggerId, MAX_INTENT_TRIGGER_BYTES)) return;
+    this.recoveryIntent = { origin: "settings-recovery", kind, exactId, triggerId };
+  }
+
+  recoveryExactId(kind: RecoveryIntentKind, link: AgentRecoveryLink | SkillRecoveryLink): string {
+    const destination = "tool" in link ? link.tool : link.runtime;
+    return JSON.stringify([kind, link.reference.sourceId, link.reference.relativePath, destination, link.projectPath]);
+  }
+
+  isRecoveryIntent(kind: RecoveryIntentKind, exactId: string): boolean {
+    return this.recoveryIntent?.origin === "settings-recovery"
+      && this.recoveryIntent.kind === kind
+      && this.recoveryIntent.exactId === exactId;
+  }
+
+  returnToSettingsRecovery(kind: RecoveryIntentKind, exactId: string): boolean {
+    if (!this.isRecoveryIntent(kind, exactId)) return false;
     this.agentRecovery = null;
     this.skillRecovery = null;
-    if (this.canBack) this.back();
-    this.openSettings("doctor");
+    if (this.canBack) this.back(true);
+    this.openSettings("doctor", true);
+    return true;
   }
 
-  consumeRecoveryReturn(): string | null {
-    const id = this.recoveryReturnId;
-    this.recoveryReturnId = null;
-    return id;
+  consumeRecoveryIntent(): RecoveryIntent | null {
+    const intent = this.recoveryIntent;
+    this.recoveryIntent = null;
+    return intent;
   }
 
   /** Open the Projects detail pane for a project path (null = back to the list).
       A nav location, so the title-bar back button returns to the list. Also
       switches to the Projects section, so deep-links from the Dashboard
       ("mirror-mesh" row / sunburst slice) actually land on the project. */
-  selectProject(path: string | null) { this.section = "projects"; this.projectsSelected = path; this.selectedPackage = null; this.commitNav(); }
+  selectProject(path: string | null) { this.clearReviewIntent(); this.clearRecoveryIntent(); this.section = "projects"; this.projectsSelected = path; this.selectedPackage = null; this.commitNav(); }
 
   /** Open the Teams detail pane for a team key (null = back to the list).
       A nav location, so the title-bar back button returns to the list. */
-  selectTeam(key: string | null) { this.teamsSelected = key; this.selectedPackage = null; this.commitNav(); }
+  selectTeam(key: string | null) { this.clearReviewIntent(); this.clearRecoveryIntent(); this.teamsSelected = key; this.selectedPackage = null; this.commitNav(); }
 
   /** Open the Tools console with `tool` preselected (null = let it auto-pick). */
   openTools(tool: Tool | null = null) {
@@ -305,6 +381,8 @@ class UiStore {
       resets the open agent. Used by the sidebar, the Dashboard stat cards, and
       the command palette. */
   openAgents(category: string | null = null, lens: string = "all") {
+    this.clearReviewIntent();
+    this.clearRecoveryIntent();
     this.applyingNav = true;
     this.agentsCategory = category;
     this.skillsSelected = null;
@@ -325,6 +403,8 @@ class UiStore {
       Wired to every division pill so a division click anywhere lands on its
       agents. */
   openDivision(category: string) {
+    this.clearReviewIntent();
+    this.clearRecoveryIntent();
     this.applyingNav = true;
     this.agentsCategory = category;
     this.section = "personas";
@@ -335,11 +415,13 @@ class UiStore {
     this.commitNav();
   }
 
-  setAgentsCategory(c: string | null) { this.agentsCategory = c; this.commitNav(); }
-  setAgentsLens(l: string) { this.agentsLens = l; this.commitNav(); }
+  setAgentsCategory(c: string | null) { this.clearReviewIntent(); this.clearRecoveryIntent(); this.agentsCategory = c; this.commitNav(); }
+  setAgentsLens(l: string) { this.clearReviewIntent(); this.clearRecoveryIntent(); this.agentsLens = l; this.commitNav(); }
   selectAgent(slug: string | null) { this.agentsSelected = slug; this.agentsReference = null; this.commitNav(); }
 
   openAgentReference(reference: AgentReference) {
+    this.clearReviewIntent();
+    this.clearRecoveryIntent();
     this.section = "personas";
     this.agentsSelected = null;
     this.agentsReference = { ...reference };
@@ -355,6 +437,8 @@ class UiStore {
   }
 
   openSkill(reference: SkillReference) {
+    this.clearReviewIntent();
+    this.clearRecoveryIntent();
     this.section = "skills";
     this.skillsSelected = { ...reference };
     this.agentsSelected = null;
@@ -368,13 +452,15 @@ class UiStore {
       default landing section has been applied. */
   initNav() { this.commitNav(); }
 
-  back() {
+  back(preserveIntent = false) {
+    if (!preserveIntent) { this.clearReviewIntent(); this.clearRecoveryIntent(); }
     if (this.navIndex > 0) {
       this.navIndex -= 1;
       this.applyNav(this.navStack[this.navIndex]);
     }
   }
-  forward() {
+  forward(preserveIntent = false) {
+    if (!preserveIntent) { this.clearReviewIntent(); this.clearRecoveryIntent(); }
     if (this.navIndex < this.navStack.length - 1) {
       this.navIndex += 1;
       this.applyNav(this.navStack[this.navIndex]);
@@ -454,10 +540,11 @@ class UiStore {
     this.drawerMinimized = false;
   }
 
-  openPalette() { this.paletteOpen = true; }
+  openPalette() { this.clearReviewIntent(); this.clearRecoveryIntent(); this.paletteOpen = true; }
   closePalette() { this.paletteOpen = false; }
 
-  openSettings(section: SettingsSection | null = null) {
+  openSettings(section: SettingsSection | null = null, preserveIntent = false) {
+    if (!preserveIntent) { this.clearReviewIntent(); this.clearRecoveryIntent(); }
     this.settingsInitialSection = section;
     this.settingsOpen = true;
   }
@@ -466,10 +553,10 @@ class UiStore {
     this.settingsInitialSection = null;
   }
 
-  openAbout() { this.aboutOpen = true; }
+  openAbout() { this.clearReviewIntent(); this.clearRecoveryIntent(); this.aboutOpen = true; }
   closeAbout() { this.aboutOpen = false; }
 
-  openPlaybook() { this.playbookOpen = true; }
+  openPlaybook() { this.clearReviewIntent(); this.clearRecoveryIntent(); this.playbookOpen = true; }
   closePlaybook() { this.playbookOpen = false; }
 
   // ---------------- Settings (Phase 12b) ----------------

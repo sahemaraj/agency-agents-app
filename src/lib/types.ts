@@ -556,6 +556,7 @@ export interface SkillDestinationPresence {
 export interface SkillVersionSnapshot {
   path: string;
   createdAt: string;
+  contentHash: string;
 }
 
 export interface SkillPlanPackage {

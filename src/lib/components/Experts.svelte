@@ -41,6 +41,7 @@
   let builder = $state<ExpertDefinition | null>(null);
   let creationReview = $state<ExpertCreationRequest | null>(null);
   let runReview = $state<ExpertRun | null>(null);
+  let linkedActivationId = $state<string | null>(null);
   let waiverReason = $state("");
   const pendingRequests = $derived(experts.requests.filter((request) => request.state === "pending"));
 
@@ -87,14 +88,16 @@
     };
   }
 
-  async function review() {
+  async function review(): Promise<boolean> {
     const expert = experts.selected;
-    if (!expert || !projectPath) return;
+    if (!expert || !projectPath) return false;
     planning = true;
     try {
       plan = await experts.plan(expert.id, projectPath, client || null);
+      return true;
     } catch (error) {
       toast.error("Could not plan activation", isAppError(error) ? appErrorMessage(error) : String(error));
+      return false;
     } finally {
       planning = false;
     }
@@ -102,6 +105,7 @@
 
   async function activate() {
     if (!plan || plan.blockers.length) return;
+    const reviewedActivationId = linkedActivationId;
     activating = true;
     try {
       const pending = pendingRequests.find((item) => item.expertId === plan?.expert.id && item.projectPath === plan?.projectPath);
@@ -121,7 +125,7 @@
         : plan.promptPreview;
       await navigator.clipboard.writeText(prompt);
       toast.success(`${plan.expert.name} activated; starter prompt copied`);
-      closeLinkedReview(() => (plan = null));
+      closeLinkedReview(() => { plan = null; linkedActivationId = null; }, "activation", reviewedActivationId);
     } catch (error) {
       activity.log({
         action: "bulk",
@@ -148,6 +152,7 @@
 
   async function saveBuilder() {
     if (!builder) return;
+    const reviewedCreationId = creationReview?.id ?? null;
     try {
       if (creationReview) {
         await experts.approveCreation(creationReview.id, proposalFrom(builder));
@@ -163,7 +168,7 @@
       } else {
         await experts.save(builder);
       }
-      closeLinkedReview(() => (builder = null));
+      closeLinkedReview(() => (builder = null), "change", reviewedCreationId);
       toast.success("Expert saved");
     } catch (error) {
       toast.error("Could not save Expert", isAppError(error) ? appErrorMessage(error) : String(error));
@@ -175,7 +180,8 @@
     return proposal;
   }
 
-  function reviewCreation(request: ExpertCreationRequest) {
+  function reviewCreation(request: ExpertCreationRequest, preserveIntent = false) {
+    if (!preserveIntent) ui.clearReviewIntent();
     creationReview = request;
     builder = {
       id: `proposal-${request.id}`,
@@ -212,10 +218,11 @@
 
   async function finishRun(verdict: "accepted" | "rework" | "rejected" | "cancelled", waive = false) {
     if (!runReview) return;
+    const reviewedRunId = runReview.id;
     const waivers = waive ? missingRequired(runReview).map((checkName) => ({ checkName, reason: waiverReason.trim() })) : [];
     try {
       await experts.reviewRun(runReview.id, verdict, waivers);
-      closeLinkedReview(() => (runReview = null));
+      closeLinkedReview(() => (runReview = null), "run", reviewedRunId);
       waiverReason = "";
       toast.success(`Run marked ${verdict}`);
     } catch (error) {
@@ -234,11 +241,16 @@
     );
   }));
 
-  async function reviewRequest(request: (typeof experts.requests)[number]) {
+  async function reviewRequest(request: (typeof experts.requests)[number], preserveIntent = false) {
+    if (!preserveIntent) ui.clearReviewIntent();
     projectPath = request.projectPath;
     client = request.client ?? "";
     experts.selectedId = request.expertId;
-    await review();
+    const opened = await review();
+    if (!opened && preserveIntent) {
+      linkedActivationId = null;
+      ui.returnToActivityReview("expert-activation", request.id);
+    }
   }
 
   let handledReviewLink = $state("");
@@ -249,7 +261,7 @@
       const request = experts.creationRequests.find((item) => item.id === link.id);
       if (!request) return;
       tab = "drafts";
-      reviewCreation(request);
+      reviewCreation(request, true);
     } else if (link.kind === "run") {
       const run = experts.runs.find((item) => item.id === link.id && item.state === "awaitingReview");
       if (!run) return;
@@ -260,15 +272,30 @@
       const request = experts.requests.find((item) => item.id === link.id && item.state === "pending");
       if (!request) return;
       tab = "experts";
-      void reviewRequest(request);
+      linkedActivationId = link.id;
+      void reviewRequest(request, true);
     }
     handledReviewLink = `${link.kind}:${link.id}`;
     ui.expertReview = null;
   });
 
-  function closeLinkedReview(close: () => void) {
+  $effect(() => {
+    const link = ui.expertReview;
+    if (!link || experts.loading) return;
+    const found = link.kind === "change"
+      ? experts.creationRequests.some((item) => item.id === link.id)
+      : link.kind === "run"
+        ? experts.runs.some((item) => item.id === link.id && item.state === "awaitingReview")
+        : experts.requests.some((item) => item.id === link.id && item.state === "pending");
+    if (found) return;
+    ui.expertReview = null;
+    ui.returnToActivityReview(`expert-${link.kind}`, link.id);
+  });
+
+  function closeLinkedReview(close: () => void, kind: "change" | "run" | "activation" | null = null, id: string | null = null) {
     close();
-    if (ui.reviewReturnId) ui.returnToActivityReview();
+    if (kind && id && ui.returnToActivityReview(`expert-${kind}`, id)) return;
+    if (ui.reviewIntent) ui.clearReviewIntent();
   }
 
   async function importExperts() {
@@ -312,7 +339,7 @@
         <article class="draft-card">
           <div class="title"><div><h2>{experts.list.find((expert) => expert.id === run.expertId)?.name ?? run.expertId}</h2><p>{run.projectPath} · {run.client} · {new Date(run.startedAt).toLocaleString()}</p></div><span class:ready={run.state === "accepted"} class="status">{run.state}</span></div>
           <p>{reportedChecks(run)}/{run.contract.checks.length} checks reported · {run.blockers.length} blockers</p>
-          {#if run.state === "awaitingReview"}<footer><button onclick={() => { runReview = run; waiverReason = ""; }}>Review run</button></footer>{/if}
+          {#if run.state === "awaitingReview"}<footer><button onclick={() => { ui.clearReviewIntent(); runReview = run; waiverReason = ""; }}>Review run</button></footer>{/if}
         </article>
       {/each}{/if}
     </div>
@@ -454,7 +481,7 @@
             {#if expert.source === "custom"}<button onclick={() => experts.remove(expert.id)}>Delete</button>{/if}
             <button onclick={() => (builder = cloneExpert(expert))}>Clone and customize</button>
             <button onclick={() => saveRoster(expert)}>Save roster as Team</button>
-            <button class="primary" disabled={!projectPath || planning} onclick={review}><Sparkles size={14} /> {planning ? "Planning…" : "Activate Expert"}</button>
+            <button class="primary" disabled={!projectPath || planning} onclick={() => { ui.clearReviewIntent(); void review(); }}><Sparkles size={14} /> {planning ? "Planning…" : "Activate Expert"}</button>
           </footer>
         {:else}<p class="empty">Select an Expert.</p>{/if}
       </article>
@@ -463,7 +490,7 @@
 </section>
 
 {#if plan}
-  <Modal open title={`Review ${plan.expert.name}`} size="wide" onClose={() => closeLinkedReview(() => (plan = null))}>
+  <Modal open title={`Review ${plan.expert.name}`} size="wide" onClose={() => closeLinkedReview(() => { plan = null; linkedActivationId = null; }, "activation", linkedActivationId)}>
     <div class="review">
       <p><strong>Destination:</strong> {plan.projectPath}</p>
       <p><strong>Client:</strong> {plan.client}</p>
@@ -477,14 +504,14 @@
       <h3>Generated starter prompt</h3><pre>{plan.promptPreview}</pre>
     </div>
     {#snippet actions()}
-      <button onclick={() => closeLinkedReview(() => (plan = null))}>Cancel</button>
+      <button onclick={() => closeLinkedReview(() => { plan = null; linkedActivationId = null; }, "activation", linkedActivationId)}>Cancel</button>
       <button class="primary" disabled={(plan?.blockers.length ?? 1) > 0 || activating} onclick={activate}>{activating ? "Activating…" : "Approve activation"}</button>
     {/snippet}
   </Modal>
 {/if}
 
 {#if runReview}
-  <Modal open title={`Review run ${runReview.id.slice(0, 8)}`} size="wide" onClose={() => closeLinkedReview(() => (runReview = null))}>
+  <Modal open title={`Review run ${runReview.id.slice(0, 8)}`} size="wide" onClose={() => closeLinkedReview(() => (runReview = null), "run", runReview?.id ?? null)}>
     <div class="review">
       <p><strong>Expert:</strong> {runReview.expertId} v{runReview.expertVersion}</p>
       <p><strong>Project:</strong> {runReview.projectPath}</p>
@@ -508,7 +535,7 @@
 {/if}
 
 {#if builder}
-  <Modal open title={creationReview ? `Review ${creationReview.kind} request` : builder.source === "custom" ? "Edit Expert" : "Clone Expert"} size="wide" onClose={() => closeLinkedReview(() => { builder = null; creationReview = null; })}>
+  <Modal open title={creationReview ? `Review ${creationReview.kind} request` : builder.source === "custom" ? "Edit Expert" : "Clone Expert"} size="wide" onClose={() => closeLinkedReview(() => { builder = null; creationReview = null; }, "change", creationReview?.id ?? null)}>
     <form class="builder" onsubmit={(event) => { event.preventDefault(); void saveBuilder(); }}>
       <label>Name<input required maxlength="120" bind:value={builder.name} /></label>
       <label>Summary<textarea required maxlength="1000" bind:value={builder.summary}></textarea></label>
@@ -524,7 +551,7 @@
       <label>Required quality checks<input maxlength="500" value={builder.qualityContract.checks.filter((check) => check.required).map((check) => check.name).join(", ")} oninput={(event) => { const optional = builder!.qualityContract.checks.filter((check) => !check.required); builder!.qualityContract = { version: 1, checks: [...event.currentTarget.value.split(",").map((name) => name.trim()).filter(Boolean).map((name) => ({ name, kind: name, required: true, evidenceMode: "clientReported" as const })), ...optional] }; }} /></label>
       <label>Optional quality checks<input maxlength="500" value={builder.qualityContract.checks.filter((check) => !check.required).map((check) => check.name).join(", ")} oninput={(event) => { const required = builder!.qualityContract.checks.filter((check) => check.required); builder!.qualityContract = { version: 1, checks: [...required, ...event.currentTarget.value.split(",").map((name) => name.trim()).filter(Boolean).map((name) => ({ name, kind: name, required: false, evidenceMode: "clientReported" as const }))] }; }} /></label>
     </form>
-    {#snippet actions()}<button onclick={() => closeLinkedReview(() => { builder = null; creationReview = null; })}>Cancel</button><button class="primary" disabled={pendingRequiredSkill} onclick={saveBuilder}>Save</button>{/snippet}
+    {#snippet actions()}<button onclick={() => closeLinkedReview(() => { builder = null; creationReview = null; }, "change", creationReview?.id ?? null)}>Cancel</button><button class="primary" disabled={pendingRequiredSkill} onclick={saveBuilder}>Save</button>{/snippet}
   </Modal>
 {/if}
 
