@@ -3462,6 +3462,24 @@ pub(crate) async fn recover_install_operations(state: &AppState) -> Result<(), A
                         remove_recovery_directory(&stage, &payload.next.installed_hash)?;
                         database.abort_filesystem_operation(&operation.id).await
                     } else if destination_hash.is_none()
+                        && skill_tree_hash(&stage)?.as_deref() == Some(&previous.installed_hash)
+                        && skill_tree_hash(&retired)?.as_deref()
+                            == Some(&payload.next.installed_hash)
+                    {
+                        std::fs::rename(&stage, &destination).map_err(|error| AppError::Io {
+                            message: format!("finish compensated Skill rollback: {error}"),
+                        })?;
+                        if skill_tree_hash(&destination)?.as_deref()
+                            != Some(&previous.installed_hash)
+                        {
+                            return Err(AppError::StorageCorrupt {
+                                message: "Compensated Skill rollback restored changed content"
+                                    .into(),
+                            });
+                        }
+                        remove_recovery_directory(&retired, &payload.next.installed_hash)?;
+                        database.abort_filesystem_operation(&operation.id).await
+                    } else if destination_hash.is_none()
                         && skill_tree_hash(&retired)?.as_deref() == Some(&previous.installed_hash)
                     {
                         std::fs::rename(&retired, &destination).map_err(|error| AppError::Io {
@@ -6048,6 +6066,85 @@ mod tests {
         assert_eq!(
             super::install::tree_hash(&fixture.destination).unwrap(),
             fixture.next.installed_hash
+        );
+        assert!(fixture
+            .database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_operation_recovery_paths_removed(&fixture.destination, &operation.id);
+        assert_recovery_snapshots_remain_exact(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_rollback_recovers_inverse_compensation_between_renames() {
+        let fixture = rollback_recovery_fixture().await;
+        let operation = fixture
+            .database
+            .prepare_filesystem_operation(
+                "skill_update",
+                &super::SkillInstallOperation {
+                    previous: Some(fixture.previous.clone()),
+                    next: fixture.next.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        super::install::install_validated_directory_with_id(
+            &fixture.content,
+            &fixture.files,
+            &fixture.destination,
+            &fixture.state.app_data_dir.join("skill-backups"),
+            true,
+            &operation.id,
+        )
+        .unwrap();
+        let (_, safety_content, safety_files) = super::validate_skill_version_snapshot(
+            &fixture.state,
+            &fixture.identity,
+            Path::new(&fixture.safety.path),
+        )
+        .await
+        .unwrap();
+        let parent = fixture.destination.parent().unwrap();
+        let stage = parent.join(format!(".agency-skill-{}.stage", operation.id));
+        let retired = parent.join(format!(".agency-skill-{}.previous", operation.id));
+        super::install::install_validated_directory(
+            &safety_content,
+            &safety_files,
+            &stage,
+            &fixture.state.app_data_dir.join("skill-backups"),
+            false,
+        )
+        .unwrap();
+        std::fs::rename(&fixture.destination, &retired).unwrap();
+        assert!(!fixture.destination.exists());
+        assert_eq!(
+            super::install::tree_hash(&stage).unwrap(),
+            fixture.previous.installed_hash
+        );
+        assert_eq!(
+            super::install::tree_hash(&retired).unwrap(),
+            fixture.next.installed_hash
+        );
+
+        super::recover_install_operations(&fixture.state)
+            .await
+            .expect("recover exact inverse compensation");
+        super::recover_install_operations(&fixture.state)
+            .await
+            .expect("inverse compensation recovery is idempotent");
+
+        assert_eq!(
+            super::install::load_ledger_for_state(&fixture.state)
+                .await
+                .unwrap(),
+            std::slice::from_ref(&fixture.previous)
+        );
+        assert_eq!(
+            super::install::tree_hash(&fixture.destination).unwrap(),
+            fixture.previous.installed_hash
         );
         assert!(fixture
             .database
