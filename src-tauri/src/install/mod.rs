@@ -4475,21 +4475,74 @@ pub(crate) async fn do_uninstall_legacy(
 /// back). Callers that want the files gone use `uninstall_agent` per row first.
 #[tauri::command]
 pub async fn project_forget(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     project_path: String,
 ) -> Result<(), AppError> {
-    let mut ledger = load_ledger(&app, &state).await?;
-    prune_project_rows(&mut ledger, &project_path);
-    save_ledger(&app, &ledger).await?;
-    Ok(())
+    project_forget_for_state(&state, &project_path).await
 }
 
 /// Drop every ledger row whose `project_path` matches, keeping all others
 /// (other projects AND user-global rows). Pure so it's unit-testable without an
-/// AppHandle; the command just wraps it with load/save.
+/// AppHandle; the command serializes recovery and persistence around it.
 fn prune_project_rows(records: &mut Vec<InstallRecord>, project_path: &str) {
     records.retain(|r| r.project_path.as_deref() != Some(project_path));
+}
+
+async fn project_forget_for_state(state: &AppState, project_path: &str) -> Result<(), AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    let mut ledger = load_ledger_for_state(state).await?;
+    prune_project_rows(&mut ledger, project_path);
+    save_ledger_for(&state.app_data_dir, &ledger).await
+}
+
+async fn commit_agent_adoptions(
+    state: &AppState,
+    adopted: Vec<InstallRecord>,
+) -> Result<(), AppError> {
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    let mut ledger = load_ledger_for_state(state).await?;
+    let mut changed = false;
+
+    for record in adopted {
+        if ledger
+            .iter()
+            .any(|current| same_agent_install(current, &record))
+        {
+            continue;
+        }
+
+        let paths = resolved_record_paths(state, &record).await?;
+        let (expected, active, disabled) = record_reconcile_hashes(state, &record).await?;
+        let expected_active = expected.into_iter().map(Some).collect::<Vec<_>>();
+        if active != expected_active || disabled.iter().any(Option::is_some) {
+            continue;
+        }
+
+        let reference = AgentReference {
+            source_id: record.source_id.clone(),
+            relative_path: record.relative_path.clone(),
+        };
+        ensure_destinations_available(
+            &ledger,
+            &reference,
+            &record.tool,
+            record.project_path.as_deref(),
+            &paths,
+            true,
+        )?;
+        ledger.push(record);
+        changed = true;
+    }
+
+    if changed {
+        save_ledger_for(&state.app_data_dir, &ledger).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn mcp_reconcile_agent_installs(
@@ -4559,7 +4612,7 @@ pub async fn installs_reconcile(
             .map(|path| path.to_string_lossy().into_owned()),
     );
     let corpus = corpus::ensure_corpus(&app, &state).await?;
-    let mut ledger = load_ledger(&app, &state).await?;
+    let ledger = load_ledger(&app, &state).await?;
     let agent_sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
     let mut out = Vec::with_capacity(ledger.len());
     for r in &ledger {
@@ -4775,8 +4828,7 @@ pub async fn installs_reconcile(
     // Persist the byte-perfect adoptions in one write. Idempotent: next reconcile
     // finds them in the ledger (skipped by the sweep), so steady state is no write.
     if !adopted.is_empty() {
-        ledger.extend(adopted);
-        save_ledger(&app, &ledger).await?;
+        commit_agent_adoptions(&state, adopted).await?;
     }
 
     // Collapse to one row per LOGICAL install (slug, tool, project). Copilot
@@ -12064,6 +12116,68 @@ mod tests {
         (app, tool_home, database, state, record, paths, contents)
     }
 
+    async fn filesystem_applied_project_disable() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::state_db::StateDatabase,
+        AppState,
+        InstallRecord,
+        InstallRecord,
+        PathBuf,
+        PathBuf,
+    ) {
+        let app = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_root = std::fs::canonicalize(project.path()).unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app.path().to_path_buf();
+        let database = crate::state_db::StateDatabase::open(app.path()).unwrap();
+        database
+            .mutate(installs_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let active = project_root.join(".codex/agents/frontend-developer.toml");
+        let disabled = disabled_destination(&active).unwrap();
+        std::fs::create_dir_all(active.parent().unwrap()).unwrap();
+        std::fs::write(&active, b"managed project agent").unwrap();
+        let previous = recovery_record(&project_root, render::sha256_hex(b"managed project agent"));
+        let mut next = previous.clone();
+        set_record_disabled_paths(&mut next, Some(std::slice::from_ref(&disabled)));
+        database
+            .mutate(installs_spec(), Vec::new(), {
+                let previous = previous.clone();
+                move |records| {
+                    records.push(previous);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        let operation = database
+            .prepare_filesystem_operation(
+                "agent_disable",
+                &AgentMoveOperation {
+                    previous: previous.clone(),
+                    next: next.clone(),
+                    active: vec![active.to_string_lossy().into_owned()],
+                    disabled: vec![disabled.to_string_lossy().into_owned()],
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::rename(&active, &disabled).unwrap();
+        save_ledger_after_filesystem(&state, std::slice::from_ref(&next), &operation.id)
+            .await
+            .unwrap();
+        (
+            app, project, database, state, previous, next, active, disabled,
+        )
+    }
+
     fn inject_agent_ledger_failure(app_data_dir: &Path) -> rusqlite::Connection {
         let connection =
             rusqlite::Connection::open(app_data_dir.join("state/agency-agents.sqlite3")).unwrap();
@@ -12382,6 +12496,82 @@ mod tests {
 
         assert_exact_kimi_lifecycle_state(&state, &database, &record, &paths, &contents, false)
             .await;
+    }
+
+    #[tokio::test]
+    async fn project_forget_finishes_pending_agent_operation_before_pruning() {
+        let (_app, project, database, state, _previous, _next, active, disabled) =
+            filesystem_applied_project_disable().await;
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+
+        project_forget_for_state(&state, &project_path.to_string_lossy())
+            .await
+            .unwrap();
+        recover_agent_operations(&state).await.unwrap();
+
+        assert!(load_ledger_for_state(&state).await.unwrap().is_empty());
+        assert!(!active.exists());
+        assert_eq!(std::fs::read(disabled).unwrap(), b"managed project agent");
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn adoption_commit_recovers_pending_operation_and_preserves_concurrent_ledger_change() {
+        let (_app, project, database, state, _previous, next, _active, _disabled) =
+            filesystem_applied_project_disable().await;
+        let project_root = std::fs::canonicalize(project.path()).unwrap();
+        let mut adopted = recovery_record(&project_root, render::sha256_hex(b"adopted"));
+        adopted.slug = "adopted".into();
+        adopted.relative_path = "engineering/adopted.md".into();
+        adopted.dest = project_root
+            .join(".codex/agents/adopted.toml")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&adopted.dest, b"adopted").unwrap();
+        let mut concurrent = recovery_record(&project_root, render::sha256_hex(b"concurrent"));
+        concurrent.slug = "concurrent".into();
+        concurrent.relative_path = "engineering/concurrent.md".into();
+        concurrent.dest = project_root
+            .join(".codex/agents/concurrent.toml")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&concurrent.dest, b"concurrent").unwrap();
+        database
+            .mutate(installs_spec(), Vec::new(), {
+                let concurrent = concurrent.clone();
+                move |records| {
+                    records.push(concurrent);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+
+        commit_agent_adoptions(&state, vec![adopted.clone()])
+            .await
+            .unwrap();
+        recover_agent_operations(&state).await.unwrap();
+
+        let records = load_ledger_for_state(&state).await.unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records
+            .iter()
+            .any(|record| exact_agent_install(record, &next)));
+        assert!(records
+            .iter()
+            .any(|record| exact_agent_install(record, &concurrent)));
+        assert!(records
+            .iter()
+            .any(|record| exact_agent_install(record, &adopted)));
+        assert!(database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
