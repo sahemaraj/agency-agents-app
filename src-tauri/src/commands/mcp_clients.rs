@@ -1221,6 +1221,19 @@ async fn collect_codex_inventory_at(
 pub(crate) async fn mcp_inventory_for_state(
     state: &AppState,
 ) -> Result<McpInventoryReport, AppError> {
+    mcp_inventory_for_state_inner(state, true).await
+}
+
+pub(crate) async fn mcp_inventory_for_state_passive(
+    state: &AppState,
+) -> Result<McpInventoryReport, AppError> {
+    mcp_inventory_for_state_inner(state, false).await
+}
+
+async fn mcp_inventory_for_state_inner(
+    state: &AppState,
+    inspect_codex_with_cli: bool,
+) -> Result<McpInventoryReport, AppError> {
     let trusted_tools = crate::skills::mcp::agency_agents_tool_names();
     let app_exe = env::current_exe().map_err(AppError::from)?;
     let claude_expected = expected_inventory_registration(&app_exe, McpClient::Claude);
@@ -1241,13 +1254,20 @@ pub(crate) async fn mcp_inventory_for_state(
     } else {
         push_inventory_issue(&mut issues, "Claude home is unavailable for MCP inventory");
     }
-    collect_codex_inventory(
-        codex_expected.as_ref(),
-        &trusted_tools,
-        &mut servers,
-        &mut issues,
-    )
-    .await;
+    if inspect_codex_with_cli {
+        collect_codex_inventory(
+            codex_expected.as_ref(),
+            &trusted_tools,
+            &mut servers,
+            &mut issues,
+        )
+        .await;
+    } else {
+        push_inventory_issue(
+            &mut issues,
+            "Codex MCP inventory is unavailable during passive inspection",
+        );
+    }
     servers.sort_by(|left, right| {
         (
             left.client,
@@ -1459,6 +1479,20 @@ async fn repair_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn passive_inventory_marks_codex_unavailable_without_cli_inspection() {
+        let app_data = tempfile::tempdir().unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+
+        let report = mcp_inventory_for_state_passive(&state).await.unwrap();
+
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("Codex MCP inventory is unavailable during passive")));
+    }
 
     #[test]
     fn inventory_normalization_redacts_secrets_and_blocks_unsafe_remote_urls() {

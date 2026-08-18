@@ -5454,7 +5454,7 @@ mod tests {
             (
                 4,
                 "skills_installed",
-                serde_json::json!({"project_paths": [project.path()]}),
+                serde_json::json!({"project_paths": [canonical_project.clone()]}),
             ),
             (
                 5,

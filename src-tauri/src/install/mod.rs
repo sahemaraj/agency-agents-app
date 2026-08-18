@@ -146,9 +146,15 @@ fn validate_roster_record(record: &AgentRosterInstallRecord) -> Result<(), AppEr
         });
     }
     let project = Path::new(&record.project_path);
-    if !project.is_absolute() {
+    if record.project_path.len() > 4096
+        || record.project_path.chars().any(char::is_control)
+        || !project.is_absolute()
+        || project
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
         return Err(AppError::InvalidArgument {
-            message: "Agent roster project path must be absolute".into(),
+            message: "Agent roster project path must be absolute and normalized".into(),
         });
     }
     let expected = render::dests(&record.tool, "roster", Path::new("/"), Some(project))?;
@@ -549,6 +555,11 @@ async fn save_rosters_after_filesystem(
 }
 
 fn validate_install_ledger(records: &[InstallRecord]) -> Result<(), AppError> {
+    if records.iter().any(|record| is_roster_target(&record.tool)) {
+        return Err(AppError::InvalidArgument {
+            message: GENERIC_ROSTER_BLOCKER.into(),
+        });
+    }
     let (_, changed) = migrate_install_records(records.to_vec(), None)?;
     if changed {
         return Err(AppError::InvalidArgument {
@@ -595,6 +606,113 @@ fn installs_spec() -> crate::state_db::DocumentSpec<Vec<InstallLedgerEntry>> {
     crate::state_db::DocumentSpec::new("installs", 1, MAX_LEDGER_BYTES, |entries| {
         validate_install_entries(entries)
     })
+}
+
+fn validate_raw_install_entries(entries: &[serde_json::Value]) -> Result<(), AppError> {
+    if entries.iter().any(|entry| !entry.is_object()) {
+        return Err(AppError::InvalidArgument {
+            message: "Agent install ledger entries must be objects".into(),
+        });
+    }
+    Ok(())
+}
+
+fn raw_installs_spec() -> crate::state_db::DocumentSpec<Vec<serde_json::Value>> {
+    crate::state_db::DocumentSpec::new("installs", 1, MAX_LEDGER_BYTES, |entries| {
+        validate_raw_install_entries(entries)
+    })
+}
+
+fn install_value_is_roster(value: &serde_json::Value) -> bool {
+    value.get("members").is_some()
+        || (value.get("sourceId").is_none()
+            && value.get("relativePath").is_none()
+            && value
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_roster_target))
+}
+
+fn parse_readiness_agent_entries(
+    entries: &[serde_json::Value],
+    built_in: Option<&AgentSourceResult>,
+) -> Result<Vec<InstallRecord>, AppError> {
+    let records = entries
+        .iter()
+        .filter(|entry| !install_value_is_roster(entry))
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<InstallRecord>, _>>()
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "generic Agent install ledger entries are invalid".into(),
+        })?;
+    let (records, _) =
+        migrate_install_records(records, built_in).map_err(|_| AppError::StorageCorrupt {
+            message: "generic Agent install ledger entries are invalid".into(),
+        })?;
+    validate_install_ledger(&records).map_err(|_| AppError::StorageCorrupt {
+        message: "generic Agent install ledger entries are invalid".into(),
+    })?;
+    Ok(records)
+}
+
+fn parse_readiness_roster_entries(
+    entries: &[serde_json::Value],
+) -> Result<Vec<AgentRosterInstallRecord>, AppError> {
+    let records = entries
+        .iter()
+        .filter(|entry| install_value_is_roster(entry))
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<AgentRosterInstallRecord>, _>>()
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent roster install ledger entries are invalid".into(),
+        })?;
+    if records.len() > MAX_ROSTER_RECORDS {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent roster install ledger exceeds its record limit".into(),
+        });
+    }
+    let mut identities = BTreeSet::new();
+    for record in &records {
+        validate_roster_record(record).map_err(|_| AppError::StorageCorrupt {
+            message: "Agent roster install ledger entries are invalid".into(),
+        })?;
+        if !identities.insert((record.tool.as_str(), record.project_path.as_str())) {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent roster install ledger contains duplicate identities".into(),
+            });
+        }
+    }
+    Ok(records)
+}
+
+async fn load_readiness_install_values(
+    state: &AppState,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        return database
+            .read(raw_installs_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent install ledger is missing after SQLite migration".into(),
+            });
+    }
+    let path = ledger_path_for(&state.app_data_dir);
+    match read_capped(&path, MAX_LEDGER_BYTES).await {
+        Ok(bytes) => {
+            let entries =
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).map_err(|_| {
+                    AppError::StorageCorrupt {
+                        message: "Agent install ledger is malformed".into(),
+                    }
+                })?;
+            validate_raw_install_entries(&entries)?;
+            Ok(entries)
+        }
+        Err(AppError::Io { .. }) if !path.exists() => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn installs_import_spec() -> crate::state_db::ImportSpec {
@@ -969,6 +1087,7 @@ pub(crate) async fn do_install<R: Runtime>(
     project_path: Option<String>,
     confirmed: bool,
 ) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
@@ -994,6 +1113,7 @@ async fn do_install_locked<R: Runtime>(
     project_path: Option<String>,
     confirmed: bool,
 ) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
     corpus::ensure_corpus(app, state).await?;
     let package = crate::agents::resolve_agent_package(&state.app_data_dir, &reference).await?;
     if !package.installable {
@@ -1724,13 +1844,14 @@ async fn compensate_roster_commit_failure(
 /// match the canonical render it shows `Current`; if they differ (older catalog
 /// version, or hand-edited) it shows `Modified`, and an explicit Update (which
 /// backs up first) reconciles it. This is the safe replacement for "Adopt".
-async fn do_track(
-    app: &AppHandle,
+async fn do_track<R: Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     reference: AgentReference,
     tool: Tool,
     project_path: Option<String>,
 ) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
@@ -2409,6 +2530,7 @@ async fn recover_agent_install_operation(
         .map_err(|_| AppError::StorageCorrupt {
             message: "Agent install recovery payload is invalid".into(),
         })?;
+    reject_generic_roster_target(&payload.next.tool)?;
     let contents = payload.rendered.contents();
     let artifacts = record_artifacts(&payload.next);
     if contents.len() != artifacts.len()
@@ -2596,6 +2718,7 @@ async fn recover_agent_move_operation(
                 message: "Agent move recovery payload is invalid".into(),
             }
         })?;
+    reject_generic_roster_target(&payload.next.tool)?;
     if !same_agent_install(&payload.previous, &payload.next)
         || payload.previous.rendered_hash != payload.next.rendered_hash
     {
@@ -2717,6 +2840,7 @@ async fn recover_agent_uninstall_operation(
         .map_err(|_| AppError::StorageCorrupt {
             message: "Agent uninstall recovery payload is invalid".into(),
         })?;
+    reject_generic_roster_target(&payload.previous.tool)?;
     let active = resolved_record_paths(state, &payload.previous).await?;
     let paths = if payload.previous.disabled_path.is_some() {
         active
@@ -3667,6 +3791,86 @@ async fn recover_agent_operations_locked(state: &AppState) -> Result<(), AppErro
     Ok(())
 }
 
+fn state_subdirectory_has_entries(app_data_dir: &Path, name: &str) -> Result<bool, AppError> {
+    let state_root = app_data_dir.join("state");
+    let state_metadata = match std::fs::symlink_metadata(&state_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("inspect application state directory: {error}"),
+            });
+        }
+    };
+    if !state_metadata.is_dir()
+        || state_metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&state_metadata)
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "application state directory is not a real directory".into(),
+        });
+    }
+    let directory = state_root.join(name);
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(AppError::Io {
+                message: format!("inspect Agent recovery directory: {error}"),
+            });
+        }
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || crate::skills::metadata_is_reparse_point(&metadata)
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Agent recovery directory is not a real directory".into(),
+        });
+    }
+    std::fs::read_dir(&directory)
+        .map_err(|error| AppError::Io {
+            message: format!("read Agent recovery directory: {error}"),
+        })?
+        .next()
+        .transpose()
+        .map(|entry| entry.is_some())
+        .map_err(|error| AppError::Io {
+            message: format!("read Agent recovery entry: {error}"),
+        })
+}
+
+async fn pending_agent_recovery_groups(state: &AppState) -> Result<(bool, bool), AppError> {
+    let mut generic = false;
+    let mut roster = state_subdirectory_has_entries(&state.app_data_dir, "roster-staging")?
+        || state_subdirectory_has_entries(&state.app_data_dir, "roster-history-staging")?;
+    let Some(database) = state.completed_state_database().await? else {
+        return Ok((generic, roster));
+    };
+    for operation in database.pending_filesystem_operations().await? {
+        let record = match operation.kind.as_str() {
+            "agent_install" | "agent_update" | "agent_disable" | "agent_enable" => {
+                operation.payload.get("next")
+            }
+            "agent_uninstall" => operation.payload.get("previous"),
+            "agent_roster_retention" => {
+                roster = true;
+                continue;
+            }
+            _ => continue,
+        };
+        match record {
+            Some(record) if record.get("members").is_some() => roster = true,
+            Some(_) => generic = true,
+            None => {
+                generic = true;
+                roster = true;
+            }
+        }
+    }
+    Ok((generic, roster))
+}
+
 pub(crate) async fn recover_agent_operations(state: &AppState) -> Result<(), AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
@@ -4342,6 +4546,16 @@ fn is_roster_target(tool: &str) -> bool {
     registry::get(tool).is_some_and(|meta| meta.install_kind.as_deref() == Some("roster"))
 }
 
+fn reject_generic_roster_target(tool: &str) -> Result<(), AppError> {
+    if is_roster_target(tool) {
+        Err(AppError::InvalidArgument {
+            message: GENERIC_ROSTER_BLOCKER.into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn roster_tool(tool: &str) -> Result<(), AppError> {
     if registry::get(tool)
         .is_some_and(|meta| meta.install_kind.as_deref() == Some("roster") && meta.installable())
@@ -4381,9 +4595,8 @@ async fn current_roster_state(
     state: &AppState,
     record: &AgentRosterInstallRecord,
 ) -> Result<InstallState, AppError> {
-    let active = Path::new(&record.dest);
-    let disabled = disabled_destination(active)?;
-    let active_hash = recovery_file_hash(active)?;
+    let (active, disabled) = validated_recovery_roster_paths(state, record).await?;
+    let active_hash = recovery_file_hash(&active)?;
     let disabled_hash = recovery_file_hash(&disabled)?;
     if record.disabled_path.is_some() {
         return Ok(match (active_hash.as_deref(), disabled_hash.as_deref()) {
@@ -6057,6 +6270,7 @@ pub(crate) async fn mcp_agent_is_tracked(
     tool: &str,
     project_path: Option<&str>,
 ) -> Result<bool, AppError> {
+    reject_generic_roster_target(tool)?;
     Ok(load_ledger_for_state(state).await?.iter().any(|record| {
         record.source_id == reference.source_id
             && record.relative_path == reference.relative_path
@@ -6117,6 +6331,7 @@ pub(crate) async fn mcp_install_agent_clean(
     project_path: Option<String>,
     authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
     let authorization = authorized_agent_project(project_path.as_deref(), authorization)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
@@ -6258,6 +6473,7 @@ pub(crate) async fn mcp_move_agent_install(
     enable: bool,
     authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
     let authorization = authorized_agent_project(project_path.as_deref(), authorization)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
@@ -6432,6 +6648,7 @@ pub(crate) async fn mcp_agent_version_history(
     project_path: Option<String>,
     authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<Vec<AgentVersionSnapshot>, AppError> {
+    reject_generic_roster_target(&tool)?;
     authorized_agent_project(project_path.as_deref(), authorization)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
@@ -6453,6 +6670,7 @@ pub(crate) async fn mcp_rollback_revision(
     project_path: Option<&str>,
     snapshot_id: &str,
 ) -> Result<String, AppError> {
+    reject_generic_roster_target(tool)?;
     let records = load_ledger_for_state(state).await?;
     let index = install_record_index(
         &records,
@@ -6855,6 +7073,13 @@ async fn reconcile_agent_rosters_locked(
     state: &AppState,
 ) -> Result<Vec<InstalledAgentRoster>, AppError> {
     let records = load_rosters_for_state(state).await?;
+    reconcile_agent_roster_records(state, records).await
+}
+
+async fn reconcile_agent_roster_records(
+    state: &AppState,
+    records: Vec<AgentRosterInstallRecord>,
+) -> Result<Vec<InstalledAgentRoster>, AppError> {
     let mut installed = Vec::with_capacity(records.len());
     for record in records {
         let lifecycle = current_roster_state(state, &record).await?;
@@ -7078,6 +7303,7 @@ pub async fn agent_version_history(
     tool: Tool,
     project_path: Option<String>,
 ) -> Result<Vec<AgentVersionSnapshot>, AppError> {
+    reject_generic_roster_target(&tool)?;
     // ponytail: one process lock serializes both install ledgers; split only if measured contention warrants it.
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
@@ -7168,6 +7394,7 @@ async fn rollback_agent_version(
     project_path: Option<String>,
     snapshot_id: String,
 ) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
@@ -7474,6 +7701,7 @@ pub async fn agent_diff(
     tool: Tool,
     project_path: Option<String>,
 ) -> Result<AgentDiff, AppError> {
+    reject_generic_roster_target(&tool)?;
     let reference = resolve_command_reference(
         &app,
         &state,
@@ -7564,6 +7792,7 @@ async fn do_uninstall(
     tool: Tool,
     project_path: Option<String>,
 ) -> Result<(), AppError> {
+    reject_generic_roster_target(&tool)?;
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
@@ -7576,6 +7805,7 @@ async fn do_uninstall_locked(
     tool: Tool,
     project_path: Option<String>,
 ) -> Result<(), AppError> {
+    reject_generic_roster_target(&tool)?;
     let mut ledger = load_ledger_for_state(state).await?;
     let index = install_record_index(
         &ledger,
@@ -7813,6 +8043,13 @@ async fn reconcile_agent_installs_locked(
     state: &AppState,
 ) -> Result<Vec<InstalledAgent>, AppError> {
     let ledger = load_ledger_for_state(state).await?;
+    reconcile_agent_records(state, ledger).await
+}
+
+async fn reconcile_agent_records(
+    state: &AppState,
+    ledger: Vec<InstallRecord>,
+) -> Result<Vec<InstalledAgent>, AppError> {
     let agent_sources = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
     let mut installed = Vec::with_capacity(ledger.len());
     for record in ledger {
@@ -7883,11 +8120,9 @@ fn append_roster_membership_evidence(
 async fn reconcile_project_agent_installs(
     state: &AppState,
 ) -> Result<Vec<InstalledAgent>, AppError> {
-    let _guard = state.skill_installs_write_lock.lock().await;
-    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
-    recover_agent_operations_locked(state).await?;
-    let mut installed = reconcile_agent_installs_locked(state).await?;
-    append_roster_membership_evidence(&mut installed, reconcile_agent_rosters_locked(state).await?);
+    let (generic, roster) = reconcile_project_agent_readiness_installs(state).await?;
+    let mut installed = generic.map_err(|message| AppError::InvalidArgument { message })?;
+    installed.extend(roster.map_err(|message| AppError::InvalidArgument { message })?);
     Ok(installed)
 }
 
@@ -9364,22 +9599,63 @@ async fn reconcile_project_agent_readiness_installs(
     AppError,
 > {
     let _guard = state.skill_installs_write_lock.lock().await;
-    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
-    if let Err(error) = recover_agent_operations_locked(state).await {
-        let message = error.to_string();
+    let database = state.completed_state_database().await?;
+    let revision_before = match &database {
+        Some(database) => Some(database.visible_revision().await?),
+        None => None,
+    };
+    let (generic_pending, roster_pending) = pending_agent_recovery_groups(state).await?;
+    let entries = match load_readiness_install_values(state).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            let message = error.to_string();
+            return Ok((Err(message.clone()), Err(message)));
+        }
+    };
+    let mut generic = if generic_pending {
+        Err("generic Agent evidence has pending crash recovery".into())
+    } else {
+        let built_in = crate::agents::inspect_builtin_agent_source(&state.app_data_dir)
+            .await
+            .ok();
+        match parse_readiness_agent_entries(&entries, built_in.as_ref()) {
+            Ok(records) => reconcile_agent_records(state, records)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    let mut roster = if roster_pending {
+        Err("Agent roster evidence has pending crash recovery".into())
+    } else {
+        match parse_readiness_roster_entries(&entries) {
+            Ok(records) => reconcile_agent_roster_records(state, records)
+                .await
+                .map(|rosters| {
+                    let mut installed = Vec::new();
+                    append_roster_membership_evidence(&mut installed, rosters);
+                    installed
+                })
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    let (generic_pending_after, roster_pending_after) =
+        pending_agent_recovery_groups(state).await?;
+    if generic_pending_after {
+        generic = Err("generic Agent evidence has pending crash recovery".into());
+    }
+    if roster_pending_after {
+        roster = Err("Agent roster evidence has pending crash recovery".into());
+    }
+    let revision_after = match &database {
+        Some(database) => Some(database.visible_revision().await?),
+        None => None,
+    };
+    if revision_after != revision_before {
+        let message = "Agent evidence changed during passive inspection".to_string();
         return Ok((Err(message.clone()), Err(message)));
     }
-    let generic = reconcile_agent_installs_locked(state)
-        .await
-        .map_err(|error| error.to_string());
-    let roster = reconcile_agent_rosters_locked(state)
-        .await
-        .map(|rosters| {
-            let mut installed = Vec::new();
-            append_roster_membership_evidence(&mut installed, rosters);
-            installed
-        })
-        .map_err(|error| error.to_string());
     Ok((generic, roster))
 }
 
@@ -9389,6 +9665,39 @@ fn status_from_skill_install(state: crate::types::SkillInstallState) -> Readines
         crate::types::SkillInstallState::SourceUnavailable => ReadinessRowState::Unavailable,
         _ => ReadinessRowState::NeedsAttention,
     }
+}
+
+fn mcp_requirement_readiness(states: &[ReadinessRowState], incomplete: bool) -> ReadinessRowState {
+    if states.contains(&ReadinessRowState::Ready) {
+        ReadinessRowState::Ready
+    } else if incomplete {
+        ReadinessRowState::Unavailable
+    } else {
+        ReadinessRowState::NeedsAttention
+    }
+}
+
+fn available_skill_references(
+    sources: Vec<crate::types::SkillSourceResult>,
+    relevant_source_ids: &BTreeSet<String>,
+) -> Result<BTreeSet<SkillReference>, AppError> {
+    if sources
+        .iter()
+        .any(|source| relevant_source_ids.contains(&source.source.id) && !source.errors.is_empty())
+    {
+        return Err(AppError::InvalidArgument {
+            message: "A referenced Skill source could not be inspected completely".into(),
+        });
+    }
+    Ok(sources
+        .into_iter()
+        .flat_map(|source| source.packages)
+        .filter(|package| package.installable)
+        .map(|package| SkillReference {
+            source_id: package.source_id,
+            relative_path: package.relative_path,
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -9418,27 +9727,31 @@ pub async fn project_readiness_get(
         ));
     };
 
+    let agent_requirements = exact_agent_requirements(&baseline);
+    let relevant_source_ids = agent_requirements
+        .iter()
+        .map(|requirement| requirement.reference.source_id.clone())
+        .collect::<BTreeSet<_>>();
     let available = crate::agents::inspect_agent_sources(&state.app_data_dir)
         .await
-        .map(|sources| {
-            sources
-                .iter()
-                .flat_map(|source| &source.agents)
-                .filter(|package| package.installable)
-                .map(|package| package.reference.clone())
-                .collect::<BTreeSet<_>>()
-        })
+        .and_then(|sources| count_available_agent_references(sources, &relevant_source_ids))
+        .map(|counts| counts.into_keys().collect::<BTreeSet<_>>())
         .map_err(|error| error.to_string());
     let (generic_installs, roster_installs) =
         reconcile_project_agent_readiness_installs(&state).await?;
     let agent_evidence = project_agent_readiness_states(
-        &exact_agent_requirements(&baseline),
+        &agent_requirements,
         &project_path,
         &available,
         &generic_installs,
         &roster_installs,
     );
 
+    let skill_requirements = exact_skill_requirements(&baseline);
+    let relevant_skill_source_ids = skill_requirements
+        .iter()
+        .map(|requirement| requirement.reference.source_id.clone())
+        .collect::<BTreeSet<_>>();
     let registered = registered_projects(&state.app_data_dir)
         .await?
         .into_iter()
@@ -9447,18 +9760,11 @@ pub async fn project_readiness_get(
     let skill_evidence = match crate::skills::reconcile_skill_installs(&state, &registered).await {
         Ok(installed) => crate::skills::inspect_skill_sources(&state)
             .await
-            .map(|sources| {
-                let available = sources
+            .and_then(|sources| available_skill_references(sources, &relevant_skill_source_ids))
+            .map(|available| {
+                skill_requirements
                     .iter()
-                    .flat_map(|source| &source.packages)
-                    .filter(|package| package.installable)
-                    .map(|package| SkillReference {
-                        source_id: package.source_id.clone(),
-                        relative_path: package.relative_path.clone(),
-                    })
-                    .collect::<BTreeSet<_>>();
-                exact_skill_requirements(&baseline)
-                    .into_iter()
+                    .cloned()
                     .map(|requirement| {
                         let reference = &requirement.reference;
                         let status = installed
@@ -9507,32 +9813,35 @@ pub async fn project_readiness_get(
                 .collect()
         })
         .map_err(|error| error.to_string());
-    let mcp_evidence = crate::commands::mcp_clients::mcp_inventory_for_state(&state)
+    let mcp_evidence = crate::commands::mcp_clients::mcp_inventory_for_state_passive(&state)
         .await
-        .and_then(|inventory| {
-            if !inventory.issues.is_empty() {
-                return Err(AppError::Io {
-                    message: "MCP inventory inspection is incomplete".into(),
-                });
-            }
-            Ok(inventory
-                .servers
-                .into_iter()
-                .filter(|server| {
-                    server.project_path.as_deref() == Some(project_path.as_str())
-                        || server.project_path.is_none()
+        .map(|inventory| {
+            let incomplete = !inventory.issues.is_empty();
+            baseline
+                .mcp_servers
+                .iter()
+                .filter(|requirement| requirement.known)
+                .map(|requirement| {
+                    let matching = inventory.servers.iter().filter(|server| {
+                        server.name == requirement.id
+                            && (server.project_path.as_deref() == Some(project_path.as_str())
+                                || server.project_path.is_none())
+                    });
+                    let states = matching
+                        .map(|server| {
+                            if server.enabled
+                                && server.validation == crate::types::McpInventoryValidation::Valid
+                            {
+                                ReadinessRowState::Ready
+                            } else {
+                                ReadinessRowState::NeedsAttention
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let state = mcp_requirement_readiness(&states, incomplete);
+                    (requirement.id.clone(), state)
                 })
-                .map(|server| {
-                    let state = if server.enabled
-                        && server.validation == crate::types::McpInventoryValidation::Valid
-                    {
-                        ReadinessRowState::Ready
-                    } else {
-                        ReadinessRowState::NeedsAttention
-                    };
-                    (server.name, state)
-                })
-                .collect())
+                .collect()
         })
         .map_err(|error| error.to_string());
     let mut tool_evidence = BTreeMap::new();
@@ -9964,20 +10273,23 @@ async fn current_recommendations(
     if include_seen_latest {
         projection.last_seen_batch = None;
     }
-    let installed = reconcile_project_agent_installs(state).await.ok();
+    let installed = match reconcile_project_agent_installs(state).await {
+        Ok(installed) => installed,
+        Err(_) => return Ok((subscription, Vec::new(), BTreeSet::new(), false)),
+    };
     let recommendations = derive_project_recommendations_with_installs(
         baseline,
         &projection,
         feed,
         &available,
-        installed.as_deref(),
+        Some(&installed),
     );
     let candidate_ids = current_project_recommendation_candidate_ids(
         baseline,
         &projection,
         feed,
         &available,
-        installed.as_deref(),
+        Some(&installed),
     );
     Ok((subscription, recommendations, candidate_ids, true))
 }
@@ -10050,42 +10362,20 @@ async fn list_project_recommendations_for_state(
     state: &AppState,
     project_path: &str,
 ) -> Result<Vec<ProjectRecommendation>, AppError> {
-    let (_, recommendations, candidate_ids, available) =
+    let (_, recommendations, _, available) =
         current_recommendations(state, project_path, false).await?;
     if !available {
         return Err(AppError::InvalidArgument {
             message: RECOMMENDATIONS_UNAVAILABLE.into(),
         });
     }
-    let inferred_pending_ids = recommendations
-        .iter()
-        .filter(|recommendation| recommendation.lifecycle == RecommendationLifecycle::Pending)
-        .map(|recommendation| recommendation.id.clone())
-        .collect::<BTreeSet<_>>();
-    let retained_project = project_path.to_string();
-    control_center_database(state)
-        .await?
-        .mutate(
-            corpus::control_center_spec(),
-            crate::types::ControlCenterDocument::default(),
-            move |document| {
-                prune_project_pending_recommendations(
-                    document,
-                    &retained_project,
-                    &candidate_ids,
-                    &inferred_pending_ids,
-                )
-            },
-        )
-        .await?;
     Ok(recommendations)
 }
 
-fn prune_project_pending_recommendations(
+fn retain_current_project_recommendation_ids(
     document: &mut crate::types::ControlCenterDocument,
     project_path: &str,
     candidate_ids: &BTreeSet<String>,
-    inferred_pending_ids: &BTreeSet<String>,
 ) -> Result<(), AppError> {
     let subscription = document
         .project_subscriptions
@@ -10100,19 +10390,6 @@ fn prune_project_pending_recommendations(
     subscription
         .dismissed_recommendation_ids
         .retain(|id| candidate_ids.contains(id));
-    for id in inferred_pending_ids {
-        if !subscription.pending_recommendation_ids.contains(id) {
-            subscription.pending_recommendation_ids.push(id.clone());
-        }
-    }
-    subscription.pending_recommendation_ids.sort();
-    if subscription.pending_recommendation_ids.len()
-        > corpus::CONTROL_CENTER_MAX_PENDING_RECOMMENDATIONS
-    {
-        return Err(AppError::InvalidArgument {
-            message: "Pending recommendations exceed the subscription limit".into(),
-        });
-    }
     Ok(())
 }
 
@@ -10308,6 +10585,7 @@ fn dismiss_project_recommendation(
     recommendation_id: String,
     candidate_ids: &BTreeSet<String>,
 ) -> Result<(), AppError> {
+    retain_current_project_recommendation_ids(document, project_path, candidate_ids)?;
     let subscription = document
         .project_subscriptions
         .iter_mut()
@@ -10317,10 +10595,7 @@ fn dismiss_project_recommendation(
         })?;
     subscription
         .pending_recommendation_ids
-        .retain(|id| id != &recommendation_id && candidate_ids.contains(id));
-    subscription
-        .dismissed_recommendation_ids
-        .retain(|id| candidate_ids.contains(id));
+        .retain(|id| id != &recommendation_id);
     if !subscription
         .dismissed_recommendation_ids
         .contains(&recommendation_id)
@@ -13208,6 +13483,207 @@ mod tests {
             .any(|blocker| blocker.contains("Agent roster review")));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_generic_lifecycle_core_rejects_roster_targets_before_io() {
+        use tauri::Manager as _;
+
+        fn assert_blocked<T>(result: Result<T, AppError>) {
+            match result {
+                Err(error) => assert!(error.to_string().contains(GENERIC_ROSTER_BLOCKER)),
+                Ok(_) => panic!("generic Agent lifecycle accepted an aggregate roster target"),
+            }
+        }
+
+        let app_data = tempfile::tempdir().unwrap();
+        let app = command_test_app(app_data.path());
+        let handle = app.handle().clone();
+        let state = app.state::<AppState>();
+        let reference = AgentReference {
+            source_id: "source".into(),
+            relative_path: "agent.md".into(),
+        };
+
+        assert_blocked(
+            do_install(
+                &handle,
+                &state,
+                reference.clone(),
+                "aider".into(),
+                None,
+                false,
+            )
+            .await,
+        );
+        assert_blocked(
+            do_install_locked(
+                &handle,
+                &state,
+                reference.clone(),
+                "windsurf".into(),
+                None,
+                false,
+            )
+            .await,
+        );
+        assert_blocked(do_track(&handle, &state, reference.clone(), "aider".into(), None).await);
+        assert_blocked(
+            mcp_install_agent_clean(&state, reference.clone(), "windsurf".into(), None, None).await,
+        );
+        assert_blocked(
+            mcp_move_agent_install(&state, reference.clone(), "aider".into(), None, false, None)
+                .await,
+        );
+        assert_blocked(
+            mcp_agent_version_history(&state, reference.clone(), "windsurf".into(), None, None)
+                .await,
+        );
+        assert_blocked(mcp_rollback_revision(&state, &reference, "aider", None, "revision").await);
+        assert_blocked(
+            rollback_agent_version(
+                &state,
+                reference.clone(),
+                "windsurf".into(),
+                None,
+                "revision".into(),
+            )
+            .await,
+        );
+        assert_blocked(do_uninstall(&state, reference.clone(), "aider".into(), None).await);
+        assert_blocked(
+            do_uninstall_locked(&state, reference.clone(), "windsurf".into(), None).await,
+        );
+        assert_blocked(mcp_agent_is_tracked(&state, &reference, "aider", None).await);
+
+        let mut invalid = row("agent", "aider", None);
+        invalid.source_id = "source".into();
+        invalid.relative_path = "agent.md".into();
+        assert_blocked(validate_install_ledger(&[invalid]));
+    }
+
+    #[tokio::test]
+    async fn passive_evidence_never_recovers_legacy_roster_target_operations() {
+        fn assert_blocked<T>(result: Result<T, AppError>) {
+            match result {
+                Err(error) => assert!(error.to_string().contains(GENERIC_ROSTER_BLOCKER)),
+                Ok(_) => panic!("legacy aggregate roster operation entered generic recovery"),
+            }
+        }
+
+        let app_data = tempfile::tempdir().unwrap();
+        let destination = app_data.path().join("shared-roster.md");
+        std::fs::write(&destination, b"user roster").unwrap();
+        let mut record = row("agent", "aider", None);
+        record.source_id = "source".into();
+        record.relative_path = "agent.md".into();
+        record.dest = destination.to_string_lossy().into_owned();
+        record.rendered_hash = render::sha256_hex(b"user roster");
+        let database = crate::state_db::StateDatabase::open(app_data.path()).unwrap();
+        database
+            .mutate(raw_installs_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let install = database
+            .prepare_filesystem_operation(
+                "agent_install",
+                &AgentInstallOperation {
+                    previous: None,
+                    next: record.clone(),
+                    targets: vec![record.dest.clone()],
+                    rendered: AgentRenderedPayload::One("replacement".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let mut disabled = record.clone();
+        disabled.disabled_path = Some(format!("{}.disabled", record.dest));
+        let moved = database
+            .prepare_filesystem_operation(
+                "agent_disable",
+                &AgentMoveOperation {
+                    previous: record.clone(),
+                    next: disabled,
+                    active: vec![record.dest.clone()],
+                    disabled: vec![format!("{}.disabled", record.dest)],
+                },
+            )
+            .await
+            .unwrap();
+        let uninstall = database
+            .prepare_filesystem_operation(
+                "agent_uninstall",
+                &AgentUninstallOperation {
+                    previous: record,
+                    paths: vec![destination.to_string_lossy().into_owned()],
+                    hashes: vec![Some(render::sha256_hex(b"user roster"))],
+                },
+            )
+            .await
+            .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let before_pending = database.pending_filesystem_operations().await.unwrap();
+        let before_revision = database.visible_revision().await.unwrap();
+
+        assert_blocked(recover_agent_install_operation(&state, &database, &install).await);
+        assert_blocked(recover_agent_move_operation(&state, &database, &moved).await);
+        assert_blocked(recover_agent_uninstall_operation(&state, &database, &uninstall).await);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"user roster");
+        assert_eq!(
+            database.pending_filesystem_operations().await.unwrap(),
+            before_pending
+        );
+        assert_eq!(database.visible_revision().await.unwrap(), before_revision);
+
+        assert_eq!(
+            pending_agent_recovery_groups(&state).await.unwrap(),
+            (true, false)
+        );
+        let (generic, roster) = reconcile_project_agent_readiness_installs(&state)
+            .await
+            .unwrap();
+        assert!(generic.is_err());
+        assert!(roster.is_ok());
+        assert!(reconcile_project_agent_installs(&state).await.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"user roster");
+        assert_eq!(
+            database.pending_filesystem_operations().await.unwrap(),
+            before_pending
+        );
+        assert_eq!(database.visible_revision().await.unwrap(), before_revision);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passive_agent_evidence_serializes_with_in_process_mutations() {
+        let app_data = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(app_data.path()).unwrap();
+        database
+            .mutate(raw_installs_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let state = std::sync::Arc::new(state);
+        let mutation_guard = state.skill_installs_write_lock.lock().await;
+        let reader_state = state.clone();
+        let reader =
+            tokio::spawn(
+                async move { reconcile_project_agent_readiness_installs(&reader_state).await },
+            );
+        tokio::task::yield_now().await;
+
+        assert!(!reader.is_finished());
+        drop(mutation_guard);
+        assert!(reader.await.unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn roster_membership_is_readiness_and_team_baseline_evidence() {
         use tauri::Manager as _;
@@ -13662,14 +14138,39 @@ mod tests {
         let first = roster_record(2);
         let mut reversed = first.clone();
         reversed.members.reverse();
+        let mut unnormalized = first.clone();
+        unnormalized.project_path = "/registered/../project".into();
         assert!(validate_roster_record(&first).is_ok());
         assert!(validate_roster_record(&reversed).is_err());
+        assert!(validate_roster_record(&unnormalized).is_err());
         assert!(validate_roster_record(&roster_record(1)).is_err());
         assert!(validate_roster_record(&roster_record(MAX_ROSTER_MEMBERS + 1)).is_err());
         assert!(matches!(
             InstallLedgerEntry::Roster(first),
             InstallLedgerEntry::Roster(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn passive_roster_reconciliation_requires_an_exact_registered_project() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let mut record = roster_record(2);
+        record.project_path = project.to_string_lossy().into_owned();
+        record.dest = render::dests("aider", "roster", Path::new("/"), Some(&project))
+            .unwrap()
+            .remove(0)
+            .to_string_lossy()
+            .into_owned();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+
+        assert!(current_roster_state(&state, &record)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exact registered canonical path"));
     }
 
     #[test]
@@ -15829,6 +16330,35 @@ mod tests {
     }
 
     #[test]
+    fn readiness_skill_source_errors_are_scoped_to_referenced_sources() {
+        let result = |id: &str, failed: bool| crate::types::SkillSourceResult {
+            source: crate::types::SkillSource {
+                id: id.into(),
+                kind: crate::types::SkillSourceKind::Local {
+                    root: format!("/{id}"),
+                },
+            },
+            packages: Vec::new(),
+            errors: failed
+                .then(|| crate::types::SkillValidationError {
+                    code: crate::types::SkillValidationCode::Io,
+                    path: format!("/{id}"),
+                    message: "source unavailable".into(),
+                })
+                .into_iter()
+                .collect(),
+        };
+        let relevant = BTreeSet::from(["required".to_string()]);
+
+        assert!(available_skill_references(
+            vec![result("required", false), result("unrelated", true)],
+            &relevant,
+        )
+        .is_ok());
+        assert!(available_skill_references(vec![result("required", true)], &relevant).is_err());
+    }
+
+    #[test]
     fn generic_and_roster_readiness_fail_independently() {
         let generic_requirement = BaselineAgentRequirement {
             reference: AgentReference {
@@ -15893,6 +16423,60 @@ mod tests {
             generic_failed[&roster_requirement],
             ReadinessRowState::Ready
         );
+    }
+
+    #[test]
+    fn incomplete_mcp_evidence_is_unavailable_without_ready_proof() {
+        assert_eq!(
+            mcp_requirement_readiness(&[ReadinessRowState::NeedsAttention], true),
+            ReadinessRowState::Unavailable
+        );
+        assert_eq!(
+            mcp_requirement_readiness(&[ReadinessRowState::Ready], true),
+            ReadinessRowState::Ready
+        );
+        assert_eq!(
+            mcp_requirement_readiness(&[ReadinessRowState::NeedsAttention], false),
+            ReadinessRowState::NeedsAttention
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_malformed_install_rows_only_disable_their_readiness_group() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let database = state.completed_state_database().await.unwrap().unwrap();
+
+        let mut malformed_roster = serde_json::to_value(roster_record(2)).unwrap();
+        malformed_roster["members"] = serde_json::json!([]);
+        database
+            .mutate(raw_installs_spec(), Vec::new(), move |entries| {
+                *entries = vec![malformed_roster];
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let entries = load_readiness_install_values(&state).await.unwrap();
+        let generic = parse_readiness_agent_entries(&entries, None);
+        let roster = parse_readiness_roster_entries(&entries);
+        assert!(generic.is_ok(), "{generic:?}");
+        assert!(roster.is_err());
+
+        let mut malformed_generic = serde_json::to_value(row("reviewer", "codex", None)).unwrap();
+        malformed_generic["relativePath"] = serde_json::Value::Null;
+        database
+            .mutate(raw_installs_spec(), Vec::new(), move |entries| {
+                *entries = vec![malformed_generic];
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let entries = load_readiness_install_values(&state).await.unwrap();
+        let generic = parse_readiness_agent_entries(&entries, None);
+        let roster = parse_readiness_roster_entries(&entries);
+        assert!(generic.is_err());
+        assert!(roster.is_ok(), "{roster:?}");
     }
 
     #[test]
@@ -16379,10 +16963,9 @@ mod tests {
             ..Default::default()
         };
 
-        prune_project_pending_recommendations(
+        retain_current_project_recommendation_ids(
             &mut document,
             "/registered/project",
-            &BTreeSet::from(["b".repeat(64)]),
             &BTreeSet::from(["b".repeat(64)]),
         )
         .unwrap();
@@ -16532,11 +17115,10 @@ mod tests {
             &available,
             Some(&installed),
         );
-        prune_project_pending_recommendations(
+        retain_current_project_recommendation_ids(
             &mut document,
             "/registered/project",
             &candidates,
-            &BTreeSet::new(),
         )
         .unwrap();
         assert_eq!(
@@ -16554,11 +17136,10 @@ mod tests {
             &available,
             Some(&installed),
         );
-        prune_project_pending_recommendations(
+        retain_current_project_recommendation_ids(
             &mut document,
             "/registered/project",
             &candidates,
-            &BTreeSet::new(),
         )
         .unwrap();
         assert!(document.project_subscriptions[0]
@@ -16638,9 +17219,37 @@ mod tests {
     async fn project_recommendation_listing_is_cursor_and_destination_write_free() {
         let app_data = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus/engineering")).unwrap();
+        std::fs::write(
+            app_data.path().join("corpus/engineering/reviewer.md"),
+            "---\nname: Reviewer\ndescription: Reviews.\n---\nReview.\n",
+        )
+        .unwrap();
         let marker = project.path().join("user-owned.txt");
         std::fs::write(&marker, "unchanged").unwrap();
         let state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let database = control_center_database(&state).await.unwrap();
+        database
+            .mutate(
+                crate::state_db::DocumentSpec::new(
+                    "agent_sources",
+                    1,
+                    1_048_576,
+                    |sources: &Vec<serde_json::Value>| {
+                        if sources.iter().all(serde_json::Value::is_object) {
+                            Ok(())
+                        } else {
+                            Err(AppError::InvalidArgument {
+                                message: "Agent source entries must be objects".into(),
+                            })
+                        }
+                    },
+                ),
+                Vec::new(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
         let project_path = std::fs::canonicalize(project.path())
             .unwrap()
             .to_string_lossy()
@@ -16649,7 +17258,10 @@ mod tests {
             source_id: crate::agents::BUILTIN_AGENT_SOURCE_ID.into(),
             relative_path: "engineering/reviewer.md".into(),
         };
-        let database = control_center_database(&state).await.unwrap();
+        database
+            .mutate(installs_spec(), Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
         corpus::save_catalog_source(&state.app_data_dir, &crate::types::CatalogSource::Bundled)
             .await
             .unwrap();
@@ -16716,6 +17328,33 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        let revision = database.visible_revision().await.unwrap();
+        assert!(
+            !list_project_recommendations_for_state(&state, &project_path)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            corpus::load_control_center(&database).await.unwrap(),
+            before
+        );
+        assert_eq!(database.visible_revision().await.unwrap(), revision);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "unchanged");
+        assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 1);
+
+        let mut malformed =
+            serde_json::to_value(row("reviewer", "codex", Some(&project_path))).unwrap();
+        malformed["relativePath"] = serde_json::Value::Null;
+        database
+            .mutate(raw_installs_spec(), Vec::new(), move |entries| {
+                *entries = vec![malformed];
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let unreadable_installs = corpus::load_control_center(&database).await.unwrap();
+        let revision = database.visible_revision().await.unwrap();
         assert!(
             list_project_recommendations_for_state(&state, &project_path)
                 .await
@@ -16725,10 +17364,9 @@ mod tests {
         );
         assert_eq!(
             corpus::load_control_center(&database).await.unwrap(),
-            before
+            unreadable_installs
         );
-        assert_eq!(std::fs::read_to_string(marker).unwrap(), "unchanged");
-        assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 1);
+        assert_eq!(database.visible_revision().await.unwrap(), revision);
 
         database
             .mutate(
@@ -17635,13 +18273,8 @@ mod tests {
             ..Default::default()
         };
         let latest = BTreeSet::from([latest_id.clone()]);
-        prune_project_pending_recommendations(
-            &mut document,
-            &baseline.project_path,
-            &latest,
-            &latest,
-        )
-        .unwrap();
+        retain_current_project_recommendation_ids(&mut document, &baseline.project_path, &latest)
+            .unwrap();
         assert_eq!(
             document.project_subscriptions[0].pending_recommendation_ids,
             vec![latest_id]
