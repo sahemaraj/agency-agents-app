@@ -73,12 +73,12 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 **Steps:**
 
-- [ ] Write failing validator, cap, migration-inventory, deterministic-diff, rename, crash-order, stale-retention, and DTO tests.
-- [ ] Add the single versioned `control-center` document and register its import validator and backup inventory.
-- [ ] Snapshot the active Agent corpus by category + normalized relative path + source/body hashes.
-- [ ] On successful explicit pull/refresh, atomically persist the new snapshot and bounded typed feed before any cursor can advance. Infer rename only for one unambiguous matching hash pair.
-- [ ] Expose bounded list/refresh DTOs and render batches plus stale/error/Retry state in Catalog Settings.
-- [ ] Run focused Rust tests and the Settings component tests.
+- [x] Write failing validator, cap, migration-inventory, deterministic-diff, rename, crash-order, stale-retention, and DTO tests.
+- [x] Add the single versioned `control-center` document and register its import validator and backup inventory.
+- [x] Snapshot the active Agent corpus by category + normalized relative path + source/body hashes.
+- [x] On successful explicit pull/refresh, atomically persist the new snapshot and bounded typed feed before any cursor can advance. Infer rename only for one unambiguous matching hash pair.
+- [x] Expose bounded list/refresh DTOs and render batches plus stale/error/Retry state in Catalog Settings.
+- [x] Run focused Rust tests and the Settings component tests.
 
 **Acceptance:** add/update/remove/rename feed is deterministic and durable; refresh failure preserves visibly stale truth and cannot emit a recommendation.
 
@@ -99,11 +99,11 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 **Steps:**
 
-- [ ] Write failing tests for no baseline, every readiness state/precedence, exact source identities, opaque Workspace Pack requirements, failed independent checks, subscription opt-in, cursor ordering, dismissal, supersession, stale ref blocking, and zero destination writes during evaluation.
-- [ ] Persist exact per-project baselines and subscription preferences inside `control-center`; reuse Workspace Pack parsing but never mark opaque requirements Ready.
-- [ ] Derive one explainable report from fresh Agent/Skill reconciliation, instruction inspection, MCP inventory, and tool detection.
-- [ ] Derive bounded recommendations only from a successful durable feed. Opening one re-resolves exact refs and enters the existing plan/apply UI; only surfaced recommendations advance the cursor.
-- [ ] Add Readiness and subscription controls to existing project/team detail surfaces with evidence and existing repair/configuration links.
+- [x] Write failing tests for no baseline, every readiness state/precedence, exact source identities, opaque Workspace Pack requirements, failed independent checks, subscription opt-in, cursor ordering, dismissal, supersession, stale ref blocking, and zero destination writes during evaluation.
+- [x] Persist exact per-project baselines and subscription preferences inside `control-center`; reuse Workspace Pack parsing but never mark opaque requirements Ready.
+- [x] Derive one explainable report from fresh Agent/Skill reconciliation, instruction inspection, MCP inventory, and tool detection.
+- [x] Derive bounded recommendations only from a successful durable feed. Opening one re-resolves exact refs and enters the existing plan/apply UI; only surfaced recommendations advance the cursor.
+- [x] Add Readiness and subscription controls to existing project/team detail surfaces with evidence and existing repair/configuration links.
 
 **Acceptance:** readiness never overclaims; subscription evaluation is local/read-only and cannot bypass the existing reviewed deployment path.
 
@@ -121,10 +121,10 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 **Steps:**
 
-- [ ] Write failing aggregation tests covering Agent, Skill, Expert change, Expert run, Expert activation, partial errors, retries, counts, and recommendation separation.
-- [ ] Add Review/History modes to Activity, delegating each action/deep-link to the existing owning domain.
-- [ ] Reuse Agent version history/rollback, Skill backup/rollback, and verified storage backup/reveal in one Settings recovery view; state explicitly that database restore is offline/manual.
-- [ ] Preserve focus on return, announce async state, use semantic buttons/headings, and keep errors domain-specific.
+- [x] Write failing aggregation tests covering Agent, Skill, Expert change, Expert run, Expert activation, partial errors, retries, counts, and recommendation separation.
+- [x] Add Review/History modes to Activity, delegating each action/deep-link to the existing owning domain.
+- [x] Reuse Agent version history/rollback, Skill backup/rollback, and verified storage backup/reveal in one Settings recovery view; state explicitly that database restore is offline/manual.
+- [x] Preserve focus on return, announce async state, use semantic buttons/headings, and keep errors domain-specific.
 
 **Acceptance:** one view reveals every pending shape without creating a second approval engine; all recovery actions retain their existing safety boundary.
 
@@ -143,10 +143,10 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 **Steps:**
 
-- [ ] Write failing tar-retention, root/path/link/reparse, extension, UTF-8, per-file byte, count, sort, search, and safe-display tests.
-- [ ] Retain only supported strategy/example markdown in managed snapshots and expose a bounded read-only catalog/read API.
-- [ ] Add Runbooks/Playbooks modes, local search, safe preformatted text, copy, empty/error/retry states, and source-relative provenance.
-- [ ] Add no markdown/HTML dependency.
+- [x] Write failing tar-retention, root/path/link/reparse, extension, UTF-8, per-file byte, count, sort, search, and safe-display tests.
+- [x] Retain only supported strategy/example markdown in managed snapshots and expose a bounded read-only catalog/read API.
+- [x] Add Runbooks/Playbooks modes, local search, safe preformatted text, copy, empty/error/retry states, and source-relative provenance.
+- [x] Add no markdown/HTML dependency.
 
 **Acceptance:** cloned and managed catalogs expose the same safe docs; catalog content cannot read outside the allowed roots or execute markup.
 
@@ -164,9 +164,9 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 **Steps:**
 
-- [ ] Write failing classification and apply tests for Strict, Local Development, Custom, corrupt settings, retained allowlist, cleared Skill/Agent client overrides, unrelated field preservation, serialization with concurrent settings writes, and no partial state.
-- [ ] Add one backend preset command that uses the existing settings write lock, loads the latest document, changes the complete policy matrix, persists once, and refreshes cache once.
-- [ ] Add complete before/after preview and explicit apply. Any non-exact shape is Custom.
+- [x] Write failing classification and apply tests for Strict, Local Development, Custom, corrupt settings, retained allowlist, cleared Skill/Agent client overrides, unrelated field preservation, serialization with concurrent settings writes, and no partial state.
+- [x] Add one backend preset command that uses the existing settings write lock, loads the latest document, changes the complete policy matrix, persists once, and refreshes cache once.
+- [x] Add complete before/after preview and explicit apply. Any non-exact shape is Custom.
 
 **Acceptance:** Strict cannot leave an override-enabled mutation path; failed persistence changes nothing.
 
@@ -183,11 +183,11 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 **Steps:**
 
-- [ ] Start with failing exact-render parity tests against the checked-out upstream converter and failure-injection tests for every artifact lifecycle operation.
-- [ ] Replace the one-string internal render assumption with the smallest artifact-set representation while preserving existing single-file public behavior.
-- [ ] Persist an artifact manifest backward-compatibly and aggregate state with Modified > Missing > Outdated > Current precedence; Disabled and SourceUnavailable retain existing semantics.
-- [ ] Route install/update/disable/enable/uninstall/history/rollback/recovery through the existing journal and exact backup mechanisms for every artifact.
-- [ ] Report OpenClaw file success separately from required external registration/restart; execute no CLI.
+- [x] Start with failing exact-render parity tests against the checked-out upstream converter and failure-injection tests for every artifact lifecycle operation.
+- [x] Replace the one-string internal render assumption with the smallest artifact-set representation while preserving existing single-file public behavior.
+- [x] Persist an artifact manifest backward-compatibly and aggregate state with Modified > Missing > Outdated > Current precedence; Disabled and SourceUnavailable retain existing semantics.
+- [x] Route install/update/disable/enable/uninstall/history/rollback/recovery through the existing journal and exact backup mechanisms for every artifact.
+- [x] Report OpenClaw file success separately from required external registration/restart; execute no CLI.
 
 **Acceptance:** deleting or modifying any secondary artifact changes the installation state; any injected failure restores every prior artifact and ledger row.
 
@@ -207,10 +207,10 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 **Steps:**
 
-- [ ] Write failing Aider/Windsurf aggregate parity, deterministic exact-reference ordering, project-only scope, foreign-file refusal, update/rollback/reconcile/recovery, caps, and no-partial-write tests.
-- [ ] Add project-scoped roster plan/apply/lifecycle commands using the existing install ledger document and filesystem journal; never encode the roster as one Agent record.
-- [ ] Expose roster targets only when multiple exact selected Agents can be reviewed; show aggregate destination and membership before apply.
-- [ ] Add Antigravity parity and end-to-end install/reconcile/uninstall tests without production changes.
+- [x] Write failing Aider/Windsurf aggregate parity, deterministic exact-reference ordering, project-only scope, foreign-file refusal, update/rollback/reconcile/recovery, caps, and no-partial-write tests.
+- [x] Add project-scoped roster plan/apply/lifecycle commands using the existing install ledger document and filesystem journal; never encode the roster as one Agent record.
+- [x] Expose roster targets only when multiple exact selected Agents can be reviewed; show aggregate destination and membership before apply.
+- [x] Add Antigravity parity and end-to-end install/reconcile/uninstall tests without production changes.
 
 **Acceptance:** Aider/Windsurf aggregate exactly the reviewed roster and never overwrite foreign project rules; Antigravity remains unchanged and proven.
 
@@ -224,12 +224,12 @@ Structured review disposition: **APPROVED**. The skeptic, constraint guardian, a
 
 **Steps:**
 
-- [ ] Run focused tests after each task, then the full 117+ frontend and 581+ Rust baselines with new tests included.
-- [ ] Run `npm run check`, `npm run build`, strict Rust format, strict Clippy, `git diff --check`, dependency audit, OpenSpec strict validation, and prohibited shell/path scans.
-- [ ] Exercise the web shim end to end for Review, Readiness, Playbooks, Feed, Recommendations, Recovery, Presets, and target planning; run native smoke where the environment supports it.
-- [ ] Verify keyboard focus, semantic states, live announcements, 375 px layout where browser evidence is available, and honest Unavailable waivers otherwise.
-- [ ] Dispatch final whole-diff spec and quality/security reviewers; fix every blocking/important finding and re-run affected gates.
-- [ ] Persist final evidence and commit the isolated branch. Do not merge or modify the original dirty `main` checkout unless separately requested.
+- [x] Run focused tests after each task, then the full 117+ frontend and 581+ Rust baselines with new tests included.
+- [x] Run `npm run check`, `npm run build`, strict Rust format, strict Clippy, `git diff --check`, dependency audit, OpenSpec strict validation, and prohibited shell/path scans.
+- [x] Exercise the web shim end to end for Review, Readiness, Playbooks, Feed, Recommendations, Recovery, Presets, and target planning; run native smoke where the environment supports it.
+- [x] Verify keyboard focus, semantic states, live announcements, 375 px layout where browser evidence is available, and honest Unavailable waivers otherwise.
+- [x] Dispatch final whole-diff spec and quality/security reviewers; fix every blocking/important finding and re-run affected gates.
+- [x] Persist final evidence and commit the isolated branch. Do not merge or modify the original dirty `main` checkout unless separately requested.
 
 **Acceptance:** all eight capabilities have runnable evidence, no blocking review findings remain, and the branch is integration-ready without touching user-owned changes.
 

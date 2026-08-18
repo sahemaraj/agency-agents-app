@@ -1,8 +1,18 @@
 # Active Context — Agency Agents
 
-## 🚧 Nightly Control Plane Program [IN PROGRESS] (2026-08-17)
+## ✅ Nightly Control Plane Program [COMPLETE] (2026-08-18)
 
-Final approval is recorded for the eight-capability nightly program: Unified Review, Project Readiness, Playbooks, Catalog Change Feed, Team/Project subscriptions, Recovery, Security presets, and Antigravity/Aider/Windsurf/OpenClaw/Kimi target coverage. Work is isolated on `feat/nightly-control-plane` at `/Users/home/.config/superpowers/worktrees/agency-agents-app/nightly-control-plane`; the original dirty `main` checkout remains untouched. State: BUILD after Task 8 independent audits found concrete completion defects. Tasks 1-6 remain implemented at `db9836e`, `4a51d43`, `e5864d3`, `cb2b883`, `15e9d5e`, and `c6337af`; Task 7's accepted base is `423f284`. Security corrections now block OpenClaw executable probing (`b08df45`), revalidate managed catalog authority immediately before Git (`8da8cb0`), and authorize/cap every MCP `skills_installed` project vector (`751ebfa`). The valid `nightly-control-plane` OpenSpec change at `ff98ea1` covers all eight capabilities. Active fixes: roster-aware generic flows/project removal and five browser-confirmed accessibility/reflow defects; full Task 8 QA and completion documentation remain pending. Plan: `docs/superpowers/plans/2026-08-17-nightly-control-plane.md`.
+The isolated `feat/nightly-control-plane` branch now delivers Unified Review, Project Readiness,
+bounded Playbooks, a durable Catalog Change Feed, explicit project subscriptions, Recovery, atomic
+security presets, and exact Antigravity/Aider/Windsurf/OpenClaw/Kimi lifecycle coverage. Final
+independent audits closed roster integration/removal/retry, passive evidence, managed/clone parity,
+security, accessibility, mobile navigation, and narrow-layout defects. Verification passed with 182
+frontend tests, 790 executed Rust library tests plus 5 intentional ignores, 2 binary tests, strict
+Clippy/format/Svelte/build/diff gates, 3/3 live upstream parity suites, browser E2E/axe coverage for
+all eight capabilities at 375 and 1440 CSS pixels, and strict OpenSpec validation. The eight delta
+specs are canonical and the completed change is archived at
+`openspec/changes/archive/2026-08-18-nightly-control-plane/`. The original `main` checkout remains
+untouched and unmerged. Record: `tasks/2026-08/260818_nightly-control-plane.md`.
 
 ## ✅ v2.0 Phase 18 — Local Ollama System-Prompt Deployment [COMPLETE] (2026-08-16)
 
