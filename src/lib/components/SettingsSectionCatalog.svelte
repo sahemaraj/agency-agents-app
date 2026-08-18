@@ -354,7 +354,7 @@
   dd { font-size: var(--text-body); color: var(--color-text-primary); overflow: hidden; text-overflow: ellipsis; display: inline-flex; align-items: center; gap: 5px; }
   .mono { font-family: var(--font-mono); font-size: var(--text-mono); }
   .muted { color: var(--color-text-muted); }
-  .warn { color: var(--color-warning); }
+  .warn { color: var(--color-warning-strong); }
   .sync { display: flex; flex-direction: column; gap: var(--space-3); }
   .sync-actions { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
   .hint { font-size: var(--text-caption); color: var(--color-text-muted); }

@@ -278,7 +278,7 @@
     border: 1px solid var(--color-border);
     border-radius: var(--radius-md);
     box-shadow: 0 8px 24px -4px color-mix(in oklch, black 30%, transparent);
-    z-index: 40;
+    z-index: 45;
     display: flex;
     flex-direction: column;
     gap: 2px;

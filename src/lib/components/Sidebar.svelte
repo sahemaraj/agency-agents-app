@@ -16,6 +16,14 @@
   import { shortcut } from "$lib/util/platform";
   import type { SidebarSection } from "$lib/types";
 
+  let {
+    collapsed = ui.sidebarCollapsed,
+    onNavigate = (section: SidebarSection) => ui.setSection(section),
+  }: {
+    collapsed?: boolean;
+    onNavigate?: (section: SidebarSection) => void;
+  } = $props();
+
   interface NavItem {
     id: SidebarSection;
     shortcut: string;
@@ -63,11 +71,11 @@
 
 <aside
   class="sidebar"
-  class:collapsed={ui.sidebarCollapsed}
-  style="width: {ui.sidebarCollapsed ? 56 : ui.sidebarWidth}px"
+  class:collapsed
+  style="width: {collapsed ? 56 : ui.sidebarWidth}px"
   aria-label={i18n.t("nav.primary")}
 >
-  <button class="brand" onclick={() => ui.setSection("personas")} title={i18n.t("nav.homeTitle")}>
+  <button class="brand" onclick={() => onNavigate("personas")} title={i18n.t("nav.homeTitle")}>
     <span class="brand-mark" aria-hidden="true">🤖</span>
     <span class="brand-name">Agency Agents</span>
   </button>
@@ -82,7 +90,7 @@
             class="nav-item"
             class:active={isActive}
             aria-current={isActive ? "page" : undefined}
-            onclick={() => ui.setSection(item.id)}
+            onclick={() => onNavigate(item.id)}
             title={`${label(item.id)} (${item.shortcut})`}
           >
             <span class="ico" aria-hidden="true"><item.icon size={16} /></span>

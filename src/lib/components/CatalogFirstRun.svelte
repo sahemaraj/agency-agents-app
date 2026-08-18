@@ -301,7 +301,7 @@
 
 <style>
   .scrim {
-    position: fixed; inset: 36px 0 0 0; z-index: 40;
+    position: fixed; inset: 36px 0 0 0; z-index: 45;
     display: flex; align-items: center; justify-content: center;
     background: color-mix(in srgb, var(--color-bg) 70%, transparent);
     backdrop-filter: blur(6px);

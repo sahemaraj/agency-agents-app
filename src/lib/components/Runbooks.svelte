@@ -141,7 +141,7 @@
       <h1 class="rbv-title">{i18n.t("nav.runbooks")}</h1>
       <p class="rbv-sub">{i18n.t("runbooks.subtitle")}</p>
     </div>
-    <div class="mode-switch" aria-label="Runbooks content">
+    <div class="mode-switch" role="group" aria-label="Runbooks content">
       <button data-runbooks-mode aria-pressed={mode === "runbooks"} onclick={() => setMode("runbooks")}>Runbooks</button>
       <button data-runbooks-mode aria-pressed={mode === "playbooks"} onclick={() => setMode("playbooks")}>Playbooks</button>
     </div>
@@ -363,5 +363,5 @@
   .rb-emoji { flex: none; }
   .rb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rb-agent.missing .rb-name { color: var(--color-text-muted); text-decoration: line-through; text-decoration-color: var(--color-text-muted); }
-  .rb-flag { flex: none; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--color-warning); background: color-mix(in srgb, var(--color-warning) 14%, transparent); padding: 1px 5px; border-radius: var(--radius-full); }
+  .rb-flag { flex: none; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--color-warning-on-subtle); background: var(--color-warning-subtle); padding: 1px 5px; border-radius: var(--radius-full); }
 </style>

@@ -379,7 +379,7 @@
       <p>Apply the complete network and MCP mutation policy as one atomic change.</p>
       <p data-security-posture-current>Current: <strong>{postureLabels[currentPosture]}</strong></p>
     </div>
-    <div class="preset-options" aria-label="Security posture preset">
+    <div class="preset-options" role="group" aria-label="Security posture preset">
       {#each ["strict", "localDevelopment"] as preset (preset)}
         <button
           type="button"

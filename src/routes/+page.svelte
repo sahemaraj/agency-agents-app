@@ -45,7 +45,10 @@
   let migrationBusy = $state(false);
   let migrationError = $state<string | null>(null);
   let showMigrationCompletion = $state(false);
+  let narrowViewport = $state(false);
+  let mobileSidebarOpen = $state(false);
   let visibleRevision = 0;
+  const sidebarCollapsed = $derived(narrowViewport ? !mobileSidebarOpen : ui.sidebarCollapsed);
   const needsMigrationGate = $derived(
     migrationStatus !== null
       && (migrationStatus.state !== "complete"
@@ -126,6 +129,16 @@
     return i18n.t("nav.activity");
   }
 
+  function navigateSection(section: SidebarSection) {
+    ui.setSection(section);
+    if (narrowViewport) mobileSidebarOpen = false;
+  }
+
+  function toggleSidebar() {
+    if (narrowViewport) mobileSidebarOpen = !mobileSidebarOpen;
+    else ui.toggleSidebarCollapsed();
+  }
+
   function isTextInput(el: EventTarget | null): boolean {
     if (!(el instanceof HTMLElement)) return false;
     return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
@@ -182,7 +195,7 @@
         "6": "experts",
         "7": "activity",
       };
-      ui.setSection(map[e.key]);
+      navigateSection(map[e.key]);
       return;
     }
 
@@ -213,12 +226,20 @@
 
   onMount(() => {
     void loadMigrationStatus();
+    const narrowMedia = window.matchMedia("(max-width: 600px)");
+    const syncViewport = () => {
+      narrowViewport = narrowMedia.matches;
+      if (!narrowViewport) mobileSidebarOpen = false;
+    };
+    syncViewport();
+    narrowMedia.addEventListener("change", syncViewport);
     window.addEventListener("keydown", onKeydown);
     window.addEventListener("mouseup", onMouseUp);
     window.addEventListener("focus", refreshIfChanged);
     const revisionPoll = window.setInterval(() => void refreshIfChanged(), 750);
     return () => {
       window.removeEventListener("keydown", onKeydown);
+      narrowMedia.removeEventListener("change", syncViewport);
       window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("focus", refreshIfChanged);
       window.clearInterval(revisionPoll);
@@ -232,7 +253,7 @@
 <div
   class="app"
   class:macos={isMac}
-  class:sidebar-collapsed={ui.sidebarCollapsed}
+  class:sidebar-collapsed={sidebarCollapsed}
   style="--sidebar-width: {ui.sidebarWidth}px"
 >
   <!--
@@ -253,12 +274,12 @@
       type="button"
       class="titlebar-btn"
       data-tauri-drag-region="false"
-      title={ui.sidebarCollapsed ? i18n.t("titlebar.showSidebar") : i18n.t("titlebar.hideSidebar")}
-      aria-label={ui.sidebarCollapsed ? i18n.t("titlebar.showSidebar") : i18n.t("titlebar.hideSidebar")}
-      aria-pressed={ui.sidebarCollapsed}
-      onclick={() => ui.toggleSidebarCollapsed()}
+      title={sidebarCollapsed ? i18n.t("titlebar.showSidebar") : i18n.t("titlebar.hideSidebar")}
+      aria-label={sidebarCollapsed ? i18n.t("titlebar.showSidebar") : i18n.t("titlebar.hideSidebar")}
+      aria-pressed={sidebarCollapsed}
+      onclick={toggleSidebar}
     >
-      {#if ui.sidebarCollapsed}
+      {#if sidebarCollapsed}
         <PanelLeftOpen size={16} />
       {:else}
         <PanelLeftClose size={16} />
@@ -293,8 +314,8 @@
     </div>
   </header>
   <div class="main">
-    <Sidebar />
-    {#if !ui.sidebarCollapsed}
+    <Sidebar collapsed={sidebarCollapsed} onNavigate={navigateSection} />
+    {#if !sidebarCollapsed}
       <ResizeHandle
         width={ui.sidebarWidth}
         min={SIDEBAR_MIN_WIDTH}
@@ -587,7 +608,7 @@
     .main :global(.sidebar) {
       position: fixed;
       inset: 36px auto 0 0;
-      z-index: 30;
+      z-index: 42;
       max-width: min(85vw, 280px);
       box-shadow: var(--shadow-lg);
     }

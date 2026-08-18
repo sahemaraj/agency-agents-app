@@ -329,7 +329,7 @@
   {#if loading && !report}<p class="loading" role="status">{i18n.t("settings.doctor.running")}</p>{/if}
 
   {#if report}
-    <div class="summary" aria-label={announcement}>
+    <div class="summary" role="group" aria-label={announcement}>
       <span class="healthy">{label("healthy")} {report.counts.healthy}</span>
       <span class="needsAttention">{label("needsAttention")} {report.counts.needsAttention}</span>
       <span class="unavailable">{label("unavailable")} {report.counts.unavailable}</span>

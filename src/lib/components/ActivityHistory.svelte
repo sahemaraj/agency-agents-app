@@ -317,7 +317,7 @@
 <section class="hist" bind:this={root}>
   <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{receiptAnnouncement || reviewAnnouncement} {modeAnnouncement}</div>
   <header class="panel-head" data-tauri-drag-region>
-    <div class="modes" data-tauri-drag-region="false" aria-label="Activity mode">
+    <div class="modes" data-tauri-drag-region="false" role="group" aria-label="Activity mode">
       <button type="button" aria-pressed={mode === "review"} onclick={() => setMode("review")}>Review</button>
       <button type="button" aria-pressed={mode === "history"} onclick={() => setMode("history")}>History</button>
     </div>

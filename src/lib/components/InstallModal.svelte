@@ -1007,7 +1007,7 @@
   .plan h3, .lifecycle h3, .history h3 { margin: 0; font-size: var(--text-body); }
   .plan ul { margin: var(--space-1) 0 0; padding-left: var(--space-5); }
   .plan-blockers { color: var(--color-danger); }
-  .plan-warnings { color: var(--color-warning); }
+  .plan-warnings { color: var(--color-warning-strong); }
   .plan-agents { display: flex; flex-direction: column; gap: var(--space-2); }
   .plan-agents li { display: flex; flex-direction: column; gap: 2px; color: var(--color-text-secondary); }
   .plan-error { padding: var(--space-2); color: var(--color-danger); background: color-mix(in srgb, var(--color-danger) 10%, transparent); border-radius: var(--radius-sm); font-size: var(--text-body-sm); }
@@ -1015,7 +1015,7 @@
   .install-facts { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: var(--text-body-sm); }
   .state-text { font-size: var(--text-caption); font-weight: var(--fw-semibold); }
   .state-text[data-state="current"] { color: var(--color-success); }
-  .state-text[data-state="outdated"], .state-text[data-state="modified"] { color: var(--color-warning); }
+  .state-text[data-state="outdated"], .state-text[data-state="modified"] { color: var(--color-warning-strong); }
   .state-text[data-state="foreign"] { color: var(--color-brand); }
   .state-text[data-state="missing"], .state-text[data-state="sourceUnavailable"] { color: var(--color-danger); }
   .state-text[data-state="disabled"] { color: var(--color-text-muted); }

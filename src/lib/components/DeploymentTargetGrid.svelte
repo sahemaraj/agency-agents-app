@@ -81,7 +81,7 @@
           </button>
         {:else}
           {@const reason = notApplicable(column, row)}
-          <div class="cell na" title={reason} aria-label={reason}>—</div>
+          <div class="cell na" role="note" title={reason} aria-label={reason}>—</div>
         {/if}
       {/each}
     {/each}

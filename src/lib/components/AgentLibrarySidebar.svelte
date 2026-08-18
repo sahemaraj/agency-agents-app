@@ -116,7 +116,7 @@
     <button class="add" onclick={() => (creating = true)}><FolderPlus size={13} /> {i18n.t("agents.newFolder")}</button>
   {/if}
   {#if agentLibrary.library.collections.length > 0}
-    <div class="collections" aria-label={i18n.t("agents.collections")}>
+    <div class="collections" role="group" aria-label={i18n.t("agents.collections")}>
       <strong>{i18n.t("agents.collections")}</strong>
       {#each agentLibrary.library.collections as collection (collection.name)}
         <button onclick={() => onSelectCollection(collection.name)}>
@@ -126,7 +126,7 @@
       {/each}
     </div>
   {/if}
-  <div class="packages" aria-label={i18n.t("agents.folderAgentsAria")}>
+  <div class="packages" role="group" aria-label={i18n.t("agents.folderAgentsAria")}>
     {#each visible as pkg (`${pkg.reference.sourceId}:${pkg.reference.relativePath}`)}
       <button disabled={!pkg.agent} onclick={() => onSelectAgent(pkg)}>
         <span class="truncate">{packageLabel(pkg)}</span>

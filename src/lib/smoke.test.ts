@@ -15,9 +15,13 @@ import skillsWorkspaceSource from "$lib/components/SkillsWorkspace.svelte?raw";
 import installModalSource from "$lib/components/InstallModal.svelte?raw";
 import settingsSource from "$lib/components/Settings.svelte?raw";
 import activityHistorySource from "$lib/components/ActivityHistory.svelte?raw";
+import sidebarSource from "$lib/components/Sidebar.svelte?raw";
+import catalogFirstRunSource from "$lib/components/CatalogFirstRun.svelte?raw";
+import titlebarControlsSource from "$lib/components/TitlebarControls.svelte?raw";
 import pageSource from "../routes/+page.svelte?raw";
 import ollamaDeployModalSource from "$lib/components/OllamaDeployModal.svelte?raw";
 import deployBrowserSource from "$lib/components/DeployBrowser.svelte?raw";
+import deploymentTargetGridSource from "$lib/components/DeploymentTargetGrid.svelte?raw";
 import dashboardSource from "$lib/components/AgencyDashboard.svelte?raw";
 import toolsViewSource from "$lib/components/ToolsView.svelte?raw";
 import teamsSource from "$lib/components/Teams.svelte?raw";
@@ -44,7 +48,7 @@ import { skillSources } from "$lib/stores/skillSources.svelte";
 import { teams } from "$lib/stores/teams.svelte";
 import { toast } from "$lib/stores/toast.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type CatalogFeedState, type CatalogStatus, type DoctorReport, type ExpertResolved, type ExpertRun, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type ProjectReadinessReport, type ProjectRecommendation, type WorkspacePackPlan } from "$lib/types";
+import { SETTINGS_DEFAULTS, type Agent, type AgentMutationPlan, type AgentPackageResult, type AgentSource, type CatalogFeedState, type CatalogStatus, type DoctorReport, type ExpertResolved, type ExpertRun, type InstalledAgent, type InstalledSkill, type InstallRecord, type McpAuditEntry, type ProjectInstructionPlan, type ProjectInstructionTarget, type ProjectReadinessReport, type ProjectRecommendation, type SidebarSection, type WorkspacePackPlan } from "$lib/types";
 
 const notificationMocks = vi.hoisted(() => ({
   isPermissionGranted: vi.fn(async () => true),
@@ -459,15 +463,48 @@ describe("frontend test harness", () => {
     expect(1.05 / (luminance + 0.05)).toBeGreaterThanOrEqual(4.5);
 
     expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.main :global\(\.handle\)[^]*?display:\s*none/);
+    const drawerLayer = Number(pageSource.match(/@media \(max-width: 600px\)[^]*?\.main :global\(\.sidebar\)[^]*?z-index:\s*(\d+)/)?.[1]);
+    const onboardingLayer = Number(catalogFirstRunSource.match(/\.scrim\s*\{[^}]*z-index:\s*(\d+)/)?.[1]);
+    const themeMenuLayer = Number(titlebarControlsSource.match(/\.popover\s*\{[^}]*z-index:\s*(\d+)/)?.[1]);
+    expect(drawerLayer).toBeGreaterThan(41);
+    expect(onboardingLayer).toBeGreaterThan(drawerLayer);
+    expect(themeMenuLayer).toBeGreaterThan(drawerLayer);
     expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.app\.sidebar-collapsed \.main :global\(\.sidebar\)[^]*?display:\s*none/);
+    expect(pageSource).toContain("const sidebarCollapsed = $derived(narrowViewport ? !mobileSidebarOpen : ui.sidebarCollapsed)");
+    expect(sidebarSource).not.toContain("toggleSidebarCollapsed");
     expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.titlebar-nav[^]*?display:\s*none/);
     expect(pageSource).toMatch(/@media \(max-width: 600px\)[^]*?\.titlebar-title[^]*?width:\s*1px[^]*?clip:\s*rect\(0, 0, 0, 0\)/);
     expect(pageSource).not.toMatch(/@media \(max-width: 600px\)[^}]*?\.titlebar-title[^}]*?display:\s*none/);
     expect(settingsSource).toMatch(/@media \(max-width: 600px\)[^]*?grid-template-columns:\s*minmax\(0, 1fr\)/);
     expect(activityHistorySource).toMatch(/@media \(max-width: 600px\)[^]*?\.review-list li[^]*?flex-direction:\s*column/);
+    expect(activityHistorySource).toContain('role="group" aria-label="Activity mode"');
+    expect(deploymentTargetGridSource).toContain('role="note" title={reason} aria-label={reason}');
+    expect(installModalSource).toContain('color: var(--color-warning-strong)');
     expect(projectsSource).toMatch(/@media \(max-width: 600px\)[^]*?\.pr-head[^]*?flex-wrap:\s*wrap/);
     expect(agentsWorkspaceSource).toMatch(/@media \(max-width: 600px\)[^]*?\.lp-search-row[^]*?flex-wrap:\s*wrap/);
     expect(agentsWorkspaceSource).toMatch(/@media \(max-width: 600px\)[^]*?\.lp-search-row :global\(\.wrap\)[^]*?flex:\s*1 1 160px/);
+  });
+
+  it("delegates section navigation without changing the persisted collapse preference", async () => {
+    localStorage.setItem("agency-agents:sidebar-collapsed", "0");
+    ui.section = "dashboard";
+    const navigate = vi.fn((section: SidebarSection) => ui.setSection(section));
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Sidebar, { target, props: { collapsed: false, onNavigate: navigate } });
+    try {
+      const projectsButton = [...target.querySelectorAll<HTMLButtonElement>("nav button")]
+        .find((button) => button.textContent?.includes("Projects"));
+      expect(projectsButton).toBeTruthy();
+      projectsButton!.click();
+      await tick();
+      expect(navigate).toHaveBeenCalledWith("projects");
+      expect(ui.section).toBe("projects");
+      expect(localStorage.getItem("agency-agents:sidebar-collapsed")).toBe("0");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
   });
 
   it("uses right-to-left document direction for Persian", async () => {
@@ -2223,6 +2260,7 @@ describe("frontend test harness", () => {
     const component = mount(SettingsSectionDoctor, { target });
     try {
       await vi.waitFor(() => expect(target.querySelector('[data-recovery-source="agents"]')?.textContent).toContain("Unavailable"));
+      expect(target.querySelector(".summary")?.getAttribute("role")).toBe("group");
       expect(target.querySelector('[data-recovery-source="skills"]')?.textContent).toContain("1 rollback point");
       expect(target.querySelector('[data-recovery-source="skills"]')?.textContent).toContain("Audit");
       expect(target.querySelector('[data-recovery-source="skills"]')?.textContent).not.toContain("Unrelated");
@@ -6485,6 +6523,7 @@ describe("bounded playbook library", () => {
     const component = mount(RunbooksView, { target: document.body });
     await vi.waitFor(() => expect(runbooks.playbooks).toEqual(entries));
     const modes = [...document.querySelectorAll<HTMLButtonElement>("[data-runbooks-mode]")];
+    expect(modes[0].parentElement?.getAttribute("role")).toBe("group");
     modes[1].click();
     await tick();
     expect(document.body.textContent).toContain("Alpha workflow");
@@ -6686,6 +6725,7 @@ describe("security posture presets", () => {
     await tick();
 
     expect(document.querySelector("[data-security-posture-current]")?.textContent).toContain("Custom");
+    expect(document.querySelector(".preset-options")?.getAttribute("role")).toBe("group");
     document.querySelector<HTMLButtonElement>('[data-security-posture="strict"]')?.click();
     await tick();
     const preview = document.querySelector("[data-security-posture-preview]")?.textContent ?? "";
