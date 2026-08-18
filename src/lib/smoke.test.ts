@@ -4732,7 +4732,7 @@ describe("frontend test harness", () => {
         retry.click();
         await vi.waitFor(() => expect(install.reconciling).toBe(true));
         expect(invokeMock.mock.calls.slice(invokesBeforeRetry).map(([command]) => command))
-          .toEqual(["installs_reconcile"]);
+          .toEqual(name === "Projects" ? ["installs_reconcile", "agent_rosters_reconcile"] : ["installs_reconcile"]);
         resolveRetry(install.installed);
         await vi.waitFor(() => expect(install.reconciling).toBe(false));
         pendingReconcile = null;
@@ -5482,8 +5482,8 @@ describe("frontend test harness", () => {
   it("uses one neutral initial-unknown contract across direct Agent-ledger consumers", () => {
     for (const source of [dashboardSource, toolsViewSource, teamsSource, projectsSource]) {
       expect(source).toContain('i18n.optional("reconcile.checking", "Checking installation status…")');
-      expect(source).toMatch(/reconcileError\s*\?/);
-      expect(source).toMatch(/\{#if install\.reconcileError\}/);
+      expect(source).toMatch(/reconcileError\s*\?\??/);
+      expect(source).toMatch(source === projectsSource ? /\{#if reconciliationError\}/ : /\{#if install\.reconcileError\}/);
       expect(source).not.toMatch(/\{#if !install\.reconciled\}[^]*?Installation status is unavailable until a retry succeeds\./);
     }
   });
@@ -5812,6 +5812,52 @@ describe("frontend test harness", () => {
     }
   });
 
+  it("surfaces roster reconciliation failure and retries both project inventories", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/roster-retry-project";
+    const projectRows = [{ path: projectPath, label: "Roster retry project", installedCount: 0 }];
+    let rosterAttempts = 0;
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "agent_rosters_reconcile") {
+        rosterAttempts += 1;
+        if (rosterAttempts === 1) throw { code: "io", message: "roster scan failed" };
+        return [] as never;
+      }
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_instructions_inspect" || command === "project_recommendations_list") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture((args as { projectPath?: string })?.projectPath ?? projectPath, false) as never;
+      return [] as never;
+    });
+    corpus.agents = [staleControlAgent];
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Projects, { target });
+    try {
+      const retry = await vi.waitFor(() => {
+        expect(target.querySelector(".install-truth-warning")?.textContent).toContain("I/O error: roster scan failed");
+        expect(target.querySelector<HTMLButtonElement>(".danger-ic")?.disabled).toBe(true);
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "Retry status check");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      retry.click();
+      await vi.waitFor(() => {
+        expect(target.querySelector(".install-truth-warning")).toBeNull();
+        expect(target.querySelector<HTMLButtonElement>(".danger-ic")?.disabled).toBe(false);
+      });
+      expect(invokeMock.mock.calls.filter(([command]) => command === "installs_reconcile")).toHaveLength(2);
+      expect(invokeMock.mock.calls.filter(([command]) => command === "agent_rosters_reconcile")).toHaveLength(2);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
   it("pins every Phase 6 truth-aware install-ledger consumer and every deployment mutation control", () => {
     const consumers = new Map<string, { source: string; markers: RegExp[] }>([
       ["AgentsWorkspace", { source: agentsWorkspaceSource, markers: [
@@ -5855,9 +5901,11 @@ describe("frontend test harness", () => {
         /i18n\.count\(agentCountFor\(selected\.path\)/,
         /const rosterTruthFresh = \$derived\(install\.rostersReconciled[^;]+\);/,
         /const mutationTruthFresh = \$derived\(installTruthFresh && rosterTruthFresh && skillSources\.reconciled && !skillSources\.reconcileError\);/,
+        /const reconciliationError = \$derived\(install\.reconcileError \?\? install\.rosterReconcileError\);/,
         /for \(const roster of aggregateRostersFor\(path\)\)[^]*?install\.planRoster\([^]*?install\.applyRoster\(plan\)/,
         /disabled=\{!installTruthFresh\} onclick=\{\(\) => \(browseFor = selected\.path\)\}/,
-        /\{#if install\.reconcileError\}[^]*?retryReconcile\(event\)/,
+        /\{#if reconciliationError\}[^]*?retryReconcile\(event\)/,
+        /async function retryReconcile[^]*?Promise\.all\(\[install\.reconcile\(\), install\.reconcileRosters\(\)\]\)/,
       ] }],
       ["InstallModal", { source: installModalSource, markers: [
         /const installTruthFresh = \$derived\(install\.reconciled && !install\.reconciling && !install\.reconcileError\);/,

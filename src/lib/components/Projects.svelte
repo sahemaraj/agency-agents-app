@@ -47,23 +47,27 @@
   const installTruthFresh = $derived(install.reconciled && !install.reconcileError);
   const rosterTruthFresh = $derived(install.rostersReconciled && !install.rosterReconciling && !install.rosterReconcileError);
   const mutationTruthFresh = $derived(installTruthFresh && rosterTruthFresh && skillSources.reconciled && !skillSources.reconcileError);
-  const installTruthMessage = $derived(install.reconcileError ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.") : i18n.optional("reconcile.checking", "Checking installation status…"));
+  const reconciliationError = $derived(install.reconcileError ?? install.rosterReconcileError);
+  const reconciliationBusy = $derived(install.reconciling || install.rosterReconciling);
+  const installTruthMessage = $derived(reconciliationError ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.") : i18n.optional("reconcile.checking", "Checking installation status…"));
   let projectsRoot: HTMLElement | undefined = $state();
   let reconcileAnnouncement = $state("");
   let priorReconcileError: string | null = $state(null);
   let priorReconcileTerminal = $state(0);
   let priorReconciling = $state(false);
   $effect(() => {
-    const { reconcileError: error, reconciling, reconcileTerminal: terminal } = install;
+    const error = reconciliationError;
+    const reconciling = reconciliationBusy;
+    const terminal = install.reconcileTerminal;
     if (reconciling && !priorReconciling) reconcileAnnouncement = i18n.optional("reconcile.refreshing", error ? "Refreshing installation status…" : "Checking installation status…");
-    else if (error && (error !== priorReconcileError || terminal !== priorReconcileTerminal)) reconcileAnnouncement = priorReconcileError ? i18n.optional("reconcile.stillOutOfDate", "Installation status is still out of date. {message}", { message: error }) : i18n.optional("reconcile.outOfDate", "Installation status may be out of date. {message}", { message: error });
+    else if (error && (error !== priorReconcileError || terminal !== priorReconcileTerminal || priorReconciling)) reconcileAnnouncement = priorReconcileError ? i18n.optional("reconcile.stillOutOfDate", "Installation status is still out of date. {message}", { message: error }) : i18n.optional("reconcile.outOfDate", "Installation status may be out of date. {message}", { message: error });
     else if (!error && priorReconcileError && !reconciling) reconcileAnnouncement = i18n.optional("reconcile.upToDate", "Installation status is up to date.");
     priorReconcileError = error; priorReconcileTerminal = terminal; priorReconciling = reconciling;
   });
   async function retryReconcile(event: MouseEvent): Promise<void> {
     const restoreFocus = event.currentTarget === document.activeElement;
-    await install.reconcile();
-    if (!install.reconcileError && restoreFocus) { await tick(); projectsRoot?.focus({ preventScroll: true }); }
+    await Promise.all([install.reconcile(), install.reconcileRosters()]);
+    if (!reconciliationError && restoreFocus) { await tick(); projectsRoot?.focus({ preventScroll: true }); }
   }
 
   onMount(() => {
@@ -752,12 +756,12 @@
 
 <section class="pr" bind:this={projectsRoot} tabindex="-1">
   <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{reconcileAnnouncement}</div>
-  {#if install.reconcileError}
-    <aside class="install-truth-warning" aria-busy={install.reconciling}>
-      <div class="reconcile-copy"><strong>{i18n.optional("reconcile.heading", "Installation status may be out of date")}</strong><p><span>{install.reconcileError}</span> {install.reconciled ? i18n.optional("reconcile.retained", "Your last known installation data is still shown.") : installTruthMessage}</p></div>
-      <Button size="sm" loading={install.reconciling} onclick={(event) => void retryReconcile(event)}>{install.reconciling ? i18n.optional("reconcile.retrying", "Retrying…") : i18n.optional("reconcile.retry", "Retry status check")}</Button>
+  {#if reconciliationError}
+    <aside class="install-truth-warning" aria-busy={reconciliationBusy}>
+      <div class="reconcile-copy"><strong>{i18n.optional("reconcile.heading", "Installation status may be out of date")}</strong><p><span>{reconciliationError}</span> {install.reconciled && install.rostersReconciled ? i18n.optional("reconcile.retained", "Your last known installation data is still shown.") : installTruthMessage}</p></div>
+      <Button size="sm" loading={reconciliationBusy} onclick={(event) => void retryReconcile(event)}>{reconciliationBusy ? i18n.optional("reconcile.retrying", "Retrying…") : i18n.optional("reconcile.retry", "Retry status check")}</Button>
     </aside>
-  {:else if !install.reconciled}
+  {:else if !install.reconciled || !install.rostersReconciled}
     <p class="install-truth-checking">{installTruthMessage}</p>
   {/if}
   {#if selected}
