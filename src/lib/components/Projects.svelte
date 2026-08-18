@@ -45,7 +45,8 @@
   import { diffLines, diffStat, type DiffRow } from "$lib/util/diff";
 
   const installTruthFresh = $derived(install.reconciled && !install.reconcileError);
-  const mutationTruthFresh = $derived(installTruthFresh && skillSources.reconciled && !skillSources.reconcileError);
+  const rosterTruthFresh = $derived(install.rostersReconciled && !install.rosterReconciling && !install.rosterReconcileError);
+  const mutationTruthFresh = $derived(installTruthFresh && rosterTruthFresh && skillSources.reconciled && !skillSources.reconcileError);
   const installTruthMessage = $derived(install.reconcileError ? i18n.optional("reconcile.unavailable", "Installation status is unavailable until a retry succeeds.") : i18n.optional("reconcile.checking", "Checking installation status…"));
   let projectsRoot: HTMLElement | undefined = $state();
   let reconcileAnnouncement = $state("");
@@ -91,6 +92,19 @@
 
   function rosterFor(path: string): InstalledAgent[] {
     return rowsByProject.get(path) ?? [];
+  }
+
+  function aggregateRostersFor(path: string) {
+    return install.rosters
+      .filter((row) => row.record.projectPath === path)
+      .slice()
+      .sort((left, right) => left.record.tool.localeCompare(right.record.tool));
+  }
+
+  function agentCountFor(path: string): number {
+    return projects.list.find((project) => project.path === path)?.installedCount
+      ?? rosterFor(path).length + aggregateRostersFor(path)
+        .reduce((count, row) => count + row.record.members.length, 0);
   }
 
   function skillsFor(path: string) {
@@ -692,6 +706,16 @@
     const { path } = confirm;
     deleteBusy = true;
     try {
+      for (const roster of aggregateRostersFor(path)) {
+        const plan = await install.planRoster(
+          roster.record.members.map((member) => member.reference),
+          "uninstall",
+          roster.record.tool,
+          path,
+        );
+        if (plan.blockers.length > 0) throw new Error(plan.blockers.join(" "));
+        await install.applyRoster(plan);
+      }
       const targets = rosterFor(path).map((r) => ({ slug: r.slug, tool: r.tool, projectPath: path }));
       if (targets.length > 0) await install.bulk("uninstall", targets);
       for (const skill of skillsFor(path)) {
@@ -744,10 +768,10 @@
         <h2 class="dh-label">{selected.label}</h2>
         <button class="dh-path" title={selected.path} onclick={() => reveal(selected.path)}>{selected.path}</button>
       </div>
-      <span class="dh-count">{install.reconciled ? i18n.count(rosterFor(selected.path).length, "common.agent.one", "common.agent.many") : installTruthMessage}</span>
+      <span class="dh-count">{install.reconciled && install.rostersReconciled ? i18n.count(agentCountFor(selected.path), "common.agent.one", "common.agent.many") : installTruthMessage}</span>
       <button class="btn" onclick={() => reveal(selected.path)}><FolderOpen size={15} /><span>{i18n.t("common.reveal")}</span></button>
       <button class="btn primary" disabled={!installTruthFresh} onclick={() => (browseFor = selected.path)}>{i18n.t("teams.deploy")}</button>
-      <button class="btn danger-ic" disabled={!mutationTruthFresh} title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: rosterFor(selected.path).length, skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
+      <button class="btn danger-ic" disabled={!mutationTruthFresh} title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: agentCountFor(selected.path), skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
     </header>
 
     <section bind:this={readinessRoot} class="readiness" aria-labelledby="project-readiness-heading" aria-busy={readinessBusy}>
@@ -907,7 +931,7 @@
                 <span class="proj-label">{project.label}</span>
                 <span class="proj-path" title={project.path}>{project.path}</span>
               </span>
-              <span class="proj-count">{install.reconciled ? i18n.count(rosterFor(project.path).length, "common.agent.one", "common.agent.many") : "—"}</span>
+              <span class="proj-count">{install.reconciled && install.rostersReconciled ? i18n.count(project.installedCount, "common.agent.one", "common.agent.many") : "—"}</span>
               <ChevronRight size={16} class="proj-go" />
             </button>
           </li>

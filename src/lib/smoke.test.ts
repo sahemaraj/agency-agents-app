@@ -5716,6 +5716,102 @@ describe("frontend test harness", () => {
     }
   });
 
+  it("counts and uninstalls exact project rosters before unregistering the project", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/roster-project";
+    const projectRows = [{ path: projectPath, label: "Roster project", installedCount: 2 }];
+    const members = [
+      { reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "a".repeat(64) },
+      { reference: { sourceId: "built-in", relativePath: "auditor.md" }, name: "Auditor", sourceHash: "b".repeat(64) },
+    ];
+    const record = {
+      tool: "aider" as const,
+      scope: "project" as const,
+      projectPath,
+      dest: `${projectPath}/CONVENTIONS.md`,
+      members,
+      renderedHash: "c".repeat(64),
+      disabledPath: null,
+      installedAt: "2026-08-18T00:00:00Z",
+    };
+    const plan = {
+      revision: "d".repeat(64),
+      operation: "uninstall" as const,
+      tool: "aider" as const,
+      scope: "project" as const,
+      projectPath,
+      destination: record.dest,
+      members,
+      state: "current" as const,
+      destinationObservation: {
+        active: { kind: "file" as const, hash: record.renderedHash },
+        disabled: { kind: "missing" as const, hash: null },
+      },
+      warnings: [],
+      blockers: [],
+      rollbackAvailable: true,
+    };
+    let rosterInstalled = true;
+    let projectRegistered = true;
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile" || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "agent_rosters_reconcile") return (rosterInstalled ? [{ record, state: "current" }] : []) as never;
+      if (command === "projects_list") return (projectRegistered ? projectRows : []) as never;
+      if (command === "project_instructions_inspect" || command === "project_recommendations_list") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath, false) as never;
+      if (command === "agent_roster_plan") {
+        expect(args).toMatchObject({
+          references: members.map((member) => member.reference),
+          operation: "uninstall",
+          tool: "aider",
+          projectPath,
+        });
+        return plan as never;
+      }
+      if (command === "agent_roster_apply") {
+        expect(args).toMatchObject({ operation: "uninstall", tool: "aider", projectPath, confirmed: true });
+        rosterInstalled = false;
+        return record as never;
+      }
+      if (command === "project_unregister") {
+        expect(rosterInstalled).toBe(false);
+        projectRegistered = false;
+        return true as never;
+      }
+      return [] as never;
+    });
+    corpus.agents = [staleControlAgent];
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Projects, { target });
+    try {
+      const remove = await vi.waitFor(() => {
+        expect(target.textContent).toContain("2 agents");
+        const candidate = target.querySelector<HTMLButtonElement>(".danger-ic");
+        expect(candidate?.disabled).toBe(false);
+        return candidate!;
+      });
+      remove.click();
+      const uninstall = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "Remove & uninstall 2");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      uninstall.click();
+      await vi.waitFor(() => expect(invokeMock.mock.calls.some(([command]) => command === "project_unregister")).toBe(true));
+      expect(invokeMock.mock.calls.filter(([command]) => command === "agent_roster_plan")).toHaveLength(1);
+      expect(invokeMock.mock.calls.filter(([command]) => command === "agent_roster_apply")).toHaveLength(1);
+      expect(invokeMock.mock.calls.some(([command]) => command === "uninstall_agent")).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
   it("pins every Phase 6 truth-aware install-ledger consumer and every deployment mutation control", () => {
     const consumers = new Map<string, { source: string; markers: RegExp[] }>([
       ["AgentsWorkspace", { source: agentsWorkspaceSource, markers: [
@@ -5755,8 +5851,11 @@ describe("frontend test harness", () => {
       ] }],
       ["Projects", { source: projectsSource, markers: [
         /for \(const r of install\.installed\)/,
-        /install\.reconciled \? i18n\.count\(rosterFor\(selected\.path\)\.length/,
-        /const mutationTruthFresh = \$derived\(installTruthFresh && skillSources\.reconciled && !skillSources\.reconcileError\);/,
+        /install\.rosters[^]*?row\.record\.projectPath === path/,
+        /i18n\.count\(agentCountFor\(selected\.path\)/,
+        /const rosterTruthFresh = \$derived\(install\.rostersReconciled[^;]+\);/,
+        /const mutationTruthFresh = \$derived\(installTruthFresh && rosterTruthFresh && skillSources\.reconciled && !skillSources\.reconcileError\);/,
+        /for \(const roster of aggregateRostersFor\(path\)\)[^]*?install\.planRoster\([^]*?install\.applyRoster\(plan\)/,
         /disabled=\{!installTruthFresh\} onclick=\{\(\) => \(browseFor = selected\.path\)\}/,
         /\{#if install\.reconcileError\}[^]*?retryReconcile\(event\)/,
       ] }],

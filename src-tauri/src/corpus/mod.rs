@@ -7349,6 +7349,61 @@ echo done
         );
     }
 
+    #[tokio::test]
+    async fn managed_and_user_clone_playbooks_have_identical_catalog_and_read_results() {
+        async fn read_source(
+            app_data: &Path,
+            root: &Path,
+            source: CatalogSource,
+        ) -> (Vec<PlaybookCatalogEntry>, PlaybookDocument) {
+            write_catalog_tooling(root);
+            std::fs::create_dir_all(root.join("strategy/runbooks")).unwrap();
+            std::fs::create_dir_all(root.join("examples")).unwrap();
+            std::fs::write(
+                root.join("strategy/runbooks/review.md"),
+                "# Review\n<script>inert</script>\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("examples/ship.md"), "# Ship\nVerify first.\n").unwrap();
+            save_catalog_source(app_data, &source).await.unwrap();
+            let state = test_app_state(app_data, false);
+            let catalog = playbooks_list_from_app_data(app_data, &state)
+                .await
+                .unwrap();
+            let document =
+                playbook_read_from_app_data(app_data, &state, "strategy/runbooks/review.md".into())
+                    .await
+                    .unwrap();
+            (catalog, document)
+        }
+
+        let managed_data = tempfile::tempdir().unwrap();
+        let managed_root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            managed_root.path().join(MANAGED_OWNERSHIP_MARKER),
+            MANAGED_OWNERSHIP_BYTES,
+        )
+        .unwrap();
+        let managed_source = CatalogSource::Managed {
+            path: managed_root.path().to_string_lossy().into_owned(),
+        };
+        let managed = with_test_managed_root(
+            managed_root.path().to_path_buf(),
+            read_source(managed_data.path(), managed_root.path(), managed_source),
+        )
+        .await;
+
+        let clone_data = tempfile::tempdir().unwrap();
+        let clone_root = tempfile::tempdir().unwrap();
+        let clone_source = CatalogSource::UserClone {
+            path: clone_root.path().to_string_lossy().into_owned(),
+            manage: false,
+        };
+        let clone = read_source(clone_data.path(), clone_root.path(), clone_source).await;
+
+        assert_eq!(managed, clone);
+    }
+
     #[test]
     fn playbook_paths_are_fixed_root_relative_markdown_only() {
         for valid in [

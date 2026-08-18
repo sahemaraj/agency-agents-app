@@ -62,7 +62,7 @@ class ProjectsStore {
   /** Ensure the registered set + ledger are loaded (panel calls on mount). */
   async refresh(): Promise<void> {
     await this.migrateLocalStorage();
-    await install.reconcile();
+    await Promise.all([install.reconcile(), install.reconcileRosters()]);
     this.list = await invoke<ProjectInfo[]>("projects_list");
   }
 
