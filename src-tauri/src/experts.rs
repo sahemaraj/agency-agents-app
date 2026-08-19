@@ -415,6 +415,90 @@ pub struct ExpertActivationPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FactoryWorkOrderInput {
+    pub ticket_reference: String,
+    pub title: String,
+    pub objective: String,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    pub playbook: Option<String>,
+    pub workspace_pack_revision: Option<String>,
+    pub risk: crate::expert_runs::FactoryRiskClass,
+}
+
+fn require_factory_playbook_reference(
+    input: &FactoryWorkOrderInput,
+    playbooks: &[crate::types::PlaybookCatalogEntry],
+) -> Result<(), AppError> {
+    let Some(playbook) = input.playbook.as_deref() else {
+        return Ok(());
+    };
+    if playbooks
+        .iter()
+        .any(|candidate| candidate.relative_path == playbook)
+    {
+        Ok(())
+    } else {
+        Err(invalid(
+            "Factory playbook must match one exact canonical Playbook reference",
+        ))
+    }
+}
+
+async fn validate_factory_playbook_reference(
+    app: &AppHandle,
+    input: &FactoryWorkOrderInput,
+) -> Result<(), AppError> {
+    let playbooks = crate::corpus::playbooks_list(app.clone()).await?;
+    require_factory_playbook_reference(input, &playbooks)
+}
+
+fn bind_factory_work_order(
+    input: Option<FactoryWorkOrderInput>,
+    readiness: Option<crate::types::ProjectReadinessReport>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<crate::expert_runs::FactoryRunCreate>, AppError> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    if input.workspace_pack_revision.is_some() {
+        return Err(invalid(
+            "Factory Workspace Pack binding requires a canonical selected plan; omit it when no plan authority is available",
+        ));
+    }
+    let readiness = readiness.ok_or_else(|| invalid("Factory project readiness is unavailable"))?;
+    if readiness.overall != crate::types::ProjectReadinessOverall::Ready {
+        return Err(invalid("Factory project readiness is not ready"));
+    }
+    let evidence = serde_json::to_vec(&readiness)
+        .map_err(|error| invalid(format!("serialize Factory readiness evidence: {error}")))?;
+    let summary = readiness
+        .categories
+        .iter()
+        .map(|category| format!("{:?}: {:?}", category.category, category.state))
+        .collect();
+    Ok(Some(crate::expert_runs::FactoryRunCreate {
+        ticket_reference: input.ticket_reference,
+        title: input.title,
+        objective: input.objective,
+        acceptance_criteria: input.acceptance_criteria,
+        non_goals: input.non_goals,
+        playbook: input.playbook,
+        workspace_pack_revision: input.workspace_pack_revision,
+        risk: input.risk,
+        readiness: crate::expert_runs::FactoryReadinessSnapshot {
+            checked_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            overall: crate::expert_runs::FactoryReadinessOverall::Ready,
+            evidence_revision: crate::render::sha256_hex(&evidence),
+            summary,
+        },
+    }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExpertActivationRecord {
     pub id: String,
@@ -430,13 +514,58 @@ pub struct ExpertActivationRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExpertActivationOperation {
     record: ExpertActivationRecord,
     run_id: String,
     run: crate::expert_runs::ExpertRunCreate,
+    #[serde(default)]
+    factory: Option<crate::expert_runs::FactoryWorkflow>,
     agent_slugs: Vec<String>,
     skill_packages: Vec<crate::types::SkillPlanPackage>,
+}
+
+fn skill_install_was_managed(
+    installs: &[crate::types::SkillInstallRecord],
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+) -> bool {
+    installs.iter().any(|record| {
+        record.source_id == source_id
+            && record.relative_path == relative_path
+            && record.runtime == runtime
+            && record.project_path.as_deref() == project_path
+    })
+}
+
+fn ensure_factory_activation_write_free(
+    agents: &[ExpertAgentAction],
+    skills: &[SkillMutationPlan],
+    installs: &[crate::types::SkillInstallRecord],
+    client: &str,
+    project_path: &str,
+) -> Result<(), AppError> {
+    let missing_agent = agents.iter().any(|agent| agent.status != "current");
+    let missing_skill = skills
+        .iter()
+        .flat_map(|skill| &skill.packages)
+        .any(|package| {
+            !skill_install_was_managed(
+                installs,
+                &package.source_id,
+                &package.relative_path,
+                client,
+                Some(project_path),
+            ) || !Path::new(&package.destination).exists()
+        });
+    if missing_agent || missing_skill {
+        return Err(invalid(
+            "Factory Run creation cannot install project dependencies; finish ordinary Expert setup first",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2057,74 +2186,114 @@ pub async fn expert_activate(
     id: String,
     project_path: String,
     client: Option<String>,
+    work_order: Option<FactoryWorkOrderInput>,
 ) -> Result<ExpertActivationRecord, AppError> {
     let plan = plan(&app, &state, &id, &project_path, client).await?;
     if !plan.blockers.is_empty() {
         return Err(invalid(plan.blockers.join("; ")));
     }
+    if let Some(work_order) = work_order.as_ref() {
+        validate_factory_playbook_reference(&app, work_order).await?;
+    }
+    let activation_now = chrono::Utc::now();
+    let factory_create = if work_order.is_some() {
+        let readiness =
+            crate::install::project_readiness_for_state(state.inner(), plan.project_path.clone())
+                .await?;
+        bind_factory_work_order(work_order, Some(readiness), activation_now)?
+    } else {
+        None
+    };
+    let run_create = crate::expert_runs::ExpertRunCreate {
+        expert_id: plan.expert.definition.id.clone(),
+        expert_version: plan.expert.definition.version,
+        project_path: plan.project_path.clone(),
+        client: plan.client.clone(),
+        lead_agent: plan.expert.definition.lead_agent.clone(),
+        supporting_agents: plan.expert.definition.supporting_agents.clone(),
+        required_skills: plan.expert.definition.required_skills.clone(),
+        optional_skills: plan.expert.definition.optional_skills.clone(),
+        runbook: plan.expert.definition.runbook.clone(),
+        contract: plan.expert.definition.quality_contract.clone(),
+    };
+    let factory = factory_create
+        .map(|factory| {
+            crate::expert_runs::prepare_factory_workflow(&run_create, factory, activation_now)
+        })
+        .transpose()?;
+    if let Some(factory) = factory.as_ref() {
+        crate::expert_runs::validate_prepared_factory_workflow(&run_create, factory)?;
+    }
     let database = state.completed_state_database().await?;
+    let skill_installs_before = if plan.skills.iter().any(|skill| !skill.packages.is_empty()) {
+        crate::skills::install::load_ledger_for_state(&state).await?
+    } else {
+        Vec::new()
+    };
+    let install_dependencies = factory.is_none();
+    if !install_dependencies {
+        ensure_factory_activation_write_free(
+            &plan.agents,
+            &plan.skills,
+            &skill_installs_before,
+            &plan.client,
+            &plan.project_path,
+        )?;
+    }
     let prepared = if let Some(database) = &database {
-        let before = crate::skills::install::load_ledger_for_state(&state).await?;
         let mut installed_skills = Vec::new();
         let mut skill_packages = Vec::new();
-        for skill in &plan.skills {
-            for package in &skill.packages {
-                let already_managed = before.iter().any(|record| {
-                    record.source_id == package.source_id
-                        && record.relative_path == package.relative_path
-                        && record.runtime == plan.client
-                        && record.project_path.as_deref() == Some(plan.project_path.as_str())
-                });
-                if !(package.dependency && already_managed)
-                    && !installed_skills.contains(&package.name)
-                {
-                    installed_skills.push(package.name.clone());
-                }
-                if !package.dependency
-                    && !skill_packages
-                        .iter()
-                        .any(|existing: &crate::types::SkillPlanPackage| {
-                            existing.source_id == package.source_id
-                                && existing.relative_path == package.relative_path
-                        })
-                {
-                    skill_packages.push(package.clone());
+        if install_dependencies {
+            for skill in &plan.skills {
+                for package in &skill.packages {
+                    let already_managed = skill_install_was_managed(
+                        &skill_installs_before,
+                        &package.source_id,
+                        &package.relative_path,
+                        &plan.client,
+                        Some(&plan.project_path),
+                    );
+                    if !already_managed && !installed_skills.contains(&package.name) {
+                        installed_skills.push(package.name.clone());
+                    }
+                    if !package.dependency
+                        && !skill_packages.iter().any(
+                            |existing: &crate::types::SkillPlanPackage| {
+                                existing.source_id == package.source_id
+                                    && existing.relative_path == package.relative_path
+                            },
+                        )
+                    {
+                        skill_packages.push(package.clone());
+                    }
                 }
             }
         }
-        let agent_slugs = plan
-            .agents
-            .iter()
-            .filter(|agent| agent.status == "missing")
-            .map(|agent| agent.slug.clone())
-            .collect::<Vec<_>>();
-        let run_id = uuid::Uuid::new_v4().to_string();
-        let run = crate::expert_runs::ExpertRunCreate {
-            expert_id: plan.expert.definition.id.clone(),
-            expert_version: plan.expert.definition.version,
-            project_path: plan.project_path.clone(),
-            client: plan.client.clone(),
-            lead_agent: plan.expert.definition.lead_agent.clone(),
-            supporting_agents: plan.expert.definition.supporting_agents.clone(),
-            required_skills: plan.expert.definition.required_skills.clone(),
-            optional_skills: plan.expert.definition.optional_skills.clone(),
-            runbook: plan.expert.definition.runbook.clone(),
-            contract: plan.expert.definition.quality_contract.clone(),
+        let agent_slugs = if install_dependencies {
+            plan.agents
+                .iter()
+                .filter(|agent| agent.status == "missing")
+                .map(|agent| agent.slug.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
         };
+        let run_id = uuid::Uuid::new_v4().to_string();
         let payload = ExpertActivationOperation {
             record: ExpertActivationRecord {
                 id: uuid::Uuid::new_v4().to_string(),
-                expert_id: run.expert_id.clone(),
-                expert_version: run.expert_version,
-                project_path: run.project_path.clone(),
-                client: run.client.clone(),
-                activated_at: chrono::Utc::now().to_rfc3339(),
+                expert_id: run_create.expert_id.clone(),
+                expert_version: run_create.expert_version,
+                project_path: run_create.project_path.clone(),
+                client: run_create.client.clone(),
+                activated_at: activation_now.to_rfc3339(),
                 installed_agents: agent_slugs.clone(),
                 installed_skills,
                 run_id: Some(run_id.clone()),
             },
             run_id,
-            run,
+            run: run_create.clone(),
+            factory: factory.clone(),
             agent_slugs,
             skill_packages,
         };
@@ -2138,7 +2307,7 @@ pub async fn expert_activate(
         None
     };
     let mut installed_agents = Vec::new();
-    for agent in &plan.agents {
+    for agent in plan.agents.iter().filter(|_| install_dependencies) {
         if agent.status == "missing" {
             match crate::install::do_install_legacy(
                 &app,
@@ -2175,7 +2344,7 @@ pub async fn expert_activate(
     }
     let mut installed_skills = Vec::new();
     let mut installed_skill_refs = Vec::new();
-    for skill in &plan.skills {
+    for skill in plan.skills.iter().filter(|_| install_dependencies) {
         for package in &skill.packages {
             if package.dependency || installed_skills.contains(&package.name) {
                 continue;
@@ -2191,8 +2360,18 @@ pub async fn expert_activate(
             {
                 Ok(created) => {
                     for item in created {
-                        if !installed_skills.contains(&item.name) {
-                            installed_skills.push(item.name.clone());
+                        if !skill_install_was_managed(
+                            &skill_installs_before,
+                            &item.source_id,
+                            &item.relative_path,
+                            &plan.client,
+                            Some(&plan.project_path),
+                        ) && !installed_skill_refs
+                            .contains(&(item.source_id.clone(), item.relative_path.clone()))
+                        {
+                            if !installed_skills.contains(&item.name) {
+                                installed_skills.push(item.name.clone());
+                            }
                             installed_skill_refs.push((item.source_id, item.relative_path));
                         }
                     }
@@ -2230,22 +2409,31 @@ pub async fn expert_activate(
             }
         }
     }
-    let run_create = crate::expert_runs::ExpertRunCreate {
-        expert_id: plan.expert.definition.id.clone(),
-        expert_version: plan.expert.definition.version,
-        project_path: plan.project_path.clone(),
-        client: plan.client.clone(),
-        lead_agent: plan.expert.definition.lead_agent.clone(),
-        supporting_agents: plan.expert.definition.supporting_agents.clone(),
-        required_skills: plan.expert.definition.required_skills.clone(),
-        optional_skills: plan.expert.definition.optional_skills.clone(),
-        runbook: plan.expert.definition.runbook.clone(),
-        contract: plan.expert.definition.quality_contract.clone(),
-    };
     let run_result = match &prepared {
+        Some((_, payload)) if payload.factory.is_some() => {
+            crate::expert_runs::create_prepared_factory_run_with_id(
+                &state,
+                &payload.run_id,
+                payload.run.clone(),
+                payload
+                    .factory
+                    .clone()
+                    .expect("checked prepared Factory workflow"),
+            )
+            .await
+        }
         Some((_, payload)) => {
             crate::expert_runs::create_run_with_id(&state, &payload.run_id, payload.run.clone())
                 .await
+        }
+        None if factory.is_some() => {
+            crate::expert_runs::create_prepared_factory_run_with_id(
+                &state,
+                &uuid::Uuid::new_v4().to_string(),
+                run_create,
+                factory.expect("checked prepared Factory workflow"),
+            )
+            .await
         }
         None => crate::expert_runs::create_run(&state, run_create).await,
     };
@@ -2311,6 +2499,100 @@ pub async fn expert_activate(
     .await
 }
 
+#[tauri::command]
+pub async fn expert_run_factory_plan_decide(
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: u64,
+    plan_revision: String,
+    decision: String,
+) -> Result<crate::expert_runs::ExpertRun, AppError> {
+    let decision = match decision.as_str() {
+        "approve" => crate::expert_runs::FactoryPlanDecision::Approve,
+        "reject" => crate::expert_runs::FactoryPlanDecision::Reject,
+        _ => return Err(invalid("unsupported Factory plan decision")),
+    };
+    crate::expert_runs::factory_decide_plan(
+        &state,
+        &id,
+        expected_revision,
+        &plan_revision,
+        decision,
+        chrono::Utc::now(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn expert_run_factory_final_decide(
+    state: State<'_, AppState>,
+    id: String,
+    input: crate::expert_runs::FactoryFinalDecisionInput,
+) -> Result<crate::expert_runs::ExpertRun, AppError> {
+    crate::expert_runs::factory_decide_final(&state, &id, input, chrono::Utc::now()).await
+}
+
+#[tauri::command]
+pub async fn expert_run_factory_cancel(
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: u64,
+    safe_detail: Option<String>,
+) -> Result<crate::expert_runs::ExpertRun, AppError> {
+    crate::expert_runs::factory_cancel(
+        &state,
+        &id,
+        expected_revision,
+        safe_detail,
+        chrono::Utc::now(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn expert_run_factory_release_claim(
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: u64,
+) -> Result<crate::expert_runs::ExpertRun, AppError> {
+    crate::expert_runs::factory_release_claim(&state, &id, expected_revision, chrono::Utc::now())
+        .await
+}
+
+#[tauri::command]
+pub async fn expert_run_factory_waive_review(
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: u64,
+    reason: String,
+) -> Result<crate::expert_runs::ExpertRun, AppError> {
+    crate::expert_runs::factory_waive_independent_review(
+        &state,
+        &id,
+        expected_revision,
+        &reason,
+        chrono::Utc::now(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn expert_run_factory_resolve_blocker(
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: u64,
+    blocker_id: String,
+) -> Result<crate::expert_runs::ExpertRun, AppError> {
+    crate::expert_runs::factory_resolve_blocker(
+        &state,
+        &id,
+        expected_revision,
+        &blocker_id,
+        chrono::Utc::now(),
+    )
+    .await
+}
+
 async fn apply_activation_metadata(
     state: &AppState,
     operation_id: &str,
@@ -2348,8 +2630,34 @@ async fn apply_activation_metadata(
         .await
 }
 
+fn find_exact_committed_activation_run<'a>(
+    runs: &'a [crate::expert_runs::ExpertRun],
+    payload: &ExpertActivationOperation,
+) -> Result<Option<&'a crate::expert_runs::ExpertRun>, AppError> {
+    let Some(run) = runs.iter().find(|run| run.id == payload.run_id) else {
+        return Ok(None);
+    };
+    if run.snapshot != payload.run
+        || !match (run.factory.as_ref(), payload.factory.as_ref()) {
+            (None, None) => true,
+            (Some(committed), Some(prepared)) => {
+                committed.work_contract == prepared.work_contract
+                    && committed.work_contract_revision == prepared.work_contract_revision
+                    && committed.created_at == prepared.created_at
+                    && committed.preflight_completed_at == prepared.preflight_completed_at
+            }
+            _ => false,
+        }
+    {
+        return Err(AppError::StorageCorrupt {
+            message: "Expert activation recovery conflicts with its committed run".into(),
+        });
+    }
+    Ok(Some(run))
+}
+
 async fn recover_activation_operation(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     operation: &crate::state_db::FilesystemOperation,
 ) -> Result<(), AppError> {
@@ -2368,28 +2676,116 @@ async fn recover_activation_operation(
             message: "Expert activation recovery payload is inconsistent".into(),
         });
     }
+    if let Some(factory) = payload.factory.as_ref() {
+        crate::expert_runs::validate_prepared_factory_workflow(&payload.run, factory)?;
+        if !payload.agent_slugs.is_empty()
+            || !payload.skill_packages.is_empty()
+            || !payload.record.installed_agents.is_empty()
+            || !payload.record.installed_skills.is_empty()
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Factory activation recovery cannot install project dependencies".into(),
+            });
+        }
+    }
+    if !payload.agent_slugs.is_empty() && app.is_none() {
+        return Err(AppError::Internal {
+            message: "Expert activation recovery requires an application handle".into(),
+        });
+    }
     if operation.phase == crate::state_db::FilesystemOperationPhase::Prepared {
-        for slug in &payload.agent_slugs {
-            crate::install::do_install_legacy(
-                app,
-                state,
-                slug.clone(),
-                payload.run.client.clone(),
-                Some(payload.run.project_path.clone()),
-            )
-            .await?;
+        let runs = crate::expert_runs::list_runs(
+            state,
+            &payload.run.client,
+            Some(&payload.run.project_path),
+        )
+        .await?;
+        if find_exact_committed_activation_run(&runs, &payload)?.is_none() {
+            let mut installed_agents = Vec::new();
+            let mut installed_skills = Vec::new();
+            let skill_installs_before = if payload.skill_packages.is_empty() {
+                Vec::new()
+            } else {
+                crate::skills::install::load_ledger_for_state(state).await?
+            };
+            let recovery = async {
+                for slug in &payload.agent_slugs {
+                    crate::install::do_install_legacy(
+                        app.expect("checked Agent recovery application handle"),
+                        state,
+                        slug.clone(),
+                        payload.run.client.clone(),
+                        Some(payload.run.project_path.clone()),
+                    )
+                    .await?;
+                    installed_agents.push(slug.clone());
+                }
+                for package in &payload.skill_packages {
+                    let created = crate::skills::install_skill_with_dependencies(
+                        state,
+                        &package.source_id,
+                        &package.relative_path,
+                        &payload.run.client,
+                        Some(&payload.run.project_path),
+                    )
+                    .await?;
+                    for item in created {
+                        if !skill_install_was_managed(
+                            &skill_installs_before,
+                            &item.source_id,
+                            &item.relative_path,
+                            &payload.run.client,
+                            Some(&payload.run.project_path),
+                        ) && !installed_skills
+                            .contains(&(item.source_id.clone(), item.relative_path.clone()))
+                        {
+                            installed_skills.push((item.source_id, item.relative_path));
+                        }
+                    }
+                }
+                if let Some(factory) = payload.factory.clone() {
+                    crate::expert_runs::create_prepared_factory_run_with_id(
+                        state,
+                        &payload.run_id,
+                        payload.run.clone(),
+                        factory,
+                    )
+                    .await?;
+                } else {
+                    crate::expert_runs::create_run_with_id(
+                        state,
+                        &payload.run_id,
+                        payload.run.clone(),
+                    )
+                    .await?;
+                }
+                Ok::<(), AppError>(())
+            }
+            .await;
+            if let Err(error) = recovery {
+                for (source_id, relative_path) in installed_skills.iter().rev() {
+                    let _ = crate::skills::uninstall_skill(
+                        state,
+                        source_id,
+                        relative_path,
+                        &payload.run.client,
+                        Some(&payload.run.project_path),
+                    )
+                    .await;
+                }
+                for slug in installed_agents.iter().rev() {
+                    let _ = crate::install::do_uninstall_legacy(
+                        app.expect("checked Agent recovery application handle"),
+                        state,
+                        slug.clone(),
+                        payload.run.client.clone(),
+                        Some(payload.run.project_path.clone()),
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
         }
-        for package in &payload.skill_packages {
-            crate::skills::install_skill_with_dependencies(
-                state,
-                &package.source_id,
-                &package.relative_path,
-                &payload.run.client,
-                Some(&payload.run.project_path),
-            )
-            .await?;
-        }
-        crate::expert_runs::create_run_with_id(state, &payload.run_id, payload.run.clone()).await?;
         apply_activation_metadata(state, &operation.id, &payload.record).await?;
     } else {
         let history = activation_history(state).await?;
@@ -2404,10 +2800,7 @@ async fn recover_activation_operation(
             Some(&payload.run.project_path),
         )
         .await?;
-        if !runs
-            .iter()
-            .any(|run| run.id == payload.run_id && run.snapshot == payload.run)
-        {
+        if find_exact_committed_activation_run(&runs, &payload)?.is_none() {
             return Err(AppError::StorageCorrupt {
                 message: "Applied Expert activation is missing its exact run".into(),
             });
@@ -2434,7 +2827,7 @@ pub(crate) async fn recover_activation_operations(
         .into_iter()
         .filter(|operation| operation.kind == "expert_activate")
     {
-        if let Err(error) = recover_activation_operation(app, state, &operation).await {
+        if let Err(error) = recover_activation_operation(Some(app), state, &operation).await {
             database
                 .retain_filesystem_operation_error(&operation.id, &error.to_string())
                 .await?;
@@ -3035,6 +3428,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn factory_activation_binding_is_optional_ready_only_and_revision_complete() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-18T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        assert_eq!(bind_factory_work_order(None, None, now).unwrap(), None);
+
+        let input = FactoryWorkOrderInput {
+            ticket_reference: "APP-42".into(),
+            title: "Factory lifecycle".into(),
+            objective: "Carry one exact work order through review.".into(),
+            acceptance_criteria: vec!["The approved revision reaches delivery.".into()],
+            non_goals: vec!["Do not execute repository commands.".into()],
+            playbook: Some("strategy/factory.md".into()),
+            workspace_pack_revision: None,
+            risk: crate::expert_runs::FactoryRiskClass::Medium,
+        };
+        let playbooks = vec![crate::types::PlaybookCatalogEntry {
+            relative_path: "strategy/factory.md".into(),
+            title: "Factory".into(),
+            kind: crate::types::PlaybookKind::Strategy,
+            size_bytes: 128,
+        }];
+        assert!(require_factory_playbook_reference(&input, &playbooks).is_ok());
+        let mut unknown_playbook = input.clone();
+        unknown_playbook.playbook = Some("strategy/missing.md".into());
+        assert!(require_factory_playbook_reference(&unknown_playbook, &playbooks).is_err());
+        let readiness = crate::types::ProjectReadinessReport {
+            project_path: "/tmp/factory-project".into(),
+            overall: crate::types::ProjectReadinessOverall::Ready,
+            baseline: None,
+            subscribed: false,
+            categories: Vec::new(),
+        };
+        let mut unbound_workspace_pack = input.clone();
+        unbound_workspace_pack.workspace_pack_revision = Some("a".repeat(64));
+        assert!(bind_factory_work_order(
+            Some(unbound_workspace_pack),
+            Some(readiness.clone()),
+            now,
+        )
+        .is_err());
+        let factory = bind_factory_work_order(Some(input.clone()), Some(readiness.clone()), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            factory.readiness.overall,
+            crate::expert_runs::FactoryReadinessOverall::Ready
+        );
+        assert_eq!(factory.readiness.evidence_revision.len(), 64);
+
+        let snapshot = crate::expert_runs::ExpertRunCreate {
+            expert_id: "factory-reviewer".into(),
+            expert_version: 3,
+            project_path: readiness.project_path.clone(),
+            client: "codex".into(),
+            lead_agent: "reviewer".into(),
+            supporting_agents: Vec::new(),
+            required_skills: Vec::new(),
+            optional_skills: Vec::new(),
+            runbook: None,
+            contract: crate::expert_runs::QualityContract::default(),
+        };
+        let first =
+            crate::expert_runs::prepare_factory_workflow(&snapshot, factory.clone(), now).unwrap();
+        let second = crate::expert_runs::prepare_factory_workflow(&snapshot, factory, now).unwrap();
+        assert_eq!(first.work_contract_revision, second.work_contract_revision);
+
+        let mut changed = input;
+        changed.title = "Changed Factory lifecycle".into();
+        let changed = bind_factory_work_order(Some(changed), Some(readiness), now)
+            .unwrap()
+            .unwrap();
+        let changed =
+            crate::expert_runs::prepare_factory_workflow(&snapshot, changed, now).unwrap();
+        assert_ne!(first.work_contract_revision, changed.work_contract_revision);
+
+        let blocked = crate::types::ProjectReadinessReport {
+            overall: crate::types::ProjectReadinessOverall::NeedsAttention,
+            ..crate::types::ProjectReadinessReport {
+                project_path: snapshot.project_path,
+                overall: crate::types::ProjectReadinessOverall::Ready,
+                baseline: None,
+                subscribed: false,
+                categories: Vec::new(),
+            }
+        };
+        assert!(bind_factory_work_order(
+            Some(FactoryWorkOrderInput {
+                ticket_reference: "APP-43".into(),
+                title: "Blocked Factory lifecycle".into(),
+                objective: "Must not start when readiness is not Ready.".into(),
+                acceptance_criteria: vec!["No Factory run is created.".into()],
+                non_goals: Vec::new(),
+                playbook: Some("strategy/factory.md".into()),
+                workspace_pack_revision: None,
+                risk: crate::expert_runs::FactoryRiskClass::High,
+            }),
+            Some(blocked),
+            now,
+        )
+        .is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        assert!(crate::expert_runs::list_runs(&state, "codex", None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!root.path().join("state/expert-runs.json").exists());
+
+        let normal = crate::expert_runs::create_run(
+            &state,
+            crate::expert_runs::ExpertRunCreate {
+                expert_id: "legacy-activation".into(),
+                expert_version: 1,
+                project_path: "/tmp/legacy-project".into(),
+                client: "codex".into(),
+                lead_agent: "lead".into(),
+                supporting_agents: Vec::new(),
+                required_skills: Vec::new(),
+                optional_skills: Vec::new(),
+                runbook: None,
+                contract: crate::expert_runs::QualityContract::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(normal.factory.is_none());
+    }
+
+    #[test]
+    fn factory_activation_rejects_project_install_work_before_any_write() {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        let missing_agent = ExpertAgentAction {
+            slug: "reviewer".into(),
+            status: "missing".into(),
+            destination: Some(
+                project
+                    .path()
+                    .join("AGENTS.md")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+        assert!(ensure_factory_activation_write_free(
+            &[missing_agent],
+            &[],
+            &[],
+            "codex",
+            &project_path,
+        )
+        .is_err());
+
+        let missing_skill = crate::types::SkillMutationPlan {
+            operation: "install".into(),
+            runtime: "codex".into(),
+            project_path: Some(project_path.clone()),
+            packages: vec![crate::types::SkillPlanPackage {
+                source_id: "local".into(),
+                relative_path: "reviewer".into(),
+                name: "reviewer".into(),
+                dependency: false,
+                destination: project
+                    .path()
+                    .join(".agents/skills/reviewer")
+                    .to_string_lossy()
+                    .into_owned(),
+                file_count: 1,
+                permissions: Vec::new(),
+            }],
+            warnings: Vec::new(),
+            blockers: Vec::new(),
+            rollback_available: false,
+        };
+        assert!(ensure_factory_activation_write_free(
+            &[ExpertAgentAction {
+                slug: "lead".into(),
+                status: "current".into(),
+                destination: None,
+            }],
+            &[missing_skill],
+            &[],
+            "codex",
+            &project_path,
+        )
+        .is_err());
+        assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn runs_scope_idempotent_evidence_and_freeze_after_review() {
         use crate::expert_runs::{
             EvidenceResult, EvidenceSubmission, ExpertCheck, ExpertRunCreate, ExpertRunState,
@@ -3242,6 +3826,414 @@ mod tests {
         let mcp_json = crate::expert_runs::mcp_view(&accepted).to_string();
         assert!(!mcp_json.contains("Approved emergency exception"));
         assert!(mcp_json.contains("security"));
+    }
+
+    #[tokio::test]
+    async fn prepared_and_applied_factory_recovery_accept_progressed_committed_run() {
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .mutate(
+                crate::state_db::DocumentSpec::new("expert_runs", 1, 4 * 1024 * 1024, |_| Ok(())),
+                Vec::<crate::expert_runs::ExpertRun>::new(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let state = test_state(root.path());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-18T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let work_order = FactoryWorkOrderInput {
+            ticket_reference: "APP-RECOVER".into(),
+            title: "Recover committed Factory activation".into(),
+            objective: "Reuse the exact committed run after an activation metadata crash.".into(),
+            acceptance_criteria: vec!["Recovery does not consult mutable live preflight.".into()],
+            non_goals: Vec::new(),
+            playbook: Some("strategy/removed-after-commit.md".into()),
+            workspace_pack_revision: None,
+            risk: crate::expert_runs::FactoryRiskClass::Medium,
+        };
+        let readiness = crate::types::ProjectReadinessReport {
+            project_path: "/tmp/factory-project".into(),
+            overall: crate::types::ProjectReadinessOverall::Ready,
+            baseline: None,
+            subscribed: false,
+            categories: Vec::new(),
+        };
+        let factory = bind_factory_work_order(Some(work_order.clone()), Some(readiness), now)
+            .unwrap()
+            .unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let run = crate::expert_runs::ExpertRunCreate {
+            expert_id: "factory-reviewer".into(),
+            expert_version: 3,
+            project_path: "/tmp/factory-project".into(),
+            client: "codex".into(),
+            lead_agent: "reviewer".into(),
+            supporting_agents: Vec::new(),
+            required_skills: Vec::new(),
+            optional_skills: Vec::new(),
+            runbook: None,
+            contract: crate::expert_runs::QualityContract::default(),
+        };
+        let record = ExpertActivationRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            expert_id: run.expert_id.clone(),
+            expert_version: run.expert_version,
+            project_path: run.project_path.clone(),
+            client: run.client.clone(),
+            activated_at: now.to_rfc3339(),
+            installed_agents: Vec::new(),
+            installed_skills: Vec::new(),
+            run_id: Some(run_id.clone()),
+        };
+        let factory = crate::expert_runs::prepare_factory_workflow(&run, factory, now).unwrap();
+        let payload = ExpertActivationOperation {
+            record: record.clone(),
+            run_id: run_id.clone(),
+            run: run.clone(),
+            factory: Some(factory.clone()),
+            agent_slugs: Vec::new(),
+            skill_packages: Vec::new(),
+        };
+        crate::expert_runs::create_prepared_factory_run_with_id(&state, &run_id, run, factory)
+            .await
+            .unwrap();
+        crate::expert_runs::factory_claim_phase(
+            &state,
+            &run_id,
+            &payload.run.client,
+            &payload.run.project_path,
+            "codex/recovery-worker",
+            crate::expert_runs::FactoryClaimRequest {
+                expected_revision: 1,
+                phase: crate::expert_runs::FactoryPhase::Planning,
+                idempotency_key: "progress-before-recovery".into(),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+
+        let prepared = database
+            .prepare_filesystem_operation("expert_activate", &payload)
+            .await
+            .unwrap();
+        recover_activation_operation(None, &state, &prepared)
+            .await
+            .unwrap();
+
+        let mut applied_payload = payload.clone();
+        applied_payload.record.id = uuid::Uuid::new_v4().to_string();
+        let applied = database
+            .prepare_filesystem_operation("expert_activate", &applied_payload)
+            .await
+            .unwrap();
+        apply_activation_metadata(&state, &applied.id, &applied_payload.record)
+            .await
+            .unwrap();
+        let applied = database
+            .pending_filesystem_operations()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.id == applied.id)
+            .unwrap();
+        assert_eq!(
+            applied.phase,
+            crate::state_db::FilesystemOperationPhase::FilesystemApplied
+        );
+        recover_activation_operation(None, &state, &applied)
+            .await
+            .unwrap();
+
+        let runs = crate::expert_runs::list_runs(
+            &state,
+            &payload.run.client,
+            Some(&payload.run.project_path),
+        )
+        .await
+        .unwrap();
+        let mut conflicting_payload = payload;
+        conflicting_payload
+            .factory
+            .as_mut()
+            .unwrap()
+            .preflight_completed_at = "2026-08-18T10:00:01Z".into();
+        assert!(find_exact_committed_activation_run(&runs, &conflicting_payload).is_err());
+    }
+
+    #[tokio::test]
+    async fn prepared_factory_recovery_uses_stored_workflow_after_live_readiness_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .mutate(
+                crate::state_db::DocumentSpec::new("expert_runs", 1, 4 * 1024 * 1024, |_| Ok(())),
+                Vec::<crate::expert_runs::ExpertRun>::new(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let state = test_state(root.path());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-18T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let run = crate::expert_runs::ExpertRunCreate {
+            expert_id: "factory-reviewer".into(),
+            expert_version: 3,
+            project_path: project_path.clone(),
+            client: "codex".into(),
+            lead_agent: "reviewer".into(),
+            supporting_agents: Vec::new(),
+            required_skills: Vec::new(),
+            optional_skills: Vec::new(),
+            runbook: Some("recovery-runbook".into()),
+            contract: crate::expert_runs::QualityContract::default(),
+        };
+        let factory = bind_factory_work_order(
+            Some(FactoryWorkOrderInput {
+                ticket_reference: "APP-DRIFT".into(),
+                title: "Recover exact Factory snapshot".into(),
+                objective: "Ignore later live readiness drift during recovery.".into(),
+                acceptance_criteria: vec!["The stored readiness snapshot is retained.".into()],
+                non_goals: Vec::new(),
+                playbook: None,
+                workspace_pack_revision: None,
+                risk: crate::expert_runs::FactoryRiskClass::Medium,
+            }),
+            Some(crate::types::ProjectReadinessReport {
+                project_path: project_path.clone(),
+                overall: crate::types::ProjectReadinessOverall::Ready,
+                baseline: None,
+                subscribed: false,
+                categories: Vec::new(),
+            }),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        let factory = crate::expert_runs::prepare_factory_workflow(&run, factory, now).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let payload = ExpertActivationOperation {
+            record: ExpertActivationRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                expert_id: run.expert_id.clone(),
+                expert_version: run.expert_version,
+                project_path: project_path.clone(),
+                client: run.client.clone(),
+                activated_at: now.to_rfc3339(),
+                installed_agents: Vec::new(),
+                installed_skills: Vec::new(),
+                run_id: Some(run_id.clone()),
+            },
+            run_id: run_id.clone(),
+            run: run.clone(),
+            factory: Some(factory.clone()),
+            agent_slugs: Vec::new(),
+            skill_packages: Vec::new(),
+        };
+        let operation = database
+            .prepare_filesystem_operation("expert_activate", &payload)
+            .await
+            .unwrap();
+        recover_activation_operation(None, &state, &operation)
+            .await
+            .unwrap();
+
+        let recovered = crate::expert_runs::get_run(&state, &run_id, "codex", &project_path)
+            .await
+            .unwrap();
+        assert_eq!(recovered.factory, Some(factory));
+    }
+
+    #[tokio::test]
+    async fn prepared_factory_recovery_rejects_install_payload_before_any_write() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("reviewer")).unwrap();
+        std::fs::write(
+            source.path().join("reviewer/SKILL.md"),
+            "---\nname: reviewer\ndescription: Reviews changes\n---\n\n# Reviewer\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(source.path().join("editor")).unwrap();
+        std::fs::write(
+            source.path().join("editor/SKILL.md"),
+            "---\nname: editor\ndescription: Edits changes\n---\n\n# Editor\n",
+        )
+        .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let database = crate::state_db::StateDatabase::open(root.path()).unwrap();
+        database
+            .mutate(
+                crate::state_db::DocumentSpec::new("expert_runs", 1, 4 * 1024 * 1024, |_| Ok(())),
+                Vec::<crate::expert_runs::ExpertRun>::new(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        database
+            .mutate(
+                crate::state_db::DocumentSpec::new("skill_sources", 1, 1024 * 1024, |_| Ok(())),
+                Vec::<crate::types::SkillSource>::new(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        database
+            .mutate(
+                crate::state_db::DocumentSpec::new("skill_installs", 1, 16 * 1024 * 1024, |_| {
+                    Ok(())
+                }),
+                Vec::<crate::types::SkillInstallRecord>::new(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        database
+            .mutate(
+                crate::state_db::DocumentSpec::new("skill_library", 1, 4 * 1024 * 1024, |_| Ok(())),
+                crate::types::SkillFolderState::default(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        database
+            .set_migration_state(crate::types::StorageMigrationState::Complete)
+            .await
+            .unwrap();
+        let state = test_state(root.path());
+        let registered = crate::skills::add_local_source(&state, source.path())
+            .await
+            .unwrap();
+        crate::skills::install_skill_with_dependencies(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-18T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let run = crate::expert_runs::ExpertRunCreate {
+            expert_id: "factory-reviewer".into(),
+            expert_version: 3,
+            project_path: project_path.clone(),
+            client: "codex".into(),
+            lead_agent: "reviewer".into(),
+            supporting_agents: Vec::new(),
+            required_skills: vec!["reviewer".into(), "editor".into()],
+            optional_skills: Vec::new(),
+            runbook: Some("recovery-runbook".into()),
+            contract: crate::expert_runs::QualityContract::default(),
+        };
+        let factory = bind_factory_work_order(
+            Some(FactoryWorkOrderInput {
+                ticket_reference: "APP-ROLLBACK".into(),
+                title: "Rollback failed recovery".into(),
+                objective: "Preserve prior installs and roll back only newly installed Skills."
+                    .into(),
+                acceptance_criteria: vec!["The project returns to its prior state.".into()],
+                non_goals: Vec::new(),
+                playbook: None,
+                workspace_pack_revision: None,
+                risk: crate::expert_runs::FactoryRiskClass::High,
+            }),
+            Some(crate::types::ProjectReadinessReport {
+                project_path: project_path.clone(),
+                overall: crate::types::ProjectReadinessOverall::Ready,
+                baseline: None,
+                subscribed: false,
+                categories: Vec::new(),
+            }),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        let factory = crate::expert_runs::prepare_factory_workflow(&run, factory, now).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let reviewer_destination = project.path().join(".agents/skills/reviewer");
+        let editor_destination = project.path().join(".agents/skills/editor");
+        let payload = ExpertActivationOperation {
+            record: ExpertActivationRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                expert_id: run.expert_id.clone(),
+                expert_version: run.expert_version,
+                project_path: project_path.clone(),
+                client: run.client.clone(),
+                activated_at: now.to_rfc3339(),
+                installed_agents: Vec::new(),
+                installed_skills: vec!["editor".into()],
+                run_id: Some(run_id.clone()),
+            },
+            run_id,
+            run,
+            factory: Some(factory),
+            agent_slugs: Vec::new(),
+            skill_packages: vec![
+                crate::types::SkillPlanPackage {
+                    source_id: registered.id.clone(),
+                    relative_path: "reviewer".into(),
+                    name: "reviewer".into(),
+                    dependency: false,
+                    destination: reviewer_destination.to_string_lossy().into_owned(),
+                    file_count: 1,
+                    permissions: Vec::new(),
+                },
+                crate::types::SkillPlanPackage {
+                    source_id: registered.id,
+                    relative_path: "editor".into(),
+                    name: "editor".into(),
+                    dependency: false,
+                    destination: editor_destination.to_string_lossy().into_owned(),
+                    file_count: 1,
+                    permissions: Vec::new(),
+                },
+            ],
+        };
+        let operation = database
+            .prepare_filesystem_operation("expert_activate", &payload)
+            .await
+            .unwrap();
+        assert!(matches!(
+            recover_activation_operation(None, &state, &operation).await,
+            Err(AppError::StorageCorrupt { .. })
+        ));
+        assert!(reviewer_destination.exists());
+        assert!(!editor_destination.exists());
+        let ledger = crate::skills::install::load_ledger_for_state(&state)
+            .await
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].relative_path, "reviewer");
+        assert!(
+            crate::expert_runs::list_runs(&state, "codex", Some(&project_path))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

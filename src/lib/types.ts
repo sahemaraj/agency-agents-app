@@ -1102,6 +1102,263 @@ export interface ExpertAgentAction {
   destination: string | null;
 }
 
+export type FactoryRisk = "low" | "medium" | "high";
+
+/** User-authored Factory input. Readiness evidence and revision digests are
+ * derived by the backend and must never be supplied by the desktop client. */
+export interface FactoryWorkOrderInput {
+  ticketReference: string;
+  title: string;
+  objective: string;
+  acceptanceCriteria: string[];
+  nonGoals: string[];
+  playbook: string | null;
+  workspacePackRevision: string | null;
+  risk: FactoryRisk;
+}
+
+export type FactoryReadinessOverall = "notConfigured" | "ready" | "needsAttention" | "unavailable";
+export type FactoryPhase =
+  | "preflight"
+  | "planning"
+  | "awaitingPlanApproval"
+  | "build"
+  | "validation"
+  | "independentReview"
+  | "delivery"
+  | "awaitingFinalApproval"
+  | "completed";
+export type FactoryProvenance = "clientReported";
+export type FactoryTerminalOutcome = "accepted" | "rework" | "rejected" | "cancelled" | "attemptExhausted";
+
+export interface FactoryReadinessSnapshot {
+  checkedAt: string;
+  overall: FactoryReadinessOverall;
+  evidenceRevision: string;
+  summary: string[];
+}
+
+export interface FactoryWorkContract extends FactoryWorkOrderInput {
+  projectPath: string;
+  expertId: string;
+  expertVersion: number;
+  runbook: string | null;
+  qualityContract: ExpertQualityContract;
+  readiness: FactoryReadinessSnapshot;
+}
+
+export interface FactoryAttempt {
+  number: number;
+  startedAt: string;
+  endedAt: string | null;
+  headCommit: string | null;
+  builderIdentity: string | null;
+  result: string | null;
+}
+
+export interface FactoryPlan {
+  revision: string;
+  content: string;
+  citations: string[];
+  declaredChecks: string[];
+  risks: string[];
+  knownLimitations: string[];
+  baseCommit: string;
+  submittedBy: string;
+  submittedAt: string;
+}
+
+export interface FactoryPlanApproval {
+  planRevision: string;
+  baseCommit: string;
+  approvedAt: string;
+}
+
+export interface FactoryClaim {
+  id: string;
+  idempotencyKey: string;
+  generation: number;
+  workerIdentity: string;
+  phase: FactoryPhase;
+  runRevision: number;
+  claimedAt: string;
+  lastRenewedAt: string;
+  expiresAt: string;
+  releasedAt: string | null;
+}
+
+export interface FactoryBlocker {
+  id: string;
+  runId: string;
+  idempotencyKey: string;
+  claimId: string;
+  claimGeneration: number;
+  kind: string;
+  summary: string;
+  phase: FactoryPhase;
+  attempt: number;
+  reportedBy: string;
+  reportedAt: string;
+  resolvedAt: string | null;
+}
+
+export interface FactoryArtifact {
+  id: string;
+  runId: string;
+  idempotencyKey: string;
+  claimId: string;
+  kind: string;
+  label: string;
+  reference: string;
+  digest: string;
+  byteSize: number;
+  summary: string;
+  phase: FactoryPhase;
+  attempt: number;
+  claimGeneration: number;
+  workContractRevision: string;
+  approvedPlanRevision: string | null;
+  baseCommit: string | null;
+  headCommit: string | null;
+  provenance: FactoryProvenance;
+  submittedAt: string;
+}
+
+export interface FactoryEvidence {
+  id: string;
+  runId: string;
+  idempotencyKey: string;
+  claimId: string;
+  checkName: string;
+  result: "pass" | "fail" | "skipped";
+  commandLabel: string | null;
+  exitCode: number | null;
+  summary: string;
+  artifactIds: string[];
+  phase: FactoryPhase;
+  attempt: number;
+  claimGeneration: number;
+  workContractRevision: string;
+  approvedPlanRevision: string | null;
+  baseCommit: string | null;
+  headCommit: string | null;
+  provenance: FactoryProvenance;
+  submittedAt: string;
+}
+
+export interface FactoryValidation {
+  phase: FactoryPhase;
+  attempt: number;
+  claimId: string;
+  claimGeneration: number;
+  headCommit: string;
+  checkNames: string[];
+  validatedAt: string;
+}
+
+export interface FactoryReviewFinding {
+  severity: "critical" | "high" | "medium" | "low" | "info";
+  summary: string;
+}
+
+export interface FactoryReview {
+  phase: FactoryPhase;
+  attempt: number;
+  claimId: string;
+  claimGeneration: number;
+  headCommit: string;
+  reviewerIdentity: string;
+  verdict: "pass" | "rework";
+  summary: string;
+  findings: FactoryReviewFinding[];
+  submittedAt: string;
+  provenance: FactoryProvenance;
+}
+
+export interface FactoryDelivery {
+  attempt: number;
+  phase: FactoryPhase;
+  claimId: string;
+  claimGeneration: number;
+  reference: string;
+  headCommit: string;
+  evidenceSummary: string;
+  knownLimitations: string[];
+  submittedAt: string;
+  provenance: FactoryProvenance;
+}
+
+export interface FactoryHumanWaiver {
+  kind: string;
+  checkName: string | null;
+  reason: string;
+  createdAt: string;
+}
+
+export interface FactoryTerminalDecision {
+  outcome: FactoryTerminalOutcome;
+  decidedAt: string;
+  safeDetail: string | null;
+}
+
+export interface FactoryCheckWaiverInput {
+  checkName: string;
+  reason: string;
+}
+
+export interface FactoryFinalDecisionInput {
+  expectedRevision: number;
+  outcome: FactoryTerminalOutcome;
+  approvedPlanRevision: string;
+  headCommit: string;
+  checkWaivers: FactoryCheckWaiverInput[];
+  independentReviewWaiverReason: string | null;
+  safeDetail: string | null;
+}
+
+export interface FactoryImprovementProposal {
+  failureClass: string;
+  target: "test" | "rule" | "skill" | "expert" | "playbook" | "instruction";
+  proposal: string;
+  suggestedTest: string | null;
+  provenance: FactoryProvenance;
+}
+
+export interface FactoryIdempotencyRecord {
+  key: string;
+  runId: string;
+  requestDigest: string;
+  resultId: string;
+  resultRevision: number;
+  resultPhase: FactoryPhase;
+  createdAt: string;
+  claimResult?: FactoryClaim | null;
+}
+
+export interface FactoryWorkflow {
+  workContract: FactoryWorkContract;
+  workContractRevision: string;
+  phase: FactoryPhase;
+  revision: number;
+  createdAt: string;
+  preflightCompletedAt: string;
+  attempts: FactoryAttempt[];
+  plan: FactoryPlan | null;
+  planApproval: FactoryPlanApproval | null;
+  currentClaim: FactoryClaim | null;
+  priorClaims: FactoryClaim[];
+  blockers: FactoryBlocker[];
+  artifacts: FactoryArtifact[];
+  evidence: FactoryEvidence[];
+  validation: FactoryValidation | null;
+  review: FactoryReview | null;
+  delivery: FactoryDelivery | null;
+  humanWaivers: FactoryHumanWaiver[];
+  terminal: FactoryTerminalDecision | null;
+  improvementProposal: FactoryImprovementProposal | null;
+  idempotency: FactoryIdempotencyRecord[];
+}
+
 export interface ExpertActivationPlan {
   expert: ExpertResolved;
   projectPath: string;
@@ -1166,6 +1423,7 @@ export interface ExpertRun {
   evidence: ExpertEvidence[];
   blockers: Array<{ kind: string; summary: string; reportedAt: string }>;
   waivers: ExpertWaiver[];
+  factory?: FactoryWorkflow | null;
 }
 
 export interface CatalogUpdateCheck {

@@ -259,6 +259,109 @@ const performanceRun = (
   evidence, blockers: [], waivers, ...changes,
 });
 
+const factoryRun = (
+  id = "factory-run",
+  phase = "awaitingPlanApproval",
+  factoryChanges: Record<string, unknown> = {},
+): ExpertRun => ({
+  ...performanceRun(id, "inProgress", [], [], { endedAt: null }),
+  factory: {
+    workContract: {
+      ticketReference: "AA-42",
+      title: "Ship Factory control room",
+      objective: "Govern one bounded external implementation.",
+      acceptanceCriteria: ["Plan is approved", "Evidence is current"],
+      nonGoals: ["Run shell commands"],
+      projectPath: "/tmp/project",
+      expertId: "reviewer",
+      expertVersion: 2,
+      playbook: null,
+      runbook: "factory-runbook",
+      workspacePackRevision: null,
+      qualityContract: structuredClone(performanceExpert().qualityContract),
+      risk: "medium",
+      readiness: {
+        checkedAt: "2026-08-18T01:00:00Z", overall: "ready",
+        evidenceRevision: "ready-1", summary: ["Ready"],
+      },
+    },
+    workContractRevision: "work-1",
+    phase,
+    revision: 7,
+    createdAt: "2026-08-18T00:55:00Z",
+    preflightCompletedAt: "2026-08-18T01:00:00Z",
+    attempts: [{
+      number: 2, startedAt: "2026-08-18T01:00:00Z", endedAt: null,
+      headCommit: "head-new", builderIdentity: "codex", result: null,
+    }],
+    currentClaim: {
+      id: "claim-1", idempotencyKey: "claim-key", generation: 4, workerIdentity: "codex", phase,
+      runRevision: 7, claimedAt: "2026-08-18T01:00:00Z", lastRenewedAt: "2026-08-18T01:00:00Z",
+      expiresAt: "2026-08-18T03:00:00Z", releasedAt: null,
+    },
+    priorClaims: [],
+    blockers: [{
+      id: "blocker-1", runId: id, idempotencyKey: "blocker-key", claimId: "claim-1", claimGeneration: 4,
+      kind: "environment", summary: "CI unavailable", phase, attempt: 2, reportedBy: "codex",
+      reportedAt: "2026-08-18T01:00:00Z", resolvedAt: null,
+    }],
+    artifacts: [],
+    plan: {
+      revision: "plan-2", content: "1. Implement the control plane.\n2. Verify the gates.",
+      citations: ["openspec/tasks.md"], declaredChecks: ["Tests"], risks: ["Stale evidence"],
+      knownLimitations: ["Desktop does not stop external work"], baseCommit: "base-abc",
+      submittedBy: "codex", submittedAt: "2026-08-18T01:10:00Z",
+    },
+    planApproval: { planRevision: "plan-2", baseCommit: "base-abc", approvedAt: "2026-08-18T01:15:00Z" },
+    evidence: [
+      {
+        id: "old-pass", runId: id, idempotencyKey: "old-pass", claimId: "claim-1", checkName: "Tests", result: "pass",
+        commandLabel: "npm test", exitCode: 0, summary: "Old head passed", provenance: "clientReported",
+        artifactIds: [], phase: "validation", attempt: 2, claimGeneration: 4, workContractRevision: "work-1",
+        approvedPlanRevision: "plan-2", baseCommit: "base-abc", headCommit: "head-old",
+        submittedAt: "2026-08-18T01:20:00Z",
+      },
+      {
+        id: "current-pass", runId: id, idempotencyKey: "current-pass", claimId: "claim-1", checkName: "Tests", result: "pass",
+        commandLabel: "npm test", exitCode: 0, summary: "Current head passed", provenance: "clientReported",
+        artifactIds: [], phase: "validation", attempt: 2, claimGeneration: 4, workContractRevision: "work-1",
+        approvedPlanRevision: "plan-2", baseCommit: "base-abc", headCommit: "head-new",
+        submittedAt: "2026-08-18T01:21:00Z",
+      },
+      {
+        id: "current-fail", runId: id, idempotencyKey: "current-fail", claimId: "claim-1", checkName: "Tests", result: "fail",
+        commandLabel: "npm test", exitCode: 1, summary: "Latest result failed", provenance: "clientReported",
+        artifactIds: [], phase: "validation", attempt: 2, claimGeneration: 4, workContractRevision: "work-1",
+        approvedPlanRevision: "plan-2", baseCommit: "base-abc", headCommit: "head-new",
+        submittedAt: "2026-08-18T01:22:00Z",
+      },
+    ],
+    validation: {
+      phase: "validation", attempt: 2, claimId: "claim-1", claimGeneration: 4,
+      headCommit: "head-new", checkNames: ["Tests"], validatedAt: "2026-08-18T01:25:00Z",
+    },
+    review: {
+      phase: "independentReview", attempt: 2, claimId: "claim-review", claimGeneration: 5,
+      headCommit: "head-new", reviewerIdentity: "claude", verdict: "pass",
+      summary: "Distinct worker review passed", findings: [], submittedAt: "2026-08-18T01:27:00Z",
+      provenance: "clientReported",
+    },
+    delivery: {
+      attempt: 2, phase: "delivery", claimId: "claim-delivery", claimGeneration: 6,
+      reference: "https://example.test/pull/42", headCommit: "head-new", evidenceSummary: "Current checks passed",
+      knownLimitations: ["Manual merge remains"], submittedAt: "2026-08-18T01:30:00Z", provenance: "clientReported",
+    },
+    humanWaivers: [],
+    terminal: null,
+    improvementProposal: {
+      failureClass: "stale-check", target: "test", proposal: "Add a stale revision regression test",
+      suggestedTest: "Reject stale expectedRevision", provenance: "clientReported",
+    },
+    idempotency: [],
+    ...factoryChanges,
+  },
+} as unknown as ExpertRun);
+
 beforeEach(async () => {
   vi.unstubAllGlobals();
   const storage = new Map<string, string>();
@@ -485,6 +588,12 @@ describe("frontend test harness", () => {
     expect(agentsWorkspaceSource).toMatch(/@media \(max-width: 600px\)[^]*?\.lp-search-row :global\(\.wrap\)[^]*?flex:\s*1 1 160px/);
   });
 
+  it("reconciles terminal Factory receipts on every visible storage revision change", () => {
+    expect(pageSource).toMatch(/visibleRevision = revision;\s+await activity\.refreshFactoryReceipts\(\);\s+await refreshVisibleSurface\(\)/);
+    expect(pageSource).not.toContain('"skills", "personas", "experts", "activity"');
+    expect(pageSource).toContain('role="region" aria-label="Sidebar resize control"');
+  });
+
   it("delegates section navigation without changing the persisted collapse preference", async () => {
     localStorage.setItem("agency-agents:sidebar-collapsed", "0");
     ui.section = "dashboard";
@@ -555,6 +664,1593 @@ describe("frontend test harness", () => {
       "Review had missing, skipped, or failed evidence in 2 of 5 runs; review its instructions or tooling.",
       "Review was waived in 2 of 5 runs; clarify the check or improve its evidence path.",
     ]);
+  });
+
+  it("summarizes Factory performance from Factory evidence and human waivers, not legacy fields", () => {
+    const terminalFactoryRun = (
+      id: string,
+      state: "accepted" | "rework" | "rejected",
+      results: Partial<Record<"Tests" | "Review", "pass" | "fail" | "skipped">>,
+      waivedChecks: Array<"Tests" | "Review"> = [],
+    ): ExpertRun => {
+      const run = factoryRun(id, "completed", {
+        currentClaim: null,
+        blockers: [],
+        terminal: { outcome: state, decidedAt: "2026-08-18T02:00:00Z", safeDetail: null },
+      });
+      const template = run.factory!.evidence.find((item) => item.id === "current-pass")!;
+      run.state = state;
+      run.endedAt = "2026-08-18T02:00:00Z";
+      run.evidence = [
+        { id: `${id}-legacy-tests`, idempotencyKey: `${id}-legacy-tests`, checkName: "Tests", result: "pass", commandLabel: null, summary: "Misleading legacy pass", submittedAt: "2026-08-18T02:00:00Z" },
+        { id: `${id}-legacy-review`, idempotencyKey: `${id}-legacy-review`, checkName: "Review", result: "pass", commandLabel: null, summary: "Misleading legacy pass", submittedAt: "2026-08-18T02:00:00Z" },
+      ];
+      run.waivers = [];
+      run.factory = {
+        ...run.factory!,
+        evidence: Object.entries(results).map(([checkName, result], index) => ({
+          ...template,
+          id: `${id}-factory-${checkName}`,
+          idempotencyKey: `${id}-factory-${checkName}`,
+          checkName,
+          result,
+          summary: `Factory ${result}`,
+          submittedAt: `2026-08-18T01:4${index}:00Z`,
+        })),
+        humanWaivers: waivedChecks.map((checkName) => ({
+          kind: "qualityCheck",
+          checkName,
+          reason: "Recorded Factory waiver",
+          createdAt: "2026-08-18T01:50:00Z",
+        })),
+      };
+      return run;
+    };
+    const runs = [
+      terminalFactoryRun("factory-performance-1", "accepted", { Tests: "pass", Review: "pass" }),
+      terminalFactoryRun("factory-performance-2", "rework", { Tests: "pass" }, ["Review"]),
+      terminalFactoryRun("factory-performance-3", "rejected", { Tests: "fail", Review: "pass" }),
+      terminalFactoryRun("factory-performance-4", "accepted", { Tests: "pass", Review: "skipped" }, ["Review"]),
+      terminalFactoryRun("factory-performance-5", "accepted", { Tests: "pass", Review: "pass" }),
+    ];
+
+    const summary = summarizeExpertPerformance(performanceExpert(), runs);
+    expect(summary).toMatchObject({ comparableRuns: 5, eligible: true, waiverRate: 40 });
+    expect(summary.checks).toEqual([
+      { name: "Tests", issueRuns: 1, waiverRuns: 0 },
+      { name: "Review", issueRuns: 2, waiverRuns: 2 },
+    ]);
+  });
+
+  it("projects optional Factory phases, current human action, and latest bound evidence without changing legacy runs", async () => {
+    const module = await import("$lib/stores/experts.svelte");
+    const projectFactoryRun = (module as unknown as {
+      projectFactoryRun?: (run: ExpertRun) => Record<string, any> | null;
+    }).projectFactoryRun;
+    expect(projectFactoryRun).toBeTypeOf("function");
+    expect(projectFactoryRun!(performanceRun("legacy", "awaitingReview"))).toBeNull();
+
+    const projection = projectFactoryRun!(factoryRun());
+    expect(projection).toMatchObject({
+      phase: "awaitingPlanApproval",
+      phaseLabel: "Awaiting plan approval",
+      attempt: 2,
+      maxAttempts: 3,
+      blocker: "CI unavailable",
+      humanAction: { kind: "plan", expectedRevision: 7, contentRevision: "plan-2" },
+    });
+    expect(projection?.latestEvidence).toEqual([
+      expect.objectContaining({ checkName: "Tests", result: "fail", summary: "Latest result failed" }),
+    ]);
+    expect(projection?.workflow.review).toMatchObject({
+      phase: "independentReview", claimId: "claim-review", claimGeneration: 5,
+    });
+    expect(projection?.workflow.delivery).toMatchObject({
+      attempt: 2, phase: "delivery", claimId: "claim-delivery", claimGeneration: 6,
+    });
+  });
+
+  it("binds current Factory evidence to exact immutable bindings and append order", async () => {
+    const run = factoryRun("factory-current-lineage", "validation");
+    const workflow = run.factory!;
+    const currentClaim = {
+      ...workflow.currentClaim!,
+      id: "claim-current",
+      generation: 5,
+      phase: "validation" as const,
+    };
+    const evidenceTemplate = workflow.evidence.find((item) => item.id === "current-fail")!;
+    run.factory = {
+      ...workflow,
+      currentClaim,
+      priorClaims: [{
+        ...currentClaim,
+        id: "claim-released",
+        generation: 4,
+        releasedAt: "2026-08-18T01:30:00Z",
+      }],
+      evidence: [
+        {
+          ...evidenceTemplate,
+          id: "released-pass",
+          idempotencyKey: "released-pass",
+          claimId: "claim-released",
+          claimGeneration: 4,
+          phase: "validation",
+          result: "pass",
+          summary: "Released claim passed later",
+          submittedAt: "2026-08-18T01:32:00Z",
+        },
+        {
+          ...evidenceTemplate,
+          id: "wrong-phase-pass",
+          idempotencyKey: "wrong-phase-pass",
+          claimId: currentClaim.id,
+          claimGeneration: currentClaim.generation,
+          phase: "build",
+          result: "pass",
+          summary: "Wrong phase passed latest",
+          submittedAt: "2026-08-18T01:33:00Z",
+        },
+        {
+          ...evidenceTemplate,
+          id: "authoritative-fail",
+          idempotencyKey: "authoritative-fail",
+          claimId: currentClaim.id,
+          claimGeneration: currentClaim.generation,
+          phase: currentClaim.phase,
+          result: "fail",
+          summary: "Current claim failed",
+          submittedAt: "2026-08-18T01:31:00Z",
+        },
+      ],
+    };
+
+    const projection = (await import("$lib/stores/experts.svelte")).projectFactoryRun(run);
+    expect(projection?.latestEvidence).toEqual([
+      expect.objectContaining({ id: "authoritative-fail", result: "fail" }),
+    ]);
+  });
+
+  it("lets later bound current-attempt review evidence override completed validation evidence", async () => {
+    const run = factoryRun("factory-cross-phase-evidence", "delivery");
+    const workflow = run.factory!;
+    const evidenceTemplate = workflow.evidence.find((item) => item.id === "current-fail")!;
+    run.factory = {
+      ...workflow,
+      currentClaim: null,
+      priorClaims: [{
+        ...workflow.currentClaim!,
+        id: "claim-validation",
+        generation: 6,
+        phase: "validation",
+        releasedAt: "2026-08-18T01:31:00Z",
+      }],
+      validation: {
+        ...workflow.validation!,
+        phase: "validation",
+        claimId: "claim-validation",
+        claimGeneration: 6,
+      },
+      review: {
+        ...workflow.review!,
+        phase: "independentReview",
+        claimId: "claim-review",
+        claimGeneration: 7,
+      },
+      evidence: [
+        {
+          ...evidenceTemplate,
+          id: "validated-fail",
+          idempotencyKey: "validated-fail",
+          claimId: "claim-validation",
+          claimGeneration: 6,
+          phase: "validation",
+          result: "fail",
+          summary: "Validated lineage failed",
+          submittedAt: "2026-08-18T01:31:00Z",
+        },
+        {
+          ...evidenceTemplate,
+          id: "obsolete-pass",
+          idempotencyKey: "obsolete-pass",
+          claimId: "claim-obsolete",
+          claimGeneration: 5,
+          phase: "validation",
+          result: "pass",
+          summary: "Obsolete validation passed later",
+          submittedAt: "2026-08-18T01:32:00Z",
+        },
+        {
+          ...evidenceTemplate,
+          id: "later-review-fail",
+          idempotencyKey: "later-review-fail",
+          claimId: "claim-review",
+          claimGeneration: 7,
+          phase: "independentReview",
+          result: "fail",
+          summary: "Later review-phase check failed",
+          submittedAt: "2026-08-18T01:33:00Z",
+        },
+      ],
+    } as unknown as typeof workflow;
+
+    const projection = (await import("$lib/stores/experts.svelte")).projectFactoryRun(run);
+    expect(projection?.latestEvidence).toEqual([
+      expect.objectContaining({ id: "later-review-fail", result: "fail" }),
+    ]);
+  });
+
+  it("retains latest exact-bound evidence after attempt exhaustion clears phase markers", async () => {
+    const run = factoryRun("factory-exhausted-evidence", "completed");
+    const workflow = run.factory!;
+    const evidenceTemplate = workflow.evidence.find((item) => item.id === "current-fail")!;
+    run.factory = {
+      ...workflow,
+      currentClaim: null,
+      validation: null,
+      review: null,
+      delivery: null,
+      terminal: {
+        outcome: "attemptExhausted",
+        decidedAt: "2026-08-18T02:00:00Z",
+        safeDetail: "Automated attempts were exhausted",
+      },
+      evidence: [
+        {
+          ...evidenceTemplate,
+          id: "exhausted-earlier-pass",
+          idempotencyKey: "exhausted-earlier-pass",
+          result: "pass",
+          submittedAt: "2026-08-18T01:59:00Z",
+        },
+        {
+          ...evidenceTemplate,
+          id: "exhausted-decisive-fail",
+          idempotencyKey: "exhausted-decisive-fail",
+          result: "fail",
+          submittedAt: "2026-08-18T01:58:00Z",
+        },
+      ],
+    };
+
+    const projection = (await import("$lib/stores/experts.svelte")).projectFactoryRun(run);
+    expect(projection?.latestEvidence).toEqual([
+      expect.objectContaining({ id: "exhausted-decisive-fail", result: "fail" }),
+    ]);
+  });
+
+  it("normalizes a bounded terminal Factory receipt while dropping unsafe paths and non-HTTPS delivery evidence", () => {
+    const normalized = normalizeActivityReceipt({
+      operation: "factory",
+      runId: "factory-run",
+      ticketReference: "AA-42",
+      workTitle: "Ship Factory control room",
+      projectLabel: "Agency Agents",
+      outcome: "accepted",
+      planRevision: "plan-2",
+      baseCommit: "base-abc",
+      headCommit: "head-new",
+      checks: [{ name: "Tests", result: "pass" }],
+      reviewStatus: "passed",
+      deliveryReference: "https://example.test/pull/42",
+      retryCount: 1,
+      limitations: [
+        "See /Users/home/private/repository before merge",
+        "artifact:/Users/home/private/colon-prefixed.log",
+        "AWS_SECRET_ACCESS_KEY=receipt-secret",
+      ],
+      provenance: "clientReported",
+      detail: "Delivered without running inside Agency Agents",
+    }) as any;
+    expect(normalized).toMatchObject({
+      operation: "factory",
+      runId: "factory-run",
+      outcome: "accepted",
+      deliveryReference: "https://example.test/pull/42",
+      provenance: "clientReported",
+    });
+    expect(normalized.limitations.join(" ")).not.toContain("/Users/home/private/repository");
+    expect(normalized.limitations.join(" ")).not.toContain("/Users/home/private/colon-prefixed.log");
+    expect(normalized.limitations.join(" ")).not.toContain("receipt-secret");
+
+    const unsafe = normalizeActivityReceipt({
+      ...normalized,
+      deliveryReference: "http://user:secret@example.test/private",
+    }) as any;
+    expect(unsafe.deliveryReference).toBeNull();
+
+    const privateLabel = normalizeActivityReceipt({
+      ...normalized,
+      projectLabel: "/Users/home/private/factory-project",
+    }) as any;
+    expect(privateLabel.projectLabel).toBe("[private path]");
+
+    const privateStructuralFields = normalizeActivityReceipt({
+      ...normalized,
+      planRevision: "/opt/acme/private/plan",
+      baseCommit: "token=secret123",
+      headCommit: "C:\\work\\private\\head",
+      checks: [{ name: "\\\\fileserver\\private\\check", result: "pass" }],
+      limitations: [
+        "Inspect /srv/customer/private/build.log",
+        "Inspect D:/customer/private/build.log",
+        "Inputs,/etc/customer/private.env",
+      ],
+    }) as any;
+    const privateFieldsJson = JSON.stringify(privateStructuralFields);
+    expect(privateFieldsJson).not.toContain("/opt/acme/private");
+    expect(privateFieldsJson).not.toContain("/srv/customer/private");
+    expect(privateFieldsJson).not.toContain("C:\\\\work\\\\private");
+    expect(privateFieldsJson).not.toContain("D:/customer/private");
+    expect(privateFieldsJson).not.toContain("/etc/customer/private.env");
+    expect(privateFieldsJson).not.toContain("fileserver");
+    expect(privateFieldsJson).not.toContain("secret123");
+
+    for (const deliveryReference of [
+      "https://example.test/pull/42?token=delivery-secret",
+      "https://example.test/pull/42?api_key=delivery-secret",
+      "https://example.test/pull/42?access.token=delivery-secret",
+      "https://example.test/pull/42?pwd=delivery-secret",
+      "https://example.test/pull/42?X-Amz-Signature=delivery-secret",
+      "https://example.test/pull/42?request_signature=delivery-secret",
+      "https://example.test/pull/42?jwt=delivery-secret",
+      "https://example.test/pull/42?session=eyJhbGciOiJIUzI1NiJ9.cHJpdmF0ZS1wYXlsb2Fk.c2VjcmV0LXNpZ25hdHVyZQ",
+      "https://example.test/pull/42?session=eyJhbGciOiJIUzI1NiJ9.e30.c2ln",
+      "https://example.test/pull/42?session=eyJhbGciOiJub25lIn0.e30.",
+      "https://example.test/pull/42?session=eyJlbmMiOiJBMTI4R0NNIn0.ZW5jcnlwdGVk.aXY.Y2lwaGVydGV4dA.dGFn",
+      "https://example.test/pull/42?sid=0123456789abcdef0123456789abcdef",
+      "https://example.test/pull/42?data=eyJlbmMiOiJBMTI4R0NNIn0..aXY.Y2lwaGVydGV4dA.dGFn",
+      "https://example.test/pull/42?session=0123456789abcdef0123456789abcdef",
+      "https://example.test/pull/42?PHPSESSID=0123456789abcdef0123456789abcdef",
+      "https://example.test/pull/42?sv=2026-01-01&sig=delivery-secret",
+      "https://example.test/pull/42#access_token=delivery-secret",
+      "https://example.test/pull/42#pwd=delivery-secret",
+      "https://example.test/pull/42#X-Amz-Signature=delivery-secret",
+      "https://example.test/pull/42#request_signature=delivery-secret",
+      "https://example.test/pull/42#jwt=delivery-secret",
+      "https://example.test/pull/42#view=files&token=delivery-secret",
+      "https://example.test/pull/42#token:delivery-secret",
+      "https://example.test/pull/token=delivery-secret",
+      "https://example.test/pull/sk-secretvalue",
+      "https://example.test/pull/ya29.abcdefghijklmnopqrstuvwxyz",
+      ["https://hooks.slack.", "com/services/T00000000/B00000000/abcdefghijklmnopqrstuvwx"].join(""),
+      "https://hooks.slack.com/%73ervices/T00000000/B00000000/abcdefghijklmnopqrstuvwx",
+      "https://discord.com/api/v10/webhooks/123456789/abcdefghijklmnopqrstuvwx",
+      "https://api.telegram.org/bot123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ/getMe",
+      "https://example.test/pull/%2FUsers%2Falice%2Fprivate%2Fresult.json",
+      "https://example.test/pull/%252FUsers%252Falice%252Fprivate%252Fresult.json",
+      "https://example.test/pull/42?file=%2FUsers%2Falice%2Fprivate%2Fresult.json",
+      "https://example.test/pull/42?file=%252FUsers%252Falice%252Fprivate%252Fresult.json",
+      "https://example.test/pull/42#file=%252FUsers%252Falice%252Fprivate%252Fresult.json",
+    ]) {
+      const credentialBearing = normalizeActivityReceipt({ ...normalized, deliveryReference }) as any;
+      expect(credentialBearing.deliveryReference).toBeNull();
+      expect(JSON.stringify(credentialBearing)).not.toContain("delivery-secret");
+    }
+    for (const deliveryReference of [
+      "https://example.test/pull/42?view=files",
+      "https://example.test/pull/42?assignee=alice",
+      "https://example.test/pull/42?assignment=ready",
+      "https://example.test/pull/42?design=compact",
+      "https://example.test/pull/42?possession=ready",
+    ]) {
+      const ordinaryQuery = normalizeActivityReceipt({ ...normalized, deliveryReference }) as any;
+      expect(ordinaryQuery.deliveryReference).toBe(deliveryReference);
+    }
+  });
+
+  it("journals terminal Factory receipts during Activity bootstrap without mounting Experts", async () => {
+    activity.clear();
+    const exhaustedRun = {
+      ...factoryRun("factory-route-independent-exhaustion", "completed", {
+        currentClaim: null,
+        blockers: [],
+        terminal: {
+          outcome: "attemptExhausted",
+          decidedAt: "2026-08-18T02:00:00Z",
+          safeDetail: "Automated attempts were exhausted",
+        },
+      }),
+      state: "rework" as const,
+      endedAt: "2026-08-18T02:00:00Z",
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "expert_runs_list") return [exhaustedRun] as never;
+      if (command === "projects_list") {
+        return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      }
+      return [] as never;
+    });
+
+    activity.hydrate();
+
+    await vi.waitFor(() => expect(activity.entries.filter((entry) =>
+      entry.receipt?.operation === "factory"
+      && entry.receipt.runId === "factory-route-independent-exhaustion")).toHaveLength(1));
+    activity.clear();
+  });
+
+  it("derives one terminal Factory receipt without raw plans, private paths, or waiver reasons", async () => {
+    const module = await import("$lib/stores/activity.svelte");
+    const factoryReceiptFromRun = (module as unknown as {
+      factoryReceiptFromRun?: (run: ExpertRun, projectLabel: string) => Record<string, any> | undefined;
+    }).factoryReceiptFromRun;
+    expect(factoryReceiptFromRun).toBeTypeOf("function");
+    const run = factoryRun("terminal-factory", "completed", {
+      currentClaim: null,
+      blockers: [],
+      humanWaivers: [{ kind: "check", checkName: "Tests", reason: "private waiver reason", createdAt: "2026-08-18T01:50:00Z" }],
+      terminal: { outcome: "accepted", decidedAt: "2026-08-18T02:00:00Z", safeDetail: "Accepted" },
+    });
+    const receipt = factoryReceiptFromRun!(run, "Agency Agents");
+    expect(receipt).toMatchObject({
+      operation: "factory", runId: "terminal-factory", outcome: "accepted",
+      workTitle: "Ship Factory control room", projectLabel: "Agency Agents",
+      planRevision: "plan-2", baseCommit: "base-abc", headCommit: "head-new",
+      deliveryReference: "https://example.test/pull/42", provenance: "clientReported",
+    });
+    expect(JSON.stringify(receipt)).not.toContain("Implement the control plane");
+    expect(JSON.stringify(receipt)).not.toContain("/tmp/project");
+    expect(JSON.stringify(receipt)).not.toContain("private waiver reason");
+
+    const unsafeRun = factoryRun("unsafe-terminal-factory", "completed", {
+      currentClaim: null,
+      blockers: [],
+      workContract: {
+        ...run.factory!.workContract,
+        title: "[source](https://alice:p4ss@example.test/spec)",
+      },
+      delivery: {
+        ...run.factory!.delivery!,
+        knownLimitations: ["return account.balance;"],
+      },
+      terminal: {
+        outcome: "accepted",
+        decidedAt: "2026-08-18T02:00:00Z",
+        safeDetail: "See %252FUsers%252Falice%252Fprivate%252Fresult.json",
+      },
+    });
+    const unsafeReceipt = factoryReceiptFromRun!(unsafeRun, "Agency Agents");
+    expect(JSON.stringify(unsafeReceipt)).not.toMatch(/alice|p4ss|%252FUsers|account\.balance/);
+
+    const rawSourceRun = factoryRun("raw-source-terminal-factory", "completed", {
+      currentClaim: null,
+      blockers: [],
+      workContract: {
+        ...run.factory!.workContract,
+        title: "if (authorized) { reveal(account.balance); }",
+      },
+      delivery: {
+        ...run.factory!.delivery!,
+        knownLimitations: ["console.log(account.balance);"],
+      },
+      terminal: {
+        outcome: "accepted",
+        decidedAt: "2026-08-18T02:00:00Z",
+        safeDetail: "if (ready) deploy();",
+      },
+    });
+    const rawSourceReceipt = factoryReceiptFromRun!(rawSourceRun, "Agency Agents");
+    expect(JSON.stringify(rawSourceReceipt)).not.toMatch(/account\.balance|deploy\(\)|if \((?:ready|authorized)\)|console\.log/);
+
+    const structuredSourceRun = factoryRun("structured-source-terminal-factory", "completed", {
+      currentClaim: null,
+      blockers: [],
+      workContract: {
+        ...run.factory!.workContract,
+        title: "user_id: int = 42",
+      },
+      plan: {
+        ...run.factory!.plan!,
+        knownLimitations: [
+          "SELECT email\nFROM users;",
+          "{\n  \"email\": \"alice@example.test\"\n}",
+          "[database]\nurl: postgres://example.test/app",
+          "x, y = 1, 2",
+          "database_url: postgres://internal.example.test/app",
+          "server_host: internal.example.test",
+          "database:\n  host: internal-db",
+          "SELECT email FROM users",
+          "Select email from users",
+          "import os",
+          "import os # platform-specific",
+          "from pathlib import Path",
+          "from pathlib import Path as P",
+          "from pathlib import *",
+          "from . import settings",
+          "result = output",
+          "result = load_config()",
+          "result = [1, 2, 3]",
+          'result = {"ok": true}',
+          "Result = load_config()",
+          "Result = output",
+          "Handler = () => deploy()",
+          "(x, y) = (1, 2)",
+          "({x} = source)",
+          "({ x = 1 } = source)",
+          "([x = 1] = source)",
+          "[x, y] = source",
+          "flags |= ADMIN",
+          "mask &= allowed",
+          "cache ??= build()",
+          "value <<= 1",
+          "Result = new Foo()",
+          "Result = new Foo<string>()",
+          "Result = [1, 2, 3]",
+          'Config = {"ok": true}',
+          "SELECT DISTINCT email FROM users",
+          "SELECT email AS address FROM users",
+          "Select email address from users",
+          "SELECT email FROM users AS u",
+          "SELECT TOP 10 email FROM users",
+          "SELECT TOP (10) email FROM users",
+          'SELECT email FROM users AS "u"',
+          "SELECT email FROM users UNION SELECT email FROM admins",
+          "SELECT email FROM users FOR UPDATE",
+          "SELECT * FROM users, roles",
+          "SELECT value FROM generate_series(1, 10)",
+          "SELECT TOP 10 PERCENT email FROM users",
+          'SELECT * FROM "users"',
+          "SELECT 1",
+          "WITH active AS (SELECT id FROM users) SELECT id FROM active",
+          "INSERT INTO users(email) VALUES ('alice@example.test')",
+          "INSERT INTO users(email)VALUES('alice@example.test')",
+          "UPDATE users SET email = 'alice@example.test' WHERE id = 1",
+          "UPDATE users u SET email = 'alice@example.test' WHERE u.id = 1",
+          "DELETE FROM users WHERE id = 1",
+          "Delete from users",
+          "DELETE FROM users AS u WHERE u.id = 1",
+          "CREATE TABLE users (id INTEGER)",
+          "CREATE TEMP TABLE users (id INTEGER)",
+          "CREATE GLOBAL TEMPORARY TABLE users (id INTEGER)",
+          "CREATE LOCAL TEMPORARY TABLE users (id INTEGER)",
+          "CREATE MATERIALIZED VIEW active_users AS SELECT id FROM users",
+          "CREATE OR REPLACE VIEW active_users AS SELECT id FROM users",
+          "CREATE TEMP VIEW active_users AS SELECT id FROM users",
+          "CREATE TEMPORARY VIEW active_users AS SELECT id FROM users",
+          "CREATE UNLOGGED TABLE audit_log (id INTEGER)",
+          "CREATE INDEX CONCURRENTLY idx_users_email ON users(email)",
+          "CREATE UNIQUE INDEX CONCURRENTLY idx_users_email ON users(email)",
+          "DROP INDEX CONCURRENTLY idx_users_email",
+          "CREATE OR REPLACE TEMP VIEW active_users AS SELECT id FROM users",
+          "CREATE OR REPLACE TEMPORARY VIEW active_users AS SELECT id FROM users",
+          "CREATE RECURSIVE VIEW active_users AS SELECT id FROM users",
+          "CREATE OR REPLACE TEMP RECURSIVE VIEW active_users AS SELECT id FROM users",
+          "CREATE TEMP RECURSIVE VIEW active_users AS SELECT id FROM users",
+          "CREATE TEMPORARY RECURSIVE VIEW active_users AS SELECT id FROM users",
+          "ALTER MATERIALIZED VIEW active_users RENAME TO archived_users",
+          "DROP MATERIALIZED VIEW active_users",
+          "REFRESH MATERIALIZED VIEW active_users",
+          "REFRESH MATERIALIZED VIEW CONCURRENTLY active_users",
+          "CREATE SEQUENCE internal_ids",
+          "CREATE TEMPORARY SEQUENCE internal_ids",
+          "CREATE UNLOGGED SEQUENCE internal_ids",
+          "EXPLAIN SELECT email FROM users",
+          "EXPLAIN VERBOSE SELECT email FROM users",
+          "EXPLAIN ANALYZE VERBOSE SELECT email FROM users",
+          "EXPLAIN QUERY PLAN SELECT email FROM users",
+          "EXPLAIN FORMAT=JSON SELECT email FROM users",
+          "EXPLAIN EXTENDED SELECT email FROM users",
+          "EXPLAIN PARTITIONS SELECT email FROM users",
+          "EXPLAIN PLAN FOR SELECT email FROM users",
+          "GRANT SELECT ON users TO analyst;",
+          "GRANT SELECT ON TABLE users TO analyst;",
+          "GRANT analyst TO reviewer;",
+          "REVOKE SELECT ON users FROM analyst;",
+          "REVOKE SELECT ON TABLE users FROM analyst;",
+          "REVOKE analyst FROM reviewer;",
+          "grant analyst to reviewer",
+          "revoke analyst from reviewer",
+          "SHOW TABLES;",
+          "SHOW VARIABLES;",
+          "SHOW STATUS;",
+          "SHOW COLUMNS FROM users;",
+          "DESCRIBE users;",
+          "DESCRIBE users email;",
+          "MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = source.value;",
+          "MERGE INTO target t USING source s ON t.id = s.id WHEN MATCHED THEN UPDATE SET value = s.value;",
+          "REPLACE INTO users(id) VALUES (1)",
+          "CALL refresh_cache()",
+          "EXEC refresh_cache",
+          "EXECUTE refresh_cache",
+          "VACUUM users;",
+          "VACUUM;",
+          "ANALYZE users;",
+          "ANALYZE;",
+          "SHOW search_path;",
+          "TRUNCATE users;",
+          "COPY users TO STDOUT;",
+          "UPSERT INTO users(id) VALUES (1);",
+          "CREATE FUNCTION f() RETURNS int AS 'SELECT 1' LANGUAGE SQL;",
+          "CREATE PROCEDURE refresh_cache() LANGUAGE SQL AS 'SELECT 1';",
+          "CREATE TRIGGER audit_insert AFTER INSERT ON users EXECUTE FUNCTION audit();",
+          "CREATE TYPE mood AS ENUM ('happy', 'sad');",
+          "BEGIN IMMEDIATE TRANSACTION",
+          "BEGIN EXCLUSIVE",
+          "ROLLBACK TO SAVEPOINT checkpoint",
+          "END TRANSACTION",
+          "ABORT TRANSACTION",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "COMMIT WORK AND CHAIN",
+          "ROLLBACK TRANSACTION AND NO CHAIN",
+          "PRAGMA table_info(users)",
+          "VALUES (1)",
+          "BEGIN TRANSACTION",
+          "COMMIT",
+          "ROLLBACK TRANSACTION",
+          "ALTER TABLE users ENABLE ROW LEVEL SECURITY",
+          "ALTER TABLE users OWNER TO admin",
+          "TRUNCATE TABLE users",
+          "DROP TABLE users",
+          "privateKey: hunter2",
+          "Database: internal-db",
+          "Database: internal database",
+          "Database: &primary internal-db",
+          "Mode: production",
+          "Profile: release",
+          "Region: us-east-1",
+          "Namespace: internal",
+          "Logging: |\n  verbose output enabled",
+          "Payload: | # internal output\n  repository source",
+          "Mode: !Ref Environment",
+          '"db host": internal',
+          '"db:host": internal database',
+          '"db\\\":host": internal database',
+          "Payload: |2 # internal output\n  repository source",
+          "Payload: >2- # internal output\n  repository source",
+          '"Database": internal database',
+          "'Database': &primary internal-db",
+          "- Database: internal-db",
+          "#include <stdio.h>",
+          "#include<stdio.h>",
+          "# include <stdio.h>",
+          "#define FEATURE 1",
+          "#pragma once",
+          "#import <Foundation/Foundation.h>",
+          "@import Foundation;",
+          "export import std;",
+          "#nullable enable",
+          "#[derive(Debug)]",
+          "@interface Foo : NSObject",
+          "#![allow(dead_code)]",
+          '#checksum "source.cs" "{00000000-0000-0000-0000-000000000000}" "00"',
+          "@synthesize property = _property;",
+          "@dynamic property;",
+          "@compatibility_alias Alias Original;",
+          "mod internal;",
+          "mod internal {}",
+          "macro_rules! example {}",
+          "@autoreleasepool {",
+          "@try {",
+          "@Override",
+          "@dataclass",
+          "@staticmethod",
+          "@cache",
+          "@contextmanager",
+          "@abstractmethod",
+          "package main",
+          "set -euo pipefail",
+          "namespace Acme {",
+          "namespace {",
+          "namespace Acme::Core {",
+          "body { color: red; }",
+          "@media (max-width: 600px) { body { color: red; } }",
+          "@Inject",
+          "@Test",
+          '@app.route("/x")',
+          "@throw exception;",
+          "@synchronized(obj) {",
+          '<?php echo "value";',
+          "#!/usr/bin/env bash",
+          "COMMIT;",
+          "PRAGMA table_info(users);",
+          "EXPLAIN SELECT email FROM users;",
+          "CREATE TEMP RECURSIVE VIEW active_users AS SELECT id FROM users;",
+          "#include HEADER_FILE",
+          "using System;",
+          "global using System;",
+          "using static System.Math;",
+          "using Foo = Namespace.Type;",
+          "use foo;",
+          "pub use foo;",
+          "<!-- internal repository note -->",
+          "<![CDATA[internal_repository]]>",
+          '<?xml-stylesheet type="text/xsl" href="style.xsl"?>',
+          '<!DOCTYPE note [<!ENTITY writer "internal">]>',
+          '<?xml version="1.0"?>',
+          "<!DOCTYPE html>",
+        ],
+      },
+      delivery: {
+        ...run.factory!.delivery!,
+        knownLimitations: ["await deploy()", "await deploy(\n  production\n)", "async with client:\n    await deploy()"],
+      },
+      terminal: {
+        outcome: "accepted",
+        decidedAt: "2026-08-18T02:00:00Z",
+        safeDetail: '<setting enabled="true" />',
+      },
+    });
+    const structuredSourceReceipt = factoryReceiptFromRun!(structuredSourceRun, "Agency Agents");
+    const structuredSourceReceiptJson = JSON.stringify(structuredSourceReceipt);
+    expect(structuredSourceReceiptJson).not.toMatch(/user_id|SELECT (?:1|email|DISTINCT|TOP)|Select email|WITH active|alice@example|\[database\]|x, y|database_url|server_host|internal-db|hunter2|import os|from \. import|pathlib|(?:result|Result) = (?:output|load_config|new |\[|\{)|Handler =|Config =|INSERT INTO|UPDATE users(?: u)? SET|DELETE FROM|Delete from users|CREATE (?:TEMP TABLE|MATERIALIZED VIEW|OR REPLACE VIEW)|(?:ALTER|DROP|REFRESH) MATERIALIZED VIEW|ALTER TABLE|TRUNCATE TABLE|DROP TABLE|await deploy|setting enabled/);
+    for (const unsafeVariant of [
+      "(x, y) = (1, 2)", "({x} = source)", "flags |= ADMIN", "mask &= allowed",
+      "cache ??= build()", "value <<= 1", "UNION SELECT", "FOR UPDATE",
+      "users, roles", "generate_series", "TOP 10 PERCENT", 'FROM \\"users\\"',
+      "CREATE TEMP VIEW", "CREATE TEMPORARY VIEW", "CREATE UNLOGGED TABLE",
+      "CREATE INDEX CONCURRENTLY", "CREATE UNIQUE INDEX CONCURRENTLY", "DROP INDEX CONCURRENTLY",
+      "CREATE OR REPLACE TEMP VIEW", "CREATE OR REPLACE TEMPORARY VIEW",
+      "CREATE GLOBAL TEMPORARY TABLE", "CREATE LOCAL TEMPORARY TABLE", "CREATE RECURSIVE VIEW",
+      "REFRESH MATERIALIZED VIEW CONCURRENTLY", "CREATE SEQUENCE", "CREATE TEMPORARY SEQUENCE",
+      "CREATE UNLOGGED SEQUENCE", "EXPLAIN SELECT", "EXPLAIN VERBOSE", "EXPLAIN ANALYZE VERBOSE",
+      "EXPLAIN QUERY PLAN", "EXPLAIN FORMAT=JSON", "PRAGMA table_info", "VALUES (1)",
+      "BEGIN TRANSACTION", "COMMIT", "ROLLBACK TRANSACTION",
+      "BEGIN IMMEDIATE TRANSACTION", "BEGIN EXCLUSIVE", "ROLLBACK TO SAVEPOINT",
+      "END TRANSACTION", "ABORT TRANSACTION", "SET TRANSACTION ISOLATION LEVEL",
+      "COMMIT WORK AND CHAIN", "ROLLBACK TRANSACTION AND NO CHAIN",
+      "Database: internal-db", "Database: internal database", "Database: &primary internal-db",
+      '"Database": internal database', "'Database': &primary internal-db", "- Database: internal-db",
+      "Mode: production", "Profile: release", "Region: us-east-1", "Namespace: internal", "Logging: |",
+      "Payload: | # internal output", "Mode: !Ref Environment",
+      '"db host": internal', "Payload: |2 # internal output", "Payload: >2- # internal output",
+      '"db:host": internal database', '"db\\\":host": internal database',
+      "#include", "# include", "#define", "#pragma", "#import", "using System", "global using",
+      "using static", "using Foo", "use foo", "pub use foo",
+      "@import Foundation", "export import std", "CREATE OR REPLACE TEMP RECURSIVE VIEW",
+      "CREATE TEMP RECURSIVE VIEW", "CREATE TEMPORARY RECURSIVE VIEW",
+      "#nullable enable", "#[derive(Debug)]", "@interface Foo",
+      "#![allow(dead_code)]", "#checksum", "@synthesize", "@dynamic", "@compatibility_alias",
+      "mod internal", "macro_rules!", "@autoreleasepool", "@try", "@Override", "@dataclass", "#!/usr/bin/env bash",
+      "@staticmethod", "@Inject", "@Test", "@app.route", "@throw", "@synchronized", "<?php",
+      "EXPLAIN EXTENDED", "EXPLAIN PARTITIONS", "COMMIT;", "PRAGMA table_info(users);",
+      "EXPLAIN PLAN FOR", "GRANT SELECT", "REVOKE SELECT", "SHOW TABLES", "DESCRIBE users", "MERGE INTO",
+      "GRANT analyst", "REVOKE analyst", "SHOW VARIABLES", "SHOW STATUS", "SHOW COLUMNS",
+      "grant analyst", "revoke analyst", "REPLACE INTO", "CALL refresh_cache", "EXEC refresh_cache",
+      "@cache", "@contextmanager", "@abstractmethod",
+      "VACUUM users", "ANALYZE users", "SHOW search_path", "TRUNCATE users",
+      "COPY users", "UPSERT INTO", "CREATE FUNCTION", "CREATE PROCEDURE", "CREATE TRIGGER",
+      "CREATE TYPE", "package main", "set -euo pipefail", "namespace Acme", "namespace {",
+      "body { color: red; }", "@media (max-width: 600px)",
+      "EXPLAIN SELECT email FROM users;", "CREATE TEMP RECURSIVE VIEW active_users AS SELECT id FROM users;",
+      "<!--", "<![CDATA", "<?xml", "<!DOCTYPE",
+      "({ x = 1 } = source)", "([x = 1] = source)", "[x, y] = source",
+    ]) expect(structuredSourceReceiptJson).not.toContain(unsafeVariant);
+
+    const safeProseRun = factoryRun("safe-prose-terminal-factory", "completed", {
+      currentClaim: null,
+      blockers: [],
+      workContract: {
+        ...run.factory!.workContract,
+        title: "Status: ready for desktop review.",
+      },
+      plan: {
+        ...run.factory!.plan!,
+        knownLimitations: [
+          "Select a project from the list.",
+          "Select items from catalog.",
+          "Select items from catalog",
+          "Select items from catalog for review.",
+          "Status = ready when all checks pass.",
+          "Status: ready",
+          "Risk: rollout remains manual.",
+          "Result: passed.",
+          "Note: review with the client.",
+          "Status: ready\nAll systems nominal.",
+          "C++ support remains unchanged.",
+          "Use <setting> as the documented label.",
+          "Import settings only after approval.",
+          "Import data",
+          "Import users",
+          "From planning, continue to review.",
+          "Result = output only after validation.",
+          "Await deployment only after approval.",
+          "Insert users into the selected team.",
+          "Update users after approval.",
+          "Create table views in the dashboard.",
+          "Explain the select option to reviewers.",
+          "Explain how to update the dashboard.",
+          "Begin",
+          "Commit",
+          "Rollback",
+          "Abort",
+          "End",
+          "Owner: Alice",
+          "Priority: High",
+          "Severity: High",
+          "Show tables in the dashboard.",
+          "@alice please review the delivery.",
+          "Call reviewers after approval.",
+          "Package main changes for release.",
+          "Set deployment rules before approval.",
+          "Namespace review remains pending.",
+          "Vacuum the workspace after approval.",
+          "Analyze reported evidence.",
+          "Show readiness after validation.",
+          "Truncate labels in the UI.",
+          "Copy the summary for review.",
+          "Create function descriptions for users.",
+          "Create type descriptions for users.",
+          "Use body color in the report.",
+          "Media queries remain review notes.",
+        ],
+      },
+      delivery: {
+        ...run.factory!.delivery!,
+        knownLimitations: [
+          "Delete old entries from history.",
+          "Delete from history",
+          "Client-reported: shown only as bounded metadata.",
+          "Database:\nHost details remain client-reported.",
+        ],
+      },
+      terminal: {
+        outcome: "accepted",
+        decidedAt: "2026-08-18T02:00:00Z",
+        safeDetail: "Validation completed successfully. All required checks passed.",
+      },
+    });
+    const safeProseReceipt = factoryReceiptFromRun!(safeProseRun, "Agency Agents");
+    expect(safeProseReceipt).toMatchObject({
+      workTitle: "Status: ready for desktop review.",
+      detail: "Validation completed successfully. All required checks passed.",
+      limitations: [
+        "Select a project from the list.",
+        "Select items from catalog.",
+        "Select items from catalog",
+        "Select items from catalog for review.",
+        "Status = ready when all checks pass.",
+        "Status: ready",
+        "Risk: rollout remains manual.",
+        "Result: passed.",
+        "Note: review with the client.",
+        "Status: ready All systems nominal.",
+        "C++ support remains unchanged.",
+        "Use <setting> as the documented label.",
+        "Import settings only after approval.",
+        "Import data",
+        "Import users",
+        "From planning, continue to review.",
+        "Result = output only after validation.",
+        "Await deployment only after approval.",
+        "Insert users into the selected team.",
+        "Update users after approval.",
+        "Create table views in the dashboard.",
+        "Explain the select option to reviewers.",
+        "Explain how to update the dashboard.",
+        "Begin",
+        "Commit",
+        "Rollback",
+        "Abort",
+        "End",
+        "Owner: Alice",
+        "Priority: High",
+        "Severity: High",
+        "Show tables in the dashboard.",
+        "@alice please review the delivery.",
+        "Call reviewers after approval.",
+        "Package main changes for release.",
+        "Set deployment rules before approval.",
+        "Namespace review remains pending.",
+        "Vacuum the workspace after approval.",
+        "Analyze reported evidence.",
+        "Show readiness after validation.",
+        "Truncate labels in the UI.",
+        "Copy the summary for review.",
+        "Create function descriptions for users.",
+        "Create type descriptions for users.",
+        "Use body color in the report.",
+        "Media queries remain review notes.",
+        "Delete old entries from history.",
+        "Delete from history",
+        "Client-reported: shown only as bounded metadata.",
+        "Database: Host details remain client-reported.",
+      ],
+    });
+  });
+
+  it("journals one bounded Factory receipt when reload observes attempt exhaustion", async () => {
+    activity.clear();
+    const exhaustedRun = {
+      ...factoryRun("factory-attempt-exhausted", "completed", {
+        currentClaim: null,
+        blockers: [],
+        terminal: {
+          outcome: "attemptExhausted",
+          decidedAt: "2026-08-18T02:00:00Z",
+          safeDetail: `Inspect /opt/customer/private/build.log ${"x".repeat(700)}`,
+        },
+      }),
+      state: "rework" as const,
+      endedAt: "2026-08-18T02:00:00Z",
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "experts_list") return [performanceExpert()] as never;
+      if (command === "expert_runs_list") return [exhaustedRun] as never;
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      return [] as never;
+    });
+    const { default: Experts } = await import("$lib/components/Experts.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Experts, { target });
+    try {
+      const receiptEntry = await vi.waitFor(() => {
+        const entries = activity.entries.filter((entry) =>
+          entry.receipt?.operation === "factory"
+          && entry.receipt.runId === "factory-attempt-exhausted");
+        expect(entries).toHaveLength(1);
+        return entries[0]!;
+      });
+      expect(receiptEntry.receipt).toMatchObject({
+        operation: "factory",
+        outcome: "attemptExhausted",
+      });
+      expect(JSON.stringify(receiptEntry)).not.toContain("/opt/customer/private");
+      expect((receiptEntry.receipt as { detail?: string }).detail?.length).toBeLessThanOrEqual(512);
+
+      const runsTab = [...target.querySelectorAll<HTMLButtonElement>('button[role="tab"]')]
+        .find((button) => button.textContent?.startsWith("Runs"))!;
+      const loadsBeforeReload = vi.mocked(invoke).mock.calls.filter(([command]) => command === "expert_runs_list").length;
+      runsTab.click();
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(([command]) =>
+        command === "expert_runs_list").length).toBeGreaterThan(loadsBeforeReload));
+      await tick();
+      expect(activity.entries.filter((entry) =>
+        entry.receipt?.operation === "factory"
+        && entry.receipt.runId === "factory-attempt-exhausted")).toHaveLength(1);
+    } finally {
+      unmount(component);
+      target.remove();
+      activity.clear();
+    }
+  });
+
+  it("does not accept an unbound Workspace Pack revision during Factory creation", async () => {
+    const expert = performanceExpert();
+    corpus.agents = [staleControlAgent];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "experts_list") return [expert] as never;
+      if (command === "expert_runs_list") return [] as never;
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      if (command === "expert_plan_activation") return {
+        expert, projectPath: "/tmp/project", client: "codex", agents: [], skills: [], existing: [],
+        warnings: [], blockers: [], promptPreview: "Start the Expert", rollbackScope: [],
+      } as never;
+      return [] as never;
+    });
+    const { default: Experts } = await import("$lib/components/Experts.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Experts, { target });
+    try {
+      const project = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLSelectElement>('select[aria-label="Project"]');
+        expect(candidate?.querySelector('option[value="/tmp/project"]')).toBeTruthy();
+        return candidate!;
+      });
+      project.value = "/tmp/project";
+      project.dispatchEvent(new Event("change", { bubbles: true }));
+      const create = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "Create Factory Run");
+        expect(candidate?.disabled).toBe(false);
+        return candidate!;
+      });
+      create.click();
+      const dialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((item) => item.querySelector("h1")?.textContent === "Create Factory Run");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      const inputs = [
+        [dialog.querySelector<HTMLInputElement>('input[aria-label="Ticket reference"]')!, "AA-100"],
+        [dialog.querySelector<HTMLInputElement>('input[aria-label="Work-order title"]')!, "Digest-bound run"],
+        [dialog.querySelector<HTMLTextAreaElement>('textarea[aria-label="Objective"]')!, "Bind the reviewed Workspace Pack"],
+        [dialog.querySelector<HTMLTextAreaElement>('textarea[aria-label="Acceptance criteria"]')!, "Digest is exact"],
+      ] as const;
+      for (const [input, value] of inputs) {
+        input.value = value;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      const confirm = dialog.querySelector<HTMLButtonElement>('button[data-modal-action="confirm"]')!;
+      expect(dialog.querySelector('input[aria-label="Workspace Pack plan digest"]')).toBeNull();
+      expect(dialog.textContent).toContain("Workspace Pack binding is unavailable until the app can verify a selected pack revision");
+      await tick();
+      expect(confirm.disabled).toBe(false);
+      confirm.click();
+      const review = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((item) => item.querySelector("h1")?.textContent === "Review Reviewer");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      expect(review.textContent).not.toContain("Workspace Pack revision:");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("creates a bounded Factory activation and exposes the existing Experts control-room authority", async () => {
+    const expert = performanceExpert();
+    const planRun = factoryRun("factory-plan");
+    const finalRun = factoryRun("factory-final", "awaitingFinalApproval", {
+      revision: 11, blockers: [], currentClaim: null,
+    });
+    const completedRun = factoryRun("factory-completed", "completed", {
+      revision: 12, blockers: [], currentClaim: null,
+      terminal: { outcome: "accepted", decidedAt: "2026-08-18T02:00:00Z", safeDetail: null },
+    });
+    corpus.agents = [staleControlAgent];
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText: vi.fn(async () => undefined) } });
+    vi.mocked(invoke).mockImplementation(async (command: string, args) => {
+      if (command === "experts_list") return [expert] as never;
+      if (command === "expert_runs_list") return [planRun, finalRun, completedRun] as never;
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      if (command === "expert_plan_activation") return {
+        expert, projectPath: "/tmp/project", client: "codex", agents: [], skills: [], existing: [],
+        warnings: [], blockers: [], promptPreview: "Start the Expert", rollbackScope: [],
+      } as never;
+      if (command === "expert_activate") return {
+        id: "activation-record", expertId: expert.id, expertVersion: expert.version,
+        projectPath: "/tmp/project", client: "codex", activatedAt: "2026-08-18T02:00:00Z",
+        installedAgents: [], installedSkills: [], runId: "factory-new",
+      } as never;
+      if (command === "expert_run_factory_release_claim") return factoryRun("factory-plan", "awaitingPlanApproval", {
+        revision: 8, currentClaim: null,
+      }) as never;
+      if (command === "expert_run_factory_plan_decide") return factoryRun("factory-plan", "build", {
+        revision: 9, currentClaim: null, blockers: [],
+      }) as never;
+      if (command === "expert_run_factory_final_decide") return factoryRun("factory-final", "completed", {
+        revision: 12, currentClaim: null, blockers: [],
+        terminal: { outcome: "rework", decidedAt: "2026-08-18T02:00:00Z", safeDetail: null },
+      }) as never;
+      return [] as never;
+    });
+    const { default: Experts } = await import("$lib/components/Experts.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Experts, { target });
+    try {
+      const project = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLSelectElement>('select[aria-label="Project"]');
+        expect(candidate?.querySelector('option[value="/tmp/project"]')).toBeTruthy();
+        return candidate!;
+      });
+      project.value = "/tmp/project";
+      project.dispatchEvent(new Event("change", { bubbles: true }));
+      const create = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "Create Factory Run");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      create.click();
+      const creationDialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((dialog) => dialog.querySelector("h1")?.textContent === "Create Factory Run");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      const ticket = creationDialog.querySelector<HTMLInputElement>('input[aria-label="Ticket reference"]')!;
+      const title = creationDialog.querySelector<HTMLInputElement>('input[aria-label="Work-order title"]')!;
+      const objective = creationDialog.querySelector<HTMLTextAreaElement>('textarea[aria-label="Objective"]')!;
+      const criteria = creationDialog.querySelector<HTMLTextAreaElement>('textarea[aria-label="Acceptance criteria"]')!;
+      const nonGoals = creationDialog.querySelector<HTMLTextAreaElement>('textarea[aria-label="Non-goals"]')!;
+      expect(ticket.maxLength).toBe(160);
+      expect(title.maxLength).toBe(160);
+      expect(objective.maxLength).toBe(4096);
+      expect(nonGoals.required).toBe(false);
+      for (const [input, value] of [[ticket, "AA-99"], [title, "Bounded run"], [objective, "Deliver safely"], [criteria, "Tests pass"]] as const) {
+        input.value = value;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      await tick();
+      const reviewCreation = creationDialog.querySelector<HTMLButtonElement>('button[data-modal-action="confirm"]')!;
+      expect(reviewCreation.disabled).toBe(false);
+      reviewCreation.click();
+      const activationDialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((dialog) => dialog.querySelector("h1")?.textContent === "Review Reviewer");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      [...activationDialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Create Factory Run")!.click();
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.some(([command, args]) =>
+        command === "expert_activate"
+        && (args as Record<string, any>)?.workOrder?.title === "Bounded run"
+        && !("readiness" in (args as Record<string, any>).workOrder)
+        && !("revision" in (args as Record<string, any>).workOrder)
+      )).toBe(true));
+      const copiedFactoryPrompt = await vi.waitFor(() => {
+        const copied = vi.mocked(navigator.clipboard.writeText).mock.calls.at(-1)?.[0];
+        expect(copied).toBeTruthy();
+        return copied!;
+      });
+      expect(copiedFactoryPrompt).toContain("Factory Run ID: factory-new");
+      expect(copiedFactoryPrompt).toContain("Agency Agents remains the control plane");
+      expect(copiedFactoryPrompt).not.toContain("expert_runs_get_contract");
+
+      target.querySelector<HTMLButtonElement>('button[role="tab"]:nth-of-type(3)')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Awaiting plan approval"));
+      expect(target.textContent).toContain("Attempt 2 of 3");
+      expect(target.textContent).toContain("Elapsed");
+      expect(target.textContent).toContain("Head head-new");
+      expect(target.textContent).toContain("Validation reported");
+      expect(target.textContent).toContain("CI unavailable");
+      expect(target.textContent).toContain("client-reported");
+
+      const reviewPlan = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Review plan")!;
+      reviewPlan.click();
+      const planDialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((dialog) => dialog.textContent?.includes("Plan revision plan-2"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      expect(planDialog.textContent).toContain("Approve plan");
+      expect(planDialog.textContent).toContain("Reject plan");
+      expect(planDialog.textContent).toContain("Agency Agents cannot stop an external process");
+      expect(planDialog.textContent).toContain("Release claim");
+      [...planDialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Release claim")!.click();
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.some(([command, args]) =>
+        command === "expert_run_factory_release_claim"
+        && JSON.stringify(args) === JSON.stringify({ id: "factory-plan", expectedRevision: 7 })
+      )).toBe(true));
+      const refreshedApprove = await vi.waitFor(() => {
+        expect(planDialog.textContent).toContain("revision 8");
+        const candidate = [...planDialog.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "Approve plan");
+        expect(candidate?.disabled).toBe(false);
+        return candidate!;
+      });
+      refreshedApprove.click();
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.some(([command, args]) =>
+        command === "expert_run_factory_plan_decide"
+        && JSON.stringify(args) === JSON.stringify({
+          id: "factory-plan", expectedRevision: 8, planRevision: "plan-2", decision: "approve",
+        })
+      )).toBe(true));
+      await vi.waitFor(() => expect(planDialog.isConnected).toBe(false));
+
+      const finalReview = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Review final result")!;
+      finalReview.click();
+      const finalDialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((dialog) => dialog.textContent?.includes("https://example.test/pull/42"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      expect(finalDialog.textContent).toContain("Manual merge remains");
+      expect(finalDialog.textContent).toContain("Accept result");
+      expect(finalDialog.textContent).toContain("Request rework");
+      const requestRework = await vi.waitFor(() => {
+        const candidate = [...finalDialog.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "Request rework");
+        expect(candidate?.disabled).toBe(false);
+        return candidate!;
+      });
+      requestRework.click();
+      const finalDecision = await vi.waitFor(() => {
+        const candidate = vi.mocked(invoke).mock.calls.find(([command]) =>
+          command === "expert_run_factory_final_decide");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      expect(finalDecision[1]).toEqual({
+        id: "factory-final",
+        input: {
+          expectedRevision: 11,
+          outcome: "rework",
+          approvedPlanRevision: "plan-2",
+          headCommit: "head-new",
+          checkWaivers: [],
+          independentReviewWaiverReason: null,
+          safeDetail: null,
+        },
+      });
+
+      const completed = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "View Factory run")!;
+      completed.click();
+      const completedDialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((dialog) => dialog.textContent?.includes("Add a stale revision regression test"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      expect(completedDialog.textContent).toContain("client-reported proposal");
+      expect([...completedDialog.querySelectorAll("a, button")].some((control) =>
+        control.textContent?.includes("Add a stale revision regression test"))).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("refreshes an open Factory decision after a stale revision without retrying or losing dialog focus", async () => {
+    const expert = performanceExpert();
+    let listedRuns = [factoryRun("factory-stale")];
+    corpus.agents = [staleControlAgent];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "experts_list") return [expert] as never;
+      if (command === "expert_runs_list") return listedRuns as never;
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      if (command === "expert_run_factory_plan_decide") {
+        listedRuns = [factoryRun("factory-stale", "awaitingPlanApproval", { revision: 8 })];
+        throw { code: "invalid_argument", message: "Factory Run revision changed from 7 to 8" };
+      }
+      return [] as never;
+    });
+    const { default: Experts } = await import("$lib/components/Experts.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Experts, { target });
+    try {
+      const runsTab = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>('button[role="tab"]')]
+          .find((button) => button.textContent?.startsWith("Runs"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      runsTab.click();
+      const review = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "Review plan");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      review.click();
+      const dialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((item) => item.textContent?.includes("revision 7"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      const approve = [...dialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Approve plan")!;
+      approve.focus();
+      approve.click();
+
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(([command]) =>
+        command === "expert_run_factory_plan_decide")).toEqual([[
+          "expert_run_factory_plan_decide",
+          { id: "factory-stale", expectedRevision: 7, planRevision: "plan-2", decision: "approve" },
+        ]]));
+      await vi.waitFor(() => expect(dialog.textContent).toContain("revision 8"));
+      expect(target.querySelector<HTMLElement>('[role="status"]')?.textContent)
+        .toContain("Current revision loaded");
+      expect(dialog.isConnected).toBe(true);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("requires an explicit local reason before waiving Independent Review and never journals that reason", async () => {
+    activity.clear();
+    const expert = performanceExpert();
+    const reviewRun = factoryRun("factory-review-waiver", "independentReview", {
+      revision: 10, currentClaim: null, blockers: [], review: null, delivery: null,
+    });
+    const deliveredRun = factoryRun("factory-review-waiver", "delivery", {
+      revision: 11, currentClaim: null, blockers: [], review: null, delivery: null,
+      humanWaivers: [{
+        kind: "independentReview", checkName: null, reason: "No distinct reviewer is available",
+        createdAt: "2026-08-18T02:00:00Z",
+      }],
+    });
+    corpus.agents = [staleControlAgent];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "experts_list") return [expert] as never;
+      if (command === "expert_runs_list") return [reviewRun] as never;
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      if (command === "expert_run_factory_waive_review") return deliveredRun as never;
+      return [] as never;
+    });
+    const { default: Experts } = await import("$lib/components/Experts.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Experts, { target });
+    try {
+      const runsTab = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>('button[role="tab"]')]
+          .find((button) => button.textContent?.startsWith("Runs"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      runsTab.click();
+      const view = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "View Factory run");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      view.click();
+      const dialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((item) => item.textContent?.includes("Independent review"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      const reason = dialog.querySelector<HTMLTextAreaElement>('textarea[aria-label="Independent Review waiver reason"]');
+      const waive = [...dialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Waive independent review");
+      expect(reason).toBeTruthy();
+      expect(reason?.maxLength).toBe(4096);
+      expect(waive?.disabled).toBe(true);
+      reason!.value = "No distinct reviewer is available";
+      reason!.dispatchEvent(new Event("input", { bubbles: true }));
+      await tick();
+      expect(waive?.disabled).toBe(false);
+      waive!.click();
+
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls).toContainEqual([
+        "expert_run_factory_waive_review",
+        { id: "factory-review-waiver", expectedRevision: 10, reason: "No distinct reviewer is available" },
+      ]));
+      await vi.waitFor(() => expect(dialog.textContent).toContain("Phase: Delivery · revision 11"));
+      expect(JSON.stringify(activity.entries)).not.toContain("No distinct reviewer is available");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("keeps one authoritative accepted Factory decision and bounded in-memory receipt when local persistence fails", async () => {
+    activity.clear();
+    ui.section = "experts";
+    const expert = performanceExpert();
+    const finalRun = factoryRun("factory-persist-failure", "awaitingFinalApproval", {
+      revision: 11, currentClaim: null, blockers: [],
+    });
+    const acceptedRun = {
+      ...factoryRun("factory-persist-failure", "completed", {
+        revision: 12,
+        currentClaim: null,
+        blockers: [],
+        humanWaivers: [
+          { kind: "qualityCheck", checkName: "Tests", reason: "private quota waiver", createdAt: "2026-08-18T02:00:00Z" },
+          { kind: "qualityCheck", checkName: "Review", reason: "private quota waiver", createdAt: "2026-08-18T02:00:00Z" },
+        ],
+        terminal: { outcome: "accepted", decidedAt: "2026-08-18T02:00:00Z", safeDetail: null },
+      }),
+      state: "accepted" as const,
+      endedAt: "2026-08-18T02:00:00Z",
+    };
+    corpus.agents = [staleControlAgent];
+    let terminalReturned = false;
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "experts_list") return [expert] as never;
+      if (command === "expert_runs_list") return [finalRun] as never;
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      if (command === "expert_run_factory_final_decide") {
+        terminalReturned = true;
+        return acceptedRun as never;
+      }
+      return [] as never;
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const originalSetItem = localStorage.setItem.bind(localStorage);
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (!terminalReturned) return originalSetItem(key, value);
+      throw new Error("quota exceeded after terminal commit");
+    });
+    const { default: Experts } = await import("$lib/components/Experts.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Experts, { target });
+    try {
+      const runsTab = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>('button[role="tab"]')]
+          .find((button) => button.textContent?.startsWith("Runs"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      runsTab.click();
+      const review = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "Review final result");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      review.click();
+      const dialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((item) => item.textContent?.includes("Final waiver reason"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      const waiver = dialog.querySelector<HTMLTextAreaElement>("textarea")!;
+      waiver.value = "private quota waiver";
+      waiver.dispatchEvent(new Event("input", { bubbles: true }));
+      await tick();
+      const accept = [...dialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Accept result")!;
+      expect(accept.disabled).toBe(false);
+      accept.click();
+
+      const terminalCall = await vi.waitFor(() => {
+        const calls = vi.mocked(invoke).mock.calls.filter(([command]) =>
+          command === "expert_run_factory_final_decide");
+        expect(calls).toHaveLength(1);
+        return calls[0]!;
+      });
+      expect(terminalCall[1]).toMatchObject({
+        id: "factory-persist-failure",
+        input: {
+          expectedRevision: 11,
+          outcome: "accepted",
+          checkWaivers: [
+            { checkName: "Tests", reason: "private quota waiver" },
+            { checkName: "Review", reason: "private quota waiver" },
+          ],
+        },
+      });
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) =>
+        command === "expert_run_factory_final_decide")).toHaveLength(1);
+      await vi.waitFor(() => expect(
+        experts.runs.find((run) => run.id === "factory-persist-failure")?.factory,
+      ).toMatchObject({ phase: "completed", revision: 12, terminal: { outcome: "accepted" } }));
+      const journaled = await vi.waitFor(() => {
+        const entry = activity.entries.find((candidate) =>
+          candidate.receipt?.operation === "factory"
+          && candidate.receipt.runId === "factory-persist-failure");
+        expect(entry).toBeTruthy();
+        return entry!;
+      });
+      await vi.waitFor(() => expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining("persistNow failed"),
+      ));
+      expect(journaled?.receipt).toMatchObject({
+        operation: "factory",
+        outcome: "accepted",
+        succeeded: 0,
+        failed: 0,
+        items: [],
+        checks: [
+          { name: "Tests", result: "waived" },
+          { name: "Review", result: "waived" },
+        ],
+        deliveryReference: "https://example.test/pull/42",
+        provenance: "clientReported",
+      });
+      expect(JSON.stringify(journaled)).not.toContain("private quota waiver");
+      expect(JSON.stringify(journaled)).not.toContain("Implement the control plane");
+      expect(JSON.stringify(journaled)).not.toContain("/tmp/project");
+      expect(setItem).toHaveBeenCalled();
+      expect(ui.section).toBe("activity");
+      expect(ui.activityReceiptId).toBe(journaled.id);
+
+      const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+      const activityTarget = document.createElement("div");
+      document.body.append(activityTarget);
+      const activityComponent = mount(ActivityHistory, { target: activityTarget });
+      try {
+        const details = await vi.waitFor(() => {
+          const candidate = activityTarget.querySelector<HTMLDetailsElement>(`details[data-activity-id="${journaled.id}"]`);
+          expect(candidate?.open).toBe(true);
+          return candidate!;
+        });
+        expect(document.activeElement).toBe(details.querySelector("summary"));
+        expect(ui.activityReceiptId).toBeNull();
+      } finally {
+        unmount(activityComponent);
+        activityTarget.remove();
+      }
+    } finally {
+      unmount(component);
+      target.remove();
+      setItem.mockRestore();
+      warning.mockRestore();
+      activity.clear();
+    }
+  });
+
+  it("cancels once and opens the exact returned Factory receipt in Activity", async () => {
+    activity.clear();
+    ui.section = "experts";
+    const activeRun = factoryRun("factory-cancel-receipt", "build", {
+      revision: 8,
+      blockers: [],
+    });
+    const cancelledRun = {
+      ...factoryRun("factory-cancel-receipt", "completed", {
+        revision: 9,
+        currentClaim: null,
+        blockers: [],
+        terminal: {
+          outcome: "cancelled",
+          decidedAt: "2026-08-18T02:00:00Z",
+          safeDetail: "Cancelled by the desktop user.",
+        },
+      }),
+      state: "cancelled" as const,
+      endedAt: "2026-08-18T02:00:00Z",
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "experts_list") return [performanceExpert()] as never;
+      if (command === "expert_runs_list") return [activeRun] as never;
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      if (command === "expert_run_factory_cancel") return cancelledRun as never;
+      return [] as never;
+    });
+    const { default: Experts } = await import("$lib/components/Experts.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Experts, { target });
+    try {
+      const runsTab = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>('button[role="tab"]')]
+          .find((button) => button.textContent?.startsWith("Runs"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      runsTab.click();
+      const view = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLButtonElement>("button")]
+          .find((button) => button.textContent?.trim() === "View Factory run");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      view.click();
+      const dialog = await vi.waitFor(() => {
+        const candidate = [...target.querySelectorAll<HTMLElement>('[role="dialog"]')]
+          .find((item) => item.textContent?.includes("Cancel run"));
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      [...dialog.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "Cancel run")!.click();
+
+      await vi.waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(([command]) =>
+        command === "expert_run_factory_cancel")).toHaveLength(1));
+      const journaled = await vi.waitFor(() => {
+        const candidate = activity.entries.find((entry) =>
+          entry.receipt?.operation === "factory"
+          && entry.receipt.runId === "factory-cancel-receipt");
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      expect(ui.section).toBe("activity");
+      expect(ui.activityReceiptId).toBe(journaled.id);
+      const cancellationDetail = journaled.receipt?.operation === "factory"
+        ? journaled.receipt.detail
+        : null;
+      expect(cancellationDetail).toContain(
+        "Agency Agents revoked control-plane authority; external work was not stopped or deleted.",
+      );
+      expect(cancellationDetail).toContain("Cancelled by the desktop user.");
+
+      const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+      const activityTarget = document.createElement("div");
+      document.body.append(activityTarget);
+      const activityComponent = mount(ActivityHistory, { target: activityTarget });
+      try {
+        const details = await vi.waitFor(() => {
+          const candidate = activityTarget.querySelector<HTMLDetailsElement>(`details[data-activity-id="${journaled.id}"]`);
+          expect(candidate?.open).toBe(true);
+          return candidate!;
+        });
+        expect(document.activeElement).toBe(details.querySelector("summary"));
+      } finally {
+        unmount(activityComponent);
+        activityTarget.remove();
+      }
+    } finally {
+      unmount(component);
+      target.remove();
+      activity.clear();
+    }
   });
 
   it("gates the Expert Improvement Coach until five comparable terminal runs", async () => {
@@ -876,6 +2572,57 @@ describe("frontend test harness", () => {
     expect(detail).toContain("[redacted]");
     expect(safeActivityDetail("https://user:password@example.test ghp_abcdefghijklmnopqrstuvwxyz sk-secretvalue"))
       .toBe("https://[redacted]@example.test [redacted] [redacted]");
+    expect(safeActivityDetail("privateKey: hunter2")).not.toContain("hunter2");
+    for (const unsafeDetail of [
+      "jwt=secret-jwt",
+      "pwd=hunter2",
+      "signature=secret-signature",
+      "sig=azure-secret",
+      "session=eyJhbGciOiJIUzI1NiJ9.e30.c2ln",
+      "session=eyJhbGciOiJub25lIn0.e30.",
+      "session=eyJlbmMiOiJBMTI4R0NNIn0.ZW5jcnlwdGVk.aXY.Y2lwaGVydGV4dA.dGFn",
+      "sid=0123456789abcdef0123456789abcdef",
+      "data=eyJlbmMiOiJBMTI4R0NNIn0..aXY.Y2lwaGVydGV4dA.dGFn",
+      "PHPSESSID=0123456789abcdef0123456789abcdef",
+    ]) expect(safeActivityDetail(unsafeDetail)).not.toContain(unsafeDetail.split("=")[1]);
+    expect(safeActivityDetail("assignee=alice assignment=ready design=compact"))
+      .toBe("assignee=alice assignment=ready design=compact");
+    for (const bearer of [
+      ["xox", "b-123456789012-123456789012-abcdefghijklmnopqrstuvwxyz"].join(""),
+      "glpat-abcdefghijklmnopqrstuvwxyz",
+      "glsoat-abcdefghijklmnopqrstuvwxyz",
+      "glffct-abcdefghijklmnopqrstuvwxyz",
+      "hf_abcdefghijklmnopqrstuvwxyz",
+      "npm_abcdefghijklmnopqrstuvwxyz",
+      "dckr_pat_abcdefghijklmnopqrstuvwxyz",
+      "pypi-abcdefghijklmnopqrstuvwxyz",
+      "lin_api_abcdefghijklmnopqrstuvwxyz",
+      "shpat_abcdefghijklmnopqrstuvwxyz",
+      "dop_v1_abcdefghijklmnopqrstuvwxyz",
+      "AIzaSyabcdefghijklmnopqrstuvwxyz",
+      "ya29.abcdefghijklmnopqrstuvwxyz",
+      "SG.abcdefghijklmnopqrstuv.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO",
+      ["sk_", "live_abcdefghijklmnopqrstuvwxyz"].join(""),
+      ["rk_", "live_abcdefghijklmnopqrstuvwxyz"].join(""),
+    ]) expect(safeActivityDetail(bearer)).not.toContain(bearer);
+    for (const encodedCredentialUrl of [
+      "https://hooks.slack.com/%73ervices/T00000000/B00000000/abcdefghijklmnopqrstuvwx",
+      "https://discord.com/api/v10/%77ebhooks/123456789/abcdefghijklmnopqrstuvwx",
+      "https://api.telegram.org/bot123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ/getMe",
+      "https://example.test/%2574oken/credential-value",
+      "https://canary.discord.com/api/webhooks/123456789/abcdefghijklmnopqrstuvwx",
+      "https://tenant.webhook.office.com/webhookb2/tenant/IncomingWebhook/abcdefghijklmnopqrstuvwx/channel",
+      "https://chat.example.test/hooks/abcdefghijklmnopqrstuvwx",
+      "https://chat.example.test/hooks/abcdefghijkl%7Emnopqrstuvwx",
+      "https://chat.example.test/hooks/abcdefghijkl+mnopqrstuvwx",
+      "https://chat.example.test/hooks/abcdefghijkl=mnopqrstuvwx",
+      "https://chat.example.test/hooks/abcdefgh;ijklmnop",
+      "https://chat.example.test/hooks/abcdefgh,ijklmnop",
+      "https://chat.example.test/hooks/abcdefgh(ijklmnop)",
+      "https://chat.example.test/hooks/abcdefgh'ijklmnop",
+      "https://chat.example.test/hooks/abcdefgh%2Fijklmnop",
+      "https://tenant.webhook.example/abcdefgh%2Fijklmnop",
+    ]) expect(safeActivityDetail(encodedCredentialUrl)).not.toContain(encodedCredentialUrl);
   });
 
   it("formats AppError Activity details before redaction and bounding", () => {
@@ -908,7 +2655,7 @@ describe("frontend test harness", () => {
     expect(normalized?.items).toHaveLength(2);
     expect(normalized?.items[0]?.destination).not.toContain("\0");
     expect(normalized?.items[0]?.destination?.length).toBeLessThanOrEqual(4096);
-    expect(normalized?.items[1]?.detail).toContain("token=[redacted]");
+    expect(normalized?.items[1]?.detail).toContain("[redacted");
     expect(normalized?.items[1]?.detail).not.toContain("secret123");
     expect(normalized?.items[1]?.detail).not.toContain("\n");
 
@@ -916,10 +2663,182 @@ describe("frontend test harness", () => {
       legacy,
       { ...legacy, id: "receipt", receipt: normalized },
       { ...legacy, id: "invalid", receipt: { operation: "execute", items: [] } },
+      { ...legacy, id: "unsafe", detail: "token=legacy-secret /Users/alice/private/build.log" },
+      {
+        ...legacy,
+        id: "unsafe-fields",
+        subjectName: "token=subject-secret",
+        agentName: "fn leaked() {}",
+        agentSlug: "/Users/alice/private-agent",
+        projectPath: "/Users/alice/private-project",
+      },
+      {
+        ...legacy,
+        id: "unsafe-additive-fields",
+        action: "bulk",
+        tool: ["xox", "b-123456789012-123456789012-abcdefghijklmnopqrstuvwxyz"].join(""),
+        extra: "package main",
+        receipt: {
+          operation: "repair",
+          items: [{
+            kind: "agent",
+            name: "package main",
+            destination: "/Users/alice/exact-destination/token=destination-secret",
+            outcome: "error",
+            detail: "body { color: red; }",
+          }],
+        },
+      },
+      { ...legacy, id: "unknown-action", action: "token=action-secret" },
+      { ...legacy, id: "invalid-time", ts: "not-a-date" },
+      { ...legacy, id: "noncanonical-time", ts: "August 19, 2026 08:00:00 UTC" },
+      { ...legacy, id: "invalid-leap-day", ts: "2026-02-29T10:00:00Z" },
+      { ...legacy, id: "invalid-hour", ts: "2026-01-01T24:00:00Z" },
+      { ...legacy, id: "invalid-outcome", outcome: "unknown" },
+      { ...legacy, detail: "duplicate must not survive" },
     ]);
     expect(restored[0]).toEqual(legacy);
     expect(restored[1]?.receipt).toEqual(normalized);
     expect(restored[2]?.receipt).toBeUndefined();
+    expect(restored[3]?.detail).not.toContain("legacy-secret");
+    expect(restored[3]?.detail).not.toContain("/Users/alice/private/build.log");
+    expect(JSON.stringify(restored[4])).not.toMatch(/subject-secret|fn leaked|private-agent|\/Users\/alice/);
+    expect(restored[4]).toMatchObject({ projectLabel: "private-project" });
+    expect(restored[4]?.projectPath).toBeUndefined();
+    expect(JSON.stringify(restored[5])).not.toMatch(
+      /action-secret|xoxb-|package main|destination-secret|body \{ color: red; \}|\"extra\"/,
+    );
+    expect(restored[5]?.action).toBe("bulk");
+    expect(JSON.stringify(restored)).not.toMatch(
+      /unknown-action|action-secret|invalid-time|noncanonical-time|invalid-leap-day|invalid-hour|invalid-outcome|duplicate must not survive/,
+    );
+    expect(restored.filter((entry) => entry.id === "legacy")).toHaveLength(1);
+  });
+
+  it("preserves exact safe generic receipt destinations beyond the detail limit", () => {
+    const longDestination = `/tmp/${"x".repeat(700)}.md`;
+    const sourceShapedDestination = "/tmp/body { color: red; }.md";
+    const normalized = normalizeActivityReceipt({
+      operation: "install",
+      items: [
+        { kind: "agent", name: "Long", destination: longDestination, outcome: "ok" },
+        { kind: "skill", name: "CSS name", destination: sourceShapedDestination, outcome: "ok" },
+      ],
+    });
+    expect(normalized?.items.map((item) => item.destination)).toEqual([
+      longDestination,
+      sourceShapedDestination,
+    ]);
+  });
+
+  it("redacts residual SQL, namespace, and nested CSS source from Factory receipts", () => {
+    for (const unsafeLimitation of [
+      "VACUUM;",
+      "ANALYZE;",
+      "CREATE TYPE mood AS ENUM ('happy', 'sad');",
+      "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
+      "CREATE ROLE analyst;",
+      "CREATE POLICY tenant_policy ON accounts;",
+      "ALTER TYPE mood ADD VALUE 'happy';",
+      "COMMENT ON TABLE accounts IS 'internal';",
+      "create extension pgcrypto",
+      "alter type mood add value 'sad'",
+      "drop role analyst",
+      "comment on table accounts is 'internal'",
+      "Create Role analyst",
+      "Comment On Table accounts IS 'internal'",
+      "CrEaTe ExTeNsIoN pgcrypto",
+      "namespace {",
+      "namespace Acme::Core {",
+      "inline namespace v1 {",
+      "export namespace v1 {",
+      "export inline namespace v1 {",
+      "namespace current = Acme::Core;",
+      "@media (max-width: 600px) { body { color: red; } }",
+    ]) {
+      const normalized = normalizeActivityReceipt({
+        operation: "factory",
+        runId: "factory-run",
+        ticketReference: "AA-42",
+        workTitle: "Ship Factory control room",
+        projectLabel: "Agency Agents",
+        outcome: "accepted",
+        planRevision: "plan-2",
+        baseCommit: "base-abc",
+        headCommit: "head-new",
+        checks: [{ name: "Tests", result: "pass" }],
+        reviewStatus: "passed",
+        deliveryReference: null,
+        retryCount: 1,
+        limitations: [unsafeLimitation],
+        provenance: "clientReported",
+      });
+      expect(JSON.stringify(normalized)).not.toContain(unsafeLimitation);
+    }
+  });
+
+  it("normalizes MCP Activity projection through the same privacy boundary", async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => command === "mcp_audit_list" ? [
+      {
+        id: "audit-invalid",
+        timestamp: "not-a-timestamp",
+        client: "codex",
+        tool: "skills_list",
+        action: "read",
+        phase: "terminal",
+        success: true,
+      },
+      {
+        id: "audit-1",
+        timestamp: "2026-08-19T08:00:00Z",
+        client: "glpat-abcdefghijklmnopqrstuvwxyz",
+        tool: "package main",
+        action: "read",
+        phase: "terminal",
+        success: true,
+        projectPath: "/Users/alice/work/Agency Agents",
+      },
+    ] as never : [] as never);
+
+    await activity.refreshMcpAudit();
+    const entry = activity.entries.find((candidate) => candidate.id === "mcp:audit-1");
+    expect(entry).toMatchObject({ action: "mcp", projectLabel: "Agency Agents" });
+    expect(JSON.stringify(entry)).not.toMatch(/glpat-|package main|\/Users\/alice/);
+    expect(entry?.projectPath).toBeUndefined();
+    expect(activity.entries.every(Boolean)).toBe(true);
+    expect(activity.entries.some((candidate) => candidate?.id === "mcp:audit-invalid")).toBe(false);
+    vi.mocked(invoke).mockResolvedValue([] as never);
+    await activity.refreshMcpAudit();
+  });
+
+  it("sanitizes Activity fields before memory and durable persistence", () => {
+    activity.clear();
+    vi.useFakeTimers();
+    try {
+      const id = activity.log({
+        action: "bulk",
+        subject: "agent",
+        subjectName: "token=subject-secret",
+        agentName: "fn leaked() {}",
+        agentSlug: "/Users/alice/private-agent",
+        scope: "project",
+        projectPath: "/Users/alice/private-project",
+        outcome: "error",
+        detail: "https://hooks.slack.com/%73ervices/T000/B000/credential-value",
+      });
+      const inMemory = JSON.stringify(activity.entries.find((entry) => entry.id === id));
+      expect(inMemory).not.toMatch(
+        /subject-secret|fn leaked|private-agent|\/Users\/alice|credential-value/,
+      );
+      expect(inMemory).toContain('"projectLabel":"private-project"');
+      vi.advanceTimersByTime(400);
+      expect(localStorage.getItem("agency-agents:activity:v2")).not.toMatch(
+        /subject-secret|fn leaked|private-agent|\/Users\/alice|credential-value/,
+      );
+    } finally {
+      vi.useRealTimers();
+      activity.clear();
+    }
   });
 
   it("returns the generated id for one normalized Activity receipt", () => {
@@ -941,6 +2860,91 @@ describe("frontend test harness", () => {
     expect(activity.entries.find((entry) => entry.id === id)?.receipt).toMatchObject({
       operation: "repair", succeeded: 1, failed: 1,
     });
+  });
+
+  it("projects both Factory human gates through Activity, restores exact focus, and keeps delivery evidence inert", async () => {
+    activity.clear();
+    const planRun = factoryRun("factory-plan");
+    const finalRun = factoryRun("factory-final", "awaitingFinalApproval", {
+      revision: 11, blockers: [], currentClaim: null,
+    });
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "expert_runs_list") return [planRun, finalRun] as never;
+      if (command === "projects_list") return [{ path: "/tmp/project", label: "Agency Agents", installedCount: 0 }] as never;
+      if (command === "project_readiness_get") return readinessFixture("/tmp/project", false) as never;
+      if (command === "agent_library_list" || command === "skill_folders_list") return emptyFolderState() as never;
+      if (["expert_creation_requests", "expert_activation_requests"].includes(command)) return [] as never;
+      return [] as never;
+    });
+    const receiptId = activity.log({
+      action: "factory" as never,
+      subject: "factory" as never,
+      subjectName: "Ship Factory control room",
+      outcome: "ok",
+      detail: "Factory result accepted",
+      receipt: {
+        operation: "factory",
+        runId: "factory-final",
+        ticketReference: "AA-42",
+        workTitle: "Ship Factory control room",
+        projectLabel: "Agency Agents",
+        outcome: "accepted",
+        planRevision: "plan-2",
+        baseCommit: "base-abc",
+        headCommit: "head-new",
+        checks: [{ name: "Tests", result: "pass" }],
+        reviewStatus: "passed",
+        deliveryReference: "https://example.test/pull/42",
+        retryCount: 1,
+        limitations: ["Manual merge remains"],
+        provenance: "clientReported",
+      } as never,
+    });
+    ui.section = "activity";
+    ui.navStack = [];
+    ui.navIndex = -1;
+    ui.initNav();
+    const { default: ActivityHistory } = await import("$lib/components/ActivityHistory.svelte");
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(ActivityHistory, { target });
+    try {
+      const factoryTriggers = await vi.waitFor(() => {
+        const candidates = [...target.querySelectorAll<HTMLButtonElement>('[data-review-source="expert-run"]')];
+        expect(candidates).toHaveLength(2);
+        return candidates;
+      });
+      expect(target.textContent).toContain("Plan approval · Ship Factory control room");
+      expect(target.textContent).toContain("Final approval · Ship Factory control room");
+      expect(target.textContent).toContain("Agency Agents · revision 7");
+      expect(target.textContent).toContain("Agency Agents · revision 11");
+      expect(factoryTriggers[0].dataset.reviewTrigger).toContain(":7");
+
+      const initiatingTrigger = factoryTriggers[0];
+      initiatingTrigger.click();
+      expect((ui as unknown as { expertReview: unknown }).expertReview).toEqual({ kind: "run", id: "factory-plan" });
+      expect(ui.returnToActivityReview("expert-run", "factory-plan")).toBe(true);
+      await vi.waitFor(() => expect(document.activeElement).toBe(initiatingTrigger));
+
+      [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "History")!.click();
+      const details = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLDetailsElement>(`details[data-activity-id="${receiptId}"]`);
+        expect(candidate).toBeTruthy();
+        return candidate!;
+      });
+      details.open = true;
+      await tick();
+      expect(details.textContent).toContain("Accepted");
+      expect(details.textContent).toContain("Client-reported");
+      expect(details.textContent).toContain("Tests · passed");
+      expect(details.textContent).toContain("https://example.test/pull/42");
+      expect(details.querySelector('a[href="https://example.test/pull/42"]')).toBeNull();
+    } finally {
+      unmount(component);
+      target.remove();
+      activity.clear();
+    }
   });
 
   it("reviews then applies one mixed Workspace Pack and records exact retained results", async () => {
@@ -5496,7 +7500,7 @@ describe("frontend test harness", () => {
       ["./components/AgentDetailTabs.svelte", [/sourceError = isAppError[^\n]*appErrorMessage/, /renderError = isAppError[^\n]*appErrorMessage/]],
       ["./components/CatalogFirstRun.svelte", [/firstRun\.error[^\n]*appErrorMessage/]],
       ["./components/SkillsWorkspace.svelte", [/skillCollectionBatch[^]*?announcement = isAppError[^\n]*appErrorMessage/, /readSkillText[^]*?folderError = isAppError[^\n]*appErrorMessage/, /skillInstallPlan[^]*?announcement = isAppError[^\n]*appErrorMessage/]],
-      ["./components/Experts.svelte", [/Could not plan activation[^\n]*appErrorMessage/, /detail: isAppError[^\n]*appErrorMessage/, /Activation failed[^\n]*appErrorMessage/, /Could not save Expert[^\n]*appErrorMessage/, /Could not reject Expert proposal[^\n]*appErrorMessage/, /Could not review run[^\n]*appErrorMessage/, /Import failed[^\n]*appErrorMessage/, /Export failed[^\n]*appErrorMessage/]],
+      ["./components/Experts.svelte", [/Could not plan activation[^\n]*appErrorMessage/, /detail: isAppError[^\n]*appErrorMessage/, /Activation failed[^\n]*appErrorMessage/, /Could not save Expert[^\n]*appErrorMessage/, /Could not reject Expert proposal[^\n]*appErrorMessage/, /Could not review run[^\n]*appErrorMessage/, /Factory action failed[^\n]*appErrorMessage/, /Import failed[^\n]*appErrorMessage/, /Export failed[^\n]*appErrorMessage/]],
       ["./components/InstallModal.svelte", [/async function reviewPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewCollection[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollback[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewRoster[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyRosterPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runRosterLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showRosterHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollbackRoster[^]*?actionError = isAppError[^\n]*appErrorMessage/]],
       ["./components/DiffModal.svelte", [/install\.diff[^]*?appErrorMessage/]],
       ["./components/AgencyDashboard.svelte", [/async function updateCatalog[^]*?appErrorMessage/]],
@@ -5506,14 +7510,14 @@ describe("frontend test harness", () => {
       ["./stores/experts.svelte.ts", [/expert_runs_list[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/activity.svelte.ts", [/safeActivityDetail[^]*?isAppError\(value\) \? appErrorMessage\(value\)/]],
     ]);
-    expect([...inventory.values()].flat()).toHaveLength(52);
+    expect([...inventory.values()].flat()).toHaveLength(53);
     for (const [path, markers] of inventory) {
       const source = rel01Sources[path];
       expect(source, path).toBeTruthy();
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(64);
+      .toHaveLength(65);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -6619,8 +8623,8 @@ describe("frontend test harness", () => {
     expect(applied.result?.outcome).toBe("succeeded");
     expect(activity.entries).toHaveLength(before + 1);
     expect(activity.entries[0]).toMatchObject({
-      action: "update", scope: "project", projectPath: "/tmp/project",
-      subjectName: "AGENTS.md", detail: "/tmp/project/AGENTS.md · token=[redacted]",
+      action: "update", scope: "project", projectLabel: "project",
+      subjectName: "AGENTS.md", detail: "[private path]",
     });
   });
 

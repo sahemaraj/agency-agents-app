@@ -19,6 +19,7 @@ use axum::{
     routing::post_service,
     Router,
 };
+use base64::Engine as _;
 use rmcp::{
     handler::server::{
         router::tool::ToolRouter,
@@ -46,6 +47,81 @@ use subtle::ConstantTimeEq;
 const MIN_HTTP_TOKEN_BYTES: usize = 43;
 const MAX_RESOURCE_SUBSCRIPTIONS: usize = 128;
 const MAX_MCP_PROJECT_PATHS: usize = 64;
+const FACTORY_TOOL_NAMES: [&str; 7] = [
+    "factory_runs_claim_phase",
+    "factory_runs_complete_phase",
+    "factory_runs_discover_work",
+    "factory_runs_get_claim_contract",
+    "factory_runs_submit_artifact",
+    "factory_runs_submit_blocker",
+    "factory_runs_submit_evidence",
+];
+
+#[cfg(test)]
+static FACTORY_TERMINAL_AUDIT_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, usize>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static FACTORY_READ_DISPATCH_BARRIERS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Barrier>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn pause_next_factory_read_dispatch(app_data_dir: &Path) -> Arc<tokio::sync::Barrier> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    FACTORY_READ_DISPATCH_BARRIERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("Factory read dispatch barrier lock")
+        .insert(app_data_dir.to_path_buf(), Arc::clone(&barrier));
+    barrier
+}
+
+#[cfg(test)]
+fn take_factory_read_dispatch_barrier(app_data_dir: &Path) -> Option<Arc<tokio::sync::Barrier>> {
+    FACTORY_READ_DISPATCH_BARRIERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("Factory read dispatch barrier lock")
+        .remove(app_data_dir)
+}
+
+#[cfg(test)]
+fn inject_factory_terminal_audit_failures(app_data_dir: &Path, failures: usize) {
+    FACTORY_TERMINAL_AUDIT_FAILURES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("Factory terminal audit failure injection lock")
+        .insert(app_data_dir.to_path_buf(), failures);
+}
+
+#[cfg(test)]
+fn should_inject_factory_terminal_audit_failure(app_data_dir: &Path) -> bool {
+    let mut failures = FACTORY_TERMINAL_AUDIT_FAILURES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("Factory terminal audit failure injection lock");
+    let Some(remaining) = failures.get_mut(app_data_dir) else {
+        return false;
+    };
+    if *remaining == 0 {
+        failures.remove(app_data_dir);
+        return false;
+    }
+    *remaining -= 1;
+    if *remaining == 0 {
+        failures.remove(app_data_dir);
+    }
+    true
+}
+
+fn canonical_mcp_client_identity(value: &str) -> &str {
+    match value {
+        "claude" | "claudeCode" => "claude",
+        value => value,
+    }
+}
 
 #[derive(Clone)]
 struct HttpAuth([u8; 32]);
@@ -621,6 +697,395 @@ struct ExpertBlockerRequest {
     summary: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+enum FactoryWorkerPhaseRequest {
+    Planning,
+    Build,
+    Validation,
+    IndependentReview,
+    Delivery,
+}
+
+impl From<FactoryWorkerPhaseRequest> for crate::expert_runs::FactoryPhase {
+    fn from(value: FactoryWorkerPhaseRequest) -> Self {
+        match value {
+            FactoryWorkerPhaseRequest::Planning => Self::Planning,
+            FactoryWorkerPhaseRequest::Build => Self::Build,
+            FactoryWorkerPhaseRequest::Validation => Self::Validation,
+            FactoryWorkerPhaseRequest::IndependentReview => Self::IndependentReview,
+            FactoryWorkerPhaseRequest::Delivery => Self::Delivery,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryWorkRequest {
+    project_path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryClaimPhaseRequest {
+    id: String,
+    project_path: String,
+    expected_revision: u64,
+    phase: FactoryWorkerPhaseRequest,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryClaimContractRequest {
+    id: String,
+    project_path: String,
+    claim_id: String,
+    claim_generation: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryWorkerContextRequest {
+    expected_revision: u64,
+    phase: FactoryWorkerPhaseRequest,
+    attempt: u8,
+    claim_id: String,
+    claim_generation: u64,
+    work_contract_revision: String,
+    approved_plan_revision: Option<String>,
+    base_commit: Option<String>,
+    head_commit: Option<String>,
+    idempotency_key: String,
+}
+
+impl From<FactoryWorkerContextRequest> for crate::expert_runs::FactoryWorkerContext {
+    fn from(value: FactoryWorkerContextRequest) -> Self {
+        Self {
+            expected_revision: value.expected_revision,
+            phase: value.phase.into(),
+            attempt: value.attempt,
+            claim_id: value.claim_id,
+            claim_generation: value.claim_generation,
+            work_contract_revision: value.work_contract_revision,
+            approved_plan_revision: value.approved_plan_revision,
+            base_commit: value.base_commit,
+            head_commit: value.head_commit,
+            idempotency_key: value.idempotency_key,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryArtifactInputRequest {
+    kind: String,
+    label: String,
+    reference: String,
+    digest: String,
+    byte_size: u64,
+    summary: String,
+}
+
+impl From<FactoryArtifactInputRequest> for crate::expert_runs::FactoryArtifactInput {
+    fn from(value: FactoryArtifactInputRequest) -> Self {
+        Self {
+            kind: value.kind,
+            label: value.label,
+            reference: value.reference,
+            digest: value.digest,
+            byte_size: value.byte_size,
+            summary: value.summary,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactorySubmitArtifactRequest {
+    id: String,
+    project_path: String,
+    context: FactoryWorkerContextRequest,
+    artifact: FactoryArtifactInputRequest,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+enum FactoryEvidenceResultRequest {
+    Pass,
+    Fail,
+    Skipped,
+}
+
+impl From<FactoryEvidenceResultRequest> for crate::expert_runs::EvidenceResult {
+    fn from(value: FactoryEvidenceResultRequest) -> Self {
+        match value {
+            FactoryEvidenceResultRequest::Pass => Self::Pass,
+            FactoryEvidenceResultRequest::Fail => Self::Fail,
+            FactoryEvidenceResultRequest::Skipped => Self::Skipped,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryEvidenceInputRequest {
+    check_name: String,
+    result: FactoryEvidenceResultRequest,
+    command_label: Option<String>,
+    exit_code: Option<i32>,
+    summary: String,
+    #[serde(default)]
+    artifact_ids: Vec<String>,
+}
+
+impl From<FactoryEvidenceInputRequest> for crate::expert_runs::FactoryEvidenceInput {
+    fn from(value: FactoryEvidenceInputRequest) -> Self {
+        Self {
+            check_name: value.check_name,
+            result: value.result.into(),
+            command_label: value.command_label,
+            exit_code: value.exit_code,
+            summary: value.summary,
+            artifact_ids: value.artifact_ids,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactorySubmitEvidenceRequest {
+    id: String,
+    project_path: String,
+    context: FactoryWorkerContextRequest,
+    evidence: FactoryEvidenceInputRequest,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryBlockerInputRequest {
+    kind: String,
+    summary: String,
+}
+
+impl From<FactoryBlockerInputRequest> for crate::expert_runs::FactoryBlockerInput {
+    fn from(value: FactoryBlockerInputRequest) -> Self {
+        Self {
+            kind: value.kind,
+            summary: value.summary,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactorySubmitBlockerRequest {
+    id: String,
+    project_path: String,
+    context: FactoryWorkerContextRequest,
+    blocker: FactoryBlockerInputRequest,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryPlanInputRequest {
+    content: String,
+    #[serde(default)]
+    citations: Vec<String>,
+    #[serde(default)]
+    declared_checks: Vec<String>,
+    #[serde(default)]
+    risks: Vec<String>,
+    #[serde(default)]
+    known_limitations: Vec<String>,
+    base_commit: String,
+}
+
+impl From<FactoryPlanInputRequest> for crate::expert_runs::FactoryPlanInput {
+    fn from(value: FactoryPlanInputRequest) -> Self {
+        Self {
+            content: value.content,
+            citations: value.citations,
+            declared_checks: value.declared_checks,
+            risks: value.risks,
+            known_limitations: value.known_limitations,
+            base_commit: value.base_commit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+enum FactoryReviewVerdictRequest {
+    Pass,
+    Rework,
+}
+
+impl From<FactoryReviewVerdictRequest> for crate::expert_runs::FactoryReviewVerdict {
+    fn from(value: FactoryReviewVerdictRequest) -> Self {
+        match value {
+            FactoryReviewVerdictRequest::Pass => Self::Pass,
+            FactoryReviewVerdictRequest::Rework => Self::Rework,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+enum FactoryReviewSeverityRequest {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Info,
+}
+
+impl From<FactoryReviewSeverityRequest> for crate::expert_runs::FactoryReviewSeverity {
+    fn from(value: FactoryReviewSeverityRequest) -> Self {
+        match value {
+            FactoryReviewSeverityRequest::Critical => Self::Critical,
+            FactoryReviewSeverityRequest::High => Self::High,
+            FactoryReviewSeverityRequest::Medium => Self::Medium,
+            FactoryReviewSeverityRequest::Low => Self::Low,
+            FactoryReviewSeverityRequest::Info => Self::Info,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryReviewFindingRequest {
+    severity: FactoryReviewSeverityRequest,
+    summary: String,
+}
+
+impl From<FactoryReviewFindingRequest> for crate::expert_runs::FactoryReviewFinding {
+    fn from(value: FactoryReviewFindingRequest) -> Self {
+        Self {
+            severity: value.severity.into(),
+            summary: value.summary,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryReviewInputRequest {
+    verdict: FactoryReviewVerdictRequest,
+    summary: String,
+    #[serde(default)]
+    findings: Vec<FactoryReviewFindingRequest>,
+}
+
+impl From<FactoryReviewInputRequest> for crate::expert_runs::FactoryReviewInput {
+    fn from(value: FactoryReviewInputRequest) -> Self {
+        Self {
+            verdict: value.verdict.into(),
+            summary: value.summary,
+            findings: value.findings.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+enum FactoryImprovementTargetRequest {
+    Test,
+    Rule,
+    Skill,
+    Expert,
+    Playbook,
+    Instruction,
+}
+
+impl From<FactoryImprovementTargetRequest> for crate::expert_runs::FactoryImprovementTarget {
+    fn from(value: FactoryImprovementTargetRequest) -> Self {
+        match value {
+            FactoryImprovementTargetRequest::Test => Self::Test,
+            FactoryImprovementTargetRequest::Rule => Self::Rule,
+            FactoryImprovementTargetRequest::Skill => Self::Skill,
+            FactoryImprovementTargetRequest::Expert => Self::Expert,
+            FactoryImprovementTargetRequest::Playbook => Self::Playbook,
+            FactoryImprovementTargetRequest::Instruction => Self::Instruction,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryImprovementProposalRequest {
+    failure_class: String,
+    target: FactoryImprovementTargetRequest,
+    proposal: String,
+    suggested_test: Option<String>,
+}
+
+impl From<FactoryImprovementProposalRequest> for crate::expert_runs::FactoryImprovementProposal {
+    fn from(value: FactoryImprovementProposalRequest) -> Self {
+        Self {
+            failure_class: value.failure_class,
+            target: value.target.into(),
+            proposal: value.proposal,
+            suggested_test: value.suggested_test,
+            provenance: crate::expert_runs::FactoryProvenance::ClientReported,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryDeliveryInputRequest {
+    reference: String,
+    head_commit: String,
+    evidence_summary: String,
+    #[serde(default)]
+    known_limitations: Vec<String>,
+    improvement_proposal: Option<FactoryImprovementProposalRequest>,
+}
+
+impl From<FactoryDeliveryInputRequest> for crate::expert_runs::FactoryDeliveryInput {
+    fn from(value: FactoryDeliveryInputRequest) -> Self {
+        Self {
+            reference: value.reference,
+            head_commit: value.head_commit,
+            evidence_summary: value.evidence_summary,
+            known_limitations: value.known_limitations,
+            improvement_proposal: value.improvement_proposal.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum FactoryPhaseCompletionRequest {
+    Planning {
+        plan: FactoryPlanInputRequest,
+    },
+    Build {
+        head_commit: String,
+    },
+    Validation,
+    IndependentReview {
+        review: FactoryReviewInputRequest,
+    },
+    Delivery {
+        delivery: FactoryDeliveryInputRequest,
+    },
+}
+
+impl From<FactoryPhaseCompletionRequest> for crate::expert_runs::FactoryPhaseCompletion {
+    fn from(value: FactoryPhaseCompletionRequest) -> Self {
+        match value {
+            FactoryPhaseCompletionRequest::Planning { plan } => {
+                Self::Planning { plan: plan.into() }
+            }
+            FactoryPhaseCompletionRequest::Build { head_commit } => Self::Build { head_commit },
+            FactoryPhaseCompletionRequest::Validation => Self::Validation,
+            FactoryPhaseCompletionRequest::IndependentReview { review } => {
+                Self::IndependentReview {
+                    review: review.into(),
+                }
+            }
+            FactoryPhaseCompletionRequest::Delivery { delivery } => Self::Delivery {
+                delivery: delivery.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FactoryCompletePhaseRequest {
+    id: String,
+    project_path: String,
+    context: FactoryWorkerContextRequest,
+    completion: FactoryPhaseCompletionRequest,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CatalogResponse {
@@ -638,6 +1103,7 @@ struct RemoveSourceResponse {
 pub struct SkillMcpServer {
     state: Arc<AppState>,
     client_identity: String,
+    connection_identity: String,
     #[allow(dead_code, reason = "tool_handler macro reads the generated router")]
     tool_router: ToolRouter<Self>,
     resource_subscriptions:
@@ -654,12 +1120,22 @@ pub(crate) fn agency_agents_tool_names() -> Vec<String> {
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
+    debug_assert!(
+        FACTORY_TOOL_NAMES.iter().all(|expected| names
+            .binary_search_by(|name| name.as_str().cmp(expected))
+            .is_ok()),
+        "Factory MCP tool inventory is incomplete"
+    );
     names
 }
 
 impl Clone for SkillMcpServer {
     fn clone(&self) -> Self {
-        Self::new_with_client(Arc::clone(&self.state), self.client_identity.clone())
+        Self::new_with_client_and_connection(
+            Arc::clone(&self.state),
+            self.client_identity.clone(),
+            self.connection_identity.clone(),
+        )
     }
 }
 
@@ -670,11 +1146,25 @@ impl SkillMcpServer {
     }
 
     fn new_with_client(state: Arc<AppState>, client_identity: impl Into<String>) -> Self {
+        Self::new_with_client_and_connection(
+            state,
+            client_identity,
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
+
+    fn new_with_client_and_connection(
+        state: Arc<AppState>,
+        client_identity: impl Into<String>,
+        connection_identity: impl Into<String>,
+    ) -> Self {
         let mut tool_router = Self::skills_tool_router();
         tool_router.merge(Self::agents_tool_router());
+        let client_identity = client_identity.into();
         Self {
             state,
-            client_identity: client_identity.into(),
+            client_identity,
+            connection_identity: connection_identity.into(),
             tool_router,
             resource_subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
@@ -686,6 +1176,30 @@ impl SkillMcpServer {
 
     pub(crate) fn client_identity(&self) -> &str {
         &self.client_identity
+    }
+
+    fn policy_client_identity(&self) -> &str {
+        canonical_mcp_client_identity(&self.client_identity)
+    }
+
+    fn factory_run_client(&self) -> Option<&'static str> {
+        match self.client_identity.as_str() {
+            "claude" | "claudeCode" => Some("claudeCode"),
+            "codex" => Some("codex"),
+            _ => None,
+        }
+    }
+
+    fn factory_worker_identity(&self) -> Result<String, String> {
+        let client = self.factory_run_client().ok_or_else(|| {
+            "Factory mutations require a Claude Code or Codex stdio client".to_string()
+        })?;
+        let canonical = if client == "claudeCode" {
+            "claude"
+        } else {
+            client
+        };
+        Ok(format!("{canonical}/{}", self.connection_identity))
     }
 
     async fn submit_approval_json(
@@ -758,12 +1272,22 @@ impl SkillMcpServer {
         success: bool,
         project_path: Option<&str>,
     ) -> Result<(), ErrorData> {
+        #[cfg(test)]
+        if phase == "terminal"
+            && is_factory_mutation_tool(tool)
+            && should_inject_factory_terminal_audit_failure(&self.state.app_data_dir)
+        {
+            return Err(ErrorData::internal_error(
+                "injected Factory terminal audit append failure",
+                None,
+            ));
+        }
         append_mcp_audit(
             &self.state.app_data_dir,
             McpAuditEntry {
                 id: id.into(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                client: Some(self.client_identity.clone()),
+                client: Some(self.policy_client_identity().into()),
                 tool: tool.into(),
                 action: action.into(),
                 phase: phase.into(),
@@ -776,6 +1300,251 @@ impl SkillMcpServer {
             ErrorData::internal_error(format!("MCP audit append failed: {error}"), None)
         })
     }
+
+    async fn append_terminal_tool_audit(
+        &self,
+        id: &str,
+        tool: &str,
+        action: &str,
+        success: bool,
+        project_path: Option<&str>,
+    ) -> Result<(), ErrorData> {
+        let first = self
+            .append_tool_audit(id, tool, action, "terminal", success, project_path)
+            .await;
+        let Err(first_error) = first else {
+            return Ok(());
+        };
+        if !is_factory_mutation_tool(tool) {
+            return Err(first_error);
+        }
+
+        let already_durable = crate::state::load_mcp_audit(&self.state.app_data_dir)
+            .await
+            .ok()
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.id == id && entry.phase == "terminal" && entry.success == success
+                })
+            });
+        if already_durable {
+            return Ok(());
+        }
+        self.append_tool_audit(id, tool, action, "terminal", success, project_path)
+            .await
+    }
+
+    fn factory_mutation_audit_digest(
+        &self,
+        tool: &str,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<String> {
+        let client = self.factory_run_client()?;
+        let worker_identity = self.factory_worker_identity().ok()?;
+        let arguments = serde_json::Value::Object(arguments?.clone());
+        let canonical = match tool {
+            "factory_runs_claim_phase" => {
+                let request: FactoryClaimPhaseRequest = serde_json::from_value(arguments).ok()?;
+                let mutation = crate::expert_runs::FactoryClaimRequest {
+                    expected_revision: request.expected_revision,
+                    phase: request.phase.into(),
+                    idempotency_key: request.idempotency_key,
+                };
+                serde_json::json!({
+                    "kind": "claim",
+                    "runId": request.id,
+                    "client": client,
+                    "projectPath": request.project_path,
+                    "workerIdentity": worker_identity,
+                    "request": mutation,
+                })
+            }
+            "factory_runs_submit_artifact" => {
+                let request: FactorySubmitArtifactRequest =
+                    serde_json::from_value(arguments).ok()?;
+                serde_json::json!({
+                    "kind": "artifact",
+                    "runId": request.id,
+                    "client": client,
+                    "projectPath": request.project_path,
+                    "workerIdentity": worker_identity,
+                    "context": crate::expert_runs::FactoryWorkerContext::from(request.context),
+                    "input": crate::expert_runs::FactoryArtifactInput::from(request.artifact),
+                })
+            }
+            "factory_runs_submit_evidence" => {
+                let request: FactorySubmitEvidenceRequest =
+                    serde_json::from_value(arguments).ok()?;
+                serde_json::json!({
+                    "kind": "evidence",
+                    "runId": request.id,
+                    "client": client,
+                    "projectPath": request.project_path,
+                    "workerIdentity": worker_identity,
+                    "context": crate::expert_runs::FactoryWorkerContext::from(request.context),
+                    "input": crate::expert_runs::FactoryEvidenceInput::from(request.evidence),
+                })
+            }
+            "factory_runs_submit_blocker" => {
+                let request: FactorySubmitBlockerRequest =
+                    serde_json::from_value(arguments).ok()?;
+                serde_json::json!({
+                    "kind": "blocker",
+                    "runId": request.id,
+                    "client": client,
+                    "projectPath": request.project_path,
+                    "workerIdentity": worker_identity,
+                    "context": crate::expert_runs::FactoryWorkerContext::from(request.context),
+                    "input": crate::expert_runs::FactoryBlockerInput::from(request.blocker),
+                })
+            }
+            "factory_runs_complete_phase" => {
+                let request: FactoryCompletePhaseRequest =
+                    serde_json::from_value(arguments).ok()?;
+                serde_json::json!({
+                    "kind": "completePhase",
+                    "runId": request.id,
+                    "client": client,
+                    "projectPath": request.project_path,
+                    "workerIdentity": worker_identity,
+                    "context": crate::expert_runs::FactoryWorkerContext::from(request.context),
+                    "completion": crate::expert_runs::FactoryPhaseCompletion::from(request.completion),
+                })
+            }
+            _ => return None,
+        };
+        serde_json::to_vec(&canonical).ok().map(|bytes| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
+        })
+    }
+
+    fn tool_audit_id(
+        &self,
+        tool: &str,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> String {
+        if is_factory_mutation_tool(tool) {
+            return self
+                .factory_mutation_audit_digest(tool, arguments)
+                .map(|digest| {
+                    let nonce = uuid::Uuid::new_v4().simple().to_string();
+                    format!("f{digest}{}", &nonce[..20])
+                })
+                .unwrap_or_else(|| format!("factory:{}", uuid::Uuid::new_v4()));
+        }
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    fn pre_dispatch_tool_audit_id(&self, tool: &str) -> String {
+        if is_factory_mutation_tool(tool) {
+            format!("factory:{}", uuid::Uuid::new_v4())
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        }
+    }
+
+    async fn reconcile_factory_terminal_audits(
+        &self,
+        policy_lease: &crate::state_db::SecurityPolicyLease,
+    ) -> Result<(), ErrorData> {
+        reconcile_factory_terminal_audits_under_policy_lease(&self.state, policy_lease)
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+    }
+}
+
+pub(crate) async fn reconcile_factory_terminal_audits(
+    state: &AppState,
+) -> Result<(), crate::error::AppError> {
+    let policy_lease = crate::state_db::SecurityPolicyLease::exclusive(&state.app_data_dir).await?;
+    reconcile_factory_terminal_audits_under_policy_lease(state, &policy_lease).await
+}
+
+pub(crate) async fn reconcile_factory_terminal_audits_under_policy_lease(
+    state: &AppState,
+    _policy_lease: &crate::state_db::SecurityPolicyLease,
+) -> Result<(), crate::error::AppError> {
+    let audit = crate::state::load_mcp_audit(&state.app_data_dir).await?;
+    let mut pending = Vec::new();
+    let mut seen = HashSet::new();
+    for attempt in audit.iter().filter(|entry| {
+        entry.phase == "attempt"
+            && (factory_audit_digest(&entry.id).is_some() || entry.id.starts_with("factory:"))
+    }) {
+        if seen.insert(attempt.id.clone()) {
+            pending.push(attempt.clone());
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let mut committed = HashSet::new();
+    for client in ["codex", "claudeCode"] {
+        for run in crate::expert_runs::list_runs(state, client, None).await? {
+            if let Some(workflow) = run.factory {
+                committed.extend(
+                    workflow
+                        .idempotency
+                        .into_iter()
+                        .filter_map(|record| factory_digest_token(&record.request_digest)),
+                );
+            }
+        }
+    }
+
+    for attempt in pending {
+        if audit
+            .iter()
+            .any(|entry| entry.id == attempt.id && entry.phase == "terminal")
+        {
+            continue;
+        }
+        let success =
+            factory_audit_digest(&attempt.id).is_some_and(|digest| committed.contains(digest));
+        append_mcp_audit(
+            &state.app_data_dir,
+            McpAuditEntry {
+                id: attempt.id,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                client: attempt.client,
+                tool: attempt.tool,
+                action: attempt.action,
+                phase: "terminal".into(),
+                success,
+                project_path: attempt.project_path,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn factory_audit_digest(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 || bytes[0] != b'f' || !bytes[44..].iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let digest = std::str::from_utf8(&bytes[1..44]).ok()?;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(digest)
+        .ok()
+        .is_some_and(|bytes| bytes.len() == 32)
+        .then_some(digest)
+}
+
+fn factory_digest_token(value: &str) -> Option<String> {
+    if value.len() != 64 {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut digest = [0_u8; 32];
+    for (index, output) in digest.iter_mut().enumerate() {
+        let high = hex_value(bytes[index * 2])?;
+        let low = hex_value(bytes[index * 2 + 1])?;
+        *output = (high << 4) | low;
+    }
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest))
 }
 
 fn action_for_tool(tool: &str) -> Option<McpAction> {
@@ -801,6 +1570,8 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "expert_runs_get"
         | "expert_runs_get_contract"
         | "expert_runs_get_review"
+        | "factory_runs_discover_work"
+        | "factory_runs_get_claim_contract"
         | "experts_get"
         | "experts_capabilities"
         | "experts_search"
@@ -841,6 +1612,11 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "expert_runs_submit_evidence"
         | "expert_runs_report_blocker"
         | "expert_runs_request_review"
+        | "factory_runs_claim_phase"
+        | "factory_runs_submit_artifact"
+        | "factory_runs_submit_evidence"
+        | "factory_runs_submit_blocker"
+        | "factory_runs_complete_phase"
         | "experts_request_update"
         | "experts_request_clone"
         | "experts_request_archive"
@@ -911,6 +1687,17 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "agents_request_batch_collection" => Some(McpAction::AgentDestructive),
         _ => None,
     }
+}
+
+fn is_factory_mutation_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "factory_runs_claim_phase"
+            | "factory_runs_submit_artifact"
+            | "factory_runs_submit_evidence"
+            | "factory_runs_submit_blocker"
+            | "factory_runs_complete_phase"
+    )
 }
 
 fn tool_call_succeeded(result: &Result<CallToolResponse, ErrorData>) -> bool {
@@ -2693,6 +3480,7 @@ impl SkillMcpServer {
         &self,
         Parameters(request): Parameters<ExpertRunListRequest>,
     ) -> Result<String, String> {
+        let include_factory = request.project_path.is_some();
         self.run_tool(
             "expert_runs_list",
             McpAction::Read,
@@ -2707,6 +3495,7 @@ impl SkillMcpServer {
                 .map_err(|error| error.to_string())?;
                 let runs = runs
                     .iter()
+                    .filter(|run| include_factory || run.factory.is_none())
                     .map(crate::expert_runs::mcp_view)
                     .collect::<Vec<_>>();
                 serde_json::to_string_pretty(&runs).map_err(|error| error.to_string())
@@ -2860,6 +3649,233 @@ impl SkillMcpServer {
     ) -> Result<String, String> {
         self.expert_runs_get(Parameters(request)).await
     }
+
+    #[tool(description = "Discover claimable Factory phases for one exact authorized project")]
+    async fn factory_runs_discover_work(
+        &self,
+        Parameters(request): Parameters<FactoryWorkRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "factory_runs_discover_work",
+            McpAction::Read,
+            Some(request.project_path.clone()),
+            async {
+                let work = match self.factory_run_client() {
+                    Some(client) => crate::expert_runs::list_factory_work(
+                        &self.state,
+                        client,
+                        &request.project_path,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?,
+                    None => Vec::new(),
+                };
+                serde_json::to_string_pretty(&work).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Claim one available Factory phase without approval or execution authority"
+    )]
+    async fn factory_runs_claim_phase(
+        &self,
+        Parameters(request): Parameters<FactoryClaimPhaseRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "factory_runs_claim_phase",
+            McpAction::Source,
+            Some(request.project_path.clone()),
+            async {
+                let client = self.factory_run_client().ok_or_else(|| {
+                    "Factory mutations require a Claude Code or Codex stdio client".to_string()
+                })?;
+                let worker_identity = self.factory_worker_identity()?;
+                let claim = crate::expert_runs::factory_claim_phase(
+                    &self.state,
+                    &request.id,
+                    client,
+                    &request.project_path,
+                    &worker_identity,
+                    crate::expert_runs::FactoryClaimRequest {
+                        expected_revision: request.expected_revision,
+                        phase: request.phase.into(),
+                        idempotency_key: request.idempotency_key,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&claim).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Read the immutable contract for this Factory worker claim")]
+    async fn factory_runs_get_claim_contract(
+        &self,
+        Parameters(request): Parameters<FactoryClaimContractRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "factory_runs_get_claim_contract",
+            McpAction::Read,
+            Some(request.project_path.clone()),
+            async {
+                let client = self.factory_run_client().ok_or_else(|| {
+                    "Factory claim contracts require a Claude Code or Codex stdio client"
+                        .to_string()
+                })?;
+                let worker_identity = self.factory_worker_identity()?;
+                let contract = crate::expert_runs::factory_claim_contract(
+                    &self.state,
+                    &request.id,
+                    client,
+                    &request.project_path,
+                    &worker_identity,
+                    &request.claim_id,
+                    request.claim_generation,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&contract).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Submit bounded metadata for an artifact produced by a Factory worker")]
+    async fn factory_runs_submit_artifact(
+        &self,
+        Parameters(request): Parameters<FactorySubmitArtifactRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "factory_runs_submit_artifact",
+            McpAction::Source,
+            Some(request.project_path.clone()),
+            async {
+                let client = self.factory_run_client().ok_or_else(|| {
+                    "Factory mutations require a Claude Code or Codex stdio client".to_string()
+                })?;
+                let worker_identity = self.factory_worker_identity()?;
+                let artifact = crate::expert_runs::factory_submit_artifact(
+                    &self.state,
+                    &request.id,
+                    client,
+                    &request.project_path,
+                    &worker_identity,
+                    request.context.into(),
+                    request.artifact.into(),
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&artifact).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Submit bounded client-reported evidence for a Factory quality check")]
+    async fn factory_runs_submit_evidence(
+        &self,
+        Parameters(request): Parameters<FactorySubmitEvidenceRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "factory_runs_submit_evidence",
+            McpAction::Source,
+            Some(request.project_path.clone()),
+            async {
+                let client = self.factory_run_client().ok_or_else(|| {
+                    "Factory mutations require a Claude Code or Codex stdio client".to_string()
+                })?;
+                let worker_identity = self.factory_worker_identity()?;
+                let evidence = crate::expert_runs::factory_submit_evidence(
+                    &self.state,
+                    &request.id,
+                    client,
+                    &request.project_path,
+                    &worker_identity,
+                    request.context.into(),
+                    request.evidence.into(),
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&evidence).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Submit one bounded blocker for the current Factory worker claim")]
+    async fn factory_runs_submit_blocker(
+        &self,
+        Parameters(request): Parameters<FactorySubmitBlockerRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "factory_runs_submit_blocker",
+            McpAction::Source,
+            Some(request.project_path.clone()),
+            async {
+                let client = self.factory_run_client().ok_or_else(|| {
+                    "Factory mutations require a Claude Code or Codex stdio client".to_string()
+                })?;
+                let worker_identity = self.factory_worker_identity()?;
+                let blocker = crate::expert_runs::factory_submit_blocker(
+                    &self.state,
+                    &request.id,
+                    client,
+                    &request.project_path,
+                    &worker_identity,
+                    request.context.into(),
+                    request.blocker.into(),
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&blocker).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Complete the current Factory phase and return only its control-plane receipt"
+    )]
+    async fn factory_runs_complete_phase(
+        &self,
+        Parameters(request): Parameters<FactoryCompletePhaseRequest>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "factory_runs_complete_phase",
+            McpAction::Source,
+            Some(request.project_path.clone()),
+            async {
+                let client = self.factory_run_client().ok_or_else(|| {
+                    "Factory mutations require a Claude Code or Codex stdio client".to_string()
+                })?;
+                let worker_identity = self.factory_worker_identity()?;
+                let receipt = crate::expert_runs::factory_complete_phase(
+                    &self.state,
+                    &request.id,
+                    client,
+                    &request.project_path,
+                    &worker_identity,
+                    request.context.into(),
+                    request.completion.into(),
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&receipt).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
 }
 
 fn detect_project_languages(project_path: &str) -> Result<Vec<String>, String> {
@@ -2997,40 +4013,47 @@ impl ServerHandler for SkillMcpServer {
         mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let tool = request.name.to_string();
-        let Some(action) = action_for_tool(&tool) else {
-            let id = uuid::Uuid::new_v4().to_string();
-            self.append_tool_audit(&id, &tool, "unknown", "attempt", false, None)
+        let action = action_for_tool(&tool);
+        let action_name = action.map(McpAction::as_str).unwrap_or("unknown");
+        let mut policy_lease =
+            match crate::state_db::SecurityPolicyLease::exclusive(&self.state.app_data_dir).await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let id = self.pre_dispatch_tool_audit_id(&tool);
+                    self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
+                        .await?;
+                    self.append_terminal_tool_audit(&id, &tool, action_name, false, None)
+                        .await?;
+                    return Err(ErrorData::internal_error(error.to_string(), None));
+                }
+            };
+        self.reconcile_factory_terminal_audits(
+            policy_lease
+                .as_ref()
+                .expect("the policy lease was established above"),
+        )
+        .await?;
+        let Some(action) = action else {
+            let id = self.pre_dispatch_tool_audit_id(&tool);
+            self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
                 .await?;
-            self.append_tool_audit(&id, &tool, "unknown", "terminal", false, None)
+            self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
                 .await?;
             return Err(ErrorData::invalid_params(
                 "unclassified MCP tool; request denied before dispatch",
                 None,
             ));
         };
-        let action_name = action.as_str();
-        let policy_lease = if action == McpAction::Read {
-            None
-        } else {
-            match crate::state_db::SecurityPolicyLease::exclusive(&self.state.app_data_dir).await {
-                Ok(lease) => Some(lease),
-                Err(error) => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
-                        .await?;
-                    self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
-                        .await?;
-                    return Err(ErrorData::internal_error(error.to_string(), None));
-                }
-            }
-        };
+        if action == McpAction::Read && !FACTORY_TOOL_NAMES.contains(&tool.as_str()) {
+            drop(policy_lease.take());
+        }
         let requested_projects = match requested_project_paths(&tool, request.arguments.as_ref()) {
             Ok(projects) => projects,
             Err(error) => {
-                let id = uuid::Uuid::new_v4().to_string();
+                let id = self.pre_dispatch_tool_audit_id(&tool);
                 self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
                     .await?;
-                self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                self.append_terminal_tool_audit(&id, &tool, action_name, false, None)
                     .await?;
                 return Err(ErrorData::invalid_params(error, None));
             }
@@ -3040,15 +4063,15 @@ impl ServerHandler for SkillMcpServer {
             for project in projects {
                 let authorization = self
                     .state
-                    .authorize_mcp_client(&self.client_identity, action, Some(project))
+                    .authorize_mcp_client(self.policy_client_identity(), action, Some(project))
                     .await;
                 match authorization {
                     Ok(Some(project)) => authorized.push(project.identity().to_owned()),
                     Ok(None) => {
-                        let id = uuid::Uuid::new_v4().to_string();
+                        let id = self.pre_dispatch_tool_audit_id(&tool);
                         self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
                             .await?;
-                        self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                        self.append_terminal_tool_audit(&id, &tool, action_name, false, None)
                             .await?;
                         return Err(ErrorData::invalid_params(
                             "project path authorization returned no project",
@@ -3056,10 +4079,10 @@ impl ServerHandler for SkillMcpServer {
                         ));
                     }
                     Err(error) => {
-                        let id = uuid::Uuid::new_v4().to_string();
+                        let id = self.pre_dispatch_tool_audit_id(&tool);
                         self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
                             .await?;
-                        self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                        self.append_terminal_tool_audit(&id, &tool, action_name, false, None)
                             .await?;
                         return Err(ErrorData::invalid_params(error.to_string(), None));
                     }
@@ -3071,16 +4094,16 @@ impl ServerHandler for SkillMcpServer {
         let requested_project = requested_project_path(&tool, request.arguments.as_ref());
         let authorization = self
             .state
-            .authorize_mcp_client(&self.client_identity, action, requested_project)
+            .authorize_mcp_client(self.policy_client_identity(), action, requested_project)
             .await
             .map_err(|error| error.to_string());
         let project_authorization = match authorization {
             Ok(project) => project,
             Err(error) => {
-                let id = uuid::Uuid::new_v4().to_string();
+                let id = self.pre_dispatch_tool_audit_id(&tool);
                 self.append_tool_audit(&id, &tool, action_name, "attempt", false, None)
                     .await?;
-                self.append_tool_audit(&id, &tool, action_name, "terminal", false, None)
+                self.append_terminal_tool_audit(&id, &tool, action_name, false, None)
                     .await?;
                 return Err(ErrorData::invalid_params(error, None));
             }
@@ -3095,7 +4118,7 @@ impl ServerHandler for SkillMcpServer {
             .extensions
             .insert(McpProjectAuthorization(project_authorization));
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = self.tool_audit_id(&tool, request.arguments.as_ref());
         self.append_tool_audit(
             &id,
             &tool,
@@ -3109,8 +4132,14 @@ impl ServerHandler for SkillMcpServer {
         let catalog_before = source_catalog_revision(&self.state, &tool).await;
         let peer = context.peer.clone();
         let tool_context = ToolCallContext::new(self, request, context);
+        #[cfg(test)]
+        if action == McpAction::Read && FACTORY_TOOL_NAMES.contains(&tool.as_str()) {
+            if let Some(barrier) = take_factory_read_dispatch_barrier(&self.state.app_data_dir) {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
         let result = self.tool_router.call(tool_context).await;
-        drop(policy_lease);
         let success = tool_call_succeeded(&result);
         let catalog_after = if catalog_before.is_some() {
             source_catalog_revision(&self.state, &tool).await
@@ -3127,15 +4156,15 @@ impl ServerHandler for SkillMcpServer {
                 tracing::debug!(tool, %error, "MCP peer does not accept resource list changes");
             }
         }
-        self.append_tool_audit(
+        self.append_terminal_tool_audit(
             &id,
             &tool,
             action_name,
-            "terminal",
             success,
             authorized_project.as_deref(),
         )
         .await?;
+        drop(policy_lease);
         result
     }
 
@@ -3584,10 +4613,12 @@ mod tests {
     use tokio::sync::{oneshot, Mutex, RwLock};
 
     use super::{
-        action_for_tool, agency_agents_tool_names, catalog_revision, detect_project_languages,
-        package_resource_uri, parse_package_resource_uri, parse_skill_type, parse_update_policy,
+        action_for_tool, agency_agents_tool_names, canonical_mcp_client_identity, catalog_revision,
+        detect_project_languages, package_resource_uri, parse_package_resource_uri,
+        parse_skill_type, parse_update_policy, pause_next_factory_read_dispatch,
         resource_list_changed, search_packages, FindAndInstallRequest, HttpAuth,
         NamedApprovalRequest, RecommendRequest, SkillMcpServer, SkillRuntime, SourceRequest,
+        FACTORY_TOOL_NAMES,
     };
 
     fn package(name: &str, description: &str, installable: bool) -> SkillPackageResult {
@@ -3629,6 +4660,55 @@ mod tests {
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         })
+    }
+
+    async fn create_factory_mcp_run(
+        state: &AppState,
+        project_path: &str,
+        client: &str,
+    ) -> crate::expert_runs::ExpertRun {
+        let now = chrono::Utc::now();
+        crate::expert_runs::create_factory_run(
+            state,
+            crate::expert_runs::ExpertRunCreate {
+                expert_id: "factory-reviewer".into(),
+                expert_version: 1,
+                project_path: project_path.into(),
+                client: client.into(),
+                lead_agent: "lead".into(),
+                supporting_agents: vec!["reviewer".into()],
+                required_skills: vec!["testing".into()],
+                optional_skills: Vec::new(),
+                runbook: Some("factory-runbook".into()),
+                contract: crate::expert_runs::QualityContract {
+                    version: 1,
+                    checks: vec![crate::expert_runs::ExpertCheck {
+                        name: "tests".into(),
+                        kind: "tests".into(),
+                        required: true,
+                        evidence_mode: "clientReported".into(),
+                    }],
+                },
+            },
+            crate::expert_runs::FactoryRunCreate {
+                ticket_reference: "APP-42".into(),
+                title: "Factory MCP lifecycle".into(),
+                objective: "Carry one bounded work order through the worker protocol.".into(),
+                acceptance_criteria: vec!["The exact revision reaches desktop review.".into()],
+                non_goals: vec!["Do not execute repository commands in the app.".into()],
+                playbook: Some("factory-build-review".into()),
+                workspace_pack_revision: Some("a".repeat(64)),
+                risk: crate::expert_runs::FactoryRiskClass::Medium,
+                readiness: crate::expert_runs::FactoryReadinessSnapshot {
+                    checked_at: now.to_rfc3339(),
+                    overall: crate::expert_runs::FactoryReadinessOverall::Ready,
+                    evidence_revision: "a".repeat(64),
+                    summary: vec!["project:ready".into()],
+                },
+            },
+        )
+        .await
+        .expect("create Factory MCP run")
     }
 
     #[test]
@@ -3852,8 +4932,21 @@ mod tests {
         state: Arc<AppState>,
         calls: Vec<serde_json::Value>,
     ) -> Vec<serde_json::Value> {
+        call_tools_over_stdio_as(state, "test", "test-session", calls).await
+    }
+
+    async fn call_tools_over_stdio_as(
+        state: Arc<AppState>,
+        client_identity: &str,
+        connection_identity: &str,
+        calls: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
-        let server = SkillMcpServer::new_with_client(state, "test");
+        let server = SkillMcpServer::new_with_client_and_connection(
+            state,
+            client_identity,
+            connection_identity,
+        );
         let server_task = tokio::spawn(async move {
             server
                 .serve(server_transport)
@@ -3913,6 +5006,19 @@ mod tests {
         }
         server_task.abort();
         responses
+    }
+
+    fn tool_call_ok(response: &serde_json::Value) -> bool {
+        response.get("error").is_none() && response["result"]["isError"] != true
+    }
+
+    fn tool_call_json(response: &serde_json::Value) -> serde_json::Value {
+        serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("tool response JSON")
     }
 
     #[test]
@@ -4868,6 +5974,1151 @@ mod tests {
         assert!(missing["candidates"].is_array());
     }
 
+    #[tokio::test]
+    async fn factory_mcp_identity_is_canonical_and_connection_bound() {
+        assert_eq!(canonical_mcp_client_identity("claudeCode"), "claude");
+        assert_eq!(canonical_mcp_client_identity("claude"), "claude");
+        assert_eq!(canonical_mcp_client_identity("codex"), "codex");
+        assert_eq!(canonical_mcp_client_identity("http"), "http");
+
+        let root = tempfile::tempdir().expect("app data");
+        let server = SkillMcpServer::new_with_client_and_connection(
+            test_state(root.path()),
+            "claudeCode",
+            "connection-a",
+        );
+        assert_eq!(server.client_identity(), "claudeCode");
+        assert_eq!(
+            server.factory_worker_identity().expect("Factory identity"),
+            "claude/connection-a"
+        );
+        assert_eq!(
+            server
+                .clone()
+                .factory_worker_identity()
+                .expect("cloned Factory identity"),
+            "claude/connection-a",
+            "router clones must not become fake independent reviewers"
+        );
+        let legacy = crate::expert_runs::create_run(
+            server.state(),
+            crate::expert_runs::ExpertRunCreate {
+                expert_id: "legacy-claude-code".into(),
+                expert_version: 1,
+                project_path: "/tmp/legacy-claude-code".into(),
+                client: "claudeCode".into(),
+                lead_agent: "lead".into(),
+                supporting_agents: Vec::new(),
+                required_skills: Vec::new(),
+                optional_skills: Vec::new(),
+                runbook: None,
+                contract: crate::expert_runs::QualityContract::default(),
+            },
+        )
+        .await
+        .expect("create legacy claudeCode run");
+        let listed: serde_json::Value = serde_json::from_str(
+            &server
+                .expert_runs_list(Parameters(super::ExpertRunListRequest {
+                    project_path: None,
+                }))
+                .await
+                .expect("list legacy claudeCode runs"),
+        )
+        .expect("legacy run JSON");
+        assert_eq!(listed.as_array().expect("legacy runs")[0]["id"], legacy.id);
+
+        for client in ["unknown", "http", "test"] {
+            let server = SkillMcpServer::new_with_client_and_connection(
+                test_state(root.path()),
+                client,
+                "connection-b",
+            );
+            assert!(server.factory_worker_identity().is_err(), "{client}");
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_reads_are_project_scoped_and_claims_use_source_policy() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist read-only MCP policy");
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+        let revision = run.factory.as_ref().expect("Factory workflow").revision;
+
+        let responses = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "read-session",
+            vec![
+                serde_json::json!({
+                    "name": "factory_runs_discover_work",
+                    "arguments": {"project_path": project},
+                }),
+                serde_json::json!({
+                    "name": "factory_runs_discover_work",
+                    "arguments": {},
+                }),
+                serde_json::json!({
+                    "name": "factory_runs_claim_phase",
+                    "arguments": {
+                        "id": run.id,
+                        "project_path": project,
+                        "expected_revision": revision,
+                        "phase": "planning",
+                        "idempotency_key": "claim-read-only",
+                    },
+                }),
+            ],
+        )
+        .await;
+        assert!(tool_call_ok(&responses[0]), "{}", responses[0]);
+        let work = tool_call_json(&responses[0]);
+        assert_eq!(work.as_array().expect("work array").len(), 1);
+        assert_eq!(work[0]["runId"], run.id);
+        assert!(!tool_call_ok(&responses[1]), "{}", responses[1]);
+        assert!(responses[2]["error"].is_object(), "{}", responses[2]);
+
+        let audit = crate::state::load_mcp_audit(app.path())
+            .await
+            .expect("Factory MCP audit");
+        let reads = audit
+            .iter()
+            .filter(|entry| entry.action == "read")
+            .collect::<Vec<_>>();
+        let sources = audit
+            .iter()
+            .filter(|entry| entry.action == "source")
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 4, "{audit:?}");
+        assert_eq!(sources.len(), 2, "{audit:?}");
+        assert!(sources.iter().all(|entry| !entry.success));
+        assert!(
+            audit
+                .iter()
+                .all(|entry| entry.tool.starts_with("factory_runs_")),
+            "Factory audit must retain only its bounded operation identity: {audit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_reads_hold_policy_lease_through_dispatch() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist read policy");
+        let state = test_state(app.path());
+        create_factory_mcp_run(&state, &project, "codex").await;
+
+        let dispatch_barrier = pause_next_factory_read_dispatch(app.path());
+
+        let read_state = Arc::clone(&state);
+        let read_project = project.clone();
+        let read = tokio::spawn(async move {
+            call_tools_over_stdio_as(
+                read_state,
+                "codex",
+                "read-policy-lease",
+                vec![serde_json::json!({
+                    "name": "factory_runs_discover_work",
+                    "arguments": {"project_path": read_project},
+                })],
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), dispatch_barrier.wait())
+            .await
+            .expect("Factory read never reached dispatch");
+
+        let revoke_state = Arc::clone(&state);
+        let mut revoke = tokio::spawn(async move {
+            crate::commands::settings::mcp_policy_set_inner(
+                &revoke_state,
+                false,
+                false,
+                false,
+                Vec::new(),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut revoke)
+                .await
+                .is_err(),
+            "policy revocation returned while a Factory read could still disclose data"
+        );
+
+        dispatch_barrier.wait().await;
+        let responses = read.await.expect("Factory read task");
+        assert!(tool_call_ok(&responses[0]), "{}", responses[0]);
+        revoke
+            .await
+            .expect("policy revoke task")
+            .expect("policy revoke");
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_claim_uses_server_identity_and_contract_is_claim_scoped() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist Factory MCP policy");
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "claudeCode").await;
+        let revision = run.factory.as_ref().expect("Factory workflow").revision;
+
+        let claimed = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "claudeCode",
+            "builder-session",
+            vec![serde_json::json!({
+                "name": "factory_runs_claim_phase",
+                "arguments": {
+                    "id": run.id,
+                    "project_path": project,
+                    "expected_revision": revision,
+                    "phase": "planning",
+                    "idempotency_key": "claim-planning",
+                    "actor": "codex/spoofed-session",
+                },
+            })],
+        )
+        .await;
+        assert!(tool_call_ok(&claimed[0]), "{}", claimed[0]);
+        let claim = tool_call_json(&claimed[0]);
+        assert_eq!(claim["workerIdentity"], "claude/builder-session");
+
+        let contract_request = serde_json::json!({
+            "name": "factory_runs_get_claim_contract",
+            "arguments": {
+                "id": run.id,
+                "project_path": project,
+                "claim_id": claim["id"],
+                "claim_generation": claim["generation"],
+                "actor": "codex/spoofed-session",
+            },
+        });
+        let same_session = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "claude",
+            "builder-session",
+            vec![contract_request.clone()],
+        )
+        .await;
+        assert!(tool_call_ok(&same_session[0]), "{}", same_session[0]);
+        let contract = tool_call_json(&same_session[0]);
+        assert_eq!(contract["runId"], run.id);
+        assert!(contract.get("humanWaivers").is_none());
+
+        let other_session = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "claude",
+            "other-session",
+            vec![contract_request],
+        )
+        .await;
+        assert!(!tool_call_ok(&other_session[0]), "{}", other_session[0]);
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_legacy_expert_run_tools_expose_only_status() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist Factory MCP policy");
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+
+        let response = call_tools_over_stdio_as(
+            state,
+            "codex",
+            "legacy-read-session",
+            vec![serde_json::json!({
+                "name": "expert_runs_get",
+                "arguments": {"id": run.id, "project_path": project},
+            })],
+        )
+        .await;
+        assert!(tool_call_ok(&response[0]), "{}", response[0]);
+        let view = tool_call_json(&response[0]);
+        let factory = view["factory"].as_object().expect("Factory status view");
+        let mut keys = factory.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "attempt",
+                "blockerCount",
+                "phase",
+                "provenance",
+                "revision",
+                "runId",
+                "terminalOutcome",
+            ]
+        );
+        for forbidden in [
+            "workContract",
+            "plan",
+            "planApproval",
+            "currentClaim",
+            "priorClaims",
+            "blockers",
+            "artifacts",
+            "evidence",
+            "review",
+            "delivery",
+            "humanWaivers",
+            "idempotency",
+        ] {
+            assert!(
+                !factory.contains_key(forbidden),
+                "legacy view leaked {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_unscoped_legacy_list_omits_factory_runs_and_scoped_list_authorizes_project(
+    ) {
+        let app = tempfile::tempdir().expect("app data");
+        let allowed_project = tempfile::tempdir().expect("allowed project");
+        let allowed_project = std::fs::canonicalize(allowed_project.path())
+            .expect("canonical allowed project")
+            .to_string_lossy()
+            .into_owned();
+        let denied_project = tempfile::tempdir().expect("denied project");
+        let denied_project = std::fs::canonicalize(denied_project.path())
+            .expect("canonical denied project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_project_allowlist: vec![allowed_project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist Factory MCP policy");
+        let state = test_state(app.path());
+        let allowed_factory = create_factory_mcp_run(&state, &allowed_project, "codex").await;
+        let denied_factory = create_factory_mcp_run(&state, &denied_project, "codex").await;
+        let legacy = crate::expert_runs::create_run(
+            &state,
+            crate::expert_runs::ExpertRunCreate {
+                expert_id: "legacy-reviewer".into(),
+                expert_version: 1,
+                project_path: allowed_project.clone(),
+                client: "codex".into(),
+                lead_agent: "lead".into(),
+                supporting_agents: Vec::new(),
+                required_skills: Vec::new(),
+                optional_skills: Vec::new(),
+                runbook: None,
+                contract: crate::expert_runs::QualityContract::default(),
+            },
+        )
+        .await
+        .expect("create legacy Expert run");
+
+        let responses = call_tools_over_stdio_as(
+            state,
+            "codex",
+            "legacy-list-session",
+            vec![
+                serde_json::json!({
+                    "name": "expert_runs_list",
+                    "arguments": {},
+                }),
+                serde_json::json!({
+                    "name": "expert_runs_list",
+                    "arguments": {"project_path": denied_project},
+                }),
+                serde_json::json!({
+                    "name": "expert_runs_list",
+                    "arguments": {"project_path": allowed_project},
+                }),
+            ],
+        )
+        .await;
+
+        assert!(tool_call_ok(&responses[0]), "{}", responses[0]);
+        let unscoped = tool_call_json(&responses[0]);
+        assert_eq!(unscoped.as_array().expect("unscoped runs").len(), 1);
+        assert_eq!(unscoped[0]["id"], legacy.id);
+        let unscoped = unscoped.to_string();
+        for private_factory_value in [
+            allowed_factory.id.as_str(),
+            denied_factory.id.as_str(),
+            denied_project.as_str(),
+            "Factory MCP lifecycle",
+        ] {
+            assert!(
+                !unscoped.contains(private_factory_value),
+                "unscoped legacy list leaked Factory data: {unscoped}"
+            );
+        }
+
+        assert!(!tool_call_ok(&responses[1]), "{}", responses[1]);
+        assert!(tool_call_ok(&responses[2]), "{}", responses[2]);
+        let scoped = tool_call_json(&responses[2]);
+        assert!(scoped
+            .as_array()
+            .expect("scoped runs")
+            .iter()
+            .any(|run| run["id"] == allowed_factory.id));
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_retries_terminal_audit_before_reporting_mutation_success() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist Factory MCP policy");
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+        let revision = run.factory.as_ref().expect("Factory workflow").revision;
+        crate::state::inject_mcp_audit_failure_after(app.path(), 1);
+
+        let responses = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "terminal-audit-session",
+            vec![serde_json::json!({
+                "name": "factory_runs_claim_phase",
+                "arguments": {
+                    "id": run.id,
+                    "project_path": project,
+                    "expected_revision": revision,
+                    "phase": "planning",
+                    "idempotency_key": "claim-with-terminal-audit-retry",
+                },
+            })],
+        )
+        .await;
+
+        assert!(tool_call_ok(&responses[0]), "{}", responses[0]);
+        let stored = crate::expert_runs::get_run(&state, &run.id, "codex", &project)
+            .await
+            .expect("stored Factory run");
+        assert!(stored
+            .factory
+            .expect("Factory workflow")
+            .current_claim
+            .is_some());
+        let audit = crate::state::load_mcp_audit(app.path())
+            .await
+            .expect("Factory MCP audit");
+        assert_eq!(audit.len(), 2, "{audit:?}");
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|entry| entry.phase == "terminal" && entry.success)
+                .count(),
+            1,
+            "{audit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_recovers_truthful_terminal_audit_after_repeated_persistence_failure() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist Factory MCP policy");
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+        let revision = run.factory.as_ref().expect("Factory workflow").revision;
+        let arguments = serde_json::json!({
+            "id": run.id,
+            "project_path": project,
+            "expected_revision": revision,
+            "phase": "planning",
+            "idempotency_key": "claim-with-durable-terminal-recovery",
+        });
+        super::inject_factory_terminal_audit_failures(app.path(), 2);
+        let committed_without_terminal = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "durable-terminal-session",
+            vec![serde_json::json!({
+                "name": "factory_runs_claim_phase",
+                "arguments": arguments.clone(),
+            })],
+        )
+        .await;
+        assert!(
+            !tool_call_ok(&committed_without_terminal[0]),
+            "{}",
+            committed_without_terminal[0]
+        );
+        let committed = crate::expert_runs::get_run(
+            &state,
+            arguments["id"].as_str().expect("run id"),
+            "codex",
+            arguments["project_path"].as_str().expect("project path"),
+        )
+        .await
+        .expect("committed Factory run");
+        assert!(
+            committed
+                .factory
+                .as_ref()
+                .expect("Factory workflow")
+                .current_claim
+                .is_some(),
+            "the mutation must commit before terminal audit persistence fails"
+        );
+        let before_recovery = crate::state::load_mcp_audit(app.path())
+            .await
+            .expect("Factory MCP audit before recovery");
+        let audit_id = before_recovery
+            .iter()
+            .find(|entry| {
+                entry.phase == "attempt" && super::factory_audit_digest(&entry.id).is_some()
+            })
+            .expect("durable Factory attempt")
+            .id
+            .clone();
+        assert!(before_recovery
+            .iter()
+            .all(|entry| entry.id != audit_id || entry.phase != "terminal"));
+
+        let unrelated_calls = (0..(crate::state::MCP_AUDIT_MAX_ENTRIES / 2 - 1))
+            .map(|_| {
+                serde_json::json!({
+                    "name": "unrelated_audit_pressure",
+                    "arguments": {},
+                })
+            })
+            .collect();
+        let unrelated_responses = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "unrelated-audit-session",
+            unrelated_calls,
+        )
+        .await;
+        assert!(
+            unrelated_responses
+                .iter()
+                .all(|response| !tool_call_ok(response)),
+            "unknown tools must remain denied: {unrelated_responses:?}"
+        );
+        let after_unrelated_pressure = crate::state::load_mcp_audit(app.path())
+            .await
+            .expect("Factory MCP audit after unrelated pressure");
+        assert_eq!(
+            after_unrelated_pressure.len(),
+            crate::state::MCP_AUDIT_MAX_ENTRIES,
+            "the bounded audit should be at capacity"
+        );
+        assert_eq!(
+            after_unrelated_pressure
+                .iter()
+                .filter(|entry| entry.id == audit_id && entry.phase == "terminal" && entry.success)
+                .count(),
+            1,
+            "an unrelated MCP call must reconcile pending Factory truth before audit pressure"
+        );
+
+        crate::expert_runs::factory_cancel(
+            &state,
+            &committed.id,
+            committed.factory.as_ref().unwrap().revision,
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("make the successfully mutated Factory run retention-eligible");
+        let restarted_state = test_state(app.path());
+        for index in 0..500 {
+            crate::expert_runs::create_run(
+                &restarted_state,
+                crate::expert_runs::ExpertRunCreate {
+                    expert_id: format!("retention-trigger-{index}"),
+                    expert_version: 1,
+                    project_path: project.clone(),
+                    client: "codex".into(),
+                    lead_agent: "lead".into(),
+                    supporting_agents: Vec::new(),
+                    required_skills: Vec::new(),
+                    optional_skills: Vec::new(),
+                    runbook: None,
+                    contract: crate::expert_runs::QualityContract::default(),
+                },
+            )
+            .await
+            .expect("fill retained run capacity");
+        }
+        let after_creation = crate::state::load_mcp_audit(app.path())
+            .await
+            .expect("Factory MCP audit after run creation");
+        assert_eq!(
+            after_creation
+                .iter()
+                .filter(|entry| entry.id == audit_id && entry.phase == "terminal" && entry.success)
+                .count(),
+            1,
+            "{after_creation:?}"
+        );
+        assert!(
+            crate::expert_runs::get_run(&restarted_state, &committed.id, "codex", &project)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_reconciliation_never_rewrites_an_existing_terminal_outcome() {
+        let app = tempfile::tempdir().expect("app data");
+        let state = test_state(app.path());
+        let server = SkillMcpServer::new_with_client_and_connection(
+            Arc::clone(&state),
+            "codex",
+            "audit-reconcile-session",
+        );
+        let arguments = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "project_path": "/tmp/factory-project",
+            "expected_revision": 1,
+            "phase": "planning",
+            "idempotency_key": "pruned-factory-request",
+        });
+        let id = server.tool_audit_id("factory_runs_claim_phase", arguments.as_object());
+        for (phase, success) in [("attempt", false), ("terminal", true)] {
+            crate::state::append_mcp_audit(
+                app.path(),
+                crate::types::McpAuditEntry {
+                    id: id.clone(),
+                    timestamp: "2026-08-19T00:00:00Z".into(),
+                    client: Some("codex".into()),
+                    tool: "factory_runs_claim_phase".into(),
+                    action: "source".into(),
+                    phase: phase.into(),
+                    success,
+                    project_path: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        super::reconcile_factory_terminal_audits(&state)
+            .await
+            .unwrap();
+
+        let audit = crate::state::load_mcp_audit(app.path()).await.unwrap();
+        let terminals = audit
+            .iter()
+            .filter(|entry| entry.id == id && entry.phase == "terminal")
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1, "{audit:?}");
+        assert!(terminals[0].success, "{audit:?}");
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_reconciliation_waits_for_policy_lease_before_inferring_truth() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+        let revision = run.factory.as_ref().expect("Factory workflow").revision;
+        let arguments = serde_json::json!({
+            "id": run.id,
+            "project_path": project,
+            "expected_revision": revision,
+            "phase": "planning",
+            "idempotency_key": "claim-racing-reconciliation",
+        });
+        let server = SkillMcpServer::new_with_client_and_connection(
+            Arc::clone(&state),
+            "codex",
+            "lease-race-session",
+        );
+        let audit_id = server.tool_audit_id("factory_runs_claim_phase", arguments.as_object());
+        crate::state::append_mcp_audit(
+            app.path(),
+            crate::types::McpAuditEntry {
+                id: audit_id.clone(),
+                timestamp: "2026-08-19T00:00:00Z".into(),
+                client: Some("codex".into()),
+                tool: "factory_runs_claim_phase".into(),
+                action: "source".into(),
+                phase: "attempt".into(),
+                success: false,
+                project_path: Some(project.clone()),
+            },
+        )
+        .await
+        .expect("append in-flight attempt");
+
+        let mutation_lease = crate::state_db::SecurityPolicyLease::exclusive(app.path())
+            .await
+            .expect("hold mutation policy lease");
+        let recovery_state = Arc::clone(&state);
+        let mut recovery =
+            tokio::spawn(
+                async move { super::reconcile_factory_terminal_audits(&recovery_state).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut recovery)
+                .await
+                .is_err(),
+            "reconciliation decided audit truth before the mutation lease was released"
+        );
+
+        crate::expert_runs::factory_claim_phase(
+            &state,
+            arguments["id"].as_str().expect("run id"),
+            "codex",
+            &project,
+            "codex/lease-race-session",
+            crate::expert_runs::FactoryClaimRequest {
+                expected_revision: revision,
+                phase: crate::expert_runs::FactoryPhase::Planning,
+                idempotency_key: "claim-racing-reconciliation".into(),
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("commit mutation while holding its policy lease");
+        drop(mutation_lease);
+        tokio::time::timeout(Duration::from_secs(2), recovery)
+            .await
+            .expect("reconciliation resumes after policy lease")
+            .expect("reconciliation task")
+            .expect("reconcile committed mutation");
+
+        let audit = crate::state::load_mcp_audit(app.path()).await.unwrap();
+        assert!(audit
+            .iter()
+            .any(|entry| entry.id == audit_id && entry.phase == "terminal" && entry.success));
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_reconciliation_keeps_a_denied_exact_retry_failed() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist permissive policy");
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+        let arguments = serde_json::json!({
+            "id": run.id,
+            "project_path": project,
+            "expected_revision": run.factory.as_ref().expect("Factory workflow").revision,
+            "phase": "planning",
+            "idempotency_key": "claim-then-denied-retry",
+        });
+        let successful = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "denied-retry-session",
+            vec![serde_json::json!({
+                "name": "factory_runs_claim_phase",
+                "arguments": arguments.clone(),
+            })],
+        )
+        .await;
+        assert!(tool_call_ok(&successful[0]), "{}", successful[0]);
+
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: false,
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("revoke source policy");
+        super::inject_factory_terminal_audit_failures(app.path(), 2);
+        let denied = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "denied-retry-session",
+            vec![serde_json::json!({
+                "name": "factory_runs_claim_phase",
+                "arguments": arguments,
+            })],
+        )
+        .await;
+        assert!(!tool_call_ok(&denied[0]), "{}", denied[0]);
+
+        let before = crate::state::load_mcp_audit(app.path()).await.unwrap();
+        let denied_id = before
+            .iter()
+            .find(|attempt| {
+                attempt.phase == "attempt"
+                    && !before
+                        .iter()
+                        .any(|entry| entry.id == attempt.id && entry.phase == "terminal")
+            })
+            .expect("denied retry without durable terminal")
+            .id
+            .clone();
+        super::reconcile_factory_terminal_audits(&state)
+            .await
+            .expect("reconcile denied retry");
+        let audit = crate::state::load_mcp_audit(app.path()).await.unwrap();
+        assert!(
+            audit.iter().any(|entry| {
+                entry.id == denied_id && entry.phase == "terminal" && !entry.success
+            }),
+            "{audit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_bound_submission_is_idempotent_and_rejects_conflicts() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist Factory MCP policy");
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+        let workflow = run.factory.as_ref().expect("Factory workflow");
+        let claim = crate::expert_runs::factory_claim_phase(
+            &state,
+            &run.id,
+            "codex",
+            &project,
+            "codex/bound-session",
+            crate::expert_runs::FactoryClaimRequest {
+                expected_revision: workflow.revision,
+                phase: workflow.phase,
+                idempotency_key: "claim-for-blocker".into(),
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("seed Factory claim");
+        let claimed = crate::expert_runs::get_run(&state, &run.id, "codex", &project)
+            .await
+            .expect("claimed Factory run");
+        let workflow = claimed.factory.as_ref().expect("Factory workflow");
+        let context = serde_json::json!({
+            "expected_revision": workflow.revision,
+            "phase": "planning",
+            "attempt": 0,
+            "claim_id": claim.id,
+            "claim_generation": claim.generation,
+            "work_contract_revision": workflow.work_contract_revision,
+            "approved_plan_revision": null,
+            "base_commit": null,
+            "head_commit": null,
+            "idempotency_key": "blocker-once",
+        });
+        let first = serde_json::json!({
+            "name": "factory_runs_submit_blocker",
+            "arguments": {
+                "id": run.id,
+                "project_path": project,
+                "context": context,
+                "blocker": {"kind": "dependency", "summary": "Waiting for an API contract."},
+                "actor": "claude/spoofed-session",
+            },
+        });
+        let mut conflict = first.clone();
+        conflict["arguments"]["blocker"]["summary"] =
+            "A different summary reuses the same key.".into();
+        let mut oversized = first.clone();
+        oversized["arguments"]["context"]["expected_revision"] = (workflow.revision + 1).into();
+        oversized["arguments"]["context"]["idempotency_key"] = "blocker-oversized".into();
+        oversized["arguments"]["blocker"]["summary"] = "x".repeat(4097).into();
+
+        let responses = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "bound-session",
+            vec![first.clone(), first, conflict, oversized],
+        )
+        .await;
+        assert!(tool_call_ok(&responses[0]), "{}", responses[0]);
+        assert!(tool_call_ok(&responses[1]), "{}", responses[1]);
+        assert_eq!(
+            tool_call_json(&responses[0])["id"],
+            tool_call_json(&responses[1])["id"],
+            "an identical retry must return the original logical result"
+        );
+        assert!(!tool_call_ok(&responses[2]), "{}", responses[2]);
+        assert!(!tool_call_ok(&responses[3]), "{}", responses[3]);
+
+        let stored = crate::expert_runs::get_run(&state, &run.id, "codex", &project)
+            .await
+            .expect("stored Factory run");
+        assert_eq!(stored.factory.expect("Factory workflow").blockers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_rejects_generic_mutation_identities_and_serializes_claims() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist Factory MCP policy");
+        let state = test_state(app.path());
+
+        for (index, client) in ["unknown", "http"].into_iter().enumerate() {
+            let run = create_factory_mcp_run(&state, &project, "codex").await;
+            let revision = run.factory.as_ref().expect("Factory workflow").revision;
+            let response = call_tools_over_stdio_as(
+                Arc::clone(&state),
+                client,
+                &format!("generic-session-{index}"),
+                vec![serde_json::json!({
+                    "name": "factory_runs_claim_phase",
+                    "arguments": {
+                        "id": run.id,
+                        "project_path": project,
+                        "expected_revision": revision,
+                        "phase": "planning",
+                        "idempotency_key": format!("generic-claim-{index}"),
+                    },
+                })],
+            )
+            .await;
+            assert!(!tool_call_ok(&response[0]), "{client}: {}", response[0]);
+            let stored = crate::expert_runs::get_run(&state, &run.id, "codex", &project)
+                .await
+                .expect("stored run");
+            assert!(
+                stored
+                    .factory
+                    .expect("Factory workflow")
+                    .current_claim
+                    .is_none(),
+                "{client} created a claim"
+            );
+        }
+
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+        let revision = run.factory.as_ref().expect("Factory workflow").revision;
+        let claim = |connection: &'static str, key: &'static str| {
+            call_tools_over_stdio_as(
+                Arc::clone(&state),
+                "codex",
+                connection,
+                vec![serde_json::json!({
+                    "name": "factory_runs_claim_phase",
+                    "arguments": {
+                        "id": run.id,
+                        "project_path": project,
+                        "expected_revision": revision,
+                        "phase": "planning",
+                        "idempotency_key": key,
+                    },
+                })],
+            )
+        };
+        let (first, second) =
+            tokio::join!(claim("worker-a", "claim-a"), claim("worker-b", "claim-b"));
+        assert_eq!(
+            [tool_call_ok(&first[0]), tool_call_ok(&second[0])]
+                .into_iter()
+                .filter(|success| *success)
+                .count(),
+            1,
+            "first={first:#?} second={second:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_mcp_honors_client_override_and_paranoid_mode() {
+        let app = tempfile::tempdir().expect("app data");
+        let project = tempfile::tempdir().expect("project");
+        let project = std::fs::canonicalize(project.path())
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        let state = test_state(app.path());
+        let run = create_factory_mcp_run(&state, &project, "codex").await;
+        let revision = run.factory.as_ref().expect("Factory workflow").revision;
+
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![project.clone()],
+                mcp_client_policies: std::collections::HashMap::from([(
+                    "codex".into(),
+                    crate::commands::settings::McpClientPolicy::default(),
+                )]),
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist client override");
+        let request = |key: &str| {
+            serde_json::json!({
+                "name": "factory_runs_claim_phase",
+                "arguments": {
+                    "id": run.id,
+                    "project_path": project,
+                    "expected_revision": revision,
+                    "phase": "planning",
+                    "idempotency_key": key,
+                },
+            })
+        };
+        let denied = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "override-session",
+            vec![request("override-denied")],
+        )
+        .await;
+        assert!(!tool_call_ok(&denied[0]), "{}", denied[0]);
+
+        crate::commands::settings::persist(
+            app.path(),
+            Settings {
+                paranoid_mode: true,
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![project.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("persist paranoid policy");
+        let blocked = call_tools_over_stdio_as(
+            Arc::clone(&state),
+            "codex",
+            "paranoid-session",
+            vec![request("paranoid-denied")],
+        )
+        .await;
+        assert!(!tool_call_ok(&blocked[0]), "{}", blocked[0]);
+
+        let stored = crate::expert_runs::get_run(&state, &run.id, "codex", &project)
+            .await
+            .expect("stored Factory run");
+        assert!(stored
+            .factory
+            .expect("Factory workflow")
+            .current_claim
+            .is_none());
+        let audit = crate::state::load_mcp_audit(app.path())
+            .await
+            .expect("Factory MCP audit");
+        assert_eq!(audit.len(), 4, "{audit:?}");
+        assert!(audit.iter().all(|entry| {
+            entry.action == "source" && entry.tool == "factory_runs_claim_phase" && !entry.success
+        }));
+    }
+
     #[test]
     fn mcp_exposes_all_skill_agent_and_expert_tools() {
         let root = tempfile::tempdir().expect("app data");
@@ -4894,7 +7145,7 @@ mod tests {
             "every routed tool must have an explicit audit/policy class"
         );
 
-        assert_eq!(names.len(), 130);
+        assert_eq!(names.len(), 137);
         assert_eq!(
             names
                 .iter()
@@ -4916,6 +7167,41 @@ mod tests {
                 .count(),
             29
         );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("factory_runs_"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            FACTORY_TOOL_NAMES
+        );
+        for tool in server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|tool| tool.name.starts_with("factory_runs_"))
+        {
+            let wire = serde_json::to_value(&tool).expect("Factory tool schema");
+            let schema = &wire["inputSchema"];
+            let required = schema["required"]
+                .as_array()
+                .expect("Factory tool required fields");
+            assert!(
+                required.iter().any(|field| field == "project_path"),
+                "{} must require exact project_path: {schema}",
+                tool.name
+            );
+            let properties = schema["properties"]
+                .as_object()
+                .expect("Factory tool properties");
+            for spoofable in ["actor", "client", "client_identity", "worker_identity"] {
+                assert!(
+                    !properties.contains_key(spoofable),
+                    "{} exposes spoofable identity field {spoofable}",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -4931,7 +7217,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<std::collections::HashSet<_>>();
 
-        assert_eq!(skill_names.len(), 79);
+        assert_eq!(skill_names.len(), 86);
         assert_eq!(agent_names.len(), 51);
         assert!(skill_names.is_disjoint(&agent_names));
     }

@@ -29,6 +29,7 @@
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { agentLibrary } from "$lib/stores/agentLibrary.svelte";
   import { experts } from "$lib/stores/experts.svelte";
+  import { activity } from "$lib/stores/activity.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import {
     storageMigrationRetry,
@@ -104,10 +105,10 @@
   async function refreshIfChanged() {
     try {
       if (document.visibilityState !== "visible" || migrationStatus?.state !== "complete") return;
-      if (!(["skills", "personas", "experts"] as SidebarSection[]).includes(ui.section)) return;
       const revision = await storageVisibleRevision();
       if (revision === visibleRevision) return;
       visibleRevision = revision;
+      await activity.refreshFactoryReceipts();
       await refreshVisibleSurface();
     } catch {
       // A later focus/poll retries; foreground work must not be interrupted.
@@ -314,18 +315,20 @@
     </div>
   </header>
   <div class="main">
-    <Sidebar collapsed={sidebarCollapsed} onNavigate={navigateSection} />
-    {#if !sidebarCollapsed}
-      <ResizeHandle
-        width={ui.sidebarWidth}
-        min={SIDEBAR_MIN_WIDTH}
-        max={SIDEBAR_MAX_WIDTH}
-        defaultWidth={SIDEBAR_DEFAULT_WIDTH}
-        direction="right"
-        label={i18n.t("titlebar.resizeSidebar")}
-        onChange={(w) => (ui.sidebarWidth = w)}
-        onCommit={(w) => ui.setSidebarWidth(w)}
-      />
+     <Sidebar collapsed={sidebarCollapsed} onNavigate={navigateSection} />
+     {#if !sidebarCollapsed}
+       <div class="sidebar-resize-region" role="region" aria-label="Sidebar resize control">
+         <ResizeHandle
+           width={ui.sidebarWidth}
+           min={SIDEBAR_MIN_WIDTH}
+           max={SIDEBAR_MAX_WIDTH}
+           defaultWidth={SIDEBAR_DEFAULT_WIDTH}
+           direction="right"
+           label={i18n.t("titlebar.resizeSidebar")}
+           onChange={(w) => (ui.sidebarWidth = w)}
+           onCommit={(w) => ui.setSidebarWidth(w)}
+         />
+       </div>
     {/if}
     <main class="content">
         <div class="section-pane">
@@ -573,6 +576,7 @@
     background: var(--color-surface);
     overflow: hidden;
   }
+  .sidebar-resize-region { display: flex; flex: none; align-self: stretch; }
   /* Quiet crossfade when switching sidebar sections.
      Tabs are peers, so we fade content rather than slide (designSystem §6). */
   .section-pane {

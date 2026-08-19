@@ -746,6 +746,8 @@ pub(crate) async fn settings_set_inner(
     state: &AppState,
     patch: GeneralSettingsPatch,
 ) -> Result<Settings, AppError> {
+    let _policy_lease =
+        crate::state_db::SecurityPolicyLease::exclusive(&state.app_data_dir).await?;
     let mut cache = state.settings.write().await;
     if let SettingsLoadState::Corrupt { message } = &*cache {
         return Err(AppError::Internal {
@@ -774,6 +776,8 @@ pub(crate) async fn mcp_policy_set_inner(
     destructive_access: bool,
     project_allowlist: Vec<String>,
 ) -> Result<Settings, AppError> {
+    let _policy_lease =
+        crate::state_db::SecurityPolicyLease::exclusive(&state.app_data_dir).await?;
     let mut cache = state.settings.write().await;
     if let SettingsLoadState::Corrupt { message } = &*cache {
         return Err(AppError::Internal {
@@ -804,6 +808,8 @@ pub(crate) async fn mcp_agent_policy_set_inner(
     install_access: bool,
     destructive_access: bool,
 ) -> Result<Settings, AppError> {
+    let _policy_lease =
+        crate::state_db::SecurityPolicyLease::exclusive(&state.app_data_dir).await?;
     let mut cache = state.settings.write().await;
     let mut latest = match load_async(&state.app_data_dir).await {
         SettingsLoadState::Loaded(latest) => latest,
@@ -940,6 +946,8 @@ pub async fn mcp_client_policy_set(
             message: "MCP client must be claude or codex".into(),
         });
     }
+    let _policy_lease =
+        crate::state_db::SecurityPolicyLease::exclusive(&state.app_data_dir).await?;
     let mut cache = state.settings.write().await;
     let mut latest = match load_async(&state.app_data_dir).await {
         SettingsLoadState::Loaded(latest) => latest,
@@ -972,6 +980,8 @@ pub async fn mcp_agent_client_policy_set(
             message: "MCP client must be claude or codex".into(),
         });
     }
+    let _policy_lease =
+        crate::state_db::SecurityPolicyLease::exclusive(&state.app_data_dir).await?;
     let mut cache = state.settings.write().await;
     let mut latest = match load_async(&state.app_data_dir).await {
         SettingsLoadState::Loaded(latest) => latest,
@@ -996,6 +1006,8 @@ pub async fn mcp_agent_client_policy_set(
 /// the file is corrupt or the user just wants to start fresh.
 #[tauri::command]
 pub async fn settings_reset(state: State<'_, AppState>) -> Result<Settings, AppError> {
+    let _policy_lease =
+        crate::state_db::SecurityPolicyLease::exclusive(&state.app_data_dir).await?;
     let mut cache = state.settings.write().await;
     let defaults = Settings::default();
     let clamped = persist(&state.app_data_dir, defaults).await?;
@@ -1130,6 +1142,87 @@ mod tests {
         assert_eq!(settings.mcp_project_allowlist, ["/retained/project"]);
         assert_eq!(settings.catalog_stale_banner_days, 45);
         assert!(!settings.ai_features_enabled);
+    }
+
+    #[tokio::test]
+    async fn mcp_policy_revocations_wait_for_in_flight_mutation_lease() {
+        let app = tempfile::tempdir().expect("app data");
+        let permissive = persist(
+            app.path(),
+            Settings {
+                mcp_source_access: true,
+                mcp_project_allowlist: vec![app.path().to_string_lossy().into_owned()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .expect("seed permissive policy");
+        let state = std::sync::Arc::new(test_app_state(
+            app.path(),
+            SettingsLoadState::Loaded(permissive),
+        ));
+        let mutation_lease = crate::state_db::SecurityPolicyLease::exclusive(app.path())
+            .await
+            .expect("hold mutation policy lease");
+        let started = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut revoke = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            let started = std::sync::Arc::clone(&started);
+            async move {
+                started.wait().await;
+                mcp_policy_set_inner(&state, false, false, false, Vec::new()).await
+            }
+        });
+        started.wait().await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut revoke)
+                .await
+                .is_err(),
+            "policy revoke returned before the in-flight mutation lease was released"
+        );
+
+        drop(mutation_lease);
+        tokio::time::timeout(std::time::Duration::from_secs(2), revoke)
+            .await
+            .expect("revoke should resume after mutation lease release")
+            .expect("revoke task should not panic")
+            .expect("revoke policy");
+
+        let mutation_lease = crate::state_db::SecurityPolicyLease::exclusive(app.path())
+            .await
+            .expect("hold mutation policy lease for paranoid-mode revoke");
+        let started = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut paranoid_revoke = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            let started = std::sync::Arc::clone(&started);
+            async move {
+                started.wait().await;
+                settings_set_inner(
+                    &state,
+                    GeneralSettingsPatch {
+                        paranoid_mode: Some(true),
+                        ..GeneralSettingsPatch::default()
+                    },
+                )
+                .await
+            }
+        });
+        started.wait().await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut paranoid_revoke,)
+                .await
+                .is_err(),
+            "paranoid-mode revoke returned before the in-flight mutation lease was released"
+        );
+
+        drop(mutation_lease);
+        tokio::time::timeout(std::time::Duration::from_secs(2), paranoid_revoke)
+            .await
+            .expect("paranoid-mode revoke should resume after mutation lease release")
+            .expect("paranoid-mode revoke task should not panic")
+            .expect("revoke through paranoid mode");
     }
 
     #[tokio::test]
