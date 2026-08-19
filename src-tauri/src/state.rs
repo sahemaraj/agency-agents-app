@@ -662,6 +662,7 @@ fn migration_import_specs() -> Vec<crate::state_db::ImportSpec> {
 
 #[tauri::command]
 pub async fn mcp_audit_list(state: State<'_, AppState>) -> Result<Vec<McpAuditEntry>, AppError> {
+    crate::skills::mcp::reconcile_factory_terminal_audits(&state).await?;
     load_mcp_audit(&state.app_data_dir).await
 }
 
@@ -983,7 +984,17 @@ fn platform_replace_mcp_audit_file(temporary: &Path, path: &Path) -> std::io::Re
 fn sanitize_mcp_audit(entry: &mut McpAuditEntry) {
     entry.id = capped_audit_field(&entry.id, 64);
     entry.timestamp = capped_audit_field(&entry.timestamp, MCP_AUDIT_FIELD_CHARS_CAP);
-    entry.tool = if entry.tool.starts_with("skills_")
+    let known_factory_tool = matches!(
+        entry.tool.as_str(),
+        "factory_runs_claim_phase"
+            | "factory_runs_complete_phase"
+            | "factory_runs_discover_work"
+            | "factory_runs_get_claim_contract"
+            | "factory_runs_submit_artifact"
+            | "factory_runs_submit_blocker"
+            | "factory_runs_submit_evidence"
+    );
+    entry.tool = if (entry.tool.starts_with("skills_") || known_factory_tool)
         && entry
             .tool
             .bytes()
@@ -2167,6 +2178,27 @@ mcp_audit|state/mcp-audit.jsonl|1|1048576|jsonl|mcp_audit"
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].tool, "[redacted]");
         assert_eq!(entries[0].project_path.as_deref(), Some("[redacted]"));
+    }
+
+    #[test]
+    fn mcp_audit_preserves_only_known_factory_tool_names() {
+        let entry = |tool: &str| McpAuditEntry {
+            id: "factory-audit".into(),
+            timestamp: "2026-08-19T00:00:00Z".into(),
+            client: Some("codex".into()),
+            tool: tool.into(),
+            action: "source".into(),
+            phase: "terminal".into(),
+            success: true,
+            project_path: None,
+        };
+        let mut known = entry("factory_runs_claim_phase");
+        sanitize_mcp_audit(&mut known);
+        assert_eq!(known.tool, "factory_runs_claim_phase");
+
+        let mut invented = entry("factory_runs_approve_plan");
+        sanitize_mcp_audit(&mut invented);
+        assert_eq!(invented.tool, "[redacted]");
     }
 
     #[tokio::test]

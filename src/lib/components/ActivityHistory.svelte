@@ -10,9 +10,10 @@
 
   import Button from "./Button.svelte";
   import EmptyState from "./EmptyState.svelte";
-  import { activity, safeActivityDetail, type JournalEntry } from "$lib/stores/activity.svelte";
+  import { activity, isFactoryActivityReceipt, safeActivityDetail, type JournalEntry } from "$lib/stores/activity.svelte";
   import { i18n } from "$lib/stores/i18n.svelte";
   import { install } from "$lib/stores/install.svelte";
+  import { projectFactoryRun } from "$lib/stores/experts.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import type { MessageKey } from "$lib/i18n/messages";
   import {
@@ -33,6 +34,7 @@
     label: string;
     meta: string;
     projectPath?: string;
+    revision?: number;
   };
   type SourceState = { status: "loading" | "ready" | "unavailable"; items: ReviewItem[]; error: string };
 
@@ -51,6 +53,7 @@
 
   onMount(() => {
     void activity.refreshMcpAudit();
+    void activity.refreshFactoryReceipts();
     void Promise.all([
       loadSource("agent"), loadSource("skill"), loadSource("expert-change"),
       loadSource("expert-run"), loadSource("expert-activation"), loadSource("recommendation"),
@@ -92,9 +95,21 @@
       }));
     }
     if (source === "expert-run") {
-      return (await expertRunsList()).filter((item) => item.state === "awaitingReview").map((item) => ({
-        id: item.id, source, label: `Run ${item.id.slice(0, 8)}`, meta: item.expertId,
-      }));
+      const [runs, registered] = await Promise.all([expertRunsList(), projectsList()]);
+      const labels = new Map(registered.map((project) => [project.path, project.label]));
+      return runs.flatMap((item) => {
+        const factory = projectFactoryRun(item);
+        if (factory?.humanAction) return [{
+          id: item.id,
+          source,
+          label: `${factory.humanAction.kind === "plan" ? "Plan approval" : "Final approval"} · ${factory.workflow.workContract.title}`,
+          meta: `${labels.get(item.projectPath) ?? "Registered project"} · revision ${factory.humanAction.expectedRevision}`,
+          revision: factory.humanAction.expectedRevision,
+        }];
+        return item.state === "awaitingReview"
+          ? [{ id: item.id, source, label: `Run ${item.id.slice(0, 8)}`, meta: item.expertId }]
+          : [];
+      });
     }
     if (source === "expert-activation") {
       return (await expertActivationRequests()).filter((item) => item.state === "pending").map((item) => ({
@@ -211,11 +226,12 @@
     switch: ToggleRightIcon,
     sync: RefreshIcon,
     bulk: LayersIcon,
+    factory: ActivityIcon,
     mcp: ActivityIcon,
   } as const;
 
   /** Sentence-case verb shown at the head of each row. */
-  const ACTION_VERB: Record<Exclude<JournalEntry["action"], "mcp">, MessageKey> = {
+  const ACTION_VERB: Record<Exclude<JournalEntry["action"], "mcp" | "factory">, MessageKey> = {
     install: "activity.action.install",
     uninstall: "activity.action.uninstall",
     update: "activity.action.update",
@@ -251,6 +267,7 @@
     if (e.action === "mcp") {
       return `${e.subjectName ?? "MCP"} · ${e.detail ?? "read"}`;
     }
+    if (e.action === "factory") return e.detail ?? `Factory result · ${e.subjectName ?? "run"}`;
     // Default-target toggle: the tool IS the subject, detail is the descriptor.
     if (e.action === "switch") {
       return tool ? `${tool} · ${e.detail ?? i18n.t("common.defaultTargetChanged")}` : (e.detail ?? i18n.t("common.defaultTargetChanged"));
@@ -262,7 +279,9 @@
     // Single-agent ops: "Verb agent → Tool · project".
     let s = `${i18n.t(ACTION_VERB[e.action])} ${e.subjectName ?? e.agentName ?? e.agentSlug ?? ""}`.trim();
     if (tool) s += ` → ${tool}`;
-    if (e.scope === "project" && e.projectPath) s += ` · ${basename(e.projectPath)}`;
+    if (e.scope === "project" && (e.projectLabel || e.projectPath)) {
+      s += ` · ${e.projectLabel ?? basename(e.projectPath!)}`;
+    }
     return s;
   }
 
@@ -345,8 +364,8 @@
             <p class="review-empty">Nothing pending.</p>
           {:else}
             <ul class="review-list">
-              {#each state.items as item (item.id)}
-                {@const triggerId = `${source}:${item.id}`}
+              {#each state.items as item (`${item.id}:${item.revision ?? "legacy"}`)}
+                {@const triggerId = `${source}:${item.id}${item.revision == null ? "" : `:${item.revision}`}`}
                 <li><div><strong>{item.label}</strong><span>{item.meta}</span></div><button type="button" data-review-source={source} data-review-trigger={triggerId} onclick={() => openReview(item, triggerId)}>Open review</button></li>
               {/each}
             </ul>
@@ -380,26 +399,48 @@
                 <span class="truncate">{rowText(e)}</span>
                 {#if e.receipt}
                   <details data-activity-id={e.id}>
-                    <summary>
-                      {i18n.optional("activity.receiptDetails", "Receipt details")}
-                      <span class="receipt-counts">{i18n.optional("activity.receiptSummary", "{succeeded} succeeded · {failed} failed", { succeeded: e.receipt.succeeded, failed: e.receipt.failed })}</span>
-                    </summary>
-                    <ul class="receipt-items">
-                      {#each e.receipt.items as item, index (`${item.kind}:${item.destination}:${index}`)}
-                        <li>
-                          <span class="receipt-name">{item.name}</span>
-                          <span class="receipt-meta">{item.kind === "agent" ? "Agent" : "Skill"} · {item.outcome === "ok" ? i18n.t("common.succeeded") : i18n.t("common.failed")}</span>
-                          <span class="receipt-path" title={item.destination ?? undefined}>{item.destination ?? i18n.optional("activity.destinationUnavailable", "No destination was changed or returned")}</span>
-                          {#if item.detail}<span class="receipt-error">{item.detail}</span>{/if}
-                        </li>
-                      {/each}
-                    </ul>
+                    {#if isFactoryActivityReceipt(e.receipt)}
+                      <summary>Factory receipt <span class="receipt-counts">{e.receipt.outcome === "attemptExhausted" ? "Attempt-exhausted" : `${e.receipt.outcome[0].toUpperCase()}${e.receipt.outcome.slice(1)}`}</span></summary>
+                      <div class="factory-receipt">
+                        <strong>{e.receipt.ticketReference} · {e.receipt.workTitle}</strong>
+                        <span>Project · {e.receipt.projectLabel}</span>
+                        <span>Result · {e.receipt.outcome === "attemptExhausted" ? "Attempt-exhausted blocked" : `${e.receipt.outcome[0].toUpperCase()}${e.receipt.outcome.slice(1)}`}</span>
+                        <span>Provenance · Client-reported</span>
+                        {#if e.receipt.planRevision}<span>Plan revision · {e.receipt.planRevision}</span>{/if}
+                        {#if e.receipt.baseCommit}<span>Base · {e.receipt.baseCommit}</span>{/if}
+                        {#if e.receipt.headCommit}<span>Head · {e.receipt.headCommit}</span>{/if}
+                        <span>Review · {e.receipt.reviewStatus}</span>
+                        <span>Retries · {e.receipt.retryCount}</span>
+                        {#each e.receipt.checks as check (check.name)}
+                          <span>{check.name} · {check.result === "pass" ? "passed" : check.result === "fail" ? "failed" : check.result}</span>
+                        {/each}
+                        {#if e.receipt.deliveryReference}<span class="receipt-path">Delivery · {e.receipt.deliveryReference}</span>{/if}
+                        {#each e.receipt.limitations as limitation, index (`${limitation}:${index}`)}<span>Limitation · {limitation}</span>{/each}
+                        {#if e.receipt.detail}<span class="receipt-error">{e.receipt.detail}</span>{/if}
+                      </div>
+                    {:else}
+                      <summary>
+                        {i18n.optional("activity.receiptDetails", "Receipt details")}
+                        <span class="receipt-counts">{i18n.optional("activity.receiptSummary", "{succeeded} succeeded · {failed} failed", { succeeded: e.receipt.succeeded, failed: e.receipt.failed })}</span>
+                      </summary>
+                      <ul class="receipt-items">
+                        {#each e.receipt.items as item, index (`${item.kind}:${item.destination}:${index}`)}
+                          <li>
+                            <span class="receipt-name">{item.name}</span>
+                            <span class="receipt-meta">{item.kind === "agent" ? "Agent" : "Skill"} · {item.outcome === "ok" ? i18n.t("common.succeeded") : i18n.t("common.failed")}</span>
+                            <span class="receipt-path" title={item.destination ?? undefined}>{item.destination ?? i18n.optional("activity.destinationUnavailable", "No destination was changed or returned")}</span>
+                            {#if item.detail}<span class="receipt-error">{item.detail}</span>{/if}
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
                   </details>
                 {/if}
               </div>
               <span class="time" title={new Date(e.ts).toLocaleString()}>{relTime(e.ts)}</span>
               <span
                 class="status-dot"
+                role="img"
                 class:ok={e.outcome === "ok"}
                 class:fail={e.outcome === "error"}
                 aria-label={e.outcome === "pending"
@@ -484,6 +525,8 @@
   summary:focus-visible { outline: 2px solid var(--color-brand); outline-offset: 2px; border-radius: var(--radius-sm); }
   .receipt-counts { margin-left: var(--space-2); color: var(--color-text-muted); }
   .receipt-items { display: grid; gap: var(--space-2); margin-top: var(--space-2); }
+  .factory-receipt { display: grid; gap: 2px; margin-top: var(--space-2); padding: var(--space-2); border-radius: var(--radius-sm); background: var(--color-surface-sunken); color: var(--color-text-muted); font-size: var(--text-body-sm); }
+  .factory-receipt strong { color: var(--color-text-primary); }
   .receipt-items li { display: grid; gap: 2px; padding: var(--space-2); border-radius: var(--radius-sm); background: var(--color-surface-sunken); }
   .receipt-name { font-weight: var(--fw-medium); }
   .receipt-meta, .receipt-path, .receipt-error { color: var(--color-text-muted); font-size: var(--text-body-sm); }

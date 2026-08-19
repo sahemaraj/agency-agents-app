@@ -1,5 +1,277 @@
 # Active Context — Agency Agents
 
+## Factory Runs MVP [READY-FOR-REVIEW] (2026-08-18)
+
+State: APPROVAL / IDLE on isolated branch `feat/factory-runs-mvp`. The approved OpenSpec change
+`factory-runs-mvp` remains the source of truth. Implementation extends the existing Expert Run,
+readiness, MCP, Experts, and Activity authorities without adding an executor, database document,
+permission family, route, runtime, or dependency. V10 independent review found one Medium
+case-sensitivity false positive and one Medium raw-source class covering call/collection
+assignments and semicolon-free mutating SQL/DDL. Exact backend and Activity regressions failed
+first; shared-classifier fixes now pass both targeted tests while preserving ordinary `Import`,
+`Insert`, `Update`, and `Create table` prose. Fresh QA passes 50/50 focused Factory tests, 843
+executable Rust library tests with 5 intentional manual-only ignores, 2 binary tests, strict
+format/Clippy, 199/199 frontend tests, zero Svelte diagnostics, production build, npm audit with
+zero vulnerabilities, 14/14 Factory MCP protocol tests, exact 137-tool inventory with seven
+Factory operations, strict OpenSpec 21/21, and diff checks. Source snapshot
+`4cd64e73fe42b5b21eac43ef9af22b08bbd1ea680ea4480ac2435c63cf16681c` received a clean goal audit,
+but v11 code/security audits found Python alias, SQL variant, uppercase RHS, DDL, `privateKey`, and
+safe SELECT-prose gaps. Exact backend/Activity regressions now pass after shared root fixes. Fresh
+QA again passes 50/50 focused Factory tests, 843 executable Rust library tests with 5 intentional
+manual-only ignores, 2 binary tests, strict format/Clippy, 199/199 frontend tests, zero Svelte
+diagnostics, production build, npm audit with zero vulnerabilities, strict OpenSpec 21/21, and diff
+checks. Source snapshot `c004b3643a5f20c9ff4500d776c5ca999efd63fbe3e4958e7b21e91b8bb45d7f`
+received a v12 security finding for bare-relative/trailing-comment Python imports and
+semicolon-free literal SELECT/CTE SQL. Exact backend/Activity regressions failed first and now pass
+after the shared classifier repair. Fresh verification passes 50/50 focused Factory tests, 843
+executable Rust library tests with 5 intentional manual-only ignores, 2 binary tests, strict
+format/Clippy, 199/199 frontend tests, zero Svelte diagnostics, production build, npm audit with
+zero vulnerabilities, 14/14 Factory MCP protocol tests, exact 137-tool inventory with seven
+Factory operations, strict OpenSpec 21/21, and diff checks. A frozen v13 code, security, and
+goal-backward audit found no lifecycle defect and a clean security result, but the code audit found
+three Medium metadata-classifier gaps: constructor assignments, materialized/replaced views plus
+frontend SELECT aliases/TOP counts, and false positives for terse sentence-case Select/Delete
+prose. Exact backend/Activity tests failed first and now pass after shared root fixes. Fresh QA again
+passes 50/50 focused Factory tests, 843 executable Rust library tests with 5 intentional manual-only
+ignores, 2 binary tests, strict format/Clippy, 199/199 frontend tests, zero Svelte diagnostics,
+production build, npm audit with zero vulnerabilities, 14/14 Factory MCP protocol tests, exact
+137-tool inventory with seven Factory operations, strict OpenSpec 21/21, and diff checks. A frozen
+v14 code, security, and goal-backward audit is next. OpenSpec progress remains 27/29 until those
+audits pass. V14 goal review found one Medium privacy regression in the broad sentence-case prose
+exception: valid `Select email from users` / `Delete from users` SQL could pass. Exact backend and
+Activity regressions failed first. The exception is now fail-closed and limited to the two reviewed
+UI literals that are syntactically ambiguous with SQL; both unsafe sentence-case variants and safe
+UI controls pass. Fresh full QA remains 843 executable Rust library tests with 5 intentional
+manual-only ignores, 2 binary tests, strict format/Clippy, 199/199 frontend tests, zero Svelte
+diagnostics, production build, npm audit with zero vulnerabilities, strict OpenSpec 21/21, and diff
+checks. A frozen v15 final audit is next. Local `main` and its unrelated dirty changes remain
+untouched. V15 code review found three adjacent Medium syntax classes: generic constructor
+assignments, alter/drop/refresh materialized-view DDL, and Activity parity for parenthesized TOP
+counts and quoted aliases. Exact backend/Activity tests failed first; root fixes now reject any
+constructor RHS, cover the materialized-view lifecycle, and mirror backend SELECT forms. Fresh full
+Rust/frontend, strict format/Clippy/Svelte/build, dependency, OpenSpec 21/21, and diff gates pass.
+A frozen v16 final audit is next; progress remains 27/29.
+V16 security/goal review found two Medium residual raw-source classes: implicit SELECT projection
+aliases and uppercase scalar/arrow assignments. Exact backend/Activity tests failed first. SELECT
+target parsing now validates the complete table/alias segment, implicit projection aliases are
+mirrored, and assignment-shaped metadata fails closed except for two exact reviewed UI sentences.
+Fresh full QA again passes 843 executable Rust library tests with 5 intentional manual-only ignores,
+2 binary tests, strict format/Clippy, 199/199 frontend tests, zero Svelte diagnostics, production
+build, npm audit with zero vulnerabilities, OpenSpec 21/21, and diff checks. A frozen v17 final
+audit is next; progress remains 27/29.
+V17 independent review found seven Medium metadata syntax families: capitalized YAML bare scalars,
+trailing SELECT operators, parenthesized destructuring, complex FROM/TOP/quoted-table forms,
+temporary/unlogged/materialized DDL, compound assignments, and C/C++/XML directives. Exact backend
+and Activity regressions failed first and now pass after shared fail-closed classifier repairs. Fresh
+QA on the exact current source passes 843 executable Rust library tests with 5 intentional
+manual-only ignores, 2 binary tests, strict format/Clippy, 199/199 frontend tests, zero Svelte
+diagnostics, production build, npm audit with zero vulnerabilities, 14/14 Factory MCP protocol
+tests, the exact 137-tool inventory with seven Factory operations, strict OpenSpec 21/21, and diff
+checks. A frozen v18 code, security, and goal-backward audit is next; progress remains 27/29.
+V18 frozen review passed all lifecycle/control-plane goal coverage but found one High backend URL
+credential-alias gap and consolidated Medium backend/Activity syntax gaps in DDL, YAML, directives,
+XML, adjacent SQL statements, and destructuring parity. State returned to BUILD / CODING for one
+paired-regression repair cycle; progress remains 27/29.
+The V18 High/Medium findings and Low safe-prose controls now have paired failing-first regressions
+and shared-validator repairs. Fresh QA passes 843 executable Rust library tests with 5 intentional
+manual-only ignores, 2 binary tests, strict format/Clippy, 199/199 frontend tests, zero Svelte
+diagnostics, production build, npm audit with zero vulnerabilities, 14/14 Factory MCP protocol
+tests, the exact 137-tool inventory with seven Factory operations, strict OpenSpec 21/21, and diff
+checks. Browser keyboard/axe evidence at 375/1440 remains applicable because the repair changes
+only metadata classification and regression fixtures. A frozen v19 code, security, and
+goal-backward audit is next; progress remains 27/29.
+V19 froze clean lifecycle evidence but code/security review found one High prefixed credential-key
+URL gap and Medium structured-YAML, SQL modifier/transaction/DDL, and directive parity gaps. The
+source returned to BUILD / CODING for paired regressions and structural classifier repair;
+progress remains 27/29.
+V19 findings now have paired failing-first regressions and structural repairs: backend credential
+suffixes match Activity, YAML uses serialization/config signals instead of every colon sentence,
+SQL covers reviewed modifier/transaction/DDL forms, and directive parity includes Objective-C,
+Rust visibility, C# static/alias, and macro imports. Fresh QA passes 843 executable Rust library
+tests with 5 intentional manual-only ignores, 2 binary tests, strict format/Clippy, 199/199
+frontend tests, zero Svelte diagnostics, production build, npm audit with zero vulnerabilities,
+14/14 Factory MCP protocol tests, exact 137/seven inventory, strict OpenSpec 21/21, and diff checks.
+A frozen v20 final audit is next; progress remains 27/29.
+V20 code/security review found one High URL-signature/password-alias gap and consolidated Medium
+classifier gaps in capital/block-scalar YAML, transaction variants, combined view modifiers,
+Objective-C/C++ imports, plus an EXPLAIN safe-prose false positive. State returned to BUILD /
+CODING for paired failing-first regressions and shared backend/Activity repair; progress remains
+27/29.
+V20 paired regressions failed first and now pass after matching credential aliases, structurally
+classifying capital/block-scalar YAML and transaction/import/view variants, and constraining
+EXPLAIN to valid modifier grammar. State advanced through DIFF to QA / RUNNING for the complete
+verification matrix; progress remains 27/29 pending clean frozen audits.
+Fresh V21 QA on the exact repaired source passes 843 Rust library tests with 5 intentional
+manual/environment ignores, 2 binary tests, 0 doctests, strict format/Clippy, 199 frontend tests,
+zero Svelte diagnostics, production build, npm audit with zero vulnerabilities, 14/14 Factory MCP
+protocol tests, exact 137/seven inventory, raw-router boundary smoke, strict OpenSpec 21/21, and
+diff checks. Prior 375/1440 keyboard/axe evidence remains applicable because V21 changes only the
+shared metadata classifiers and their regressions. A frozen V21 code, security, and goal-backward
+audit is next; progress remains 27/29.
+V21 goal-backward audit passed with all 21 requirements and 47 scenarios proven, but the frozen
+code/security audits found one High JWT URL-credential gap and Medium combined SQL, tagged/commented
+YAML, and source-directive gaps, plus Low one-word transaction and Owner prose false positives.
+State returned to BUILD / CODING for paired regressions and shared-classifier repair; progress
+remains 27/29.
+V21 findings now have paired failing-first regressions and shared root repairs for JWT key/value
+credentials, valid combined SQL forms, tagged/commented YAML, C#/Rust/Objective-C directives, and
+reviewed one-word/Owner prose controls. State advanced through DIFF to QA / RUNNING for V22 full
+verification; progress remains 27/29.
+Fresh V22 QA passes 843 Rust library tests with 5 intentional ignores, 2 binary tests, 0 doctests,
+strict format/Clippy, 199 frontend tests, zero Svelte diagnostics, production build, npm audit with
+zero vulnerabilities, 14/14 Factory MCP protocol tests, exact 137/seven inventory, raw-router
+boundary smoke, strict OpenSpec 21/21, and diff checks. Retained 375/1440 keyboard/axe evidence is
+unchanged because V22 remains classifier/test-only. Frozen V22 audits are next; progress remains
+27/29.
+V22 code/security review found one High SAS `sig` credential gap and Medium compact-JWT/generic
+redaction, semicolon SQL parity, YAML quoted/indentation forms, EXPLAIN modifiers, and additional
+Rust/C#/Objective-C directives, plus the Priority prose control. The failing snapshot did not need
+a goal verdict; state returned to BUILD / CODING for paired regressions and root repair. Progress
+remains 27/29.
+V22 findings now have paired failing-first regressions and root fixes across backend, Factory
+Activity normalization, and generic Activity redaction. Compact JWTs, SAS signatures, semicolon
+SQL, quoted/indentation YAML, EXPLAIN modifiers, directives, and Priority prose controls all pass.
+State advanced through DIFF to QA / RUNNING for V23 verification; progress remains 27/29.
+Fresh V23 QA passes 843 Rust library tests with 5 intentional ignores, 2 binary tests, 0 doctests,
+strict format/Clippy, 199 frontend tests, zero Svelte diagnostics, production build, npm audit with
+zero vulnerabilities, 14/14 Factory MCP protocol tests, exact 137/seven inventory, raw-router
+boundary smoke, strict OpenSpec 21/21, and diff checks. Retained 375/1440 keyboard/axe evidence is
+unchanged because V23 remains classifier/test-only. Frozen V23 code, security, and goal-backward
+audits are next; progress remains 27/29.
+Frozen V30 security and goal-backward audits found zero Critical/High findings but consolidated
+Medium privacy gaps in structured `SG.` credentials, host-indicated encoded multi-segment webhook
+tails, mixed-case semicolon-free generic DDL, and exported namespace declarations. State returned
+to BUILD / CODING for one shared-classifier repair with paired failing-first regressions; progress
+remains 27/29. The code-audit worker returned a stale status instead of an audit and will be rerun
+on the next frozen snapshot.
+V30 findings now pass paired regressions after structural multipart-token recognition, aggregate
+decoded webhook-tail validation for both marker and host contexts, case-independent DDL structure
+with punctuation-based prose exclusion, and exported/aliased namespace handling. Focused QA passes
+1/1 Rust and 2/2 frontend tests with zero Svelte diagnostics. State advanced through DIFF to
+QA / RUNNING for the complete V31 matrix; progress remains 27/29.
+Fresh V31 QA passes 844 Rust library tests with 5 intentional ignores, 2 binary tests, 0 doctests,
+strict format/Clippy, 203 frontend tests, zero Svelte diagnostics, production build, npm audit with
+zero vulnerabilities, all Factory MCP/inventory/router coverage, strict OpenSpec 21/21, and clean
+dependency/scope/diff gates. Local `main` remains at the shared base with unrelated dirty changes
+untouched; no archive exists. Frozen V31 code, security, and goal-backward audits are next;
+progress remains 27/29.
+Frozen V31 code-quality, security, and goal-backward audits all pass with zero Critical, High,
+Medium, or Low findings against unchanged source hash
+`efce76bf56fdaf037bf083d3ccd0d44aea67c8abaa453cb64010c45152051af2`. The goal audit proves all
+21/21 delta requirements, 47/47 delta scenarios, and 8/8 canonical compatibility requirements.
+OpenSpec tasks are 29/29 complete. The implementation is frozen and ready for human review; it
+remains uncommitted, unmerged, and unarchived, and local `main` remains untouched.
+Frozen V23 goal review passed all 21 requirements and 47 scenarios, but code/security review found
+one High standard-session credential gap and consolidated Medium gaps in compact JWT/JWE handling,
+frontend credential-key parity, quoted YAML separators, SQL/source syntax, and legacy JSON
+validation. State returned to BUILD / CODING for paired regressions and root repair; progress
+remains 27/29.
+V23 findings now have paired failing-first regressions and shared root repairs for standard session
+credentials, unsecured JWT/JWE values, key-aware frontend redaction, quoted YAML separators,
+additional SQL/source grammar, legacy JSON validation, and reviewed Severity prose. Focused QA
+passes 51/51 Rust Factory tests and 3/3 targeted Activity tests. State advanced through DIFF to
+QA / RUNNING for V24 full verification; progress remains 27/29.
+Fresh V24 QA on the exact repaired source passes 844 Rust library tests with 5 intentional ignores,
+2 binary tests, 0 doctests, strict format/Clippy, 199 frontend tests, zero Svelte diagnostics,
+production build, npm audit with zero vulnerabilities, 14/14 Factory MCP protocol tests, exact
+137/seven inventory, raw-router boundary smoke, strict OpenSpec 21/21, and diff/scope/boundary
+checks. Retained 375/1440 keyboard/axe evidence remains applicable because V24 changes only shared
+metadata validation/redaction, legacy JSON validation, and regressions. Frozen V24 code, security,
+and goal-backward audits are next; progress remains 27/29.
+Frozen V24 goal review again proves all 21 requirements and 47 scenarios, but code/security review
+found Medium trust-boundary gaps in persisted Activity hydration, `sid` and direct-encryption JWE
+credentials, credential-bearing webhook paths, SQL variants, and source annotation/directive
+families. State returned to BUILD / CODING for paired regressions and shared backend/Activity root
+repairs. No Critical or High finding exists; progress remains 27/29.
+V24 findings now have paired failing-first regressions and shared root repairs: persisted Activity
+details pass through the existing privacy normalizer, `sid` and direct-encryption JWE values are
+credentials without the prior `possession` false positive, known webhook bearer paths fail closed,
+and SQL/source families are mirrored across Rust and Activity with reviewed prose controls. The
+focused Rust privacy test and four targeted frontend tests pass. State advanced through DIFF to
+QA / RUNNING for V25 full verification; progress remains 27/29.
+Fresh V25 QA passes 844 Rust library tests with 5 intentional manual/environment ignores, 2 binary
+tests, 0 doctests, strict format/Clippy, 199 frontend tests, zero Svelte diagnostics, production
+build, npm audit with zero vulnerabilities, 14/14 Factory MCP protocol tests, exact 137/seven tool
+inventory, raw-router and router-composition boundaries, strict OpenSpec 21/21, and clean
+dependency/scope/diff checks. Retained 375/1440 keyboard/axe evidence remains applicable because
+V25 changes only shared metadata validation/redaction, hydration, and regressions. Frozen V25
+code, security, and goal-backward audits are next; progress remains 27/29.
+Frozen V25 goal review again proves 21/21 requirements and 47/47 scenarios, but code/security
+review found one High credential-bearing API/webhook URL gap and consolidated Medium gaps in
+durable Activity normalization, percent-encoded credentials, SQL families/case handling, and bare
+decorators. State returned to BUILD / CODING for paired regressions and shared root repairs;
+progress remains 27/29.
+V25 findings now have paired failing-first regressions and shared repairs: every local Activity
+entry is normalized before memory and persistence, hydration rewrites safe bytes, URL components
+decode before credential checks with Slack/Discord/Telegram bearer paths covered, and mirrored
+SQL/decorator families fail closed. The focused Rust privacy test and five targeted frontend tests
+pass. State advanced through DIFF to QA / RUNNING for V26 full verification; progress remains
+27/29. V26 full Rust and OpenSpec verification pass, while full frontend verification exposed one
+obsolete project-instruction Activity assertion that still expected raw private paths. Runtime
+redaction matches the approved privacy contract; the fixture is corrected and frontend
+reverification passes 200/200 tests, zero Svelte diagnostics, and the production build. V26 also
+passes strict format/Clippy, npm audit with zero vulnerabilities, 14/14 Factory MCP protocol tests,
+the exact inventory and router boundaries, strict OpenSpec 21/21, and diff/scope checks. The exact
+source is ready to freeze for independent code, security, and goal-backward audits; progress
+remains 27/29. Frozen V26 goal-backward review passed 21/21 requirements and 47/47 scenarios with
+zero Critical/High/Medium findings. Code/security review found one High and consolidated Medium
+privacy gaps: common bearer-token values and generic opaque webhook paths, additional raw
+SQL/source/CSS forms, and unsanitized additive/receipt fields in legacy Activity entries. State
+returned to BUILD / CODING for one paired-regression shared-validator repair cycle; progress
+remains 27/29. V26 findings now have failing-first backend/Activity regressions and shared root
+repairs: bounded common bearer-token recognition, structural webhook-path detection, mirrored
+SQL/source/CSS shapes with reviewed prose controls, and closed Activity reconstruction across
+hydration, new writes, persistence, generic receipts, and MCP projection. Display-only local
+project paths retain only a safe basename label; canonical generic mutation receipts preserve their
+spec-required exact destinations while redacting unsafe content. Focused Rust privacy and six
+frontend Activity tests pass. State advanced through DIFF to QA / RUNNING for V27 full
+verification; progress remains 27/29. Fresh V27 QA passes 844 Rust library tests with 5
+intentional ignores, 2 binary tests, 0 doctests, strict format/Clippy, 201 frontend tests, zero
+Svelte diagnostics, production build, npm audit with zero vulnerabilities, 14/14 Factory MCP
+protocol tests, exact inventory and router boundaries, strict OpenSpec 21/21, and clean
+dependency/scope/diff checks. Prior 375/1440 keyboard/axe evidence remains applicable because V27
+does not change Factory control-room or review interaction structure; the Activity change replaces
+only persisted display strings and is covered by mount/focus regressions. A frozen V27 code,
+security, and goal-backward audit is next; progress remains 27/29.
+Frozen V27 goal review passed all 21 requirements and 47 scenarios. Code/security review found one
+High common-token family gap plus Medium opaque-webhook character, SQL/source/CSS, generic exact
+receipt-destination, and fail-closed Activity-envelope gaps. State returned to BUILD / CODING for
+paired failing-first backend/Activity regressions and shared root repairs; progress remains 27/29.
+V27 findings now pass the paired regressions after shared fixes for common bearer families,
+URL-valid opaque webhook tokens, maintenance/type SQL, namespace/nested-CSS source, fail-closed
+Activity envelopes/MCP projection, and exact safe generic destinations through 4096 characters.
+Focused QA passes 1/1 Rust and 6/6 frontend tests. State advanced through DIFF to QA / RUNNING for
+the complete verification matrix; progress remains 27/29.
+Fresh V28 QA passes 844 Rust library tests with 5 intentional ignores, 2 binary tests, 0 doctests,
+strict format/Clippy, 203 frontend tests, zero Svelte diagnostics, production build, npm audit with
+zero vulnerabilities, 14/14 Factory MCP protocol tests, exact 137/seven inventory, raw-router and
+router-composition checks, strict OpenSpec 21/21, and dependency/scope/diff checks. Local `main`
+remains at the shared base with its unrelated dirty changes untouched; no archive exists. Prior
+375/1440 keyboard/axe evidence remains applicable because V28 changes only shared metadata and
+Activity journal normalization, with current mount/focus regressions passing. Frozen V28 code,
+security, and goal-backward audits are next; progress remains 27/29.
+Frozen V28 code, security, and goal-backward audits reported zero Critical/High findings but five
+Medium privacy-classifier gaps: common standalone credential families, literal and encoded webhook
+path separators, generic SQL DDL, and C++ inline namespaces. One Low finding requires calendar-
+strict Activity timestamps. State returned to BUILD / CODING for one generalized shared-validator
+repair with paired failing-first regressions; progress remains 27/29.
+V28 findings now pass paired regressions after centralized credential-family matching, RFC-valid
+embedded webhook scanning with decoded multi-segment opaque tails, generalized DDL detection,
+inline-namespace parity, and calendar-strict Activity timestamps. Focused QA passes 1/1 Rust and
+4/4 frontend tests with zero Svelte diagnostics. State advanced through DIFF to QA / RUNNING for
+the complete V29 verification matrix; progress remains 27/29.
+V29 QA passed, but the pre-freeze boundary self-audit found lowercase semicolon-free generic DDL
+was not covered by the generalized rule. State briefly returned to BUILD; paired Rust/Activity
+regressions failed first and now pass while reviewed sentence-case UI prose remains safe. State is
+QA / RUNNING for the complete V30 verification matrix; progress remains 27/29.
+Fresh V30 QA on the formatted source passes 844 Rust library tests with 5 intentional ignores,
+2 binary tests, 0 doctests, strict format/Clippy, 203 frontend tests, zero Svelte diagnostics,
+production build, npm audit with zero vulnerabilities, 14/14 Factory MCP protocol coverage, exact
+137/seven inventory and router boundaries, strict OpenSpec 21/21, and dependency/scope/diff checks.
+Prior 375/1440 keyboard/axe evidence remains applicable because V30 changes only shared metadata
+classification and Activity timestamp normalization. Frozen V30 code, security, and goal-backward
+audits are next; progress remains 27/29.
+
 ## ✅ Nightly Control Plane Program [COMPLETE] (2026-08-18)
 
 The isolated `feat/nightly-control-plane` branch now delivers Unified Review, Project Readiness,

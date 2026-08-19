@@ -82,8 +82,13 @@ import type {
   PlaybookDocument,
   InstalledAgent,
   ExpertActivationRequest,
+  ExpertActivationPlan,
+  ExpertActivationRecord,
+  ExpertClient,
   ExpertCreationRequest,
   ExpertRun,
+  FactoryWorkOrderInput,
+  FactoryFinalDecisionInput,
   WorkspacePack,
 } from "./types";
 
@@ -163,6 +168,30 @@ export const expertCreationRequests = () =>
 export const expertRunsList = () => invoke<ExpertRun[]>("expert_runs_list", { projectPath: null });
 export const expertActivationRequests = () =>
   invoke<ExpertActivationRequest[]>("expert_activation_requests");
+export const expertPlanActivation = (id: string, projectPath: string, client: ExpertClient | null) =>
+  invoke<ExpertActivationPlan>("expert_plan_activation", { id, projectPath, client });
+export const expertActivate = (
+  id: string,
+  projectPath: string,
+  client: ExpertClient | null,
+  workOrder: FactoryWorkOrderInput | null = null,
+) => invoke<ExpertActivationRecord>("expert_activate", { id, projectPath, client, workOrder });
+export const expertRunFactoryPlanDecide = (
+  id: string,
+  expectedRevision: number,
+  planRevision: string,
+  decision: "approve" | "reject",
+) => invoke<ExpertRun>("expert_run_factory_plan_decide", { id, expectedRevision, planRevision, decision });
+export const expertRunFactoryFinalDecide = (id: string, input: FactoryFinalDecisionInput) =>
+  invoke<ExpertRun>("expert_run_factory_final_decide", { id, input });
+export const expertRunFactoryCancel = (id: string, expectedRevision: number, safeDetail: string | null) =>
+  invoke<ExpertRun>("expert_run_factory_cancel", { id, expectedRevision, safeDetail });
+export const expertRunFactoryReleaseClaim = (id: string, expectedRevision: number) =>
+  invoke<ExpertRun>("expert_run_factory_release_claim", { id, expectedRevision });
+export const expertRunFactoryWaiveReview = (id: string, expectedRevision: number, reason: string) =>
+  invoke<ExpertRun>("expert_run_factory_waive_review", { id, expectedRevision, reason });
+export const expertRunFactoryResolveBlocker = (id: string, expectedRevision: number, blockerId: string) =>
+  invoke<ExpertRun>("expert_run_factory_resolve_blocker", { id, expectedRevision, blockerId });
 
 export const agentInstallsReconcile = () =>
   invoke<InstalledAgent[]>("installs_reconcile", { projectRoots: [] });

@@ -9700,13 +9700,12 @@ fn available_skill_references(
         .collect())
 }
 
-#[tauri::command]
-pub async fn project_readiness_get(
-    state: State<'_, AppState>,
+pub(crate) async fn project_readiness_for_state(
+    state: &AppState,
     project_path: String,
 ) -> Result<ProjectReadinessReport, AppError> {
-    let project_path = exact_registered_project(&state, &project_path).await?;
-    let database = control_center_database(&state).await?;
+    let project_path = exact_registered_project(state, &project_path).await?;
+    let database = control_center_database(state).await?;
     let document = corpus::load_control_center(&database).await?;
     let baseline = document
         .project_baselines
@@ -9738,7 +9737,7 @@ pub async fn project_readiness_get(
         .map(|counts| counts.into_keys().collect::<BTreeSet<_>>())
         .map_err(|error| error.to_string());
     let (generic_installs, roster_installs) =
-        reconcile_project_agent_readiness_installs(&state).await?;
+        reconcile_project_agent_readiness_installs(state).await?;
     let agent_evidence = project_agent_readiness_states(
         &agent_requirements,
         &project_path,
@@ -9757,8 +9756,8 @@ pub async fn project_readiness_get(
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let skill_evidence = match crate::skills::reconcile_skill_installs(&state, &registered).await {
-        Ok(installed) => crate::skills::inspect_skill_sources(&state)
+    let skill_evidence = match crate::skills::reconcile_skill_installs(state, &registered).await {
+        Ok(installed) => crate::skills::inspect_skill_sources(state)
             .await
             .and_then(|sources| available_skill_references(sources, &relevant_skill_source_ids))
             .map(|available| {
@@ -9795,7 +9794,7 @@ pub async fn project_readiness_get(
     }
     .map_err(|error| error.to_string());
 
-    let instruction_evidence = inspect_project_instruction_targets(&state, &project_path)
+    let instruction_evidence = inspect_project_instruction_targets(state, &project_path)
         .await
         .map(|targets| {
             targets
@@ -9813,7 +9812,7 @@ pub async fn project_readiness_get(
                 .collect()
         })
         .map_err(|error| error.to_string());
-    let mcp_evidence = crate::commands::mcp_clients::mcp_inventory_for_state_passive(&state)
+    let mcp_evidence = crate::commands::mcp_clients::mcp_inventory_for_state_passive(state)
         .await
         .map(|inventory| {
             let incomplete = !inventory.issues.is_empty();
@@ -9846,7 +9845,7 @@ pub async fn project_readiness_get(
         .map_err(|error| error.to_string());
     let mut tool_evidence = BTreeMap::new();
     for tool in &baseline.tools {
-        match tool_detected(&state, tool).await {
+        match tool_detected(state, tool).await {
             Ok(true) => {
                 tool_evidence.insert(tool.clone(), ReadinessRowState::Ready);
             }
@@ -9874,6 +9873,14 @@ pub async fn project_readiness_get(
         .iter()
         .any(|subscription| subscription.project_path == project_path);
     Ok(report)
+}
+
+#[tauri::command]
+pub async fn project_readiness_get(
+    state: State<'_, AppState>,
+    project_path: String,
+) -> Result<ProjectReadinessReport, AppError> {
+    project_readiness_for_state(&state, project_path).await
 }
 
 fn catalog_item_reference(item: &crate::types::CatalogSnapshotItem) -> AgentReference {
@@ -16623,6 +16630,30 @@ mod tests {
             independently_unavailable.overall,
             ProjectReadinessOverall::Unavailable
         );
+    }
+
+    #[tokio::test]
+    async fn project_readiness_command_and_internal_authority_match() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _state = project_instruction_test_state(app_data.path(), project.path()).await;
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+
+        let state = app.state::<AppState>();
+        let internal = project_readiness_for_state(state.inner(), project_path.clone())
+            .await
+            .unwrap();
+        let command = project_readiness_get(app.state(), project_path)
+            .await
+            .unwrap();
+
+        assert_eq!(internal, command);
     }
 
     #[test]
