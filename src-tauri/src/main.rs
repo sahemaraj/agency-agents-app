@@ -52,20 +52,34 @@ where
     Ok(Mode::Http(bind))
 }
 
-#[tokio::main]
-async fn main() {
-    let result = match parse_mode(std::env::args()) {
-        Ok(Mode::App) => {
-            agency_agents_lib::run();
-            return;
+fn main() {
+    let mode = match parse_mode(std::env::args()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("MCP server failed: {error}");
+            std::process::exit(1);
         }
-        Ok(Mode::Stdio(client)) => agency_agents_lib::run_mcp(client).await,
-        Ok(Mode::Http(bind)) => match std::env::var("AGENCY_AGENTS_MCP_TOKEN") {
-            Ok(token) => agency_agents_lib::run_mcp_http(bind, token).await,
-            Err(_) => Err("AGENCY_AGENTS_MCP_TOKEN is required".into()),
-        },
-        Err(error) => Err(error),
     };
+
+    if matches!(&mode, Mode::App) {
+        agency_agents_lib::run();
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|error| {
+        eprintln!("MCP server failed: {error}");
+        std::process::exit(1);
+    });
+    let result = runtime.block_on(async move {
+        match mode {
+            Mode::Stdio(client) => agency_agents_lib::run_mcp(client).await,
+            Mode::Http(bind) => match std::env::var("AGENCY_AGENTS_MCP_TOKEN") {
+                Ok(token) => agency_agents_lib::run_mcp_http(bind, token).await,
+                Err(_) => Err("AGENCY_AGENTS_MCP_TOKEN is required".into()),
+            },
+            Mode::App => unreachable!(),
+        }
+    });
     if let Err(error) = result {
         eprintln!("MCP server failed: {error}");
         std::process::exit(1);
@@ -103,5 +117,46 @@ mod tests {
         }
         assert!(parse_mode(["app", "--mcp", "--mcp-http"]).is_err());
         assert!(parse_mode(["app", "--bind", "127.0.0.1:1"]).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "launches the native desktop binary"]
+    fn desktop_app_stays_alive_past_startup() {
+        use std::{
+            io::Read,
+            path::PathBuf,
+            process::{Command, Stdio},
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let binary =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/agency-agents-app");
+        assert!(
+            binary.is_file(),
+            "build the desktop binary before running this test"
+        );
+        let mut child = Command::new(binary)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch desktop binary");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().expect("poll desktop binary") {
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .expect("capture desktop stderr")
+                    .read_to_string(&mut stderr)
+                    .expect("read desktop stderr");
+                panic!("desktop app exited during startup ({status}): {stderr}");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        child.kill().expect("stop desktop binary");
+        child.wait().expect("reap desktop binary");
     }
 }

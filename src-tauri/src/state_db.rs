@@ -1224,7 +1224,8 @@ fn legacy_conflicts_raw(
     }
     let mut conflicts = Vec::new();
     for document in inventory {
-        let (was_present, expected_size, expected_hash) = connection
+        let source = app_data_dir.join(safe_relative_path(document.relative_path)?);
+        let fingerprint = connection
             .query_row(
                 "SELECT was_present, size_bytes, sha256 FROM legacy_imports WHERE name = ?1",
                 [document.name],
@@ -1237,11 +1238,18 @@ fn legacy_conflicts_raw(
                 },
             )
             .optional()
-            .map_err(map_sqlite_error)?
-            .ok_or_else(|| AppError::StorageCorrupt {
+            .map_err(map_sqlite_error)?;
+        let Some((was_present, expected_size, expected_hash)) = fingerprint else {
+            if matches!(
+                std::fs::symlink_metadata(&source),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                continue;
+            }
+            return Err(AppError::StorageCorrupt {
                 message: "legacy fingerprint inventory is incomplete".into(),
-            })?;
-        let source = app_data_dir.join(safe_relative_path(document.relative_path)?);
+            });
+        };
         if !was_present {
             if std::fs::symlink_metadata(&source).is_ok() {
                 conflicts.push(document.relative_path.to_string());
@@ -1951,6 +1959,37 @@ mod tests {
         );
         let document = DocumentSpec::new("one", 1, 1024, validate);
         assert_eq!(database.read(document).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn completed_migration_accepts_a_new_absent_inventory_document() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let database = StateDatabase::open(root.path()).unwrap();
+        database
+            .import_legacy(
+                root.path(),
+                &SYNTHETIC_INVENTORY[..1],
+                &[import_spec("one")],
+            )
+            .await
+            .unwrap();
+
+        assert!(database
+            .legacy_conflicts(root.path(), SYNTHETIC_INVENTORY)
+            .await
+            .unwrap()
+            .is_empty());
+
+        std::fs::write(state_dir.join("two.json"), r#"{"values":[]}"#).unwrap();
+        assert!(matches!(
+            database
+                .legacy_conflicts(root.path(), SYNTHETIC_INVENTORY)
+                .await,
+            Err(AppError::StorageCorrupt { message })
+                if message == "legacy fingerprint inventory is incomplete"
+        ));
     }
 
     #[tokio::test]

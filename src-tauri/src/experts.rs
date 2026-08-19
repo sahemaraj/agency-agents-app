@@ -478,7 +478,7 @@ fn bind_factory_work_order(
     let summary = readiness
         .categories
         .iter()
-        .map(|category| format!("{:?}: {:?}", category.category, category.state))
+        .map(|category| format!("{:?} {:?}", category.category, category.state))
         .collect();
     Ok(Some(crate::expert_runs::FactoryRunCreate {
         ticket_reference: input.ticket_reference,
@@ -3459,7 +3459,20 @@ mod tests {
             overall: crate::types::ProjectReadinessOverall::Ready,
             baseline: None,
             subscribed: false,
-            categories: Vec::new(),
+            categories: [
+                crate::types::ReadinessCategoryKind::AgentRoster,
+                crate::types::ReadinessCategoryKind::Skills,
+                crate::types::ReadinessCategoryKind::Instructions,
+                crate::types::ReadinessCategoryKind::Mcp,
+                crate::types::ReadinessCategoryKind::Tools,
+            ]
+            .into_iter()
+            .map(|category| crate::types::ReadinessCategoryReport {
+                category,
+                state: crate::types::ReadinessCategoryState::NotRequired,
+                rows: Vec::new(),
+            })
+            .collect(),
         };
         let mut unbound_workspace_pack = input.clone();
         unbound_workspace_pack.workspace_pack_revision = Some("a".repeat(64));
