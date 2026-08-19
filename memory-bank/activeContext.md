@@ -1,8 +1,8 @@
 # Active Context — Agency Agents
 
-## Factory Runs MVP [READY-FOR-REVIEW] (2026-08-18)
+## Factory Runs MVP [COMPLETE] (2026-08-18)
 
-State: APPROVAL / IDLE on isolated branch `feat/factory-runs-mvp`. The approved OpenSpec change
+State: DOCS / IDLE on local `main` after the approved merge. The approved OpenSpec change
 `factory-runs-mvp` remains the source of truth. Implementation extends the existing Expert Run,
 readiness, MCP, Experts, and Activity authorities without adding an executor, database document,
 permission family, route, runtime, or dependency. V10 independent review found one Medium
@@ -159,8 +159,9 @@ Frozen V31 code-quality, security, and goal-backward audits all pass with zero C
 Medium, or Low findings against unchanged source hash
 `efce76bf56fdaf037bf083d3ccd0d44aea67c8abaa453cb64010c45152051af2`. The goal audit proves all
 21/21 delta requirements, 47/47 delta scenarios, and 8/8 canonical compatibility requirements.
-OpenSpec tasks are 29/29 complete. The implementation is frozen and ready for human review; it
-remains uncommitted, unmerged, and unarchived, and local `main` remains untouched.
+OpenSpec tasks are 29/29 complete. The implementation was committed and merged into local `main`.
+Its deltas were synchronised into four canonical specs, strict canonical validation passes 22/22,
+and the change is archived at `openspec/changes/archive/2026-08-19-factory-runs-mvp/`.
 Frozen V23 goal review passed all 21 requirements and 47 scenarios, but code/security review found
 one High standard-session credential gap and consolidated Medium gaps in compact JWT/JWE handling,
 frontend credential-key parity, quoted YAML separators, SQL/source syntax, and legacy JSON

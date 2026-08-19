@@ -4,7 +4,7 @@
 
 ### 2026-08-18: Factory Runs MVP
 
-[READY-FOR-REVIEW] Implemented the approved `factory-runs-mvp` OpenSpec change on isolated branch
+[COMPLETE] Implemented the approved `factory-runs-mvp` OpenSpec change on isolated branch
 `feat/factory-runs-mvp`. Core lifecycle, shared readiness/activation, the seven-tool pull MCP
 protocol, desktop control room, Activity review, and bounded terminal receipts are implemented.
 V10 review found two Medium raw-source classifier gaps. Exact backend/Activity regressions failed
@@ -199,8 +199,10 @@ with zero vulnerabilities, Factory MCP inventory/protocol boundaries, strict Ope
 diff/scope checks. Independent code-quality, security, and goal-backward audits all report zero
 Critical/High/Medium/Low findings against the unchanged frozen source hash. All 21 delta
 requirements, 47 delta scenarios, and affected canonical receipt/review requirements are proven;
-OpenSpec progress is 29/29. The branch is ready for human review and remains uncommitted, unmerged,
-and unarchived; local `main` is untouched.
+OpenSpec progress is 29/29. Commit `c96afea` was merged into local `main` by `6d4ca5f`. The two new
+Factory capabilities and the receipt/review deltas are synchronised into canonical specs, strict
+canonical validation passes 22/22, and the change is archived under
+`openspec/changes/archive/2026-08-19-factory-runs-mvp/`.
 
 ## Completed
 
