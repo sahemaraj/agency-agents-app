@@ -68,10 +68,15 @@ pub(crate) fn recommend_agents(
     results: &[AgentSourceResult],
     preferred: &[AgentPreferredSource],
     task: &str,
+    languages: &[String],
     limit: usize,
 ) -> Result<Vec<AgentRecommendation>, AppError> {
-    validate_recommend_request(task, &[])?;
+    validate_recommend_request(task, languages)?;
     let task_tokens = metadata_tokens(task);
+    let language_tokens = languages
+        .iter()
+        .flat_map(|language| metadata_tokens(language))
+        .collect::<std::collections::BTreeSet<_>>();
     let mut recommendations = results
         .iter()
         .flat_map(|source| &source.agents)
@@ -98,6 +103,12 @@ pub(crate) fn recommend_agents(
                 } else if taxonomy.contains(token) {
                     score += 2;
                     reasons.push(format!("task:taxonomy:{token}"));
+                }
+            }
+            for token in &language_tokens {
+                if name.contains(token) || description.contains(token) || taxonomy.contains(token) {
+                    score += 3;
+                    reasons.push(format!("language:{token}"));
                 }
             }
             if preferred.iter().any(|item| {
@@ -210,7 +221,7 @@ pub(crate) fn recommend_catalog(
     languages: &[String],
     limit: usize,
 ) -> Result<Vec<TaskRecommendation>, AppError> {
-    let mut combined = recommend_agents(agents, preferred, task, limit)?
+    let mut combined = recommend_agents(agents, preferred, task, languages, limit)?
         .into_iter()
         .map(|item| TaskRecommendation::Agent {
             package: item.package,
@@ -258,8 +269,10 @@ pub async fn task_recommendations(
     state: State<'_, AppState>,
     task: String,
     limit: Option<usize>,
+    languages: Option<Vec<String>>,
 ) -> Result<Vec<TaskRecommendation>, AppError> {
-    validate_recommend_request(&task, &[])?;
+    let languages = languages.unwrap_or_default();
+    validate_recommend_request(&task, &languages)?;
     let agents = crate::agents::inspect_agent_sources(&state.app_data_dir).await?;
     let preferred = crate::agents::organize::list(&state)
         .await?
@@ -270,7 +283,7 @@ pub async fn task_recommendations(
         &preferred,
         &skills,
         &task,
-        &[],
+        &languages,
         limit.unwrap_or(10),
     )
 }
@@ -675,6 +688,45 @@ mod tests {
             [4, 4, 4, 4]
         );
         assert!(recommend_catalog(&agents, &[], &skills, &"x".repeat(2049), &[], 10).is_err());
+    }
+
+    #[test]
+    fn language_tokens_reach_agent_and_skill_recommenders() {
+        let agents = vec![AgentSourceResult {
+            source: AgentSource {
+                id: "agents".into(),
+                label: "Agent source".into(),
+                enabled: true,
+                kind: AgentSourceKind::Local {
+                    root: "/agents".into(),
+                },
+            },
+            agents: vec![agent_package("source-a", "reviewer.md", true)],
+            errors: Vec::new(),
+            revision: "revision".into(),
+        }];
+        let skills = vec![SkillSourceResult {
+            source: SkillSource {
+                id: "skills".into(),
+                kind: SkillSourceKind::Local {
+                    root: "/skills".into(),
+                },
+            },
+            packages: vec![skill_package("skill-a", "review", true)],
+            errors: Vec::new(),
+        }];
+
+        let matches = recommend_catalog(&agents, &[], &skills, "", &["rust".into()], 10)
+            .expect("stack-aware recommendations");
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|recommendation| {
+            recommendation.score() == 3
+                && match recommendation {
+                    TaskRecommendation::Agent { reasons, .. }
+                    | TaskRecommendation::Skill { reasons, .. } => reasons == &["language:rust"],
+                }
+        }));
     }
 
     #[test]

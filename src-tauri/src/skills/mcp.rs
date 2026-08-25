@@ -624,6 +624,11 @@ struct ExpertCreationContextRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProjectDetectStackRequest {
+    project_path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ExpertCreationSubmitRequest {
     client_request_id: String,
     outcome: String,
@@ -1565,6 +1570,7 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "skills_recommend"
         | "skills_plan_install"
         | "skills_version_history" => Some(McpAction::Read),
+        "project_detect_stack" => Some(McpAction::Read),
         "experts_list"
         | "expert_runs_list"
         | "expert_runs_get"
@@ -2364,7 +2370,11 @@ impl SkillMcpServer {
             project_path.clone(),
             async {
                 if let Some(project_path) = project_path.as_deref() {
-                    languages.extend(detect_project_languages(project_path)?);
+                    languages.extend(
+                        crate::projects::detect_project_stack(project_path)
+                            .map_err(|error| error.to_string())?
+                            .languages,
+                    );
                     languages.sort();
                     languages.dedup();
                 }
@@ -2379,6 +2389,28 @@ impl SkillMcpServer {
                         limit.unwrap_or(10).clamp(1, 50),
                     )
                     .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Detect bounded root-manifest stack tokens for an allowlisted project")]
+    async fn project_detect_stack(
+        &self,
+        Parameters(ProjectDetectStackRequest { project_path }): Parameters<
+            ProjectDetectStackRequest,
+        >,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "project_detect_stack",
+            McpAction::Read,
+            Some(project_path.clone()),
+            async {
+                serde_json::to_string_pretty(
+                    &crate::projects::detect_project_stack(&project_path)
+                        .map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())
             },
@@ -3116,7 +3148,9 @@ impl SkillMcpServer {
                     crate::experts::mcp_creation_context(&self.state, &outcome, &project_path)
                         .await
                         .map_err(|error| error.to_string())?;
-                let languages = detect_project_languages(&project_path)?;
+                let languages = crate::projects::detect_project_stack(&project_path)
+                    .map_err(|error| error.to_string())?
+                    .languages;
                 let sources = super::inspect_skill_sources(&self.state)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -3881,35 +3915,6 @@ impl SkillMcpServer {
     }
 }
 
-fn detect_project_languages(project_path: &str) -> Result<Vec<String>, String> {
-    let root = std::fs::canonicalize(project_path)
-        .map_err(|error| format!("open recommendation project: {error}"))?;
-    if !root.is_dir() {
-        return Err("recommendation project must be a directory".into());
-    }
-    let names = std::fs::read_dir(&root)
-        .map_err(|error| format!("read recommendation project: {error}"))?
-        .take(256)
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-        .collect::<HashSet<_>>();
-    let mut languages = Vec::new();
-    for (manifest, detected) in [
-        ("package.json", "typescript"),
-        ("Cargo.toml", "rust"),
-        ("pyproject.toml", "python"),
-        ("requirements.txt", "python"),
-        ("go.mod", "go"),
-        ("pom.xml", "java"),
-        ("build.gradle", "java"),
-    ] {
-        if names.contains(manifest) {
-            languages.push(detected.into());
-        }
-    }
-    Ok(languages)
-}
-
 #[rmcp::tool_handler(router = self.tool_router)]
 impl ServerHandler for SkillMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -4617,11 +4622,10 @@ mod tests {
 
     use super::{
         action_for_tool, agency_agents_tool_names, canonical_mcp_client_identity, catalog_revision,
-        detect_project_languages, package_resource_uri, parse_package_resource_uri,
-        parse_skill_type, parse_update_policy, pause_next_factory_read_dispatch,
-        resource_list_changed, search_packages, FindAndInstallRequest, HttpAuth,
-        NamedApprovalRequest, RecommendRequest, SkillMcpServer, SkillRuntime, SourceRequest,
-        FACTORY_TOOL_NAMES,
+        package_resource_uri, parse_package_resource_uri, parse_skill_type, parse_update_policy,
+        pause_next_factory_read_dispatch, resource_list_changed, search_packages,
+        FindAndInstallRequest, HttpAuth, NamedApprovalRequest, RecommendRequest, SkillMcpServer,
+        SkillRuntime, SourceRequest, FACTORY_TOOL_NAMES,
     };
 
     fn package(name: &str, description: &str, installable: bool) -> SkillPackageResult {
@@ -7149,7 +7153,7 @@ mod tests {
             "every routed tool must have an explicit audit/policy class"
         );
 
-        assert_eq!(names.len(), 140);
+        assert_eq!(names.len(), 141);
         assert_eq!(
             names
                 .iter()
@@ -7221,7 +7225,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<std::collections::HashSet<_>>();
 
-        assert_eq!(skill_names.len(), 86);
+        assert_eq!(skill_names.len(), 87);
         assert_eq!(agent_names.len(), 54);
         assert!(skill_names.is_disjoint(&agent_names));
     }
@@ -7593,17 +7597,6 @@ mod tests {
     fn mcp_rejects_unknown_creator_types_and_update_policies() {
         assert!(parse_skill_type("unknown").is_err());
         assert!(parse_update_policy("always").is_err());
-    }
-
-    #[test]
-    fn project_recommendations_detect_bounded_root_manifests() {
-        let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("Cargo.toml"), "[package]").unwrap();
-        std::fs::write(project.path().join("package.json"), "{}").unwrap();
-        assert_eq!(
-            detect_project_languages(project.path().to_str().unwrap()).unwrap(),
-            ["typescript", "rust"]
-        );
     }
 
     #[tokio::test]

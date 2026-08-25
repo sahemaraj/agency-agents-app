@@ -81,6 +81,7 @@ import type {
   ProjectReadinessReport,
   ProjectRecommendation,
   ProjectInfo,
+  ProjectStackDetection,
   PlaybookCatalogEntry,
   PlaybookDocument,
   InstalledAgent,
@@ -134,8 +135,15 @@ export const lockPlan = (projectPath: string) =>
 export const lockApply = (projectPath: string, revision: string) =>
   invoke<LockApplyResponse>("lock_apply", { projectPath, revision });
 
-export const taskRecommendations = (task: string, limit = 10) =>
-  invoke<TaskRecommendation[]>("task_recommendations", { task, limit });
+export const taskRecommendations = (task: string, limit = 10, languages?: string[]) =>
+  invoke<TaskRecommendation[]>("task_recommendations", {
+    task,
+    limit,
+    ...(languages ? { languages } : {}),
+  });
+
+export const projectDetectStack = (projectPath: string) =>
+  invoke<ProjectStackDetection>("project_detect_stack", { projectPath });
 
 export const catalogFeedList = () => invoke<CatalogFeedState>("catalog_feed_list");
 export const catalogSourceTransitionRecover = () =>

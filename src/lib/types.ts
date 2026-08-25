@@ -1938,6 +1938,16 @@ export interface ProjectInfo {
   installedCount: number;
 }
 
+export interface ProjectStackEvidence {
+  file: string;
+  token: string;
+}
+
+export interface ProjectStackDetection {
+  languages: string[];
+  evidence: ProjectStackEvidence[];
+}
+
 export type ProjectInstructionOperation = "upsert" | "remove";
 
 export interface ProjectInstructionSnippet {

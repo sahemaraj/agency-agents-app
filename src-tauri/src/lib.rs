@@ -15,6 +15,7 @@ mod github;
 mod install;
 mod library;
 mod ollama;
+mod projects;
 mod registry;
 mod render;
 mod skills;
@@ -298,6 +299,7 @@ pub fn run() {
             agents::organize::agent_library_export,
             agents::organize::agent_library_import,
             agents::organize::agent_update_policy_set,
+            projects::project_detect_stack,
             agents::organize::agent_publisher_trust_set,
             agents::organize::agent_preferred_source_set,
             agents::organize::agent_usage_record,

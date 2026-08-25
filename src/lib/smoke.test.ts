@@ -7505,20 +7505,20 @@ describe("frontend test harness", () => {
       ["./components/InstallModal.svelte", [/async function reviewPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewCollection[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollback[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewRoster[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyRosterPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runRosterLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showRosterHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollbackRoster[^]*?actionError = isAppError[^\n]*appErrorMessage/]],
       ["./components/DiffModal.svelte", [/install\.diff[^]*?appErrorMessage/]],
       ["./components/AgencyDashboard.svelte", [/async function updateCatalog[^]*?appErrorMessage/]],
-      ["./components/Projects.svelte", [/async function reveal[^]*?appErrorMessage/, /async function forgetProject[^]*?appErrorMessage/, /async function uninstallAndRemove[^]*?appErrorMessage/, /async function refreshProjectInstructions[^]*?appErrorMessage/, /async function reviewInstruction[^]*?appErrorMessage/, /async function applyInstruction[^]*?appErrorMessage/]],
+      ["./components/Projects.svelte", [/const detection = await projectDetectStack[^]*?stackError = isAppError[^\n]*appErrorMessage/, /async function reveal[^]*?appErrorMessage/, /async function forgetProject[^]*?appErrorMessage/, /async function uninstallAndRemove[^]*?appErrorMessage/, /async function refreshProjectInstructions[^]*?appErrorMessage/, /async function reviewInstruction[^]*?appErrorMessage/, /async function applyInstruction[^]*?appErrorMessage/]],
       ["./stores/catalog.svelte.ts", [/catalog_status[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_check_updates[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_detect[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /async setSource[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /async provisionManaged[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_pull[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/settings.svelte.ts", [/corruptOnDisk = true[^]*?this\.error = appErrorMessage/, /else if \(isAppError\(e\)\)[^]*?this\.error = appErrorMessage/, /async save[^]*?this\.error = appErrorMessage/, /async reset[^]*?this\.error = appErrorMessage/, /async applySecurityPosture[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/experts.svelte.ts", [/expert_runs_list[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/activity.svelte.ts", [/safeActivityDetail[^]*?isAppError\(value\) \? appErrorMessage\(value\)/]],
     ]);
-    expect([...inventory.values()].flat()).toHaveLength(53);
+    expect([...inventory.values()].flat()).toHaveLength(54);
     for (const [path, markers] of inventory) {
       const source = rel01Sources[path];
       expect(source, path).toBeTruthy();
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(65);
+      .toHaveLength(66);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -7715,6 +7715,76 @@ describe("frontend test harness", () => {
       expect(invokeMock.mock.calls.filter(([command]) => command === "installs_reconcile"))
         .toHaveLength(genericReconcilesAfterMount);
       expect(install.reconciled).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("shows manifest evidence and routes stack-aware Agent and Skill suggestions through existing views", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/stack-project";
+    const projectRows = [{ path: projectPath, label: "Stack project", installedCount: 0 }];
+    const recommendations = [
+      {
+        kind: "agent" as const,
+        package: staleControlPackage,
+        score: 3,
+        reasons: ["language:rust"],
+      },
+      {
+        ...skillRecommendation(),
+        score: 3,
+        reasons: ["language:typescript"],
+      },
+    ];
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile" || command === "agent_rosters_reconcile"
+        || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_instructions_inspect" || command === "project_recommendations_list") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath, false) as never;
+      if (command === "project_detect_stack") {
+        expect(args).toEqual({ projectPath });
+        return {
+          languages: ["typescript", "rust"],
+          evidence: [
+            { file: "package.json", token: "typescript" },
+            { file: "Cargo.toml", token: "rust" },
+          ],
+        } as never;
+      }
+      if (command === "task_recommendations") {
+        expect(args).toEqual({ task: "", limit: 10, languages: ["typescript", "rust"] });
+        return recommendations as never;
+      }
+      return [] as never;
+    });
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Projects, { target });
+    try {
+      const stack = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLElement>(".stack-onboarding");
+        expect(candidate?.textContent).toContain("package.json");
+        expect(candidate?.textContent).toContain("Cargo.toml");
+        expect(candidate?.textContent).toContain("language:rust");
+        expect(candidate?.textContent).toContain("language:typescript");
+        return candidate!;
+      });
+      const open = [...stack.querySelectorAll<HTMLButtonElement>(".stack-recommendations button")];
+      expect(open).toHaveLength(2);
+      const callsBeforeNavigation = invokeMock.mock.calls.length;
+      open[0].click();
+      expect(ui.section).toBe("personas");
+      expect(ui.agentsReference).toEqual(staleControlPackage.reference);
+      open[1].click();
+      expect(ui.section).toBe("skills");
+      expect(ui.skillsSelected).toEqual({ sourceId: "skills-b", relativePath: "nested/reviewer" });
+      expect(invokeMock.mock.calls).toHaveLength(callsBeforeNavigation);
     } finally {
       unmount(component);
       target.remove();

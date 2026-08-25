@@ -1294,6 +1294,7 @@ impl SkillMcpServer {
                     &sources,
                     &library.preferred_sources,
                     &task,
+                    &[],
                     limit.unwrap_or(10),
                 )
                 .map_err(|error| error.to_string())?,
