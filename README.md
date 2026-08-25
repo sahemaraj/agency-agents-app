@@ -18,7 +18,7 @@ It is full source, MIT-licensed, local-first, and does not run telemetry.
 
 ## Why This Exists
 
-The `agency-agents` repo is a useful catalog of specialist AI agent personas, but every coding tool has its own agent format and install path. Claude Code, Codex, Cursor, Gemini CLI, Qwen, opencode, Copilot, and Osaurus all want similar content in slightly different places.
+The `agency-agents` repo is a useful catalog of specialist AI agent personas, but every coding tool has its own agent format and install path. Claude Code, Codex, Cursor, Gemini CLI, Qwen, opencode, Copilot, Osaurus, ZCode, Antigravity, Kimi, OpenClaw, Aider, and Windsurf all want similar content in slightly different places.
 
 Agency Agents gives that catalog a native control surface:
 
@@ -33,16 +33,18 @@ The core idea is simple: AI tools do not share a package database, so the app ke
 
 ## Features
 
-Agency Agents is organized around four pillars — **Agents** (who), **Tools** (how), **Teams** (which), and **Projects** (where):
+Agency Agents is organized into eight sections — **Dashboard**, **Agents** (who), **Skills**, **Tools** (how), **Teams** (which), **Projects** (where), **Experts**, and **Activity**:
 
-- **Agents workspace** — searchable three-pane catalog, division and category filters, an install-state lens, a detail panel, and per-agent deployment controls.
+- **Agents workspace** — searchable three-pane catalog, division and category filters, an install-state lens, a detail panel, and per-agent deployment controls. Agents come from multiple sources: built-in catalog, local, published, and GitHub.
+- **Skills** — a first-class skill package platform: sources, trust and approvals, dependencies, lifecycle, backups, rollback, drafts, and organization.
+- **Experts** — expert runs backed by the Factory: the app binary doubles as an MCP server (stdio or token-authenticated loopback HTTP), and external Claude Code or Codex stdio workers claim and complete factory work (the HTTP transport is read-only for factory mutations). Derived local models are managed through Ollama (list/show/create/copy/delete — no in-app inference).
 - **Tools panel** — shows all recognized tools from the registry, detected installs, counts, versions where available, default targets, project installs, and bulk operations. Installable targets render in full; recognized-only targets appear dimmed.
-- **Teams** — app-bundled preset teams plus your own saved teams; open a team for a detail panel with Deploy built in. (Teams replaces the earlier "Loadouts" concept; Agentfile export/import remains.)
+- **Teams** — app-bundled preset teams plus your own saved teams; open a team for a detail panel with Deploy built in. (Teams replaces the earlier "Loadouts" concept; export writes Workspace Pack v1 bundles of agents and skills, and legacy Agentfiles can still be imported.)
 - **Projects** — project-scoped installs with a dedicated panel and master/detail navigation, so a project gets exactly the agents and tools it needs.
 - **Install tracking** — records every app-managed install with source hash, rendered hash, tool, destination, scope, and project path where relevant.
-- **Reconciliation** — classifies installed files as current, outdated, modified, removed, or foreign by re-rendering canonical source and comparing bytes. The Dashboard surfaces what "needs attention," and the Agents pane filters to exactly those.
-- **Auto-update** — checks a signed update manifest and installs new versions in place, verified against an embedded key, with one-click install + relaunch. Live for macOS (Apple Silicon + Intel) as of v0.2.0; opt-in and gated by Settings.
-- **Tool registry** — tool knowledge lives in a single upstream-owned `tools.json` shared by the backend and frontend; adding a tool is editing one JSON entry, and installability is derived from whether the app ships a renderer for that tool's format.
+- **Reconciliation** — classifies installed files into seven states — current, outdated, modified, missing, foreign, disabled, or source-unavailable — by comparing disk bytes against ledger hashes and the canonical source. Byte-identical foreign files are adopted into the ledger as tracked installs. The Dashboard surfaces what "needs attention," and the Agents pane filters to exactly those.
+- **Auto-update** — checks an update manifest, then verifies the downloaded artifact's minisign signature against an embedded public key before installing in place, with one-click install + relaunch. Live for macOS (Apple Silicon + Intel) as of v0.2.0; opt-in and gated by Settings.
+- **Tool registry** — tool knowledge lives in a single upstream-owned `tools.json` shared by the backend and frontend; adding a tool is editing one JSON entry, and installability is derived from whether the app ships a renderer for that tool's format and the tool installs per-agent or roster files (aggregate `plugin` integrations stay recognized-only).
 - **Dashboard** — install health, a Global-vs-Projects install sunburst, cross-tool coverage merged with the catalog-by-division view (linked hover), and deep links back into the workspace.
 - **GitHub integration** — optional OAuth Device Flow for GitHub-backed app features. Tokens are stored in the platform keychain and are never returned to the frontend.
 - **Offline-first catalog** — ships with a bundled corpus baseline and can use a local or managed clone of `agency-agents`.
@@ -54,18 +56,24 @@ New to directing agents? See **[docs/USING-AGENTS.md](./docs/USING-AGENTS.md)** 
 
 The app currently installs to the renderer-backed targets that have deterministic byte parity with the upstream `agency-agents` converter:
 
-| Tool | Scope Today | Output |
-|------|-------------|--------|
-| Claude Code | user | `~/.claude/agents/*.md` |
-| Codex | user | `~/.codex/agents/*.toml` |
-| Gemini CLI | user | `~/.gemini/agents/*.md` |
-| GitHub Copilot | user | `~/.github/agents/*.md` and `~/.copilot/agents/*.md` |
-| Qwen Code | user | `~/.qwen/agents/*.md` |
+| Tool | Scope | Output |
+|------|-------|--------|
+| Claude Code | user + project | `.claude/agents/*.md` |
+| Codex | user + project | `.codex/agents/*.toml` |
+| Gemini CLI | user + project | `.gemini/agents/*.md` |
+| GitHub Copilot | user + project | `~/.copilot/agents/*.md` and `.github/agents/*.md` |
+| Qwen Code | user + project | `.qwen/agents/*.md` |
 | Cursor | project | `.cursor/rules/*.mdc` |
-| opencode | project | `.opencode/agents/*.md` |
+| opencode | user + project | `~/.config/opencode/agents/*.md` / `.opencode/agents/*.md` |
 | Osaurus | user | `~/.osaurus/skills/agency-<slug>/SKILL.md` |
+| ZCode | user + project | `~/.config/zcode/agents/*.md` / `.zcode/agents/*.md` |
+| Antigravity | user + project | `~/.gemini/config/skills/agency-<slug>/SKILL.md` / `.agents/skills/agency-<slug>/SKILL.md` |
+| Kimi | user | `~/.config/kimi/agents/<slug>/agent.yaml` + `system.md` |
+| OpenClaw | user | `~/.openclaw/agency-agents/<slug>/` (SOUL, AGENTS, IDENTITY) |
+| Aider | project | `CONVENTIONS.md` (roster) |
+| Windsurf | project | `.windsurfrules` (roster) |
 
-The upstream AA repo also contains integrations for Antigravity, Aider, Windsurf, OpenClaw, and Kimi. Those output shapes need additional app work before they should be exposed as first-class app installs — they appear in the Tools panel as recognized-only.
+Hermes is recognized-only: it integrates via a single router plugin owned by its CLI, not per-agent files, so the app never installs to it.
 
 ## What This Isn't
 
@@ -180,7 +188,7 @@ The highest-value areas before 1.0 are:
 
 - verified tool-target manifest shared with the AA repo
 - additional project-scope install targets
-- multi-file renderer support for Aider, Windsurf, OpenClaw, Antigravity, and Kimi once their target formats are verified
+- new tool integrations — add a `tools.json` entry plus a renderer for the tool's format
 - Windows/Linux packaging validation
 - GitHub issue/discussion integrations
 
