@@ -5,6 +5,7 @@
 //! in `commands::*`.
 
 mod agents;
+mod cli;
 mod commands;
 mod corpus;
 mod error;
@@ -31,6 +32,21 @@ pub async fn run_mcp(client: String) -> Result<(), String> {
 
 pub async fn run_mcp_http(bind: std::net::SocketAddr, token: String) -> Result<(), String> {
     skills::mcp::serve_http(bind, token).await
+}
+
+pub use cli::CliOutcome;
+
+pub async fn run_cli(
+    command: &str,
+    project: Option<std::path::PathBuf>,
+    json: bool,
+    dry_run: bool,
+) -> Result<CliOutcome, String> {
+    cli::run(command, project, json, dry_run).await
+}
+
+pub(crate) fn app_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
 }
 
 // =============================================================
@@ -396,7 +412,7 @@ pub fn run() {
             install::lockfile::lock_plan,
             install::lockfile::lock_apply,
         ])
-        .run(tauri::generate_context!())
+        .run(app_context())
         .expect("error while running tauri application");
 }
 

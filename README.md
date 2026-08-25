@@ -106,6 +106,19 @@ npm run tauri dev
 
 For a signed release build on macOS, see [docs/BUILD.md](./docs/BUILD.md).
 
+## CLI (macOS and Linux)
+
+The app binary also manages a project's `agency.lock.json` without opening the GUI:
+
+```sh
+agency-agents-app check [--project <path>] [--json]
+agency-agents-app plan [--project <path>] [--json]
+agency-agents-app apply [--project <path>] [--json] [--dry-run]
+agency-agents-app list [--project <path>] [--json]
+```
+
+The project defaults to the current directory. Exit code `0` means success/in sync, `1` means drift or apply blockers, and `2` means an error. Commands never prompt.
+
 ## Build From Source
 
 Prerequisites:

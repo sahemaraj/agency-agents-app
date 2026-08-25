@@ -19,27 +19,27 @@ const LOCK_FILENAME: &str = "agency.lock.json";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgencyLock {
-    agency_lock: u32,
-    entries: Vec<LockEntry>,
+    pub(crate) agency_lock: u32,
+    pub(crate) entries: Vec<LockEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LockEntry {
-    artifacts: Vec<LockArtifact>,
-    kind: String,
-    scope: String,
-    source: PortableSource,
-    source_hash: String,
-    source_relative_path: String,
-    tool: String,
+    pub(crate) artifacts: Vec<LockArtifact>,
+    pub(crate) kind: String,
+    pub(crate) scope: String,
+    pub(crate) source: PortableSource,
+    pub(crate) source_hash: String,
+    pub(crate) source_relative_path: String,
+    pub(crate) tool: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LockArtifact {
-    content_hash: String,
-    path: String,
+    pub(crate) content_hash: String,
+    pub(crate) path: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,43 +56,43 @@ pub enum LockEntryStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LockCheckEntry {
-    entry: LockEntry,
-    status: LockEntryStatus,
+    pub(crate) entry: LockEntry,
+    pub(crate) status: LockEntryStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LockCheckResult {
-    lock: AgencyLock,
-    entries: Vec<LockCheckEntry>,
-    clean: bool,
+    pub(crate) lock: AgencyLock,
+    pub(crate) entries: Vec<LockCheckEntry>,
+    pub(crate) clean: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LockOperation {
-    kind: String,
-    source_relative_path: String,
-    tool: String,
-    action: String,
+    pub(crate) kind: String,
+    pub(crate) source_relative_path: String,
+    pub(crate) tool: String,
+    pub(crate) action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LockPlan {
-    project_path: String,
-    check: LockCheckResult,
-    operations: Vec<LockOperation>,
-    warnings: Vec<String>,
-    blockers: Vec<String>,
-    revision: String,
+    pub(crate) project_path: String,
+    pub(crate) check: LockCheckResult,
+    pub(crate) operations: Vec<LockOperation>,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) blockers: Vec<String>,
+    pub(crate) revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LockApplyResponse {
-    plan: LockPlan,
-    applied: bool,
+    pub(crate) plan: LockPlan,
+    pub(crate) applied: bool,
 }
 
 fn invalid(message: impl Into<String>) -> AppError {
@@ -300,20 +300,25 @@ fn artifact_state(project: &Path, artifacts: &[LockArtifact]) -> LockEntryStatus
 
 fn classify(
     ledger: Option<&LockEntry>,
-    disk: LockEntryStatus,
+    expected_disk: LockEntryStatus,
+    managed_disk: Option<LockEntryStatus>,
     expected: &LockEntry,
 ) -> LockEntryStatus {
     let Some(ledger) = ledger else {
-        return if disk == LockEntryStatus::Missing {
+        return if expected_disk == LockEntryStatus::Missing {
             LockEntryStatus::Missing
         } else {
             LockEntryStatus::Foreign
         };
     };
     if ledger.source_hash != expected.source_hash || ledger.source != expected.source {
-        return LockEntryStatus::Outdated;
+        return match managed_disk {
+            Some(LockEntryStatus::Current) => LockEntryStatus::Outdated,
+            Some(LockEntryStatus::Missing) => LockEntryStatus::Missing,
+            _ => LockEntryStatus::Modified,
+        };
     }
-    disk
+    expected_disk
 }
 
 fn same_identity(left: &LockEntry, right: &LockEntry) -> bool {
@@ -335,8 +340,9 @@ async fn check_at(state: &AppState, project: &Path) -> Result<LockCheckResult, A
                 .entries
                 .iter()
                 .find(|candidate| same_identity(candidate, &entry));
-            let disk = artifact_state(project, &entry.artifacts);
-            let status = classify(ledger, disk, &entry);
+            let expected_disk = artifact_state(project, &entry.artifacts);
+            let managed_disk = ledger.map(|entry| artifact_state(project, &entry.artifacts));
+            let status = classify(ledger, expected_disk, managed_disk, &entry);
             LockCheckEntry { entry, status }
         })
         .collect::<Vec<_>>();
@@ -497,22 +503,50 @@ pub async fn lock_apply(
     revision: String,
 ) -> Result<LockApplyResponse, AppError> {
     let project = canonical_project(&project_path)?;
-    let mut plan = plan_at(&state, &project).await?;
+    apply_at(&state, &project, &revision, LockApplyPolicy::Desktop(&app)).await
+}
+
+enum LockApplyPolicy<'a> {
+    Desktop(&'a AppHandle),
+    Mcp(Option<&'a crate::state::AuthorizedMcpProject>),
+    Cli,
+}
+
+async fn apply_at(
+    state: &AppState,
+    project: &Path,
+    revision: &str,
+    policy: LockApplyPolicy<'_>,
+) -> Result<LockApplyResponse, AppError> {
+    let mut plan = plan_at(state, project).await?;
     if plan.revision != revision || !plan.blockers.is_empty() {
         return Ok(LockApplyResponse {
             plan,
             applied: false,
         });
     }
+    if matches!(policy, LockApplyPolicy::Mcp(_))
+        && plan
+            .operations
+            .iter()
+            .any(|operation| operation.kind == "agent" && operation.action == "update")
+    {
+        plan.blockers
+            .push("MCP lock_apply requires desktop approval for Agent updates".into());
+        return Ok(LockApplyResponse {
+            plan,
+            applied: false,
+        });
+    }
     let mut workspace = build_workspace_pack_plan(
-        &state,
+        state,
         pack_from_lock(&plan.check.lock),
         Some(plan.project_path.clone()),
     )
     .await?;
-    materialize_workspace_pack_sources(&state, &workspace.source_additions).await?;
+    materialize_workspace_pack_sources(state, &workspace.source_additions).await?;
     workspace =
-        build_workspace_pack_plan(&state, workspace.pack, Some(plan.project_path.clone())).await?;
+        build_workspace_pack_plan(state, workspace.pack, Some(plan.project_path.clone())).await?;
     if !workspace.source_additions.is_empty() {
         return Err(invalid("lockfile sources could not be materialized"));
     }
@@ -526,15 +560,38 @@ pub async fn lock_apply(
                         && item.tool == operation.tool
                 })
                 .ok_or_else(|| invalid("lockfile Agent operation could not be resolved"))?;
-            let record = super::do_install(
-                &app,
-                &state,
-                item.reference.clone(),
-                item.tool.clone(),
-                Some(plan.project_path.clone()),
-                true,
-            )
-            .await?;
+            let record = match &policy {
+                LockApplyPolicy::Desktop(app) => {
+                    super::do_install(
+                        app,
+                        state,
+                        item.reference.clone(),
+                        item.tool.clone(),
+                        Some(plan.project_path.clone()),
+                        true,
+                    )
+                    .await?
+                }
+                LockApplyPolicy::Mcp(authorization) => {
+                    super::mcp_install_agent_clean(
+                        state,
+                        item.reference.clone(),
+                        item.tool.clone(),
+                        Some(plan.project_path.clone()),
+                        *authorization,
+                    )
+                    .await?
+                }
+                LockApplyPolicy::Cli => {
+                    super::do_install_headless_lock(
+                        state,
+                        item.reference.clone(),
+                        item.tool.clone(),
+                        plan.project_path.clone(),
+                    )
+                    .await?
+                }
+            };
             let expected = plan
                 .check
                 .lock
@@ -547,7 +604,7 @@ pub async fn lock_apply(
                 })
                 .ok_or_else(|| invalid("lockfile Agent entry disappeared"))?;
             if record.source_hash != expected.source_hash
-                || installed_source_revision(&state, &item.reference, &record.source_hash).await?
+                || installed_source_revision(state, &item.reference, &record.source_hash).await?
                     != match &expected.source {
                         PortableSource::Builtin { source_revision } => source_revision.clone(),
                         PortableSource::Github {
@@ -570,19 +627,34 @@ pub async fn lock_apply(
                         && item.runtime == operation.tool
                 })
                 .ok_or_else(|| invalid("lockfile Skill operation could not be resolved"))?;
-            skills::install_skill_with_dependencies(
-                &state,
-                &item.reference.source_id,
-                &item.reference.relative_path,
-                &item.runtime,
-                Some(&plan.project_path),
-            )
-            .await?;
+            match &policy {
+                LockApplyPolicy::Mcp(authorization) => {
+                    skills::install_skill_with_dependencies_authorized(
+                        state,
+                        &item.reference.source_id,
+                        &item.reference.relative_path,
+                        &item.runtime,
+                        Some(&plan.project_path),
+                        *authorization,
+                    )
+                    .await?;
+                }
+                LockApplyPolicy::Desktop(_) | LockApplyPolicy::Cli => {
+                    skills::install_skill_with_dependencies(
+                        state,
+                        &item.reference.source_id,
+                        &item.reference.relative_path,
+                        &item.runtime,
+                        Some(&plan.project_path),
+                    )
+                    .await?;
+                }
+            }
         }
     }
     crate::util::fs::atomic_write(&project.join(LOCK_FILENAME), &serialize(&plan.check.lock)?)
         .await?;
-    plan = plan_at(&state, &project).await?;
+    plan = plan_at(state, project).await?;
     Ok(LockApplyResponse {
         applied: plan.check.clean,
         plan,
@@ -610,79 +682,36 @@ pub(crate) async fn mcp_lock_apply(
     authorization: Option<&crate::state::AuthorizedMcpProject>,
 ) -> Result<LockApplyResponse, AppError> {
     let project = canonical_project(project_path)?;
-    let mut plan = plan_at(state, &project).await?;
-    if plan.revision != revision || !plan.blockers.is_empty() {
-        return Ok(LockApplyResponse {
-            plan,
-            applied: false,
-        });
-    }
-    if plan
-        .operations
-        .iter()
-        .any(|operation| operation.kind == "agent" && operation.action == "update")
-    {
-        plan.blockers
-            .push("MCP lock_apply requires desktop approval for Agent updates".into());
-        return Ok(LockApplyResponse {
-            plan,
-            applied: false,
-        });
-    }
-    let mut workspace = build_workspace_pack_plan(
+    apply_at(
         state,
-        pack_from_lock(&plan.check.lock),
-        Some(plan.project_path.clone()),
+        &project,
+        revision,
+        LockApplyPolicy::Mcp(authorization),
     )
-    .await?;
-    materialize_workspace_pack_sources(state, &workspace.source_additions).await?;
-    workspace =
-        build_workspace_pack_plan(state, workspace.pack, Some(plan.project_path.clone())).await?;
-    for operation in &plan.operations {
-        if operation.kind == "agent" {
-            let item = workspace
-                .agents
-                .iter()
-                .find(|item| {
-                    item.reference.relative_path == operation.source_relative_path
-                        && item.tool == operation.tool
-                })
-                .ok_or_else(|| invalid("lockfile Agent operation could not be resolved"))?;
-            super::mcp_install_agent_clean(
-                state,
-                item.reference.clone(),
-                item.tool.clone(),
-                Some(plan.project_path.clone()),
-                authorization,
-            )
-            .await?;
-        } else {
-            let item = workspace
-                .skills
-                .iter()
-                .find(|item| {
-                    item.reference.relative_path == operation.source_relative_path
-                        && item.runtime == operation.tool
-                })
-                .ok_or_else(|| invalid("lockfile Skill operation could not be resolved"))?;
-            skills::install_skill_with_dependencies_authorized(
-                state,
-                &item.reference.source_id,
-                &item.reference.relative_path,
-                &item.runtime,
-                Some(&plan.project_path),
-                authorization,
-            )
-            .await?;
-        }
-    }
-    crate::util::fs::atomic_write(&project.join(LOCK_FILENAME), &serialize(&plan.check.lock)?)
-        .await?;
-    plan = plan_at(state, &project).await?;
-    Ok(LockApplyResponse {
-        applied: plan.check.clean,
-        plan,
-    })
+    .await
+}
+
+pub(crate) async fn cli_lock_check(
+    state: &AppState,
+    project_path: &str,
+) -> Result<LockCheckResult, AppError> {
+    check_at(state, &canonical_project(project_path)?).await
+}
+
+pub(crate) async fn cli_lock_plan(
+    state: &AppState,
+    project_path: &str,
+) -> Result<LockPlan, AppError> {
+    plan_at(state, &canonical_project(project_path)?).await
+}
+
+pub(crate) async fn cli_lock_apply(
+    state: &AppState,
+    project_path: &str,
+    revision: &str,
+) -> Result<LockApplyResponse, AppError> {
+    let project = canonical_project(project_path)?;
+    apply_at(state, &project, revision, LockApplyPolicy::Cli).await
 }
 
 #[cfg(test)]
@@ -733,28 +762,48 @@ mod tests {
     fn lock_status_classification_covers_disk_and_ledger_drift() {
         let expected = entry(&"c".repeat(64));
         assert_eq!(
-            classify(Some(&expected), LockEntryStatus::Current, &expected),
+            classify(
+                Some(&expected),
+                LockEntryStatus::Current,
+                Some(LockEntryStatus::Current),
+                &expected,
+            ),
             LockEntryStatus::Current
         );
         assert_eq!(
-            classify(None, LockEntryStatus::Missing, &expected),
+            classify(None, LockEntryStatus::Missing, None, &expected),
             LockEntryStatus::Missing
         );
         assert_eq!(
-            classify(None, LockEntryStatus::Modified, &expected),
+            classify(None, LockEntryStatus::Modified, None, &expected),
             LockEntryStatus::Foreign
         );
         assert_eq!(
-            classify(Some(&expected), LockEntryStatus::Modified, &expected),
+            classify(
+                Some(&expected),
+                LockEntryStatus::Modified,
+                Some(LockEntryStatus::Modified),
+                &expected,
+            ),
             LockEntryStatus::Modified
         );
         assert_eq!(
             classify(
                 Some(&entry(&"d".repeat(64))),
-                LockEntryStatus::Current,
-                &expected
+                LockEntryStatus::Modified,
+                Some(LockEntryStatus::Current),
+                &expected,
             ),
             LockEntryStatus::Outdated
+        );
+        assert_eq!(
+            classify(
+                Some(&entry(&"d".repeat(64))),
+                LockEntryStatus::Modified,
+                Some(LockEntryStatus::Modified),
+                &expected,
+            ),
+            LockEntryStatus::Modified
         );
     }
 }

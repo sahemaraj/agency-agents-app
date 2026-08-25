@@ -328,13 +328,17 @@ pub(crate) async fn load_ledger<R: Runtime>(
     state: &AppState,
 ) -> Result<Vec<InstallRecord>, AppError> {
     corpus::ensure_corpus(app, state).await?;
+    load_ledger_for_install(state).await
+}
+
+async fn load_ledger_for_install(state: &AppState) -> Result<Vec<InstallRecord>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
         return Ok(agent_entries(
             load_migrated_database_entries(&database, None).await?,
         ));
     }
     let built_in = crate::agents::inspect_builtin_agent_source(&state.app_data_dir).await?;
-    let path = ledger_path(app)?;
+    let path = ledger_path_for(&state.app_data_dir);
     load_migrated_ledger_path(&path, Some(&built_in), &now_iso()).await
 }
 
@@ -1056,10 +1060,6 @@ fn now_iso() -> String {
 /// under app data, NOT inside any tool's agent dir — so the Foreign sweep never
 /// mistakes a backup for an installed agent. Every destructive write copies the
 /// prior bytes here first, making install/update/restore reversible.
-fn backups_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, AppError> {
-    Ok(backups_dir_for(&corpus::app_data_dir(app)?))
-}
-
 fn backups_dir_for(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("backups")
 }
@@ -1221,6 +1221,12 @@ async fn backup_if_differs(
 
 // ---------- Install / update (shared core) ----------
 
+#[derive(Clone, Copy)]
+enum AgentInstallConsent {
+    Desktop { confirmed: bool },
+    Lockfile,
+}
+
 pub(crate) async fn do_install<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
@@ -1233,10 +1239,39 @@ pub(crate) async fn do_install<R: Runtime>(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
-    let record = do_install_locked(app, state, reference, tool, project_path, confirmed).await?;
+    corpus::ensure_corpus(app, state).await?;
+    let record = do_install_locked(
+        state,
+        reference,
+        tool,
+        project_path,
+        AgentInstallConsent::Desktop { confirmed },
+    )
+    .await?;
     if let Some(project) = record.project_path.as_deref() {
         lockfile::sync_project_lock(state, project).await?;
     }
+    Ok(record)
+}
+
+pub(crate) async fn do_install_headless_lock(
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: String,
+) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    let record = do_install_locked(
+        state,
+        reference,
+        tool,
+        Some(project_path),
+        AgentInstallConsent::Lockfile,
+    )
+    .await?;
     Ok(record)
 }
 
@@ -1251,16 +1286,14 @@ pub(crate) async fn do_install_legacy(
     do_install(app, state, reference, tool, project_path, false).await
 }
 
-async fn do_install_locked<R: Runtime>(
-    app: &AppHandle<R>,
+async fn do_install_locked(
     state: &AppState,
     reference: AgentReference,
     tool: Tool,
     project_path: Option<String>,
-    confirmed: bool,
+    consent: AgentInstallConsent,
 ) -> Result<InstallRecord, AppError> {
     reject_generic_roster_target(&tool)?;
-    corpus::ensure_corpus(app, state).await?;
     let package = crate::agents::resolve_agent_package(&state.app_data_dir, &reference).await?;
     if !package.installable {
         return Err(AppError::InvalidArgument {
@@ -1289,8 +1322,8 @@ async fn do_install_locked<R: Runtime>(
 
     let home = tool_home(state, &tool).await?;
     let proot = project_path.as_ref().map(PathBuf::from);
-    let backups = backups_dir(app)?;
-    let mut ledger = load_ledger(app, state).await?;
+    let backups = backups_dir_for(&state.app_data_dir);
+    let mut ledger = load_ledger_for_install(state).await?;
     let existing_record = ledger
         .iter()
         .find(|record| {
@@ -1300,7 +1333,9 @@ async fn do_install_locked<R: Runtime>(
                 && record.project_path == project_path
         })
         .cloned();
-    if let Some(existing) = &existing_record {
+    if let (Some(existing), AgentInstallConsent::Desktop { confirmed }) =
+        (&existing_record, consent)
+    {
         let library = crate::agents::organize::list(state).await?;
         let policy = library
             .update_policies
@@ -1331,6 +1366,31 @@ async fn do_install_locked<R: Runtime>(
         Some(record) => resolved_record_paths(state, record).await?,
         None => install_target_paths(&agent, Some(&raw), &tool, &home, proot.as_deref(), None)?,
     };
+    if let (Some(existing), AgentInstallConsent::Lockfile) = (&existing_record, consent) {
+        let expected = record_rendered_hashes(existing, targets.len());
+        for (path, expected_hash) in targets.iter().zip(expected) {
+            match tokio::fs::read(path).await {
+                Ok(bytes) if render::sha256_hex(&bytes) == expected_hash => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(AppError::InvalidArgument {
+                        message: format!(
+                            "managed Agent has local modifications: {}",
+                            path.display()
+                        ),
+                    })
+                }
+                Err(error) => {
+                    return Err(AppError::Io {
+                        message: format!(
+                            "read managed Agent before lockfile apply {}: {error}",
+                            path.display()
+                        ),
+                    })
+                }
+            }
+        }
+    }
     ensure_destinations_available(
         &ledger,
         &reference,
@@ -1460,7 +1520,7 @@ async fn do_install_locked<R: Runtime>(
     ledger.push(record.clone());
     let save = match &operation {
         Some(operation) => save_ledger_after_filesystem(state, &ledger, &operation.id).await,
-        None => save_ledger(app, &ledger).await,
+        None => save_ledger_for(&state.app_data_dir, &ledger).await,
     };
     if let Err(error) = save {
         if operation.is_some() {
@@ -6242,12 +6302,11 @@ async fn execute_install_plan(
     let mut installed = Vec::with_capacity(plan.agents.len());
     for item in &plan.agents {
         match do_install_locked(
-            app,
             state,
             item.reference.clone(),
             plan.tool.clone(),
             plan.project_path.clone(),
-            confirmed,
+            AgentInstallConsent::Desktop { confirmed },
         )
         .await
         {
@@ -14165,12 +14224,11 @@ mod tests {
         );
         assert_blocked(
             do_install_locked(
-                &handle,
                 &state,
                 reference.clone(),
                 "windsurf".into(),
                 None,
-                false,
+                AgentInstallConsent::Desktop { confirmed: false },
             )
             .await,
         );
