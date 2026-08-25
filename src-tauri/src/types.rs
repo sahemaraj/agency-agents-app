@@ -1516,6 +1516,10 @@ pub struct InstallRecord {
     /// Exact source bytes selected for the installed version.
     #[serde(default)]
     pub source_snapshot_hash: String,
+    /// Verified canonical render used as the common ancestor for drift merges.
+    /// Legacy rows remain `None` until the next clean install or update.
+    #[serde(default)]
+    pub base_snapshot_id: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
@@ -1680,6 +1684,32 @@ pub struct AgentPlanItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentMergeOutcome {
+    Clean {
+        preview_hash: String,
+    },
+    Conflicts {
+        count: u32,
+        hunk_summaries: Vec<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMergePreview {
+    pub preview: String,
+    pub preview_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMutationPlan {
     pub revision: String,
@@ -1691,6 +1721,8 @@ pub struct AgentMutationPlan {
     pub warnings: Vec<String>,
     pub blockers: Vec<String>,
     pub rollback_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_outcome: Option<AgentMergeOutcome>,
 }
 
 /// Result of `agent_diff` — what's on disk now vs the canonical render the app
@@ -1809,6 +1841,29 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&UpdateKind::Substantive).unwrap(),
             "\"substantive\""
+        );
+    }
+
+    #[test]
+    fn agent_merge_outcomes_serialize_for_tauri_plans() {
+        assert_eq!(
+            serde_json::to_value(AgentMergeOutcome::Clean {
+                preview_hash: "a".repeat(64),
+            })
+            .unwrap(),
+            serde_json::json!({"status": "clean", "previewHash": "a".repeat(64)})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentMergeOutcome::Conflicts {
+                count: 1,
+                hunk_summaries: vec!["Conflict 1".into()],
+            })
+            .unwrap(),
+            serde_json::json!({
+                "status": "conflicts",
+                "count": 1,
+                "hunkSummaries": ["Conflict 1"]
+            })
         );
     }
 

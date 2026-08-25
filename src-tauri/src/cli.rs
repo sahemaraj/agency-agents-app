@@ -67,6 +67,7 @@ pub async fn run(
     project: Option<PathBuf>,
     json: bool,
     dry_run: bool,
+    merge: bool,
 ) -> Result<CliOutcome, String> {
     #[cfg(target_os = "windows")]
     return Err("CLI mode is supported on macOS and Linux only".into());
@@ -87,7 +88,7 @@ pub async fn run(
         match command {
             "check" => run_check(&state, &project, json).await,
             "plan" => run_plan(&state, &project, json).await,
-            "apply" => run_apply(&state, &project, json, dry_run).await,
+            "apply" => run_apply(&state, &project, json, dry_run, merge).await,
             "list" => run_list(&state, &project, json).await,
             _ => Err(format!("unknown CLI command: {command}")),
         }
@@ -116,7 +117,7 @@ async fn run_check(state: &AppState, project: &str, json: bool) -> Result<CliOut
 }
 
 async fn run_plan(state: &AppState, project: &str, json: bool) -> Result<CliOutcome, String> {
-    let plan = cli_lock_plan(state, project)
+    let plan = cli_lock_plan(state, project, false)
         .await
         .map_err(|error| error.to_string())?;
     let stdout = if json {
@@ -139,14 +140,15 @@ async fn run_apply(
     project: &str,
     json: bool,
     dry_run: bool,
+    merge: bool,
 ) -> Result<CliOutcome, String> {
-    let plan = cli_lock_plan(state, project)
+    let plan = cli_lock_plan(state, project, merge)
         .await
         .map_err(|error| error.to_string())?;
     let (applied, blockers) = if dry_run || !plan.blockers.is_empty() {
         (false, plan.blockers.clone())
     } else {
-        let response = cli_lock_apply(state, project, &plan.revision)
+        let response = cli_lock_apply(state, project, &plan.revision, merge)
             .await
             .map_err(|error| error.to_string())?;
         (response.applied, response.plan.blockers)

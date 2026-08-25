@@ -42,8 +42,9 @@ pub async fn run_cli(
     project: Option<std::path::PathBuf>,
     json: bool,
     dry_run: bool,
+    merge: bool,
 ) -> Result<CliOutcome, String> {
-    cli::run(command, project, json, dry_run).await
+    cli::run(command, project, json, dry_run, merge).await
 }
 
 pub(crate) fn app_context() -> tauri::Context<tauri::Wry> {
@@ -362,6 +363,8 @@ pub fn run() {
             // agent state layer: render/ledger/reconcile/tools/projects.
             install::install_agent,
             install::update_agent,
+            install::agent_merge_preview,
+            install::agent_merge_apply,
             install::agent_install_plan,
             install::agent_update_plan,
             install::agent_uninstall_plan,

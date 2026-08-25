@@ -22,6 +22,7 @@ struct CliArgs {
     project: Option<PathBuf>,
     json: bool,
     dry_run: bool,
+    merge: bool,
 }
 
 fn parse_mode<I, S>(args: I) -> Result<Mode, String>
@@ -77,6 +78,7 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
     let mut project = None;
     let mut json = false;
     let mut dry_run = false;
+    let mut merge = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -96,6 +98,10 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
                 dry_run = true;
                 index += 1;
             }
+            "--merge" if command == "apply" && !merge => {
+                merge = true;
+                index += 1;
+            }
             flag => return Err(format!("invalid {command} option: {flag}")),
         }
     }
@@ -104,6 +110,7 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
         project,
         json,
         dry_run,
+        merge,
     })
 }
 
@@ -153,14 +160,18 @@ fn main() {
                     .map(|_| 0),
                 Err(_) => Err("AGENCY_AGENTS_MCP_TOKEN is required".into()),
             },
-            Mode::Cli(args) => {
-                agency_agents_lib::run_cli(&args.command, args.project, args.json, args.dry_run)
-                    .await
-                    .map(|outcome| {
-                        print!("{}", outcome.stdout);
-                        outcome.exit_code
-                    })
-            }
+            Mode::Cli(args) => agency_agents_lib::run_cli(
+                &args.command,
+                args.project,
+                args.json,
+                args.dry_run,
+                args.merge,
+            )
+            .await
+            .map(|outcome| {
+                print!("{}", outcome.stdout);
+                outcome.exit_code
+            }),
             Mode::App => unreachable!(),
         }
     });
@@ -223,6 +234,7 @@ mod tests {
                 project: None,
                 json: false,
                 dry_run: false,
+                merge: false,
             })
         );
         assert_eq!(
@@ -232,6 +244,7 @@ mod tests {
                 project: Some("/tmp/project".into()),
                 json: true,
                 dry_run: false,
+                merge: false,
             })
         );
         assert_eq!(
@@ -249,6 +262,7 @@ mod tests {
                 project: Some("/tmp/project".into()),
                 json: true,
                 dry_run: true,
+                merge: false,
             })
         );
         assert_eq!(
@@ -258,6 +272,17 @@ mod tests {
                 project: Some(".".into()),
                 json: false,
                 dry_run: false,
+                merge: false,
+            })
+        );
+        assert_eq!(
+            parse_mode(["app", "apply", "--merge"]).unwrap(),
+            Mode::Cli(CliArgs {
+                command: "apply".into(),
+                project: None,
+                json: false,
+                dry_run: false,
+                merge: true,
             })
         );
     }
@@ -267,6 +292,7 @@ mod tests {
         assert!(parse_mode(["app", "check", "--dry-run"]).is_err());
         assert!(parse_mode(["app", "apply", "--project"]).is_err());
         assert!(parse_mode(["app", "list", "--json", "--json"]).is_err());
+        assert!(parse_mode(["app", "plan", "--merge"]).is_err());
         assert!(parse_mode(["app", "plan", "--unknown"]).is_err());
     }
 

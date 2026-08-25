@@ -1430,6 +1430,7 @@ pub(super) async fn create_snapshot_protected(
     Ok(snapshot)
 }
 
+#[cfg(test)]
 pub(super) async fn create_snapshot_from_bytes(
     app_data_dir: &Path,
     identity: &AgentInstallIdentity,
@@ -1446,6 +1447,32 @@ pub(super) async fn create_snapshot_from_bytes(
         rendered_hash,
         created_at,
         None,
+        None,
+    )
+    .await?;
+    let snapshot = mutation.snapshot.clone();
+    mutation.publish().await?;
+    mutation.commit().await?;
+    Ok(snapshot)
+}
+
+pub(super) async fn create_snapshot_from_bytes_protecting(
+    app_data_dir: &Path,
+    identity: &AgentInstallIdentity,
+    contents: &[Vec<u8>],
+    source_hash: &str,
+    rendered_hash: &str,
+    created_at: &str,
+    protected_snapshot_id: Option<&str>,
+) -> Result<AgentVersionSnapshot, AppError> {
+    let mut mutation = create_snapshot_from_bytes_protected(
+        app_data_dir,
+        identity,
+        contents,
+        source_hash,
+        rendered_hash,
+        created_at,
+        protected_snapshot_id,
         None,
     )
     .await?;

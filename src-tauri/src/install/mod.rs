@@ -25,11 +25,12 @@ use crate::registry;
 use crate::render;
 use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
-    AgentApprovalAction, AgentArtifactDiff, AgentDiff, AgentInstallIdentity, AgentMutationPlan,
-    AgentPlanItem, AgentReference, AgentRosterDestinationObservation, AgentRosterInstallRecord,
-    AgentRosterMember, AgentRosterMutationPlan, AgentRosterPathObservation, AgentSourceResult,
-    AgentVersionSnapshot, BaselineAgentRequirement, BaselineRequirement, BaselineSkillRequirement,
-    CatalogChange, CatalogFeedBatch, InstallArtifact, InstallRecord, InstallState, InstalledAgent,
+    AgentApprovalAction, AgentArtifactDiff, AgentDiff, AgentInstallIdentity, AgentMergeOutcome,
+    AgentMergePreview, AgentMutationPlan, AgentPlanItem, AgentReference,
+    AgentRosterDestinationObservation, AgentRosterInstallRecord, AgentRosterMember,
+    AgentRosterMutationPlan, AgentRosterPathObservation, AgentSourceResult, AgentVersionSnapshot,
+    BaselineAgentRequirement, BaselineRequirement, BaselineSkillRequirement, CatalogChange,
+    CatalogFeedBatch, InstallArtifact, InstallRecord, InstallState, InstalledAgent,
     InstalledAgentRoster, ProjectInfo, ProjectReadinessBaseline, ProjectReadinessOverall,
     ProjectReadinessReport, ProjectRecommendation, ProjectRecommendationTarget,
     ProjectSubscription, ReadinessCategoryKind, ReadinessCategoryReport, ReadinessCategoryState,
@@ -872,6 +873,17 @@ fn migrate_install_records(
             record.source_revision = record.source_hash.clone();
             changed = true;
         }
+        if record.base_snapshot_id.as_deref().is_some_and(|id| {
+            id.is_empty()
+                || id.len() > 128
+                || id
+                    .chars()
+                    .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        }) {
+            return Err(AppError::InvalidArgument {
+                message: format!("invalid Agent base snapshot for {}", record.slug),
+            });
+        }
         if !record.artifacts.is_empty() {
             let valid_hash =
                 |hash: &str| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
@@ -1098,6 +1110,7 @@ fn record_for(
         artifacts: Vec::new(),
         disabled_path: None,
         source_snapshot_hash: source_hash.to_string(),
+        base_snapshot_id: None,
         capabilities: Vec::new(),
         publisher_key: None,
         publisher_verified: false,
@@ -1183,6 +1196,226 @@ fn record_artifacts(record: &InstallRecord) -> Vec<InstallArtifact> {
     }
 }
 
+struct AgentMergeComputation {
+    outcome: AgentMergeOutcome,
+    preview: Option<AgentMergePreview>,
+}
+
+fn unavailable_merge(reason: impl Into<String>) -> AgentMergeComputation {
+    AgentMergeComputation {
+        outcome: AgentMergeOutcome::Unavailable {
+            reason: reason.into(),
+        },
+        preview: None,
+    }
+}
+
+fn conflict_hunk_summaries(conflicted: &str) -> Vec<String> {
+    let mut summaries = Vec::new();
+    let mut start = None;
+    for (index, line) in conflicted.lines().enumerate() {
+        if line.starts_with("<<<<<<< ") {
+            start = Some(index + 1);
+        } else if line.starts_with(">>>>>>> ") {
+            if let Some(start) = start.take() {
+                summaries.push(format!(
+                    "Conflict {}: merged lines {start}-{}",
+                    summaries.len() + 1,
+                    index + 1
+                ));
+            }
+        }
+    }
+    summaries
+}
+
+fn merge_preview_hash(
+    record: &InstallRecord,
+    base_snapshot_id: &str,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    preview: &[u8],
+) -> Result<String, AppError> {
+    let binding = serde_json::to_vec(&(
+        "agent-drift-merge-v1",
+        install_identity(record),
+        &record.dest,
+        base_snapshot_id,
+        render::sha256_hex(base),
+        render::sha256_hex(ours),
+        render::sha256_hex(theirs),
+        render::sha256_hex(preview),
+    ))
+    .map_err(|error| AppError::Internal {
+        message: format!("serialize Agent merge preview binding: {error}"),
+    })?;
+    Ok(render::sha256_hex(&binding))
+}
+
+fn merge_utf8(
+    record: &InstallRecord,
+    base_snapshot_id: &str,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+) -> Result<AgentMergeComputation, AppError> {
+    let Ok(base_text) = std::str::from_utf8(base) else {
+        return Ok(unavailable_merge("base snapshot is not valid UTF-8"));
+    };
+    let Ok(ours_text) = std::str::from_utf8(ours) else {
+        return Ok(unavailable_merge("installed Agent is not valid UTF-8"));
+    };
+    let Ok(theirs_text) = std::str::from_utf8(theirs) else {
+        return Ok(unavailable_merge("rendered Agent is not valid UTF-8"));
+    };
+    match diffy::merge(base_text, ours_text, theirs_text) {
+        Ok(preview) => {
+            let preview_hash = merge_preview_hash(
+                record,
+                base_snapshot_id,
+                base,
+                ours,
+                theirs,
+                preview.as_bytes(),
+            )?;
+            Ok(AgentMergeComputation {
+                outcome: AgentMergeOutcome::Clean {
+                    preview_hash: preview_hash.clone(),
+                },
+                preview: Some(AgentMergePreview {
+                    preview,
+                    preview_hash,
+                }),
+            })
+        }
+        Err(conflicted) => {
+            let hunk_summaries = conflict_hunk_summaries(&conflicted);
+            Ok(AgentMergeComputation {
+                outcome: AgentMergeOutcome::Conflicts {
+                    count: hunk_summaries.len() as u32,
+                    hunk_summaries,
+                },
+                preview: None,
+            })
+        }
+    }
+}
+
+fn merge_eligibility(
+    record: &InstallRecord,
+    paths: &[PathBuf],
+    theirs: &[render::RenderedArtifact],
+) -> Option<&'static str> {
+    if record.disabled_path.is_some() {
+        return Some("enable the Agent before merging");
+    }
+    if paths.len() != 1 || theirs.len() != 1 || record_artifacts(record).len() != 1 {
+        return Some("multi-artifact Agent installs cannot be merged");
+    }
+    if !paths[0]
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "md" | "toml" | "mdc"))
+    {
+        return Some("only md, toml, and mdc Agent installs can be merged");
+    }
+    if record.base_snapshot_id.is_none() {
+        return Some("no canonical base snapshot; overwrite once to enable merging");
+    }
+    None
+}
+
+fn require_merge_preview_hash(actual: &str, expected: &str) -> Result<(), AppError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument {
+            message: "Agent merge preview is stale; base, installed, or rendered bytes changed"
+                .into(),
+        })
+    }
+}
+
+async fn merge_for_record(
+    state: &AppState,
+    record: &InstallRecord,
+    paths: &[PathBuf],
+    theirs: &[render::RenderedArtifact],
+) -> Result<AgentMergeComputation, AppError> {
+    if let Some(reason) = merge_eligibility(record, paths, theirs) {
+        return Ok(unavailable_merge(reason));
+    }
+    let Some(base_snapshot_id) = record.base_snapshot_id.as_deref() else {
+        return Ok(unavailable_merge(
+            "no canonical base snapshot; overwrite once to enable merging",
+        ));
+    };
+    let ours = match read_capped(&paths[0], MAX_INSTALLED_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(unavailable_merge("installed Agent bytes are unavailable")),
+    };
+    let (snapshot, contents) = match history::snapshot_contents(
+        &state.app_data_dir,
+        &install_identity(record),
+        base_snapshot_id,
+        paths,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => return Ok(unavailable_merge("canonical base snapshot is unavailable")),
+    };
+    if contents.len() != 1
+        || snapshot.artifact_hashes.len() != 1
+        || snapshot.source_hash != record.source_snapshot_hash
+        || snapshot.artifact_hashes[0] != render::sha256_hex(&contents[0])
+        || snapshot.rendered_hash != snapshot.artifact_hashes[0]
+    {
+        return Ok(unavailable_merge(
+            "canonical base snapshot failed verification",
+        ));
+    }
+    merge_utf8(
+        record,
+        base_snapshot_id,
+        &contents[0],
+        &ours,
+        theirs[0].content.as_bytes(),
+    )
+}
+
+async fn merge_for_reference(
+    state: &AppState,
+    reference: &AgentReference,
+    tool: &str,
+    project_path: Option<&str>,
+) -> Result<AgentMergeComputation, AppError> {
+    reject_generic_roster_target(tool)?;
+    let records = load_ledger_for_state(state).await?;
+    let index = install_record_index(
+        &records,
+        &reference.source_id,
+        &reference.relative_path,
+        tool,
+        project_path,
+    )?;
+    let record = &records[index];
+    let package = crate::agents::resolve_agent_package(&state.app_data_dir, reference).await?;
+    let raw = crate::agents::read_agent_text(&state.app_data_dir, reference).await?;
+    if render::sha256_hex(raw.as_bytes()) != package.source_hash {
+        return Err(AppError::InvalidArgument {
+            message: "Agent source changed after inspection".into(),
+        });
+    }
+    let agent = package.agent.ok_or_else(|| AppError::InvalidArgument {
+        message: "Agent package has no valid metadata".into(),
+    })?;
+    let theirs = render::render_artifacts(&agent, &raw, tool)?;
+    let paths = resolved_record_paths(state, record).await?;
+    merge_for_record(state, record, &paths, &theirs).await
+}
+
 /// Copy `dest`'s current bytes into `backup_dir` before it's overwritten, but
 /// only if it exists AND differs from the incoming bytes (no-op writes leave no
 /// litter). Backup name keeps the original filename + a timestamp so it's
@@ -1246,6 +1479,7 @@ pub(crate) async fn do_install<R: Runtime>(
         tool,
         project_path,
         AgentInstallConsent::Desktop { confirmed },
+        None,
     )
     .await?;
     if let Some(project) = record.project_path.as_deref() {
@@ -1270,9 +1504,61 @@ pub(crate) async fn do_install_headless_lock(
         tool,
         Some(project_path),
         AgentInstallConsent::Lockfile,
+        None,
     )
     .await?;
     Ok(record)
+}
+
+async fn do_install_merge<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: Option<String>,
+    confirmed: bool,
+    preview_hash: &str,
+) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    corpus::ensure_corpus(app, state).await?;
+    let record = do_install_locked(
+        state,
+        reference,
+        tool,
+        project_path,
+        AgentInstallConsent::Desktop { confirmed },
+        Some(preview_hash),
+    )
+    .await?;
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock(state, project).await?;
+    }
+    Ok(record)
+}
+
+pub(crate) async fn do_install_headless_merge(
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: String,
+    preview_hash: &str,
+) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    do_install_locked(
+        state,
+        reference,
+        tool,
+        Some(project_path),
+        AgentInstallConsent::Lockfile,
+        Some(preview_hash),
+    )
+    .await
 }
 
 pub(crate) async fn do_install_legacy(
@@ -1292,6 +1578,7 @@ async fn do_install_locked(
     tool: Tool,
     project_path: Option<String>,
     consent: AgentInstallConsent,
+    merge_preview_hash: Option<&str>,
 ) -> Result<InstallRecord, AppError> {
     reject_generic_roster_target(&tool)?;
     let package = crate::agents::resolve_agent_package(&state.app_data_dir, &reference).await?;
@@ -1366,27 +1653,29 @@ async fn do_install_locked(
         Some(record) => resolved_record_paths(state, record).await?,
         None => install_target_paths(&agent, Some(&raw), &tool, &home, proot.as_deref(), None)?,
     };
-    if let (Some(existing), AgentInstallConsent::Lockfile) = (&existing_record, consent) {
-        let expected = record_rendered_hashes(existing, targets.len());
-        for (path, expected_hash) in targets.iter().zip(expected) {
-            match tokio::fs::read(path).await {
-                Ok(bytes) if render::sha256_hex(&bytes) == expected_hash => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(_) => {
-                    return Err(AppError::InvalidArgument {
-                        message: format!(
-                            "managed Agent has local modifications: {}",
-                            path.display()
-                        ),
-                    })
-                }
-                Err(error) => {
-                    return Err(AppError::Io {
-                        message: format!(
-                            "read managed Agent before lockfile apply {}: {error}",
-                            path.display()
-                        ),
-                    })
+    if merge_preview_hash.is_none() {
+        if let (Some(existing), AgentInstallConsent::Lockfile) = (&existing_record, consent) {
+            let expected = record_rendered_hashes(existing, targets.len());
+            for (path, expected_hash) in targets.iter().zip(expected) {
+                match tokio::fs::read(path).await {
+                    Ok(bytes) if render::sha256_hex(&bytes) == expected_hash => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Err(AppError::InvalidArgument {
+                            message: format!(
+                                "managed Agent has local modifications: {}",
+                                path.display()
+                            ),
+                        })
+                    }
+                    Err(error) => {
+                        return Err(AppError::Io {
+                            message: format!(
+                                "read managed Agent before lockfile apply {}: {error}",
+                                path.display()
+                            ),
+                        })
+                    }
                 }
             }
         }
@@ -1411,7 +1700,24 @@ async fn do_install_locked(
         .collect::<Vec<_>>();
     let installed_at = now_iso();
     let rendered = render::render_artifacts(&agent, &raw, &tool)?;
-    let manifest = artifact_manifest(&targets, &rendered)?;
+    let write_rendered = if let Some(expected_preview_hash) = merge_preview_hash {
+        let existing = existing_record
+            .as_ref()
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "Agent merge requires an existing install".into(),
+            })?;
+        let computed = merge_for_record(state, existing, &targets, &rendered).await?;
+        let preview = computed.preview.ok_or_else(|| AppError::InvalidArgument {
+            message: "Agent merge is no longer clean; request a new preview".into(),
+        })?;
+        require_merge_preview_hash(&preview.preview_hash, expected_preview_hash)?;
+        vec![render::RenderedArtifact {
+            content: preview.preview,
+        }]
+    } else {
+        rendered.clone()
+    };
+    let manifest = artifact_manifest(&targets, &write_rendered)?;
     let mut planned_record = record_for(
         &agent,
         &targets[0],
@@ -1432,6 +1738,28 @@ async fn do_install_locked(
     planned_record.capabilities = package.capabilities.clone();
     planned_record.publisher_key = package.publisher_key.clone();
     planned_record.publisher_verified = package.publisher_verified;
+    let prior_snapshot = match (existing_record.as_ref(), prior_paths.is_empty()) {
+        (Some(record), false) => Some(snapshot_record(state, record, &prior_paths).await?),
+        _ => None,
+    };
+    let canonical_manifest = artifact_manifest(&targets, &rendered)?;
+    let canonical_contents = rendered
+        .iter()
+        .map(|artifact| artifact.content.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let base_snapshot = history::create_snapshot_from_bytes_protecting(
+        &state.app_data_dir,
+        &install_identity(&planned_record),
+        &canonical_contents,
+        &package.source_hash,
+        &canonical_manifest[0].rendered_hash,
+        &installed_at,
+        existing_record
+            .as_ref()
+            .and_then(|record| record.base_snapshot_id.as_deref()),
+    )
+    .await?;
+    planned_record.base_snapshot_id = Some(base_snapshot.id);
     let database = state.completed_state_database().await?;
     let operation = if let Some(database) = &database {
         Some(
@@ -1449,11 +1777,14 @@ async fn do_install_locked(
                             .iter()
                             .map(|path| path.to_string_lossy().into_owned())
                             .collect(),
-                        rendered: if rendered.len() == 1 {
-                            AgentRenderedPayload::One(rendered[0].content.clone())
+                        rendered: if write_rendered.len() == 1 {
+                            AgentRenderedPayload::One(write_rendered[0].content.clone())
                         } else {
                             AgentRenderedPayload::Many(
-                                rendered.iter().map(|item| item.content.clone()).collect(),
+                                write_rendered
+                                    .iter()
+                                    .map(|item| item.content.clone())
+                                    .collect(),
                             )
                         },
                     },
@@ -1463,25 +1794,10 @@ async fn do_install_locked(
     } else {
         None
     };
-    let prior_snapshot = match (existing_record.as_ref(), prior_paths.is_empty()) {
-        (Some(record), false) => Some(snapshot_record(state, record, &prior_paths).await?),
-        _ => None,
-    };
-    let write_result = write_agent_files_at(
-        &agent,
-        &raw,
-        &tool,
-        proot.as_deref(),
-        Some(&backups),
-        &package.source_hash,
-        &package.body_hash,
-        &revision,
-        &installed_at,
-        &targets,
-    )
-    .await;
-    let mut record = match write_result {
-        Ok(record) => record,
+    let write_result =
+        write_rendered_agent_files(&targets, &write_rendered, Some(&backups), &installed_at).await;
+    let record = match write_result {
+        Ok(()) => planned_record,
         Err(error) => {
             let restore = restore_install_transaction(
                 state,
@@ -1502,14 +1818,6 @@ async fn do_install_locked(
             };
         }
     };
-    record.source_id = reference.source_id.clone();
-    record.relative_path = reference.relative_path.clone();
-    record.source_revision =
-        installed_source_revision(state, &reference, &package.source_hash).await?;
-    record.source_snapshot_hash = package.source_hash;
-    record.capabilities = package.capabilities;
-    record.publisher_key = package.publisher_key;
-    record.publisher_verified = package.publisher_verified;
 
     ledger.retain(|existing| {
         !(existing.source_id == reference.source_id
@@ -2772,6 +3080,31 @@ async fn recover_agent_install_operation(
         return Err(AppError::StorageCorrupt {
             message: "Agent install recovery destinations changed".into(),
         });
+    }
+    if let Some(base_snapshot_id) = payload.next.base_snapshot_id.as_deref() {
+        let (snapshot, contents) = history::snapshot_contents(
+            &state.app_data_dir,
+            &install_identity(&payload.next),
+            base_snapshot_id,
+            &resolved,
+        )
+        .await
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent install recovery lost its canonical base snapshot".into(),
+        })?;
+        if snapshot.source_hash != payload.next.source_snapshot_hash
+            || snapshot.artifact_hashes.len() != contents.len()
+            || snapshot.rendered_hash != snapshot.artifact_hashes[0]
+            || snapshot
+                .artifact_hashes
+                .iter()
+                .zip(&contents)
+                .any(|(expected, bytes)| *expected != render::sha256_hex(bytes))
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent install recovery canonical base snapshot changed".into(),
+            });
+        }
     }
     let base = payload
         .next
@@ -4169,6 +4502,7 @@ async fn write_agent_files_to(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn write_agent_files_at(
     agent: &crate::types::Agent,
     raw: &str,
@@ -4183,8 +4517,31 @@ async fn write_agent_files_at(
 ) -> Result<InstallRecord, AppError> {
     let rendered = render::render_artifacts(agent, raw, tool)?;
     let manifest = artifact_manifest(paths, &rendered)?;
+    write_rendered_agent_files(paths, &rendered, backup_dir, installed_at).await?;
+    let mut record = record_for(
+        agent,
+        &paths[0],
+        tool,
+        project_root,
+        manifest[0].rendered_hash.clone(),
+        source_hash,
+        body_hash,
+        corpus_version,
+        installed_at,
+    );
+    record.artifacts = manifest;
+    Ok(record)
+}
+
+async fn write_rendered_agent_files(
+    paths: &[PathBuf],
+    rendered: &[render::RenderedArtifact],
+    backup_dir: Option<&Path>,
+    installed_at: &str,
+) -> Result<(), AppError> {
+    let manifest = artifact_manifest(paths, rendered)?;
     let prior = capture_batch_files(paths).await?;
-    for ((dest, artifact), entry) in paths.iter().zip(&rendered).zip(&manifest) {
+    for ((dest, artifact), entry) in paths.iter().zip(rendered).zip(&manifest) {
         if let Some(bdir) = backup_dir {
             backup_if_differs(dest, artifact.content.as_bytes(), bdir, installed_at).await?;
         }
@@ -4213,19 +4570,7 @@ async fn write_agent_files_at(
             };
         }
     }
-    let mut record = record_for(
-        agent,
-        &paths[0],
-        tool,
-        project_root,
-        manifest[0].rendered_hash.clone(),
-        source_hash,
-        body_hash,
-        corpus_version,
-        installed_at,
-    );
-    record.artifacts = manifest;
-    Ok(record)
+    Ok(())
 }
 
 fn install_target_paths(
@@ -4582,6 +4927,9 @@ async fn build_mutation_plan(
             warnings: Vec::new(),
             blockers: vec![GENERIC_ROSTER_BLOCKER.into()],
             rollback_available: true,
+            merge_outcome: (operation == "update").then(|| AgentMergeOutcome::Unavailable {
+                reason: "aggregate roster installs cannot be merged".into(),
+            }),
         };
         plan.revision =
             render::sha256_hex(
@@ -4737,6 +5085,22 @@ async fn build_mutation_plan(
     warnings.dedup();
     blockers.sort();
     blockers.dedup();
+    let merge_outcome = if operation != "update" {
+        None
+    } else if roots.len() != 1 {
+        Some(AgentMergeOutcome::Unavailable {
+            reason: "multi-Agent update plans cannot be merged".into(),
+        })
+    } else {
+        Some(
+            match merge_for_reference(state, &roots[0], &tool, project_path.as_deref()).await {
+                Ok(computed) => computed.outcome,
+                Err(error) => AgentMergeOutcome::Unavailable {
+                    reason: error.to_string(),
+                },
+            },
+        )
+    };
     let mut plan = AgentMutationPlan {
         revision: String::new(),
         operation: operation.into(),
@@ -4747,6 +5111,7 @@ async fn build_mutation_plan(
         warnings,
         blockers,
         rollback_available: true,
+        merge_outcome,
     };
     plan.revision =
         render::sha256_hex(
@@ -6307,6 +6672,7 @@ async fn execute_install_plan(
             plan.tool.clone(),
             plan.project_path.clone(),
             AgentInstallConsent::Desktop { confirmed },
+            None,
         )
         .await
         {
@@ -6674,6 +7040,29 @@ pub(crate) async fn mcp_install_agent_clean(
     record.capabilities = package.capabilities;
     record.publisher_key = package.publisher_key;
     record.publisher_verified = package.publisher_verified;
+    let snapshot_contents = rendered
+        .iter()
+        .map(|artifact| artifact.content.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let base_snapshot = history::create_snapshot_from_bytes_protecting(
+        &state.app_data_dir,
+        &install_identity(&record),
+        &snapshot_contents,
+        &record.source_snapshot_hash,
+        &record.rendered_hash,
+        &record.installed_at,
+        None,
+    )
+    .await;
+    match base_snapshot {
+        Ok(snapshot) => record.base_snapshot_id = Some(snapshot.id),
+        Err(error) => {
+            return match rollback_clean_agent_files(&created, &hashes, authorization).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("snapshot Agent install", error, rollback)),
+            };
+        }
+    }
     ledger.push(record.clone());
     if let Err(error) = save_ledger_for(&state.app_data_dir, &ledger).await {
         return match rollback_clean_agent_files(&created, &hashes, authorization).await {
@@ -6780,13 +7169,14 @@ pub(crate) async fn mcp_move_agent_install(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        history::create_snapshot_from_bytes(
+        history::create_snapshot_from_bytes_protecting(
             &state.app_data_dir,
             &install_identity(&records[index]),
             &contents,
             &records[index].source_snapshot_hash,
             &records[index].rendered_hash,
             &now_iso(),
+            records[index].base_snapshot_id.as_deref(),
         )
         .await?;
         for (moved, (source, destination)) in sources.iter().zip(destinations).enumerate() {
@@ -7080,6 +7470,75 @@ pub async fn update_agent(
         tool,
         project_path,
         confirmed.unwrap_or(false),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn agent_merge_preview(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: Option<String>,
+    relative_path: Option<String>,
+    slug: Option<String>,
+    tool: Tool,
+    project_path: Option<String>,
+) -> Result<AgentMergePreview, AppError> {
+    corpus::ensure_corpus(&app, &state).await?;
+    let reference = resolve_command_reference(
+        &app,
+        &state,
+        source_id.as_deref(),
+        relative_path.as_deref(),
+        slug.as_deref(),
+    )
+    .await?;
+    let computed = merge_for_reference(&state, &reference, &tool, project_path.as_deref()).await?;
+    computed.preview.ok_or_else(|| AppError::InvalidArgument {
+        message: match computed.outcome {
+            AgentMergeOutcome::Conflicts { count, .. } => {
+                format!("Agent merge has {count} conflict(s)")
+            }
+            AgentMergeOutcome::Unavailable { reason } => reason,
+            AgentMergeOutcome::Clean { .. } => "Agent merge preview is unavailable".into(),
+        },
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // ponytail: flat Tauri args preserve the existing command ABI.
+pub async fn agent_merge_apply(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: Option<String>,
+    relative_path: Option<String>,
+    slug: Option<String>,
+    tool: Tool,
+    project_path: Option<String>,
+    preview_hash: String,
+    confirmed: Option<bool>,
+) -> Result<InstallRecord, AppError> {
+    if confirmed != Some(true) {
+        return Err(AppError::InvalidArgument {
+            message: "Agent merge requires explicit confirmation".into(),
+        });
+    }
+    let reference = resolve_command_reference(
+        &app,
+        &state,
+        source_id.as_deref(),
+        relative_path.as_deref(),
+        slug.as_deref(),
+    )
+    .await?;
+    do_install_merge(
+        &app,
+        &state,
+        reference,
+        tool,
+        project_path,
+        true,
+        &preview_hash,
     )
     .await
 }
@@ -7473,7 +7932,7 @@ async fn snapshot_record(
     record: &InstallRecord,
     paths: &[PathBuf],
 ) -> Result<AgentVersionSnapshot, AppError> {
-    snapshot_record_protected(state, record, paths, None).await
+    snapshot_record_protected(state, record, paths, record.base_snapshot_id.as_deref()).await
 }
 
 async fn snapshot_record_protected(
@@ -7650,6 +8109,7 @@ async fn rollback_agent_version(
     let mut next = previous.clone();
     next.source_hash = selected_meta.source_hash.clone();
     next.source_snapshot_hash = selected_meta.source_hash.clone();
+    next.base_snapshot_id = None;
     next.rendered_hash = selected_meta.rendered_hash.clone();
     if !next.artifacts.is_empty() {
         for (artifact, hash) in next
@@ -14229,6 +14689,7 @@ mod tests {
                 "windsurf".into(),
                 None,
                 AgentInstallConsent::Desktop { confirmed: false },
+                None,
             )
             .await,
         );
@@ -19443,6 +19904,7 @@ mod tests {
             artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: String::new(),
+            base_snapshot_id: None,
             capabilities: Vec::new(),
             publisher_key: None,
             publisher_verified: false,
@@ -19469,6 +19931,7 @@ mod tests {
             artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: "a".repeat(64),
+            base_snapshot_id: None,
             capabilities: Vec::new(),
             publisher_key: None,
             publisher_verified: false,
@@ -19477,6 +19940,191 @@ mod tests {
             source_revision: "a".repeat(64),
             deployment_notice: None,
         }
+    }
+
+    #[test]
+    fn three_way_merge_combines_independent_edits() {
+        let mut record = row("reviewer", "codex", Some("/project"));
+        record.dest = "/project/.codex/agents/reviewer.toml".into();
+        let computed = merge_utf8(
+            &record,
+            "base",
+            b"alpha\nbeta\n",
+            b"ALPHA\nbeta\n",
+            b"alpha\nbeta\ngamma\n",
+        )
+        .unwrap();
+        assert_eq!(computed.preview.unwrap().preview, "ALPHA\nbeta\ngamma\n");
+        assert!(matches!(computed.outcome, AgentMergeOutcome::Clean { .. }));
+    }
+
+    #[test]
+    fn three_way_merge_reports_conflicts_without_returning_markers() {
+        let record = row("reviewer", "codex", Some("/project"));
+        let computed = merge_utf8(
+            &record,
+            "base",
+            b"alpha\nbeta\n",
+            b"alpha\nours\n",
+            b"alpha\ntheirs\n",
+        )
+        .unwrap();
+        assert!(computed.preview.is_none());
+        match computed.outcome {
+            AgentMergeOutcome::Conflicts {
+                count,
+                hunk_summaries,
+            } => {
+                assert_eq!(count, 1);
+                assert_eq!(hunk_summaries.len(), 1);
+                assert!(!hunk_summaries[0].contains("<<<<<<<"));
+            }
+            outcome => panic!("expected conflicts, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn three_way_merge_rejects_non_utf8() {
+        let record = row("reviewer", "codex", Some("/project"));
+        let computed = merge_utf8(
+            &record,
+            "base",
+            b"alpha\n",
+            &[0xff, b'\n'],
+            b"alpha\nbeta\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            computed.outcome,
+            AgentMergeOutcome::Unavailable { reason } if reason.contains("UTF-8")
+        ));
+    }
+
+    #[test]
+    fn three_way_merge_requires_a_single_artifact_and_base_snapshot() {
+        let mut record = row("reviewer", "codex", Some("/project"));
+        let paths = vec![PathBuf::from("/project/reviewer.toml")];
+        let rendered = vec![render::RenderedArtifact {
+            content: "agent".into(),
+        }];
+        assert!(merge_eligibility(&record, &paths, &rendered)
+            .unwrap()
+            .contains("base snapshot"));
+
+        record.base_snapshot_id = Some("base".into());
+        record.artifacts = vec![
+            InstallArtifact {
+                dest: "/project/reviewer.toml".into(),
+                rendered_hash: "a".repeat(64),
+                disabled_path: None,
+            },
+            InstallArtifact {
+                dest: "/project/reviewer.md".into(),
+                rendered_hash: "b".repeat(64),
+                disabled_path: None,
+            },
+        ];
+        assert!(merge_eligibility(&record, &paths, &rendered)
+            .unwrap()
+            .contains("multi-artifact"));
+    }
+
+    #[test]
+    fn merge_preview_hash_rejects_ours_changed_after_preview() {
+        let record = row("reviewer", "codex", Some("/project"));
+        let first = merge_utf8(
+            &record,
+            "base",
+            b"alpha\nbeta\n",
+            b"ALPHA\nbeta\n",
+            b"alpha\nbeta\ngamma\n",
+        )
+        .unwrap()
+        .preview
+        .unwrap();
+        let changed = merge_utf8(
+            &record,
+            "base",
+            b"alpha\nbeta\n",
+            b"Alpha changed again\nbeta\n",
+            b"alpha\nbeta\ngamma\n",
+        )
+        .unwrap()
+        .preview
+        .unwrap();
+        assert!(require_merge_preview_hash(&changed.preview_hash, &first.preview_hash).is_err());
+    }
+
+    #[tokio::test]
+    async fn base_snapshot_lifecycle_install_modify_update() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project_path.join("reviewer.md");
+        let base = b"alpha\nbeta\n".to_vec();
+        std::fs::write(&destination, &base).unwrap();
+
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let mut record = row("reviewer", "claudeCode", project_path.to_str());
+        record.dest = destination.to_string_lossy().into_owned();
+        record.source_snapshot_hash = "a".repeat(64);
+        record.rendered_hash = render::sha256_hex(&base);
+        let identity = install_identity(&record);
+        let first = history::create_snapshot_from_bytes_protecting(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&base),
+            &record.source_snapshot_hash,
+            &record.rendered_hash,
+            "2026-08-26T00:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        record.base_snapshot_id = Some(first.id.clone());
+
+        std::fs::write(&destination, b"ALPHA\nbeta\n").unwrap();
+        let theirs = vec![render::RenderedArtifact {
+            content: "alpha\nbeta\ngamma\n".into(),
+        }];
+        let computed =
+            merge_for_record(&state, &record, std::slice::from_ref(&destination), &theirs)
+                .await
+                .unwrap();
+        let preview = computed.preview.unwrap();
+        assert_eq!(preview.preview, "ALPHA\nbeta\ngamma\n");
+
+        let canonical = theirs[0].content.as_bytes().to_vec();
+        let second = history::create_snapshot_from_bytes_protecting(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&canonical),
+            &"b".repeat(64),
+            &render::sha256_hex(&canonical),
+            "2026-08-26T00:01:00Z",
+            record.base_snapshot_id.as_deref(),
+        )
+        .await
+        .unwrap();
+        record.base_snapshot_id = Some(second.id.clone());
+        record.rendered_hash = render::sha256_hex(preview.preview.as_bytes());
+        std::fs::write(&destination, preview.preview).unwrap();
+
+        assert_ne!(first.id, second.id);
+        let (_, refreshed_base) = history::snapshot_contents(
+            app_data.path(),
+            &identity,
+            &second.id,
+            std::slice::from_ref(&destination),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed_base, vec![canonical]);
+        assert_eq!(
+            render::sha256_hex(&std::fs::read(&destination).unwrap()),
+            record.rendered_hash
+        );
     }
 
     async fn completed_sqlite_kimi_install(
@@ -20638,6 +21286,9 @@ mod tests {
         assert_eq!(migrated[0].relative_path, "engineering/unique.md");
         assert_eq!(migrated[0].source_snapshot_hash, "old-source");
         assert_eq!(migrated[0].source_revision, "old-source");
+        assert!(migrated
+            .iter()
+            .all(|record| record.base_snapshot_id.is_none()));
         for row in &migrated[1..] {
             assert_eq!(row.source_id, "legacy:unresolved");
             assert!(row.relative_path.starts_with("legacy/"));
@@ -21149,6 +21800,7 @@ mod tests {
             warnings: Vec::new(),
             blockers: Vec::new(),
             rollback_available: false,
+            merge_outcome: None,
         };
         assert!(require_plan_revision(&plan, "stale").is_err());
         assert!(require_plan_revision(&plan, "current").is_ok());
@@ -22355,6 +23007,7 @@ mod tests {
             artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: "sh".into(),
+            base_snapshot_id: None,
             capabilities: Vec::new(),
             publisher_key: None,
             publisher_verified: false,

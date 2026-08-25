@@ -75,6 +75,8 @@ pub struct LockOperation {
     pub(crate) source_relative_path: String,
     pub(crate) tool: String,
     pub(crate) action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) merge_preview_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -409,12 +411,40 @@ fn pack_from_lock(lock: &AgencyLock) -> WorkspacePack {
     }
 }
 
-async fn plan_at(state: &AppState, project: &Path) -> Result<LockPlan, AppError> {
+fn merged_lock_operation(
+    entry: &LockEntry,
+    outcome: crate::types::AgentMergeOutcome,
+) -> Result<LockOperation, String> {
+    match outcome {
+        crate::types::AgentMergeOutcome::Clean { preview_hash } => Ok(LockOperation {
+            kind: entry.kind.clone(),
+            source_relative_path: entry.source_relative_path.clone(),
+            tool: entry.tool.clone(),
+            action: "update".into(),
+            merge_preview_hash: Some(preview_hash),
+        }),
+        crate::types::AgentMergeOutcome::Conflicts { count, .. } => Err(format!(
+            "Lock entry has {count} merge conflict(s): {}",
+            entry.source_relative_path
+        )),
+        crate::types::AgentMergeOutcome::Unavailable { reason } => Err(format!(
+            "Lock entry merge is unavailable ({reason}): {}",
+            entry.source_relative_path
+        )),
+    }
+}
+
+async fn plan_at(
+    state: &AppState,
+    project: &Path,
+    allow_merge: bool,
+) -> Result<LockPlan, AppError> {
     let check = check_at(state, project).await?;
+    let project_string = project.to_string_lossy().into_owned();
     let workspace = build_workspace_pack_plan(
         state,
         pack_from_lock(&check.lock),
-        Some(project.to_string_lossy().into_owned()),
+        Some(project_string.clone()),
     )
     .await?;
     let mut operations = Vec::new();
@@ -432,17 +462,62 @@ async fn plan_at(state: &AppState, project: &Path) -> Result<LockPlan, AppError>
                 source_relative_path: checked.entry.source_relative_path.clone(),
                 tool: checked.entry.tool.clone(),
                 action: "install".into(),
+                merge_preview_hash: None,
             }),
             LockEntryStatus::Outdated => operations.push(LockOperation {
                 kind: checked.entry.kind.clone(),
                 source_relative_path: checked.entry.source_relative_path.clone(),
                 tool: checked.entry.tool.clone(),
                 action: "update".into(),
+                merge_preview_hash: None,
             }),
             LockEntryStatus::Extra => warnings.push(format!(
                 "Project has an unlocked {}: {}",
                 checked.entry.kind, checked.entry.source_relative_path
             )),
+            LockEntryStatus::Modified if allow_merge && checked.entry.kind == "agent" => {
+                let item = workspace.agents.iter().find(|item| {
+                    item.reference.relative_path == checked.entry.source_relative_path
+                        && item.tool == checked.entry.tool
+                });
+                let modified_blocker_suffix = item.map(|item| {
+                    format!(
+                        "{}:{}",
+                        item.reference.source_id, item.reference.relative_path
+                    )
+                });
+                let computed = match item {
+                    Some(item) => {
+                        super::merge_for_reference(
+                            state,
+                            &item.reference,
+                            &item.tool,
+                            Some(&project_string),
+                        )
+                        .await
+                    }
+                    None => Err(invalid("lockfile Agent merge source could not be resolved")),
+                };
+                match computed
+                    .map(|computed| computed.outcome)
+                    .map(|outcome| merged_lock_operation(&checked.entry, outcome))
+                {
+                    Ok(Ok(operation)) => {
+                        if let Some(suffix) = modified_blocker_suffix.as_deref() {
+                            blockers.retain(|blocker| {
+                                !(blocker.contains("Agent is not safe to apply in state modified")
+                                    && blocker.ends_with(suffix))
+                            });
+                        }
+                        operations.push(operation);
+                    }
+                    Ok(Err(blocker)) => blockers.push(blocker),
+                    Err(error) => blockers.push(format!(
+                        "Lock entry merge is unavailable ({error}): {}",
+                        checked.entry.source_relative_path
+                    )),
+                }
+            }
             LockEntryStatus::Modified | LockEntryStatus::Foreign => blockers.push(format!(
                 "Lock entry is not safe to apply in state {:?}: {}",
                 checked.status, checked.entry.source_relative_path
@@ -461,7 +536,7 @@ async fn plan_at(state: &AppState, project: &Path) -> Result<LockPlan, AppError>
     blockers.sort();
     blockers.dedup();
     let mut plan = LockPlan {
-        project_path: project.to_string_lossy().into_owned(),
+        project_path: project_string,
         check,
         operations,
         warnings,
@@ -492,7 +567,7 @@ pub async fn lock_plan(
     project_path: String,
 ) -> Result<LockPlan, AppError> {
     let project = canonical_project(&project_path)?;
-    plan_at(&state, &project).await
+    plan_at(&state, &project, false).await
 }
 
 #[tauri::command]
@@ -509,7 +584,7 @@ pub async fn lock_apply(
 enum LockApplyPolicy<'a> {
     Desktop(&'a AppHandle),
     Mcp(Option<&'a crate::state::AuthorizedMcpProject>),
-    Cli,
+    Cli { merge: bool },
 }
 
 async fn apply_at(
@@ -518,7 +593,8 @@ async fn apply_at(
     revision: &str,
     policy: LockApplyPolicy<'_>,
 ) -> Result<LockApplyResponse, AppError> {
-    let mut plan = plan_at(state, project).await?;
+    let allow_merge = matches!(&policy, LockApplyPolicy::Cli { merge: true });
+    let mut plan = plan_at(state, project, allow_merge).await?;
     if plan.revision != revision || !plan.blockers.is_empty() {
         return Ok(LockApplyResponse {
             plan,
@@ -582,30 +658,61 @@ async fn apply_at(
                     )
                     .await?
                 }
-                LockApplyPolicy::Cli => {
-                    super::do_install_headless_lock(
-                        state,
-                        item.reference.clone(),
-                        item.tool.clone(),
-                        plan.project_path.clone(),
-                    )
-                    .await?
-                }
+                LockApplyPolicy::Cli { .. } => match operation.merge_preview_hash.as_deref() {
+                    Some(preview_hash) => {
+                        super::do_install_headless_merge(
+                            state,
+                            item.reference.clone(),
+                            item.tool.clone(),
+                            plan.project_path.clone(),
+                            preview_hash,
+                        )
+                        .await?
+                    }
+                    None => {
+                        super::do_install_headless_lock(
+                            state,
+                            item.reference.clone(),
+                            item.tool.clone(),
+                            plan.project_path.clone(),
+                        )
+                        .await?
+                    }
+                },
             };
             let expected = plan
                 .check
                 .lock
                 .entries
-                .iter()
+                .iter_mut()
                 .find(|entry| {
                     entry.kind == "agent"
                         && entry.source_relative_path == operation.source_relative_path
                         && entry.tool == operation.tool
                 })
                 .ok_or_else(|| invalid("lockfile Agent entry disappeared"))?;
-            if record.source_hash != expected.source_hash
+            if operation.merge_preview_hash.is_some() {
+                let actual_hashes = if record.artifacts.is_empty() {
+                    vec![record.rendered_hash.clone()]
+                } else {
+                    record
+                        .artifacts
+                        .iter()
+                        .map(|artifact| artifact.rendered_hash.clone())
+                        .collect()
+                };
+                if expected.artifacts.len() != actual_hashes.len() {
+                    return Err(invalid("merged Agent artifact count changed"));
+                }
+                for (locked, installed_hash) in expected.artifacts.iter_mut().zip(actual_hashes) {
+                    locked.content_hash = installed_hash;
+                }
+            }
+            let expected_source_hash = expected.source_hash.clone();
+            let expected_source = expected.source.clone();
+            if record.source_hash != expected_source_hash
                 || installed_source_revision(state, &item.reference, &record.source_hash).await?
-                    != match &expected.source {
+                    != match &expected_source {
                         PortableSource::Builtin { source_revision } => source_revision.clone(),
                         PortableSource::Github {
                             resolved_commit: Some(commit),
@@ -639,7 +746,7 @@ async fn apply_at(
                     )
                     .await?;
                 }
-                LockApplyPolicy::Desktop(_) | LockApplyPolicy::Cli => {
+                LockApplyPolicy::Desktop(_) | LockApplyPolicy::Cli { .. } => {
                     skills::install_skill_with_dependencies(
                         state,
                         &item.reference.source_id,
@@ -654,7 +761,7 @@ async fn apply_at(
     }
     crate::util::fs::atomic_write(&project.join(LOCK_FILENAME), &serialize(&plan.check.lock)?)
         .await?;
-    plan = plan_at(state, project).await?;
+    plan = plan_at(state, project, allow_merge).await?;
     Ok(LockApplyResponse {
         applied: plan.check.clean,
         plan,
@@ -672,7 +779,7 @@ pub(crate) async fn mcp_lock_plan(
     state: &AppState,
     project_path: &str,
 ) -> Result<LockPlan, AppError> {
-    plan_at(state, &canonical_project(project_path)?).await
+    plan_at(state, &canonical_project(project_path)?, false).await
 }
 
 pub(crate) async fn mcp_lock_apply(
@@ -701,17 +808,19 @@ pub(crate) async fn cli_lock_check(
 pub(crate) async fn cli_lock_plan(
     state: &AppState,
     project_path: &str,
+    allow_merge: bool,
 ) -> Result<LockPlan, AppError> {
-    plan_at(state, &canonical_project(project_path)?).await
+    plan_at(state, &canonical_project(project_path)?, allow_merge).await
 }
 
 pub(crate) async fn cli_lock_apply(
     state: &AppState,
     project_path: &str,
     revision: &str,
+    merge: bool,
 ) -> Result<LockApplyResponse, AppError> {
     let project = canonical_project(project_path)?;
-    apply_at(state, &project, revision, LockApplyPolicy::Cli).await
+    apply_at(state, &project, revision, LockApplyPolicy::Cli { merge }).await
 }
 
 #[cfg(test)]
@@ -805,5 +914,29 @@ mod tests {
             ),
             LockEntryStatus::Modified
         );
+    }
+
+    #[test]
+    fn cli_merge_plans_clean_updates_and_blocks_conflicts() {
+        let entry = entry(&"c".repeat(64));
+        let clean = merged_lock_operation(
+            &entry,
+            crate::types::AgentMergeOutcome::Clean {
+                preview_hash: "d".repeat(64),
+            },
+        )
+        .unwrap();
+        assert_eq!(clean.action, "update");
+        assert_eq!(clean.merge_preview_hash, Some("d".repeat(64)));
+
+        let conflict = merged_lock_operation(
+            &entry,
+            crate::types::AgentMergeOutcome::Conflicts {
+                count: 1,
+                hunk_summaries: vec!["Conflict 1: merged lines 2-8".into()],
+            },
+        )
+        .unwrap_err();
+        assert!(conflict.contains("1 merge conflict"));
     }
 }
