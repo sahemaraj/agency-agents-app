@@ -59,6 +59,7 @@ import type {
   AgentSourceResult,
   AgentUpdatePolicy,
   AgentMutationPlan,
+  AgentMergePreview,
   AgentRosterInstallRecord,
   AgentRosterMutationPlan,
   AgentVersionSnapshot,
@@ -375,6 +376,24 @@ export const agentDiffExact = (
   tool: Tool,
   projectPath: string | null,
 ) => invoke<AgentDiff>("agent_diff", exactAgentArgs(reference, tool, projectPath));
+
+export const agentMergePreview = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentMergePreview>(
+  "agent_merge_preview", exactAgentArgs(reference, tool, projectPath),
+);
+
+export const agentMergeApply = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+  previewHash: string,
+  confirmed: boolean,
+) => invoke<InstallRecord>("agent_merge_apply", {
+  ...exactAgentArgs(reference, tool, projectPath), previewHash, confirmed,
+});
 
 export const agentUninstallExact = (
   reference: AgentReference,

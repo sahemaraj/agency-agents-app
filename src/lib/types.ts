@@ -1588,6 +1588,16 @@ export interface AgentPlanItem {
   capabilities: string[];
 }
 
+export type AgentMergeOutcome =
+  | { status: "clean"; previewHash: string }
+  | { status: "conflicts"; count: number; hunkSummaries: string[] }
+  | { status: "unavailable"; reason: string };
+
+export interface AgentMergePreview {
+  preview: string;
+  previewHash: string;
+}
+
 export interface AgentMutationPlan {
   revision: string;
   operation: string;
@@ -1598,6 +1608,7 @@ export interface AgentMutationPlan {
   warnings: string[];
   blockers: string[];
   rollbackAvailable: boolean;
+  mergeOutcome?: AgentMergeOutcome;
 }
 
 export interface OllamaModel {

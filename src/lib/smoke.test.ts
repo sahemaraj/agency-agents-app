@@ -7101,7 +7101,7 @@ describe("frontend test harness", () => {
     }
   });
 
-  it("offers only exact tracked outdated and missing Agent and Skill repairs", async () => {
+  it("offers exact tracked outdated, missing, and modified Agent repairs while Skills stay reject-on-modified", async () => {
     install.reconciled = true;
     skillSources.reconciled = true;
     install.installed = [
@@ -7114,6 +7114,7 @@ describe("frontend test harness", () => {
     skillSources.installed = [
       { sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/audit", state: "outdated", tracked: true },
       { sourceId: "skills", relativePath: "build", name: "Build", runtime: "claudeCode", scope: "project", projectPath: "/tmp/project", path: "/tmp/project/build", state: "missing", tracked: true },
+      { sourceId: "skills", relativePath: "edited", name: "Edited Skill", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/edited-skill", state: "modified", tracked: true },
       { sourceId: "skills", relativePath: "off", name: "Off", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/off", state: "disabled", tracked: true },
       { sourceId: "gone", relativePath: "source", name: "Gone", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/gone", state: "sourceUnavailable", tracked: true },
     ];
@@ -7123,21 +7124,150 @@ describe("frontend test harness", () => {
     try {
       await tick();
       const choices = [...target.querySelectorAll<HTMLInputElement>('input[name="repair-item"]')];
-      expect(choices).toHaveLength(4);
+      expect(choices).toHaveLength(5);
       expect(choices.every((choice) => choice.checked)).toBe(true);
       expect(choices.map((choice) => choice.dataset.candidateKey)).toEqual([
         "agent\0built-in\0reviewer.md\0claudeCode\0",
         "agent\0local\0nested/writer.md\0claudeCode\0/tmp/project",
+        "agent\0local\0edited.md\0claudeCode\0",
         "skill\0skills\0audit\0codex\0",
         "skill\0skills\0build\0claudeCode\0/tmp/project",
       ]);
       expect(target.textContent).toContain("Update");
       expect(target.textContent).toContain("Reinstall");
+      expect(target.textContent).toContain("Review local edits");
+      expect(target.textContent).toContain("Edited Skill");
       expect(target.textContent).toContain("Local changes require manual review");
       expect(target.textContent).toContain("Untracked content requires manual review");
       expect(target.textContent).toContain("Other Foreign");
       expect(target.textContent).toContain("Enable this installation before repair");
       expect(target.textContent).toContain("Restore its source before repair");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("renders every modified-Agent merge outcome and offers merge apply only for a clean preview", async () => {
+    const modified = (relativePath: string, name: string): InstalledAgent => ({
+      ...staleControlRow,
+      slug: relativePath.replace(".md", ""),
+      name,
+      sourceId: "built-in",
+      relativePath,
+      dest: `/tmp/${relativePath}`,
+      state: "modified",
+      tracked: true,
+    });
+    const clean = modified("clean.md", "Clean Agent");
+    const conflicts = modified("conflicts.md", "Conflict Agent");
+    const unavailable = modified("unavailable.md", "Unavailable Agent");
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [clean, conflicts, unavailable];
+    vi.mocked(invoke).mockImplementation(async (command: string, args?: unknown) => {
+      const relativePath = String(args && typeof args === "object" && !Array.isArray(args)
+        ? (args as Record<string, unknown>).relativePath ?? ""
+        : "");
+      if (command === "agent_update_plan") {
+        const mergeOutcome = relativePath === "clean.md"
+          ? { status: "clean" as const, previewHash: "preview-clean" }
+          : relativePath === "conflicts.md"
+            ? { status: "conflicts" as const, count: 2, hunkSummaries: ["Conflict 1: merged lines 4-8", "Conflict 2: merged lines 14-17"] }
+            : { status: "unavailable" as const, reason: "no canonical base snapshot; overwrite once to enable merging" };
+        return {
+          revision: `rev-${relativePath}`, operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+          agents: [{ reference: { sourceId: "built-in", relativePath }, name: relativePath, sourceHash: "hash", dependency: false, destination: `/tmp/${relativePath}`, renderedFileCount: 1, capabilities: [] }],
+          warnings: [], blockers: [], rollbackAvailable: true, mergeOutcome,
+        } as never;
+      }
+      if (command === "agent_merge_preview") return { preview: "local edit\nupstream addition\n", previewHash: "preview-clean" } as never;
+      if (command === "agent_diff") return {
+        slug: "clean", tool: "claudeCode", projectPath: null, dest: "/tmp/clean.md",
+        onDisk: "local edit\n", proposed: "upstream only\n", differs: true, artifacts: [],
+      } as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      expect(target.querySelectorAll('input[name="repair-item"]')).toHaveLength(3);
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.querySelectorAll("[data-merge-status]")).toHaveLength(3));
+      expect(target.querySelectorAll('[data-merge-status="clean"]')).toHaveLength(1);
+      expect(target.querySelectorAll('[data-merge-status="conflicts"]')).toHaveLength(1);
+      expect(target.querySelectorAll('[data-merge-status="unavailable"]')).toHaveLength(1);
+      const mergeButtons = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .filter((button) => button.textContent?.includes("Merge and update"));
+      expect(mergeButtons).toHaveLength(1);
+      expect(target.textContent).toContain("Your edits are kept, and upstream changes are added.");
+      expect(target.textContent).toContain("2 conflicting parts need your choice");
+      expect(target.textContent).toContain("No recorded base exists for this install yet");
+
+      mergeButtons[0].click();
+      await vi.waitFor(() => expect(target.textContent).toContain("upstream addition"));
+      expect(target.textContent).toContain("Merged result");
+      target.querySelector<HTMLButtonElement>(".box .close")!.click();
+      await tick();
+
+      [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("View conflicting parts"))!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Conflict 1: merged lines 4-8"));
+      expect(target.textContent).toContain("Nothing has been written");
+      expect(target.textContent).not.toContain("<<<<<<<");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("reports a stale merge apply and re-previews without silently retrying", async () => {
+    const agent: InstalledAgent = {
+      ...staleControlRow,
+      sourceId: "built-in",
+      relativePath: "reviewer.md",
+      state: "modified",
+      tracked: true,
+    };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [agent];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_update_plan") return {
+        revision: "merge-rev", operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "hash", dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+        mergeOutcome: { status: "clean", previewHash: "bound-preview" },
+      } as never;
+      if (command === "agent_merge_preview") return { preview: "local edit\nupstream update\n", previewHash: "bound-preview" } as never;
+      if (command === "agent_merge_apply") throw { code: "invalid_argument", message: "Agent merge preview is stale; base, installed, or rendered bytes changed" };
+      if (command === "installs_reconcile") return [agent] as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "agent_diff") return {
+        slug: "reviewer", tool: "claudeCode", projectPath: null, dest: "/tmp/reviewer.md",
+        onDisk: "changed again\n", proposed: "upstream\n", differs: true, artifacts: [],
+      } as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Merge and update"));
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("This file changed on disk after the preview"));
+      expect(target.textContent).not.toContain("Repaired ·");
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_apply")).toHaveLength(1);
+
+      [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("Re-preview"))!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("The preview was refreshed from the file now on disk"));
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_preview")).toHaveLength(3);
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_apply")).toHaveLength(1);
     } finally {
       unmount(component);
       target.remove();

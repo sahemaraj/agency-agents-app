@@ -70,7 +70,7 @@
 
   // Tracked Agent and Skill destinations that the safe-repair flow can recover.
   const repairCount = $derived(
-    install.installed.filter((row) => row.tracked && ["outdated", "missing"].includes(row.state)).length
+    install.installed.filter((row) => row.tracked && ["outdated", "modified", "missing"].includes(row.state)).length
     + skillSources.installed.filter((row) => row.tracked && ["outdated", "missing"].includes(row.state)).length,
   );
   let updatesOpen = $state(false);

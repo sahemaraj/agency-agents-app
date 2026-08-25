@@ -27,6 +27,8 @@ import {
   agentEnable,
   agentInstallPlan,
   agentInstallWithDependencies,
+  agentMergeApply,
+  agentMergePreview,
   agentRosterApply,
   agentRosterDisable,
   agentRosterEnable,
@@ -46,6 +48,7 @@ import { agentInstallKey } from "$lib/agents/libraryModel";
 import { appErrorMessage, isAppError } from "$lib/types";
 import type {
   AgentDiff,
+  AgentMergePreview,
   AgentMutationPlan,
   AgentReference,
   AgentRosterInstallRecord,
@@ -433,6 +436,24 @@ class InstallStore {
 
   diffReference(reference: AgentReference, tool: Tool, projectPath: string | null): Promise<AgentDiff> {
     return agentDiffExact(reference, tool, projectPath);
+  }
+
+  mergePreviewReference(
+    reference: AgentReference,
+    tool: Tool,
+    projectPath: string | null,
+  ): Promise<AgentMergePreview> {
+    return agentMergePreview(reference, tool, projectPath);
+  }
+
+  mergeApplyReference(
+    reference: AgentReference,
+    tool: Tool,
+    projectPath: string | null,
+    previewHash: string,
+  ): Promise<InstallRecord> {
+    return this.exactMutation("update", reference, tool, projectPath, () =>
+      agentMergeApply(reference, tool, projectPath, previewHash, true));
   }
 
   rollbackReference(
