@@ -391,6 +391,7 @@ export type SkillSourceKind =
       kind: "github";
       repository: string;
       gitRef: string | null;
+      resolvedCommit: string | null;
       subdirectory: string | null;
       activeCheckout: string | null;
     };
@@ -712,6 +713,7 @@ export type AgentSourceKind =
       kind: "github";
       repository: string;
       gitRef: string | null;
+      resolvedCommit: string | null;
       subdirectory: string | null;
       activeCheckout: string | null;
     }
@@ -1478,6 +1480,7 @@ export interface InstallRecord {
   publisherVerified: boolean;
   installedAt: string;
   corpusVersion: string;
+  sourceRevision: string;
   /** Truthful post-install follow-up for tools whose files need external activation. */
   deploymentNotice?: string | null;
 }
@@ -1654,12 +1657,23 @@ export interface OllamaMutationResult {
 
 export type WorkspacePackScope = "user" | "project";
 
+export type PortableSource =
+  | { kind: "builtin"; sourceRevision: string }
+  | {
+      kind: "github";
+      repository: string;
+      requestedRef: string | null;
+      resolvedCommit: string | null;
+      subdirectory: string | null;
+    }
+  | { kind: "legacy"; sourceId: string };
+
 export interface WorkspacePack {
-  workspacePack: 1;
+  workspacePack: 2;
   name: string;
   scope: WorkspacePackScope;
-  agents: Array<{ reference: AgentReference; tool: Tool }>;
-  skills: Array<{ reference: SkillReference; runtime: string }>;
+  agents: Array<{ source: PortableSource; reference: AgentReference; tool: Tool }>;
+  skills: Array<{ source: PortableSource; reference: SkillReference; runtime: string }>;
   runbook: string | null;
   instructions: string[];
   mcpServers: string[];
@@ -1671,7 +1685,7 @@ export interface WorkspacePackAgentPlan {
   tool: Tool;
   destinations: string[];
   dependency: boolean;
-  state: "current" | "missing" | "missingTracked" | "outdated" | "modified" | "foreign" | "disabled" | "sourceUnavailable" | "blocked";
+  state: "current" | "missing" | "missingTracked" | "outdated" | "modified" | "foreign" | "disabled" | "sourceUnavailable" | "sourceMissing" | "blocked";
 }
 
 export interface WorkspacePackSkillPlan {
@@ -1692,6 +1706,7 @@ export interface WorkspacePackPlan {
   warnings: string[];
   blockers: string[];
   rollbackScope: string[];
+  sourceAdditions: Array<{ kind: "agent" | "skill"; source: PortableSource }>;
   revision: string;
 }
 
@@ -1716,6 +1731,53 @@ export interface WorkspacePackApplyResult {
 export interface WorkspacePackApplyResponse {
   plan: WorkspacePackPlan;
   result: WorkspacePackApplyResult | null;
+}
+
+export interface AgencyLockArtifact {
+  path: string;
+  contentHash: string;
+}
+
+export interface AgencyLockEntry {
+  kind: "agent" | "skill";
+  source: Exclude<PortableSource, { kind: "legacy" }>;
+  sourceRelativePath: string;
+  sourceHash: string;
+  tool: string;
+  scope: "project";
+  artifacts: AgencyLockArtifact[];
+}
+
+export interface AgencyLock {
+  agencyLock: 1;
+  entries: AgencyLockEntry[];
+}
+
+export type LockEntryStatus = "current" | "missing" | "modified" | "outdated" | "foreign" | "extra";
+
+export interface LockCheckResult {
+  lock: AgencyLock;
+  entries: Array<{ entry: AgencyLockEntry; status: LockEntryStatus }>;
+  clean: boolean;
+}
+
+export interface LockPlan {
+  projectPath: string;
+  check: LockCheckResult;
+  operations: Array<{
+    kind: "agent" | "skill";
+    sourceRelativePath: string;
+    tool: string;
+    action: "install" | "update";
+  }>;
+  warnings: string[];
+  blockers: string[];
+  revision: string;
+}
+
+export interface LockApplyResponse {
+  plan: LockPlan;
+  applied: boolean;
 }
 
 export interface BaselineRequirement {

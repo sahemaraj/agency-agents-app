@@ -128,6 +128,8 @@ pub enum SkillSourceKind {
     Github {
         repository: String,
         git_ref: Option<String>,
+        #[serde(default)]
+        resolved_commit: Option<String>,
         subdirectory: Option<String>,
         active_checkout: Option<String>,
     },
@@ -1049,6 +1051,8 @@ pub enum AgentSourceKind {
     Github {
         repository: String,
         git_ref: Option<String>,
+        #[serde(default)]
+        resolved_commit: Option<String>,
         subdirectory: Option<String>,
         active_checkout: Option<String>,
     },
@@ -1520,6 +1524,8 @@ pub struct InstallRecord {
     pub publisher_verified: bool,
     pub installed_at: String,
     pub corpus_version: String,
+    #[serde(default)]
+    pub source_revision: String,
     /// Truthful post-install follow-up for tools whose files need external activation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_notice: Option<String>,
@@ -1904,6 +1910,7 @@ mod tests {
             kind: AgentSourceKind::Github {
                 repository: "https://github.com/example/agents.git".into(),
                 git_ref: Some("main".into()),
+                resolved_commit: Some("a".repeat(40)),
                 subdirectory: Some("catalog".into()),
                 active_checkout: None,
             },
@@ -1911,6 +1918,10 @@ mod tests {
         let value = serde_json::to_value(&source).unwrap();
         assert_eq!(value["kind"]["kind"], "github");
         assert_eq!(value["kind"]["gitRef"], "main");
+        assert_eq!(
+            value["kind"]["resolvedCommit"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(value["kind"]["subdirectory"], "catalog");
     }
 

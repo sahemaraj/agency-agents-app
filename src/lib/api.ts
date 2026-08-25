@@ -66,6 +66,9 @@ import type {
   AgentDiff,
   BaselineAgentRequirement,
   InstallRecord,
+  LockApplyResponse,
+  LockCheckResult,
+  LockPlan,
   Tool,
   StorageMigrationStatus,
   TaskRecommendation,
@@ -123,6 +126,13 @@ export const storageBackup = () => invoke<string>("storage_backup");
 export const storageOpenDataDirectory = () => invoke<void>("storage_open_data_directory");
 export const storageLegacyConflictsDismiss = () =>
   invoke<void>("storage_legacy_conflicts_dismiss");
+
+export const lockCheck = (projectPath: string) =>
+  invoke<LockCheckResult>("lock_check", { projectPath });
+export const lockPlan = (projectPath: string) =>
+  invoke<LockPlan>("lock_plan", { projectPath });
+export const lockApply = (projectPath: string, revision: string) =>
+  invoke<LockApplyResponse>("lock_apply", { projectPath, revision });
 
 export const taskRecommendations = (task: string, limit = 10) =>
   invoke<TaskRecommendation[]>("task_recommendations", { task, limit });

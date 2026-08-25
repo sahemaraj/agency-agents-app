@@ -392,6 +392,9 @@ pub fn run() {
             install::loadout_export,
             install::loadout_import,
             install::loadout_apply,
+            install::lockfile::lock_check,
+            install::lockfile::lock_plan,
+            install::lockfile::lock_apply,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

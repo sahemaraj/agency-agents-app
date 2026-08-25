@@ -318,6 +318,19 @@ struct AgentBatchRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LockRequest {
+    project_path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LockApplyRequest {
+    project_path: String,
+    revision: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(
     tag = "action",
     rename_all = "camelCase",
@@ -2329,6 +2342,74 @@ impl SkillMcpServer {
         )
         .await
     }
+
+    #[tool(description = "Compare a project's disk and install ledgers with agency.lock.json")]
+    async fn lock_check(
+        &self,
+        Parameters(LockRequest { project_path }): Parameters<LockRequest>,
+        Extension(_project_authorization): Extension<McpProjectAuthorization>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "lock_check",
+            McpAction::Read,
+            Some(project_path.clone()),
+            async {
+                let result = crate::install::lockfile::mcp_lock_check(self.state(), &project_path)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Plan project installs and updates required by agency.lock.json")]
+    async fn lock_plan(
+        &self,
+        Parameters(LockRequest { project_path }): Parameters<LockRequest>,
+        Extension(_project_authorization): Extension<McpProjectAuthorization>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "lock_plan",
+            McpAction::Read,
+            Some(project_path.clone()),
+            async {
+                let result = crate::install::lockfile::mcp_lock_plan(self.state(), &project_path)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Apply an unchanged, unblocked agency.lock.json plan")]
+    async fn lock_apply(
+        &self,
+        Parameters(LockApplyRequest {
+            project_path,
+            revision,
+        }): Parameters<LockApplyRequest>,
+        Extension(project_authorization): Extension<McpProjectAuthorization>,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "lock_apply",
+            McpAction::AgentInstall,
+            Some(project_path.clone()),
+            async {
+                let result = crate::install::lockfile::mcp_lock_apply(
+                    self.state(),
+                    &project_path,
+                    &revision,
+                    project_authorization.0.as_ref(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -2512,6 +2593,9 @@ mod tests {
                 "agents_uninstall",
                 "agents_update",
                 "agents_version_history",
+                "lock_apply",
+                "lock_check",
+                "lock_plan",
             ]
         );
     }

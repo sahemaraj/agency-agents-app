@@ -39,6 +39,7 @@ use crate::types::{
 use crate::util::fs::{atomic_write, read_capped};
 
 mod history;
+pub(crate) mod lockfile;
 
 /// Cap on an installed agent file we read back during reconciliation.
 const MAX_INSTALLED_BYTES: u64 = 4 * 1024 * 1024;
@@ -328,13 +329,9 @@ pub(crate) async fn load_ledger<R: Runtime>(
 ) -> Result<Vec<InstallRecord>, AppError> {
     corpus::ensure_corpus(app, state).await?;
     if let Some(database) = state.completed_state_database().await? {
-        return database
-            .read(installs_spec())
-            .await?
-            .ok_or_else(|| AppError::StorageCorrupt {
-                message: "Agent install ledger is missing after SQLite migration".into(),
-            })
-            .map(agent_entries);
+        return Ok(agent_entries(
+            load_migrated_database_entries(&database, None).await?,
+        ));
     }
     let built_in = crate::agents::inspect_builtin_agent_source(&state.app_data_dir).await?;
     let path = ledger_path(app)?;
@@ -343,13 +340,9 @@ pub(crate) async fn load_ledger<R: Runtime>(
 
 async fn load_ledger_for_state(state: &AppState) -> Result<Vec<InstallRecord>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
-        return database
-            .read(installs_spec())
-            .await?
-            .ok_or_else(|| AppError::StorageCorrupt {
-                message: "Agent install ledger is missing after SQLite migration".into(),
-            })
-            .map(agent_entries);
+        return Ok(agent_entries(
+            load_migrated_database_entries(&database, None).await?,
+        ));
     }
     let built_in = crate::agents::inspect_builtin_agent_source(&state.app_data_dir)
         .await
@@ -366,12 +359,7 @@ async fn load_install_entries_for_state(
     state: &AppState,
 ) -> Result<Vec<InstallLedgerEntry>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
-        return database
-            .read(installs_spec())
-            .await?
-            .ok_or_else(|| AppError::StorageCorrupt {
-                message: "Agent install ledger is missing after SQLite migration".into(),
-            });
+        return load_migrated_database_entries(&database, None).await;
     }
     let path = ledger_path_for(&state.app_data_dir);
     match read_capped(&path, MAX_LEDGER_BYTES).await {
@@ -390,6 +378,70 @@ async fn load_install_entries_for_state(
     }
 }
 
+async fn load_migrated_database_entries(
+    database: &crate::state_db::StateDatabase,
+    built_in: Option<&AgentSourceResult>,
+) -> Result<Vec<InstallLedgerEntry>, AppError> {
+    let values =
+        database
+            .read(raw_installs_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent install ledger is missing after SQLite migration".into(),
+            })?;
+    let roster_values = values
+        .iter()
+        .filter(|value| install_value_is_roster(value))
+        .cloned()
+        .collect::<Vec<_>>();
+    let records = values
+        .iter()
+        .filter(|value| !install_value_is_roster(value))
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<InstallRecord>, _>>()
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent install ledger entries are invalid".into(),
+        })?;
+    let (records, changed) = migrate_install_records(records, built_in)?;
+    let mut migrated_values = records
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AppError::Internal {
+            message: format!("serialize migrated Agent install record: {error}"),
+        })?;
+    migrated_values.extend(roster_values);
+    if changed {
+        let replacement = migrated_values.clone();
+        database
+            .mutate(raw_installs_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await?;
+    }
+    let entries = migrated_values
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<InstallLedgerEntry>, _>>()
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent install ledger entries are invalid".into(),
+        })?;
+    validate_install_entries(&entries)?;
+    Ok(entries)
+}
+
+async fn load_ledger_for_lock(state: &AppState) -> Result<Vec<InstallRecord>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        let Some(values) = database.read(raw_installs_spec()).await? else {
+            return Ok(Vec::new());
+        };
+        return parse_readiness_agent_entries(&values, None);
+    }
+    load_ledger_for_state(state).await
+}
+
 async fn load_rosters_for_state(
     state: &AppState,
 ) -> Result<Vec<AgentRosterInstallRecord>, AppError> {
@@ -402,13 +454,14 @@ pub(crate) async fn load_ledger_read_only(
     state: &AppState,
 ) -> Result<Vec<InstallRecord>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
-        return database
-            .read(installs_spec())
-            .await?
-            .ok_or_else(|| AppError::StorageCorrupt {
-                message: "Agent install ledger is missing after SQLite migration".into(),
-            })
-            .map(agent_entries);
+        let values =
+            database
+                .read(raw_installs_spec())
+                .await?
+                .ok_or_else(|| AppError::StorageCorrupt {
+                    message: "Agent install ledger is missing after SQLite migration".into(),
+                })?;
+        return parse_readiness_agent_entries(&values, None);
     }
     load_ledger_read_only_at(&ledger_path_for(&state.app_data_dir)).await
 }
@@ -716,7 +769,48 @@ async fn load_readiness_install_values(
 }
 
 pub(crate) fn installs_import_spec() -> crate::state_db::ImportSpec {
-    crate::state_db::ImportSpec::document(installs_spec(), Vec::new())
+    crate::state_db::ImportSpec::new("installs", "[]", parse_installs_import)
+}
+
+fn parse_installs_import(raw: &[u8]) -> Result<String, AppError> {
+    let mut values = serde_json::from_slice::<Vec<serde_json::Value>>(raw).map_err(|_| {
+        AppError::StorageCorrupt {
+            message: "installs legacy state is malformed".into(),
+        }
+    })?;
+    for value in values
+        .iter_mut()
+        .filter(|value| !install_value_is_roster(value))
+    {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "installs legacy state is invalid".into(),
+            })?;
+        if !object.contains_key("sourceRevision") {
+            let source_hash =
+                object
+                    .get("sourceHash")
+                    .cloned()
+                    .ok_or_else(|| AppError::StorageCorrupt {
+                        message: "installs legacy state is invalid".into(),
+                    })?;
+            object.insert("sourceRevision".into(), source_hash);
+        }
+    }
+    let entries = values
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<InstallLedgerEntry>, _>>()
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "installs legacy state is invalid".into(),
+        })?;
+    validate_install_entries(&entries).map_err(|_| AppError::StorageCorrupt {
+        message: "installs legacy state is invalid".into(),
+    })?;
+    serde_json::to_string(&entries).map_err(|_| AppError::Internal {
+        message: "serialize installs migration state".into(),
+    })
 }
 
 /// Upgrade pre-source ledgers entirely in memory. Existing source-aware rows
@@ -768,6 +862,10 @@ fn migrate_install_records(
         }
         if record.source_snapshot_hash.is_empty() {
             record.source_snapshot_hash = record.source_hash.clone();
+            changed = true;
+        }
+        if record.source_revision.is_empty() {
+            record.source_revision = record.source_hash.clone();
             changed = true;
         }
         if !record.artifacts.is_empty() {
@@ -1005,7 +1103,51 @@ fn record_for(
         publisher_verified: false,
         installed_at: installed_at.to_string(),
         corpus_version: corpus_version.to_string(),
+        source_revision: source_hash.to_string(),
         deployment_notice: (tool == "openclaw").then(|| OPENCLAW_DEPLOYMENT_NOTICE.into()),
+    }
+}
+
+async fn installed_source_revision(
+    state: &AppState,
+    reference: &AgentReference,
+    source_hash: &str,
+) -> Result<String, AppError> {
+    if reference.source_id == crate::agents::BUILTIN_AGENT_SOURCE_ID {
+        let revision = crate::agents::inspect_builtin_agent_source(&state.app_data_dir)
+            .await?
+            .revision;
+        return Ok(select_source_revision(
+            &reference.source_id,
+            source_hash,
+            Some(&revision),
+            None,
+        ));
+    }
+    let source = crate::agents::source_by_id(&state.app_data_dir, &reference.source_id).await?;
+    Ok(select_source_revision(
+        &reference.source_id,
+        source_hash,
+        None,
+        Some(&source.kind),
+    ))
+}
+
+fn select_source_revision(
+    source_id: &str,
+    source_hash: &str,
+    builtin_revision: Option<&str>,
+    kind: Option<&crate::types::AgentSourceKind>,
+) -> String {
+    if source_id == crate::agents::BUILTIN_AGENT_SOURCE_ID {
+        return builtin_revision.unwrap_or(source_hash).to_string();
+    }
+    match kind {
+        Some(crate::types::AgentSourceKind::Github {
+            resolved_commit: Some(commit),
+            ..
+        }) => commit.clone(),
+        _ => source_hash.to_string(),
     }
 }
 
@@ -1091,7 +1233,11 @@ pub(crate) async fn do_install<R: Runtime>(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
-    do_install_locked(app, state, reference, tool, project_path, confirmed).await
+    let record = do_install_locked(app, state, reference, tool, project_path, confirmed).await?;
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock(state, project).await?;
+    }
+    Ok(record)
 }
 
 pub(crate) async fn do_install_legacy(
@@ -1221,6 +1367,8 @@ async fn do_install_locked<R: Runtime>(
     planned_record.source_id = reference.source_id.clone();
     planned_record.relative_path = reference.relative_path.clone();
     planned_record.source_snapshot_hash = package.source_hash.clone();
+    planned_record.source_revision =
+        installed_source_revision(state, &reference, &package.source_hash).await?;
     planned_record.capabilities = package.capabilities.clone();
     planned_record.publisher_key = package.publisher_key.clone();
     planned_record.publisher_verified = package.publisher_verified;
@@ -1296,6 +1444,8 @@ async fn do_install_locked<R: Runtime>(
     };
     record.source_id = reference.source_id.clone();
     record.relative_path = reference.relative_path.clone();
+    record.source_revision =
+        installed_source_revision(state, &reference, &package.source_hash).await?;
     record.source_snapshot_hash = package.source_hash;
     record.capabilities = package.capabilities;
     record.publisher_key = package.publisher_key;
@@ -1911,6 +2061,8 @@ async fn do_track<R: Runtime>(
     )?;
     record.source_id = reference.source_id.clone();
     record.relative_path = reference.relative_path.clone();
+    record.source_revision =
+        installed_source_revision(state, &reference, &package.source_hash).await?;
     record.source_snapshot_hash = package.source_hash;
     record.capabilities = package.capabilities;
     record.publisher_key = package.publisher_key;
@@ -1924,6 +2076,9 @@ async fn do_track<R: Runtime>(
     });
     ledger.push(record.clone());
     save_ledger(app, &ledger).await?;
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock(state, project).await?;
+    }
     Ok(record)
 }
 
@@ -6114,6 +6269,9 @@ async fn execute_install_plan(
             }
         }
     }
+    if let Some(project) = plan.project_path.as_deref() {
+        lockfile::sync_project_lock(state, project).await?;
+    }
     Ok(installed)
 }
 
@@ -6451,6 +6609,8 @@ pub(crate) async fn mcp_install_agent_clean(
     record.artifacts = manifest;
     record.source_id = reference.source_id.clone();
     record.relative_path = reference.relative_path.clone();
+    record.source_revision =
+        installed_source_revision(state, &reference, &package.source_hash).await?;
     record.source_snapshot_hash = package.source_hash;
     record.capabilities = package.capabilities;
     record.publisher_key = package.publisher_key;
@@ -6461,6 +6621,9 @@ pub(crate) async fn mcp_install_agent_clean(
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("save Agent install", error, rollback)),
         };
+    }
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock(state, project).await?;
     }
     Ok(record)
 }
@@ -11866,7 +12029,7 @@ async fn apply_project_instruction(
 
 // ---------- Loadouts (Agentfile) ----------
 
-const WORKSPACE_PACK_VERSION: u32 = 1;
+const WORKSPACE_PACK_VERSION: u32 = 2;
 const MAX_WORKSPACE_PACK_ITEMS: usize = 256;
 const MAX_WORKSPACE_PACK_NAME_BYTES: usize = 160;
 const MAX_WORKSPACE_PACK_REQUIREMENT_BYTES: usize = 512;
@@ -11889,6 +12052,38 @@ pub struct WorkspacePack {
     mcp_servers: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePackV1 {
+    workspace_pack: u32,
+    name: String,
+    scope: WorkspacePackScope,
+    #[serde(default)]
+    agents: Vec<WorkspacePackAgentV1>,
+    #[serde(default)]
+    skills: Vec<WorkspacePackSkillV1>,
+    #[serde(default)]
+    runbook: Option<String>,
+    #[serde(default)]
+    instructions: Vec<String>,
+    #[serde(default)]
+    mcp_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePackAgentV1 {
+    reference: AgentReference,
+    tool: Tool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePackSkillV1 {
+    reference: SkillReference,
+    runtime: String,
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkspacePackScope {
@@ -11899,6 +12094,7 @@ pub enum WorkspacePackScope {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspacePackAgent {
+    source: PortableSource,
     reference: AgentReference,
     tool: Tool,
 }
@@ -11906,8 +12102,38 @@ struct WorkspacePackAgent {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspacePackSkill {
+    source: PortableSource,
     reference: SkillReference,
     runtime: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum PortableSource {
+    Builtin {
+        source_revision: String,
+    },
+    Github {
+        repository: String,
+        requested_ref: Option<String>,
+        resolved_commit: Option<String>,
+        subdirectory: Option<String>,
+    },
+    Legacy {
+        source_id: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePackSourceAddition {
+    kind: String,
+    source: PortableSource,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -11943,6 +12169,7 @@ pub struct WorkspacePackPlan {
     warnings: Vec<String>,
     blockers: Vec<String>,
     rollback_scope: Vec<String>,
+    source_additions: Vec<WorkspacePackSourceAddition>,
     revision: String,
 }
 
@@ -12068,6 +12295,7 @@ fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, Ap
         }
     }
     for agent in &pack.agents {
+        validate_portable_source(&agent.source)?;
         crate::library::validate_reference(
             &agent.reference.source_id,
             &agent.reference.relative_path,
@@ -12075,6 +12303,7 @@ fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, Ap
         validate_workspace_pack_runtime(&agent.tool, "agent tool")?;
     }
     for skill in &pack.skills {
+        validate_portable_source(&skill.source)?;
         crate::library::validate_reference(
             &skill.reference.source_id,
             &skill.reference.relative_path,
@@ -12098,16 +12327,23 @@ fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, Ap
         }
     }
 
-    pack.agents
-        .sort_by(|left, right| (&left.reference, &left.tool).cmp(&(&right.reference, &right.tool)));
+    pack.agents.sort_by(|left, right| {
+        (&left.source, &left.reference, &left.tool).cmp(&(
+            &right.source,
+            &right.reference,
+            &right.tool,
+        ))
+    });
     pack.agents.dedup();
     pack.skills.sort_by(|left, right| {
         (
+            &left.source,
             &left.reference.source_id,
             &left.reference.relative_path,
             &left.runtime,
         )
             .cmp(&(
+                &right.source,
                 &right.reference.source_id,
                 &right.reference.relative_path,
                 &right.runtime,
@@ -12119,6 +12355,75 @@ fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, Ap
     pack.mcp_servers.sort();
     pack.mcp_servers.dedup();
     Ok(pack)
+}
+
+fn validate_portable_source(source: &PortableSource) -> Result<(), AppError> {
+    match source {
+        PortableSource::Builtin { source_revision } => {
+            if !valid_sha256(source_revision) {
+                return Err(invalid_workspace_pack(
+                    "built-in source revision must be a SHA-256",
+                ));
+            }
+        }
+        PortableSource::Github {
+            repository,
+            requested_ref,
+            resolved_commit,
+            subdirectory,
+        } => {
+            if crate::skills::canonical_github_repository(repository)? != *repository
+                || crate::skills::validated_git_ref(requested_ref.as_deref())? != *requested_ref
+                || crate::skills::validated_resolved_commit(resolved_commit.as_deref())?
+                    != *resolved_commit
+                || crate::skills::validated_subdirectory(subdirectory.as_deref())? != *subdirectory
+            {
+                return Err(invalid_workspace_pack(
+                    "GitHub source coordinate is invalid",
+                ));
+            }
+        }
+        PortableSource::Legacy { source_id } => {
+            crate::library::validate_reference(source_id, "source.md")?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_workspace_pack_v1(pack: WorkspacePackV1) -> Result<WorkspacePack, AppError> {
+    if pack.workspace_pack != 1 {
+        return Err(invalid_workspace_pack("Unsupported Workspace Pack version"));
+    }
+    normalize_workspace_pack(WorkspacePack {
+        workspace_pack: WORKSPACE_PACK_VERSION,
+        name: pack.name,
+        scope: pack.scope,
+        agents: pack
+            .agents
+            .into_iter()
+            .map(|entry| WorkspacePackAgent {
+                source: PortableSource::Legacy {
+                    source_id: entry.reference.source_id.clone(),
+                },
+                reference: entry.reference,
+                tool: entry.tool,
+            })
+            .collect(),
+        skills: pack
+            .skills
+            .into_iter()
+            .map(|entry| WorkspacePackSkill {
+                source: PortableSource::Legacy {
+                    source_id: entry.reference.source_id.clone(),
+                },
+                reference: entry.reference,
+                runtime: entry.runtime,
+            })
+            .collect(),
+        runbook: pack.runbook,
+        instructions: pack.instructions,
+        mcp_servers: pack.mcp_servers,
+    })
 }
 
 fn serialize_workspace_pack(pack: &WorkspacePack) -> Result<Vec<u8>, AppError> {
@@ -12149,10 +12454,27 @@ fn parse_workspace_pack_input(bytes: &[u8]) -> Result<WorkspacePackInput, AppErr
     ) {
         (Some(version), None) if version == u64::from(WORKSPACE_PACK_VERSION) => {
             validate_workspace_pack_json_shape(object)?;
-            let pack = serde_json::from_value(value).map_err(|error| {
+            let pack: WorkspacePack = serde_json::from_value(value).map_err(|error| {
                 invalid_workspace_pack(format!("parse Workspace Pack: {error}"))
             })?;
+            if pack.agents.iter().any(|entry: &WorkspacePackAgent| {
+                matches!(entry.source, PortableSource::Legacy { .. })
+            }) || pack.skills.iter().any(|entry: &WorkspacePackSkill| {
+                matches!(entry.source, PortableSource::Legacy { .. })
+            }) {
+                return Err(invalid_workspace_pack(
+                    "Workspace Pack v2 must use portable sources",
+                ));
+            }
             Ok(WorkspacePackInput::Pack(normalize_workspace_pack(pack)?))
+        }
+        (Some(1), None) => {
+            validate_workspace_pack_json_shape(object)?;
+            validate_workspace_pack_v1_entries(object)?;
+            let pack: WorkspacePackV1 = serde_json::from_value(value).map_err(|error| {
+                invalid_workspace_pack(format!("parse Workspace Pack v1: {error}"))
+            })?;
+            Ok(WorkspacePackInput::Pack(normalize_workspace_pack_v1(pack)?))
         }
         (None, Some(1)) => {
             let legacy: Agentfile = serde_json::from_value(value)
@@ -12186,6 +12508,12 @@ fn validate_workspace_pack_json_shape(
             "Workspace Pack contains an unknown field",
         ));
     }
+    Ok(())
+}
+
+fn validate_workspace_pack_v1_entries(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), AppError> {
     for (label, entries, target) in [
         ("agent", object.get("agents"), "tool"),
         ("skill", object.get("skills"), "runtime"),
@@ -12230,6 +12558,8 @@ fn workspace_pack_from_ledgers(
     project_path: Option<&str>,
     agent_records: &[InstallRecord],
     skill_records: &[crate::types::SkillInstallRecord],
+    agent_sources: &[crate::types::AgentSource],
+    skill_sources: &[crate::types::SkillSource],
 ) -> Result<WorkspacePack, AppError> {
     let selected = |candidate: Option<&str>| match scope {
         WorkspacePackScope::User => candidate.is_none(),
@@ -12242,29 +12572,94 @@ fn workspace_pack_from_ledgers(
         agents: agent_records
             .iter()
             .filter(|record| selected(record.project_path.as_deref()))
-            .map(|record| WorkspacePackAgent {
-                reference: AgentReference {
-                    source_id: record.source_id.clone(),
-                    relative_path: record.relative_path.clone(),
-                },
-                tool: record.tool.clone(),
+            .map(|record| {
+                Ok(WorkspacePackAgent {
+                    source: portable_agent_source(record, agent_sources)?,
+                    reference: AgentReference {
+                        source_id: record.source_id.clone(),
+                        relative_path: record.relative_path.clone(),
+                    },
+                    tool: record.tool.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, AppError>>()?,
         skills: skill_records
             .iter()
             .filter(|record| selected(record.project_path.as_deref()))
-            .map(|record| WorkspacePackSkill {
-                reference: SkillReference {
-                    source_id: record.source_id.clone(),
-                    relative_path: record.relative_path.clone(),
-                },
-                runtime: record.runtime.clone(),
+            .map(|record| {
+                Ok(WorkspacePackSkill {
+                    source: portable_skill_source(record, skill_sources)?,
+                    reference: SkillReference {
+                        source_id: record.source_id.clone(),
+                        relative_path: record.relative_path.clone(),
+                    },
+                    runtime: record.runtime.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, AppError>>()?,
         runbook: None,
         instructions: Vec::new(),
         mcp_servers: Vec::new(),
     })
+}
+
+fn portable_agent_source(
+    record: &InstallRecord,
+    sources: &[crate::types::AgentSource],
+) -> Result<PortableSource, AppError> {
+    if record.source_id == crate::agents::BUILTIN_AGENT_SOURCE_ID {
+        return Ok(PortableSource::Builtin {
+            source_revision: record.source_revision.clone(),
+        });
+    }
+    let source = sources
+        .iter()
+        .find(|source| source.id == record.source_id)
+        .ok_or_else(|| invalid_workspace_pack("Agent source is unavailable for export"))?;
+    match &source.kind {
+        crate::types::AgentSourceKind::Github {
+            repository,
+            git_ref,
+            resolved_commit,
+            subdirectory,
+            ..
+        } => Ok(PortableSource::Github {
+            repository: repository.clone(),
+            requested_ref: git_ref.clone(),
+            resolved_commit: resolved_commit.clone(),
+            subdirectory: subdirectory.clone(),
+        }),
+        _ => Err(invalid_workspace_pack(
+            "Workspace Pack export requires built-in or GitHub Agent sources",
+        )),
+    }
+}
+
+fn portable_skill_source(
+    record: &crate::types::SkillInstallRecord,
+    sources: &[crate::types::SkillSource],
+) -> Result<PortableSource, AppError> {
+    let source = sources
+        .iter()
+        .find(|source| source.id == record.source_id)
+        .ok_or_else(|| invalid_workspace_pack("Skill source is unavailable for export"))?;
+    match &source.kind {
+        crate::types::SkillSourceKind::Github {
+            repository,
+            git_ref,
+            resolved_commit,
+            subdirectory,
+            ..
+        } => Ok(PortableSource::Github {
+            repository: repository.clone(),
+            requested_ref: git_ref.clone(),
+            resolved_commit: resolved_commit.clone(),
+            subdirectory: subdirectory.clone(),
+        }),
+        _ => Err(invalid_workspace_pack(
+            "Workspace Pack export requires GitHub Skill sources",
+        )),
+    }
 }
 
 fn convert_legacy_agentfile(
@@ -12309,8 +12704,12 @@ fn convert_legacy_agentfile(
         .map(|entry| {
             validate_workspace_pack_text(&entry.slug, "legacy slug", 160)?;
             validate_workspace_pack_runtime(&entry.tool, "legacy tool")?;
+            let reference = resolve_legacy_workspace_pack_reference(sources, &entry.slug)?;
             Ok(WorkspacePackAgent {
-                reference: resolve_legacy_workspace_pack_reference(sources, &entry.slug)?,
+                source: PortableSource::Legacy {
+                    source_id: reference.source_id.clone(),
+                },
+                reference,
                 tool: entry.tool,
             })
         })
@@ -12400,6 +12799,8 @@ fn finalize_workspace_pack_plan(plan: &mut WorkspacePackPlan) -> Result<(), AppE
         values.sort();
         values.dedup();
     }
+    plan.source_additions.sort();
+    plan.source_additions.dedup();
     plan.revision.clear();
     plan.revision =
         render::sha256_hex(
@@ -12516,11 +12917,160 @@ fn skill_install_state_name(state: crate::types::SkillInstallState) -> &'static 
     }
 }
 
+fn github_agent_coordinate_matches(
+    kind: &crate::types::AgentSourceKind,
+    coordinate: &PortableSource,
+) -> bool {
+    matches!(
+        (kind, coordinate),
+        (
+            crate::types::AgentSourceKind::Github {
+                repository,
+                git_ref,
+                resolved_commit,
+                subdirectory,
+                ..
+            },
+            PortableSource::Github {
+                repository: expected_repository,
+                requested_ref,
+                resolved_commit: expected_commit,
+                subdirectory: expected_subdirectory,
+            }
+        ) if repository == expected_repository
+            && git_ref == requested_ref
+            && resolved_commit == expected_commit
+            && subdirectory == expected_subdirectory
+    )
+}
+
+fn github_skill_coordinate_matches(
+    kind: &crate::types::SkillSourceKind,
+    coordinate: &PortableSource,
+) -> bool {
+    matches!(
+        (kind, coordinate),
+        (
+            crate::types::SkillSourceKind::Github {
+                repository,
+                git_ref,
+                resolved_commit,
+                subdirectory,
+                ..
+            },
+            PortableSource::Github {
+                repository: expected_repository,
+                requested_ref,
+                resolved_commit: expected_commit,
+                subdirectory: expected_subdirectory,
+            }
+        ) if repository == expected_repository
+            && git_ref == requested_ref
+            && resolved_commit == expected_commit
+            && subdirectory == expected_subdirectory
+    )
+}
+
+fn unresolved_source_id(kind: &str, source: &PortableSource) -> Result<String, AppError> {
+    Ok(format!(
+        "pending:{kind}:{}",
+        render::sha256_hex(
+            &serde_json::to_vec(source).map_err(|error| AppError::Internal {
+                message: format!("serialize portable source coordinate: {error}"),
+            })?
+        )
+    ))
+}
+
+async fn resolve_workspace_pack_sources(
+    state: &AppState,
+    pack: &mut WorkspacePack,
+) -> Result<(Vec<WorkspacePackSourceAddition>, Vec<String>), AppError> {
+    let agent_sources = crate::agents::load_agent_sources(&state.app_data_dir).await?;
+    let skill_sources = crate::skills::load_skill_sources_for_state(state).await?;
+    let builtin_revision = if pack
+        .agents
+        .iter()
+        .any(|entry| matches!(entry.source, PortableSource::Builtin { .. }))
+    {
+        Some(
+            crate::agents::inspect_builtin_agent_source(&state.app_data_dir)
+                .await?
+                .revision,
+        )
+    } else {
+        None
+    };
+    let mut additions = Vec::new();
+    let mut blockers = Vec::new();
+
+    for entry in &mut pack.agents {
+        match &entry.source {
+            PortableSource::Builtin { source_revision } => {
+                entry.reference.source_id = crate::agents::BUILTIN_AGENT_SOURCE_ID.into();
+                if Some(source_revision) != builtin_revision.as_ref() {
+                    blockers.push(format!(
+                        "Built-in Agent source revision is unavailable: {source_revision}"
+                    ));
+                }
+            }
+            PortableSource::Github { .. } => {
+                if let Some(source) = agent_sources
+                    .iter()
+                    .find(|source| github_agent_coordinate_matches(&source.kind, &entry.source))
+                {
+                    entry.reference.source_id.clone_from(&source.id);
+                } else {
+                    entry.reference.source_id = unresolved_source_id("agent", &entry.source)?;
+                    additions.push(WorkspacePackSourceAddition {
+                        kind: "agent".into(),
+                        source: entry.source.clone(),
+                    });
+                }
+            }
+            PortableSource::Legacy { source_id } => {
+                entry.reference.source_id.clone_from(source_id);
+            }
+        }
+    }
+    for entry in &mut pack.skills {
+        match &entry.source {
+            PortableSource::Github { .. } => {
+                if let Some(source) = skill_sources
+                    .iter()
+                    .find(|source| github_skill_coordinate_matches(&source.kind, &entry.source))
+                {
+                    entry.reference.source_id.clone_from(&source.id);
+                } else {
+                    entry.reference.source_id = unresolved_source_id("skill", &entry.source)?;
+                    additions.push(WorkspacePackSourceAddition {
+                        kind: "skill".into(),
+                        source: entry.source.clone(),
+                    });
+                }
+            }
+            PortableSource::Legacy { source_id } => {
+                entry.reference.source_id.clone_from(source_id);
+            }
+            PortableSource::Builtin { .. } => blockers.push(
+                "Built-in source markers are not valid for Skill Workspace Pack entries".into(),
+            ),
+        }
+    }
+    additions.sort();
+    additions.dedup();
+    blockers.sort();
+    blockers.dedup();
+    Ok((additions, blockers))
+}
+
 async fn build_workspace_pack_plan(
     state: &AppState,
-    pack: WorkspacePack,
+    mut pack: WorkspacePack,
     project_path: Option<String>,
 ) -> Result<WorkspacePackPlan, AppError> {
+    let (source_additions, source_blockers) =
+        resolve_workspace_pack_sources(state, &mut pack).await?;
     let project_path = bind_workspace_pack_project(state, pack.scope, project_path).await?;
     if pack.scope == WorkspacePackScope::Project && project_path.is_none() {
         let mut plan = WorkspacePackPlan {
@@ -12554,6 +13104,7 @@ async fn build_workspace_pack_plan(
             warnings: Vec::new(),
             blockers: vec!["Project Workspace Pack requires an explicit project binding".into()],
             rollback_scope: Vec::new(),
+            source_additions,
             revision: String::new(),
         };
         finalize_workspace_pack_plan(&mut plan)?;
@@ -12575,10 +13126,27 @@ async fn build_workspace_pack_plan(
         warnings: Vec::new(),
         blockers: Vec::new(),
         rollback_scope: Vec::new(),
+        source_additions,
         revision: String::new(),
     };
+    plan.blockers.extend(source_blockers);
 
     for requested in &plan.pack.agents {
+        if plan
+            .source_additions
+            .iter()
+            .any(|addition| addition.kind == "agent" && addition.source == requested.source)
+        {
+            plan.agents.push(WorkspacePackAgentPlan {
+                reference: requested.reference.clone(),
+                name: requested.reference.relative_path.clone(),
+                tool: requested.tool.clone(),
+                destinations: Vec::new(),
+                dependency: false,
+                state: "sourceMissing".into(),
+            });
+            continue;
+        }
         let mutation = match build_mutation_plan(
             state,
             vec![requested.reference.clone()],
@@ -12671,6 +13239,22 @@ async fn build_workspace_pack_plan(
     }
 
     for requested in &plan.pack.skills {
+        if plan
+            .source_additions
+            .iter()
+            .any(|addition| addition.kind == "skill" && addition.source == requested.source)
+        {
+            plan.skills.push(WorkspacePackSkillPlan {
+                reference: requested.reference.clone(),
+                name: requested.reference.relative_path.clone(),
+                runtime: requested.runtime.clone(),
+                destinations: Vec::new(),
+                dependency: false,
+                state: "sourceMissing".into(),
+                permissions: Vec::new(),
+            });
+            continue;
+        }
         let mutation = match crate::skills::plan_skill_install(
             state,
             &requested.reference.source_id,
@@ -12831,6 +13415,8 @@ pub async fn loadout_export(
     }
     let agent_records = load_ledger(&app, &state).await?;
     let skill_records = crate::skills::install::load_ledger_for_state(&state).await?;
+    let agent_source_records = crate::agents::load_agent_sources(&state.app_data_dir).await?;
+    let skill_source_records = crate::skills::load_skill_sources_for_state(&state).await?;
     if agent_records
         .iter()
         .filter(|record| selected(record.project_path.as_deref()))
@@ -12852,6 +13438,8 @@ pub async fn loadout_export(
         project_path.as_deref(),
         &agent_records,
         &skill_records,
+        &agent_source_records,
+        &skill_source_records,
     )?;
     let n = (pack.agents.len() + pack.skills.len()) as u32;
     let bytes = serialize_workspace_pack(&pack)?;
@@ -12918,6 +13506,47 @@ fn expected_workspace_pack_creations(plan: &WorkspacePackPlan) -> Vec<WorkspaceP
         .collect::<Vec<_>>();
     created.dedup();
     created
+}
+
+async fn materialize_workspace_pack_sources(
+    state: &AppState,
+    additions: &[WorkspacePackSourceAddition],
+) -> Result<(), AppError> {
+    for addition in additions {
+        let PortableSource::Github {
+            repository,
+            requested_ref,
+            resolved_commit,
+            subdirectory,
+        } = &addition.source
+        else {
+            continue;
+        };
+        match addition.kind.as_str() {
+            "agent" => {
+                crate::agents::materialize_github_source(
+                    state,
+                    repository,
+                    requested_ref.as_deref(),
+                    resolved_commit.as_deref(),
+                    subdirectory.as_deref(),
+                )
+                .await?;
+            }
+            "skill" => {
+                crate::skills::materialize_github_source(
+                    state,
+                    repository,
+                    requested_ref.as_deref(),
+                    resolved_commit.as_deref(),
+                    subdirectory.as_deref(),
+                )
+                .await?;
+            }
+            _ => return Err(invalid_workspace_pack("unknown planned source addition")),
+        }
+    }
+    Ok(())
 }
 
 async fn rollback_workspace_pack_created(
@@ -13064,9 +13693,19 @@ pub async fn loadout_apply(
     revision: String,
 ) -> Result<WorkspacePackApplyResponse, AppError> {
     let pack = read_workspace_pack_file(&app, &state, Path::new(&path)).await?;
-    let plan = build_workspace_pack_plan(&state, pack, project_path).await?;
+    let mut plan = build_workspace_pack_plan(&state, pack, project_path).await?;
     if require_workspace_pack_revision(&plan, &revision).is_err() || !plan.blockers.is_empty() {
         return Ok(WorkspacePackApplyResponse { plan, result: None });
+    }
+    if !plan.source_additions.is_empty() {
+        materialize_workspace_pack_sources(&state, &plan.source_additions).await?;
+        let approved_revision = plan.revision.clone();
+        plan =
+            build_workspace_pack_plan(&state, plan.pack.clone(), plan.project_path.clone()).await?;
+        plan.revision = approved_revision;
+        if !plan.source_additions.is_empty() || !plan.blockers.is_empty() {
+            return Ok(WorkspacePackApplyResponse { plan, result: None });
+        }
     }
 
     let expected_created = expected_workspace_pack_creations(&plan);
@@ -13472,6 +14111,9 @@ mod tests {
                 .iter()
                 .cloned()
                 .map(|reference| WorkspacePackAgent {
+                    source: PortableSource::Legacy {
+                        source_id: reference.source_id.clone(),
+                    },
                     reference,
                     tool: "aider".into(),
                 })
@@ -16109,11 +16751,17 @@ mod tests {
 
     fn workspace_pack_fixture() -> WorkspacePack {
         WorkspacePack {
-            workspace_pack: 1,
+            workspace_pack: WORKSPACE_PACK_VERSION,
             name: "Review workspace".into(),
             scope: WorkspacePackScope::Project,
             agents: vec![
                 WorkspacePackAgent {
+                    source: PortableSource::Github {
+                        repository: "https://github.com/acme/agents.git".into(),
+                        requested_ref: Some("main".into()),
+                        resolved_commit: Some("a".repeat(40)),
+                        subdirectory: None,
+                    },
                     reference: AgentReference {
                         source_id: "source-b".into(),
                         relative_path: "nested/writer.md".into(),
@@ -16121,6 +16769,12 @@ mod tests {
                     tool: "claudeCode".into(),
                 },
                 WorkspacePackAgent {
+                    source: PortableSource::Github {
+                        repository: "https://github.com/acme/agents.git".into(),
+                        requested_ref: Some("main".into()),
+                        resolved_commit: Some("a".repeat(40)),
+                        subdirectory: None,
+                    },
                     reference: AgentReference {
                         source_id: "source-a".into(),
                         relative_path: "engineering/reviewer.md".into(),
@@ -16129,6 +16783,12 @@ mod tests {
                 },
             ],
             skills: vec![WorkspacePackSkill {
+                source: PortableSource::Github {
+                    repository: "https://github.com/acme/skills.git".into(),
+                    requested_ref: Some("v1".into()),
+                    resolved_commit: Some("b".repeat(40)),
+                    subdirectory: Some("skills".into()),
+                },
                 reference: crate::types::SkillReference {
                     source_id: "skills".into(),
                     relative_path: "audit".into(),
@@ -18359,7 +19019,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_pack_v1_is_deterministic_bounded_and_path_private() {
+    fn workspace_pack_v2_is_deterministic_bounded_and_path_private() {
         let mut pack = workspace_pack_fixture();
         pack.agents.reverse();
         pack.agents.push(pack.agents[0].clone());
@@ -18369,7 +19029,8 @@ mod tests {
         assert_eq!(normalized.agents.len(), 2);
         assert_eq!(normalized.agents[0].reference.source_id, "source-a");
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("\"workspacePack\": 1"));
+        assert!(text.contains("\"workspacePack\": 2"));
+        assert!(text.contains("\"resolvedCommit\""));
         assert!(!text.contains("/Users/") && !text.contains("projectPath"));
 
         let mut oversize = workspace_pack_fixture();
@@ -18397,8 +19058,14 @@ mod tests {
             panic!("legacy Agentfile must enter review conversion")
         };
         assert_eq!(legacy.installs.len(), 1);
+        let v1 = br#"{"workspacePack":1,"name":"old","scope":"user","agents":[{"reference":{"sourceId":"source-a","relativePath":"reviewer.md"},"tool":"codex"}],"skills":[]}"#;
+        let WorkspacePackInput::Pack(v1) = parse_workspace_pack_input(v1).unwrap() else {
+            panic!("Workspace Pack v1 must normalize into v2")
+        };
+        assert_eq!(v1.workspace_pack, 2);
+        assert!(matches!(v1.agents[0].source, PortableSource::Legacy { .. }));
         assert!(parse_workspace_pack_input(
-            br#"{"workspacePack":2,"name":"future","scope":"user","agents":[],"skills":[]}"#
+            br#"{"workspacePack":3,"name":"future","scope":"user","agents":[],"skills":[]}"#
         )
         .is_err());
         assert!(parse_workspace_pack_input(br#"{"agentfile":2,"installs":[]}"#).is_err());
@@ -18431,6 +19098,17 @@ mod tests {
             Some(project),
             &agents,
             &skills,
+            &[],
+            &[crate::types::SkillSource {
+                id: "skills".into(),
+                kind: crate::types::SkillSourceKind::Github {
+                    repository: "https://github.com/acme/skills.git".into(),
+                    git_ref: None,
+                    resolved_commit: Some("c".repeat(40)),
+                    subdirectory: None,
+                    active_checkout: None,
+                },
+            }],
         )
         .unwrap();
         let text = String::from_utf8(serialize_workspace_pack(&pack).unwrap()).unwrap();
@@ -18438,6 +19116,45 @@ mod tests {
         assert_eq!(pack.skills.len(), 1);
         assert!(text.contains("project.md") && text.contains("\"audit\""));
         assert!(!text.contains(project) && !text.contains("global.md"));
+    }
+
+    #[test]
+    fn github_coordinate_matching_includes_resolved_commit() {
+        let kind = crate::types::AgentSourceKind::Github {
+            repository: "https://github.com/acme/agents.git".into(),
+            git_ref: Some("main".into()),
+            resolved_commit: Some("a".repeat(40)),
+            subdirectory: Some("agents".into()),
+            active_checkout: Some("/tmp/checkout".into()),
+        };
+        let coordinate = PortableSource::Github {
+            repository: "https://github.com/acme/agents.git".into(),
+            requested_ref: Some("main".into()),
+            resolved_commit: Some("a".repeat(40)),
+            subdirectory: Some("agents".into()),
+        };
+        assert!(github_agent_coordinate_matches(&kind, &coordinate));
+        let mut changed = coordinate;
+        if let PortableSource::Github {
+            resolved_commit, ..
+        } = &mut changed
+        {
+            *resolved_commit = Some("b".repeat(40));
+        }
+        assert!(!github_agent_coordinate_matches(&kind, &changed));
+    }
+
+    #[test]
+    fn builtin_install_revision_uses_corpus_content_revision() {
+        assert_eq!(
+            select_source_revision(
+                crate::agents::BUILTIN_AGENT_SOURCE_ID,
+                &"b".repeat(64),
+                Some(&"a".repeat(64)),
+                None,
+            ),
+            "a".repeat(64)
+        );
     }
 
     #[test]
@@ -18500,6 +19217,7 @@ mod tests {
             warnings: vec!["z".into(), "a".into(), "a".into()],
             blockers: Vec::new(),
             rollback_scope: vec!["/bound/project/.codex/agents/reviewer.md".into()],
+            source_additions: Vec::new(),
             revision: String::new(),
         };
         finalize_workspace_pack_plan(&mut plan).unwrap();
@@ -18532,6 +19250,7 @@ mod tests {
             warnings: Vec::new(),
             blockers: Vec::new(),
             rollback_scope: Vec::new(),
+            source_additions: Vec::new(),
             revision: String::new(),
         };
         finalize_workspace_pack_plan(&mut plan).unwrap();
@@ -18609,10 +19328,13 @@ mod tests {
         );
         *state.settings.write().await = SettingsLoadState::Loaded(settings);
         let pack = WorkspacePack {
-            workspace_pack: 1,
+            workspace_pack: WORKSPACE_PACK_VERSION,
             name: "Local review".into(),
             scope: WorkspacePackScope::User,
             agents: vec![WorkspacePackAgent {
+                source: PortableSource::Legacy {
+                    source_id: source.id.clone(),
+                },
                 reference: AgentReference {
                     source_id: source.id,
                     relative_path: "lead.md".into(),
@@ -18668,6 +19390,7 @@ mod tests {
             publisher_verified: false,
             installed_at: String::new(),
             corpus_version: String::new(),
+            source_revision: "a".repeat(64),
             deployment_notice: None,
         }
     }
@@ -18693,6 +19416,7 @@ mod tests {
             publisher_verified: false,
             installed_at: "2026-08-06T00:00:00Z".into(),
             corpus_version: "1".into(),
+            source_revision: "a".repeat(64),
             deployment_notice: None,
         }
     }
@@ -19855,6 +20579,7 @@ mod tests {
         );
         assert_eq!(migrated[0].relative_path, "engineering/unique.md");
         assert_eq!(migrated[0].source_snapshot_hash, "old-source");
+        assert_eq!(migrated[0].source_revision, "old-source");
         for row in &migrated[1..] {
             assert_eq!(row.source_id, "legacy:unresolved");
             assert!(row.relative_path.starts_with("legacy/"));
@@ -19898,10 +20623,22 @@ mod tests {
             "sourceId": "local:external",
             "relativePath": "nested/external.md",
             "disabledPath": null,
-            "sourceSnapshotHash": "snapshot"
+            "sourceSnapshotHash": "snapshot",
+            "sourceRevision": "source"
         }))
         .unwrap();
         let original = serde_json::to_value(&migrated).unwrap();
+        let mut legacy_database_row = original.clone();
+        legacy_database_row
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceRevision");
+        let imported =
+            parse_installs_import(&serde_json::to_vec(&vec![legacy_database_row]).unwrap())
+                .unwrap();
+        let imported: Vec<InstallRecord> = serde_json::from_str(&imported).unwrap();
+        assert_eq!(imported[0].source_revision, "source");
+
         let (rows, changed) = migrate_install_records(vec![migrated], None).unwrap();
         assert!(!changed);
         assert_eq!(serde_json::to_value(&rows[0]).unwrap(), original);
@@ -21565,6 +22302,7 @@ mod tests {
             publisher_verified: false,
             installed_at: "2026-06-05T00:00:00Z".into(),
             corpus_version: "v".into(),
+            source_revision: "sh".into(),
             deployment_notice: None,
         }];
         let bytes = serde_json::to_vec(&recs).unwrap();

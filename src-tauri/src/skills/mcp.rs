@@ -1649,7 +1649,9 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "agents_list_folders"
         | "agents_list_approvals"
         | "agents_plan_install"
-        | "agents_version_history" => Some(McpAction::Read),
+        | "agents_version_history"
+        | "lock_check"
+        | "lock_plan" => Some(McpAction::Read),
         "agents_add_local_source"
         | "agents_add_github_source"
         | "agents_refresh_source"
@@ -1673,7 +1675,8 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "agents_install_with_dependencies"
         | "agents_find_and_install"
         | "agents_update"
-        | "agents_enable" => Some(McpAction::AgentInstall),
+        | "agents_enable"
+        | "lock_apply" => Some(McpAction::AgentInstall),
         "agents_remove_source"
         | "agents_delete_folder"
         | "agents_delete_collection"
@@ -5132,6 +5135,7 @@ mod tests {
                 kind: SkillSourceKind::Github {
                     repository: "https://github.com/example/skills.git".into(),
                     git_ref: Some("main".into()),
+                    resolved_commit: Some("a".repeat(40)),
                     subdirectory: Some("skills".into()),
                     active_checkout: Some(checkout.into()),
                 },
@@ -7145,7 +7149,7 @@ mod tests {
             "every routed tool must have an explicit audit/policy class"
         );
 
-        assert_eq!(names.len(), 137);
+        assert_eq!(names.len(), 140);
         assert_eq!(
             names
                 .iter()
@@ -7218,7 +7222,7 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(skill_names.len(), 86);
-        assert_eq!(agent_names.len(), 51);
+        assert_eq!(agent_names.len(), 54);
         assert!(skill_names.is_disjoint(&agent_names));
     }
 

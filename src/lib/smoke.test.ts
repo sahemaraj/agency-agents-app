@@ -126,6 +126,7 @@ const installRecord = (slug: string, dest: string): InstallRecord => ({
   projectPath: null, dest, sourceHash: "source", bodyHash: "body", renderedHash: "rendered",
   disabledPath: null, sourceSnapshotHash: "snapshot", capabilities: [], publisherKey: null,
   publisherVerified: false, installedAt: "2026-08-14T01:00:00Z", corpusVersion: "test",
+  sourceRevision: "source",
 });
 const catalogStatusFixture: CatalogStatus = {
   source: { kind: "bundled" }, root: null, isGit: false, branch: null, commit: null,
@@ -2950,16 +2951,16 @@ describe("frontend test harness", () => {
   it("reviews then applies one mixed Workspace Pack and records exact retained results", async () => {
     const plan: WorkspacePackPlan = {
       pack: {
-        workspacePack: 1, name: "Review workspace", scope: "project",
-        agents: [{ reference: { sourceId: "agents", relativePath: "reviewer.md" }, tool: "codex" }],
-        skills: [{ reference: { sourceId: "skills", relativePath: "audit" }, runtime: "codex" }],
+        workspacePack: 2, name: "Review workspace", scope: "project",
+        agents: [{ source: { kind: "github", repository: "https://github.com/acme/agents.git", requestedRef: "main", resolvedCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", subdirectory: null }, reference: { sourceId: "agents", relativePath: "reviewer.md" }, tool: "codex" }],
+        skills: [{ source: { kind: "github", repository: "https://github.com/acme/skills.git", requestedRef: "main", resolvedCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", subdirectory: null }, reference: { sourceId: "skills", relativePath: "audit" }, runtime: "codex" }],
         runbook: "review-flow", instructions: ["Follow AGENTS.md"], mcpServers: ["memory"],
       },
       projectPath: "/project",
       agents: [{ reference: { sourceId: "agents", relativePath: "reviewer.md" }, name: "Reviewer", tool: "codex", destinations: ["/project/.codex/agents/reviewer.toml"], dependency: false, state: "missing" }],
       skills: [{ reference: { sourceId: "skills", relativePath: "audit" }, name: "Audit", runtime: "codex", destinations: ["/project/.agents/skills/audit"], dependency: false, state: "current", permissions: [] }],
       warnings: ["MCP requirements are declarative"], blockers: [],
-      rollbackScope: ["/project/.codex/agents/reviewer.toml"], revision: "revision-1",
+      rollbackScope: ["/project/.codex/agents/reviewer.toml"], sourceAdditions: [], revision: "revision-1",
     };
     vi.mocked(invoke).mockImplementation(async (command: string) => {
       if (command === "loadout_import") return plan as never;

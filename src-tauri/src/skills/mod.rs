@@ -537,11 +537,13 @@ fn validate_skill_sources(sources: &[SkillSource]) -> Result<(), AppError> {
             SkillSourceKind::Github {
                 repository,
                 git_ref,
+                resolved_commit,
                 subdirectory,
                 active_checkout,
             } => {
                 if canonical_github_repository(repository)? != *repository
                     || validated_git_ref(git_ref.as_deref())? != *git_ref
+                    || validated_resolved_commit(resolved_commit.as_deref())? != *resolved_commit
                     || validated_subdirectory(subdirectory.as_deref())? != *subdirectory
                     || active_checkout
                         .as_ref()
@@ -726,6 +728,20 @@ pub(crate) fn validated_git_ref(git_ref: Option<&str>) -> Result<Option<String>,
     Ok(Some(value.to_string()))
 }
 
+pub(crate) fn validated_resolved_commit(
+    resolved_commit: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let Some(value) = resolved_commit else {
+        return Ok(None);
+    };
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::InvalidArgument {
+            message: "resolved Git commit must be a 40-character SHA".into(),
+        });
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
 pub(crate) fn validated_subdirectory(
     subdirectory: Option<&str>,
 ) -> Result<Option<String>, AppError> {
@@ -784,6 +800,7 @@ pub(crate) async fn add_github_source(
             kind: SkillSourceKind::Github {
                 repository,
                 git_ref,
+                resolved_commit: None,
                 subdirectory,
                 active_checkout: None,
             },
@@ -850,6 +867,15 @@ async fn refresh_git_source_from(
     source_id: &str,
     clone_source: &str,
 ) -> Result<SkillSourceResult, AppError> {
+    refresh_git_source_from_ref(state, source_id, clone_source, None).await
+}
+
+async fn refresh_git_source_from_ref(
+    state: &AppState,
+    source_id: &str,
+    clone_source: &str,
+    checkout_override: Option<&str>,
+) -> Result<SkillSourceResult, AppError> {
     state.require_network("skill_source_refresh").await?;
     let sources = load_skill_sources_for_state(state).await?;
     let source_index = sources
@@ -900,7 +926,7 @@ async fn refresh_git_source_from(
         cleanup_unreferenced(staging).await;
         return Err(error);
     }
-    let checkout_ref = git_ref.as_deref().unwrap_or("HEAD");
+    let checkout_ref = checkout_override.or(git_ref.as_deref()).unwrap_or("HEAD");
     if let Err(error) = crate::corpus::run_git(
         &["checkout", "--detach", checkout_ref, "--"],
         Some(&staging),
@@ -910,6 +936,14 @@ async fn refresh_git_source_from(
         cleanup_unreferenced(staging).await;
         return Err(error);
     }
+    let resolved_commit = match crate::corpus::run_git(&["rev-parse", "HEAD"], Some(&staging)).await
+    {
+        Ok(value) => Some(value.trim().to_ascii_lowercase()),
+        Err(error) => {
+            cleanup_unreferenced(staging).await;
+            return Err(error);
+        }
+    };
 
     let candidate_source = sources[source_index].clone();
     let staging_for_validation = staging.clone();
@@ -1002,10 +1036,12 @@ async fn refresh_git_source_from(
     let mut active_source = candidate.source;
     if let SkillSourceKind::Github {
         active_checkout: active,
+        resolved_commit: commit,
         ..
     } = &mut active_source.kind
     {
         *active = Some(active_checkout.to_string_lossy().into_owned());
+        *commit = resolved_commit;
     }
     refresh_fs("state_persist", || Ok(())).await?;
     let source_id = source_id.to_owned();
@@ -1031,6 +1067,17 @@ async fn refresh_git_source_from(
         packages: candidate.packages,
         errors: candidate.errors,
     })
+}
+
+pub(crate) async fn materialize_github_source(
+    state: &AppState,
+    repository: &str,
+    requested_ref: Option<&str>,
+    resolved_commit: Option<&str>,
+    subdirectory: Option<&str>,
+) -> Result<SkillSourceResult, AppError> {
+    let source = add_github_source(state, repository, requested_ref, subdirectory).await?;
+    refresh_git_source_from_ref(state, &source.id, repository, resolved_commit).await
 }
 
 pub(crate) async fn discover_source(source: SkillSource) -> Result<SkillSourceResult, AppError> {
@@ -3042,7 +3089,10 @@ pub(crate) async fn install_skill_authorized(
                 })
             }
             Some(_) if record.source_hash == source_hash => {
-                return Ok(installed_view(record, SkillInstallState::Current))
+                if let Some(project) = record.project_path.as_deref() {
+                    crate::install::lockfile::sync_project_lock(state, project).await?;
+                }
+                return Ok(installed_view(record, SkillInstallState::Current));
             }
             Some(_) => true,
             None => false,
@@ -3164,6 +3214,9 @@ pub(crate) async fn install_skill_authorized(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         install::save_ledger_after_filesystem(state, &records, &operation.id).await?;
         database.commit_filesystem_operation(&operation.id).await?;
+    }
+    if let Some(project) = record.project_path.as_deref() {
+        crate::install::lockfile::sync_project_lock(state, project).await?;
     }
     Ok(installed_view(&record, SkillInstallState::Current))
 }
@@ -7412,6 +7465,7 @@ mod tests {
             SkillSourceKind::Github {
                 ref repository,
                 git_ref: Some(ref git_ref),
+                resolved_commit: None,
                 subdirectory: Some(ref subdirectory),
                 active_checkout: None,
             } if repository == "https://github.com/Owner/Repo.git"
@@ -7512,8 +7566,9 @@ mod tests {
         let active = match &result.source.kind {
             SkillSourceKind::Github {
                 active_checkout: Some(path),
+                resolved_commit: Some(commit),
                 ..
-            } => PathBuf::from(path),
+            } if commit.len() == 40 => PathBuf::from(path),
             other => panic!("missing active checkout: {other:?}"),
         };
         assert!(active.ends_with("skills"));
@@ -7746,6 +7801,7 @@ mod tests {
         let kind = SkillSourceKind::Github {
             repository: "owner/repo".into(),
             git_ref: Some("v1.0.0".into()),
+            resolved_commit: Some("a".repeat(40)),
             subdirectory: Some("skills".into()),
             active_checkout: Some("/tmp/checkout".into()),
         };
@@ -7756,6 +7812,7 @@ mod tests {
                 "kind": "github",
                 "repository": "owner/repo",
                 "gitRef": "v1.0.0",
+                "resolvedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "subdirectory": "skills",
                 "activeCheckout": "/tmp/checkout"
             })
