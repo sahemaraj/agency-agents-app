@@ -14,7 +14,7 @@ use crate::types::{AgentReference, SkillReference};
 use crate::{render, skills};
 
 const LOCK_VERSION: u32 = 1;
-const LOCK_FILENAME: &str = "agency.lock.json";
+pub(crate) const LOCK_FILENAME: &str = "agency.lock.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -97,6 +97,31 @@ pub struct LockApplyResponse {
     pub(crate) applied: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum VerifyStatus {
+    Ok,
+    Missing,
+    Modified,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VerifyEntry {
+    pub(crate) entry: LockEntry,
+    pub(crate) status: VerifyStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VerifyResult {
+    pub(crate) entries: Vec<VerifyEntry>,
+    pub(crate) clean: bool,
+}
+
 fn invalid(message: impl Into<String>) -> AppError {
     AppError::InvalidArgument {
         message: message.into(),
@@ -132,13 +157,14 @@ fn relative_project_path(project: &Path, path: &Path) -> Result<String, AppError
     Ok(parts.join("/"))
 }
 
-fn normalize(mut lock: AgencyLock) -> Result<AgencyLock, AppError> {
+fn normalize(mut lock: AgencyLock, allow_user_scope: bool) -> Result<AgencyLock, AppError> {
     if lock.agency_lock != LOCK_VERSION {
         return Err(invalid("unsupported agency lockfile version"));
     }
     for entry in &mut lock.entries {
+        let valid_scope = entry.scope == "project" || (allow_user_scope && entry.scope == "user");
         if !matches!(entry.kind.as_str(), "agent" | "skill")
-            || entry.scope != "project"
+            || !valid_scope
             || !super::valid_sha256(&entry.source_hash)
             || entry.source_relative_path.is_empty()
             || entry.tool.is_empty()
@@ -166,11 +192,12 @@ fn normalize(mut lock: AgencyLock) -> Result<AgencyLock, AppError> {
 }
 
 fn serialize(lock: &AgencyLock) -> Result<Vec<u8>, AppError> {
-    let mut bytes = serde_json::to_vec_pretty(&normalize(lock.clone())?).map_err(|error| {
-        AppError::Internal {
-            message: format!("serialize agency lockfile: {error}"),
-        }
-    })?;
+    let mut bytes =
+        serde_json::to_vec_pretty(&normalize(lock.clone(), false)?).map_err(|error| {
+            AppError::Internal {
+                message: format!("serialize agency lockfile: {error}"),
+            }
+        })?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -183,7 +210,28 @@ async fn read(project: &Path) -> Result<AgencyLock, AppError> {
         message: error.to_string(),
         raw_excerpt: String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).into_owned(),
     })?;
-    normalize(lock)
+    normalize(lock, false)
+}
+
+fn finish_current_lock(
+    entries: Vec<LockEntry>,
+    mut unresolved: Vec<String>,
+) -> Result<AgencyLock, AppError> {
+    if !unresolved.is_empty() {
+        unresolved.sort();
+        unresolved.dedup();
+        return Err(invalid(format!(
+            "lockfile sources could not be resolved: {}",
+            unresolved.join("; ")
+        )));
+    }
+    normalize(
+        AgencyLock {
+            agency_lock: LOCK_VERSION,
+            entries,
+        },
+        false,
+    )
 }
 
 async fn current_lock(state: &AppState, project: &Path) -> Result<AgencyLock, AppError> {
@@ -201,13 +249,21 @@ async fn current_lock(state: &AppState, project: &Path) -> Result<AgencyLock, Ap
         skills::load_skill_sources_for_state(state).await?
     };
     let mut entries = Vec::new();
+    let mut unresolved = Vec::new();
 
     for record in agent_records
         .iter()
         .filter(|record| record.project_path.as_deref() == Some(project_string.as_ref()))
     {
-        let Ok(source) = portable_agent_source(record, &agent_sources) else {
-            continue;
+        let source = match portable_agent_source(record, &agent_sources) {
+            Ok(source) => source,
+            Err(error) => {
+                unresolved.push(format!(
+                    "agent {} for {} ({error})",
+                    record.relative_path, record.tool
+                ));
+                continue;
+            }
         };
         let artifacts = if record.artifacts.is_empty() {
             vec![LockArtifact {
@@ -241,8 +297,15 @@ async fn current_lock(state: &AppState, project: &Path) -> Result<AgencyLock, Ap
         .iter()
         .filter(|record| record.project_path.as_deref() == Some(project_string.as_ref()))
     {
-        let Ok(source) = portable_skill_source(record, &skill_sources) else {
-            continue;
+        let source = match portable_skill_source(record, &skill_sources) {
+            Ok(source) => source,
+            Err(error) => {
+                unresolved.push(format!(
+                    "skill {} for {} ({error})",
+                    record.relative_path, record.runtime
+                ));
+                continue;
+            }
         };
         let package =
             skills::resolve_skill_package(state, &record.source_id, &record.relative_path).await?;
@@ -267,10 +330,7 @@ async fn current_lock(state: &AppState, project: &Path) -> Result<AgencyLock, Ap
             artifacts,
         });
     }
-    normalize(AgencyLock {
-        agency_lock: LOCK_VERSION,
-        entries,
-    })
+    finish_current_lock(entries, unresolved)
 }
 
 pub(crate) async fn sync_project_lock(
@@ -298,6 +358,78 @@ fn artifact_state(project: &Path, artifacts: &[LockArtifact]) -> LockEntryStatus
     } else {
         LockEntryStatus::Current
     }
+}
+
+fn verify_artifacts<F>(
+    project: &Path,
+    artifacts: &[LockArtifact],
+    read_file: &mut F,
+) -> Result<VerifyStatus, AppError>
+where
+    F: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+{
+    let mut status = VerifyStatus::Ok;
+    for artifact in artifacts {
+        let path = project.join(&artifact.path);
+        match read_file(&path) {
+            Ok(bytes) if render::sha256_hex(&bytes) == artifact.content_hash => {}
+            Ok(_) => status = VerifyStatus::Modified,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if status != VerifyStatus::Modified {
+                    status = VerifyStatus::Missing;
+                }
+            }
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("read lockfile artifact {}: {error}", path.display()),
+                })
+            }
+        }
+    }
+    Ok(status)
+}
+
+pub(crate) fn verify_lockfile<F>(
+    lockfile_bytes: &[u8],
+    project: &Path,
+    mut read_file: F,
+) -> Result<VerifyResult, AppError>
+where
+    F: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+{
+    if lockfile_bytes.len() as u64 > super::MAX_LEDGER_BYTES {
+        return Err(invalid("agency lockfile exceeds the size limit"));
+    }
+    let lock = serde_json::from_slice(lockfile_bytes).map_err(|error| AppError::JsonParse {
+        command: "verify".into(),
+        message: error.to_string(),
+        raw_excerpt: String::from_utf8_lossy(&lockfile_bytes[..lockfile_bytes.len().min(256)])
+            .into_owned(),
+    })?;
+    let lock = normalize(lock, true)?;
+    let entries = lock
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let (status, reason) = if entry.scope == "user" {
+                (VerifyStatus::Skipped, Some("user-scope"))
+            } else {
+                (
+                    verify_artifacts(project, &entry.artifacts, &mut read_file)?,
+                    None,
+                )
+            };
+            Ok(VerifyEntry {
+                entry,
+                status,
+                reason,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let clean = entries
+        .iter()
+        .all(|entry| matches!(entry.status, VerifyStatus::Ok | VerifyStatus::Skipped));
+    Ok(VerifyResult { entries, clean })
 }
 
 fn classify(
@@ -865,6 +997,95 @@ mod tests {
         assert!(keys
             .windows(2)
             .all(|pair| text.find(pair[0]).unwrap() < text.find(pair[1]).unwrap()));
+    }
+
+    #[test]
+    fn unresolved_source_cannot_produce_a_truncated_lockfile() {
+        let error = finish_current_lock(
+            vec![entry(&"c".repeat(64))],
+            vec!["agent engineering/missing.md for codex".into()],
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("agent engineering/missing.md for codex"));
+    }
+
+    #[test]
+    fn stateless_verify_reports_only_filesystem_statuses_and_skips_user_scope() {
+        let project = Path::new("/project");
+        let mut ok = entry(&"c".repeat(64));
+        ok.source_relative_path = "engineering/ok.md".into();
+        ok.artifacts[0].path = "agents/ok.md".into();
+        ok.artifacts[0].content_hash = render::sha256_hex(b"ok\n");
+
+        let mut modified = entry(&"d".repeat(64));
+        modified.source_relative_path = "engineering/modified.md".into();
+        modified.artifacts[0].path = "agents/modified.md".into();
+
+        let mut missing = entry(&"e".repeat(64));
+        missing.source_relative_path = "engineering/missing.md".into();
+        missing.artifacts[0].path = "agents/missing.md".into();
+
+        let mut user = entry(&"f".repeat(64));
+        user.scope = "user".into();
+        user.source_relative_path = "engineering/user.md".into();
+        user.artifacts[0].path = ".codex/agents/user.md".into();
+
+        let bytes = serde_json::to_vec(&AgencyLock {
+            agency_lock: LOCK_VERSION,
+            entries: vec![user, missing, modified, ok],
+        })
+        .unwrap();
+        let result = verify_lockfile(&bytes, project, |path| match path {
+            path if path == project.join("agents/ok.md") => Ok(b"ok\n".to_vec()),
+            path if path == project.join("agents/modified.md") => Ok(b"changed\n".to_vec()),
+            path if path == project.join("agents/missing.md") => {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+            path => panic!("user-scope artifact must not be read: {}", path.display()),
+        })
+        .unwrap();
+
+        assert!(!result.clean);
+        let mut statuses = result
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.entry.source_relative_path.as_str(),
+                    entry.entry.scope.as_str(),
+                    entry.status,
+                    entry.reason,
+                )
+            })
+            .collect::<Vec<_>>();
+        statuses.sort_by_key(|entry| entry.0);
+        assert_eq!(
+            statuses,
+            vec![
+                (
+                    "engineering/missing.md",
+                    "project",
+                    VerifyStatus::Missing,
+                    None
+                ),
+                (
+                    "engineering/modified.md",
+                    "project",
+                    VerifyStatus::Modified,
+                    None,
+                ),
+                ("engineering/ok.md", "project", VerifyStatus::Ok, None),
+                (
+                    "engineering/user.md",
+                    "user",
+                    VerifyStatus::Skipped,
+                    Some("user-scope"),
+                ),
+            ]
+        );
     }
 
     #[test]

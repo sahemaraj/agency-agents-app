@@ -1,0 +1,22 @@
+{
+  "agencyLock": 1,
+  "entries": [
+    {
+      "artifacts": [
+        {
+          "contentHash": "d6a6b491e78ac82556aedde2f4e47d1351891e40a53aa736d6036d9d3c185a61",
+          "path": "agents/reviewer.md"
+        }
+      ],
+      "kind": "agent",
+      "scope": "project",
+      "source": {
+        "kind": "builtin",
+        "sourceRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "sourceHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "sourceRelativePath": "engineering/reviewer.md",
+      "tool": "codex"
+    }
+  ]
+}

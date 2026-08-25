@@ -60,6 +60,15 @@ jobs:
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Self-check stateless lockfile verification
+        shell: pwsh
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --bin agency-agents-app
+          & src-tauri/target/debug/agency-agents-app.exe verify `
+            --project src-tauri/tests/fixtures/verify-project `
+            --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   build:
     name: Build Windows installers (x64 + arm64, unsigned)
     if: github.event_name != 'pull_request'

@@ -106,18 +106,31 @@ npm run tauri dev
 
 For a signed release build on macOS, see [docs/BUILD.md](./docs/BUILD.md).
 
-## CLI (macOS and Linux)
+## CLI
 
 The app binary also manages a project's `agency.lock.json` without opening the GUI:
 
 ```sh
+agency-agents-app verify [--project <path>] [--json]
 agency-agents-app check [--project <path>] [--json]
 agency-agents-app plan [--project <path>] [--json]
 agency-agents-app apply [--project <path>] [--json] [--dry-run]
 agency-agents-app list [--project <path>] [--json]
 ```
 
-The project defaults to the current directory. Exit code `0` means success/in sync, `1` means drift or apply blockers, and `2` means an error. Commands never prompt.
+`verify` is available on macOS, Linux, and Windows and checks only project files; the other verbs remain macOS/Linux-only and use desktop-managed state. The project defaults to the current directory. Exit code `0` means success/in sync, `1` means drift or apply blockers, and `2` means an error. Commands never prompt.
+
+Use the repository's composite Action to gate CI on lockfile drift:
+
+```yaml
+- uses: msitarzewski/agency-agents-app/.github/actions/agency-verify@main
+  with:
+    version: latest
+    project-path: .
+    fail-on-drift: true
+```
+
+The Action downloads the requested released Linux AppImage and runs stateless `verify`; it does not launch or initialize the desktop app.
 
 ## Build From Source
 

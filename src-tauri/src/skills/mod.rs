@@ -625,6 +625,37 @@ pub(crate) async fn add_local_source(
         .map(|(source, _)| source)
 }
 
+#[cfg(test)]
+pub(crate) async fn add_test_github_source(
+    state: &AppState,
+    root: &Path,
+) -> Result<SkillSource, AppError> {
+    let source = add_local_source(state, root).await?;
+    let source_id = source.id.clone();
+    let portable = SkillSource {
+        id: source.id,
+        kind: SkillSourceKind::Github {
+            repository: format!("https://github.com/agency-agents-test/{source_id}.git"),
+            git_ref: None,
+            resolved_commit: Some("a".repeat(40)),
+            subdirectory: None,
+            active_checkout: Some(std::fs::canonicalize(root)?.to_string_lossy().into_owned()),
+        },
+    };
+    let replacement = portable.clone();
+    mutate_skill_sources(state, move |sources| {
+        *sources
+            .iter_mut()
+            .find(|source| source.id == source_id)
+            .ok_or_else(|| AppError::Internal {
+                message: "registered test source disappeared".into(),
+            })? = replacement;
+        Ok(())
+    })
+    .await?;
+    Ok(portable)
+}
+
 pub(crate) async fn ensure_local_source(
     state: &AppState,
     root: &Path,
@@ -5516,8 +5547,8 @@ mod tests {
     use crate::types::SkillType;
 
     use super::{
-        add_github_source, add_local_source, apply_skill_trust, discover_source,
-        discover_source_blocking, ensure_local_source, inspect_skill_sources,
+        add_github_source, add_local_source, add_test_github_source, apply_skill_trust,
+        discover_source, discover_source_blocking, ensure_local_source, inspect_skill_sources,
         is_windows_reparse_point, load_or_create_trust_key_with, load_skill_sources,
         load_skill_sources_for_state, read_skill_file, refresh_git_source_from,
         remove_skill_source, reset_refresh_fs_probe, resolve_skill_package, sign_trust_record,
@@ -5639,9 +5670,7 @@ mod tests {
             .expect("complete migration");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
 
         super::install_skill(
             &state,
@@ -5726,7 +5755,7 @@ mod tests {
             .unwrap();
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let package = resolve_skill_package(&state, &registered.id, "reviewer")
             .await
             .unwrap();
@@ -5833,7 +5862,7 @@ mod tests {
         let project = tempdir().expect("project");
         let (database, state) = completed_sqlite_skill_state(app.path()).await;
         write_skill(source.path(), "reviewer", "reviewer", "Version zero");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -6031,6 +6060,12 @@ mod tests {
         state
     }
 
+    async fn add_portable_test_source(state: &AppState, root: &Path) -> SkillSource {
+        add_test_github_source(state, root)
+            .await
+            .expect("register portable test source")
+    }
+
     fn write_skill(root: &Path, relative_dir: &str, name: &str, description: &str) {
         let package = root.join(relative_dir);
         std::fs::create_dir_all(&package).expect("create package");
@@ -6066,7 +6101,7 @@ mod tests {
         let project = tempdir().expect("project");
         let (database, state) = completed_sqlite_skill_state(app.path()).await;
         write_skill(source.path(), "reviewer", "reviewer", "Version zero");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -6544,7 +6579,7 @@ mod tests {
         let project = tempdir().expect("project");
         let (database, state) = completed_sqlite_skill_state(app.path()).await;
         write_skill(source.path(), "reviewer", "reviewer", "Version zero");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -6663,10 +6698,8 @@ mod tests {
             "reviewer",
             "Second source v1",
         );
-        let first = add_local_source(&state, first_source.path()).await.unwrap();
-        let second = add_local_source(&state, second_source.path())
-            .await
-            .unwrap();
+        let first = add_portable_test_source(&state, first_source.path()).await;
+        let second = add_portable_test_source(&state, second_source.path()).await;
         let first_project_path = first_project.path().to_string_lossy().into_owned();
         let second_project_path = second_project.path().to_string_lossy().into_owned();
 
@@ -6808,7 +6841,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Codex version 0");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -6963,7 +6996,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Version zero");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -7042,7 +7075,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Version one");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -7111,7 +7144,7 @@ mod tests {
         let outside = tempdir().expect("outside");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Version one");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -7178,7 +7211,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Version one");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -8633,9 +8666,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let canonical_project = std::fs::canonicalize(project.path())
             .expect("canonical project")
@@ -8767,9 +8798,7 @@ mod tests {
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
         let first_state = Arc::new(test_state(app.path()));
         let second_state = Arc::new(test_state(app.path()));
-        let registered = add_local_source(&first_state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&first_state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let first = super::lock_skill_installs(app.path()).expect("first process lock");
         let second = Arc::clone(&second_state);
@@ -8830,9 +8859,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let installed = super::install_skill(
             &state,
@@ -8909,9 +8936,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -8953,9 +8978,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -8995,9 +9018,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -9039,9 +9060,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let installed = super::install_skill(
             &state,
@@ -9122,9 +9141,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let installed = super::install_skill(
             &state,
@@ -9174,9 +9191,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let installed = super::install_skill(
             &state,

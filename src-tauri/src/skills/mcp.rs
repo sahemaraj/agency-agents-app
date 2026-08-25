@@ -4669,6 +4669,15 @@ mod tests {
         })
     }
 
+    async fn add_portable_skill_source(
+        state: &AppState,
+        root: &std::path::Path,
+    ) -> crate::types::SkillSource {
+        super::super::add_test_github_source(state, root)
+            .await
+            .expect("register portable test source")
+    }
+
     async fn create_factory_mcp_run(
         state: &AppState,
         project_path: &str,
@@ -5388,9 +5397,7 @@ mod tests {
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
-        let registered = super::super::add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_skill_source(&state, source.path()).await;
         let installed = super::super::install_skill(
             &state,
             &registered.id,
@@ -5400,9 +5407,10 @@ mod tests {
         )
         .await
         .expect("seed managed install");
-        let registered_agent = crate::agents::add_local_source(app.path(), agent_source.path())
-            .await
-            .expect("register Agent source");
+        let registered_agent =
+            crate::agents::add_test_github_source(app.path(), agent_source.path())
+                .await
+                .expect("register Agent source");
         let responses = call_tools_over_stdio(
             Arc::clone(&state),
             vec![
@@ -5917,9 +5925,7 @@ mod tests {
             ))),
             updater_state: crate::commands::updater::empty_state(),
         });
-        super::super::add_local_source(&state, first_source.path())
-            .await
-            .expect("register first source");
+        add_portable_skill_source(&state, first_source.path()).await;
         let server = SkillMcpServer::new(Arc::clone(&state));
         let installed: serde_json::Value = serde_json::from_str(
             &server
@@ -5938,9 +5944,7 @@ mod tests {
         assert_eq!(installed["installed"]["state"], "current");
         assert_eq!(installed["candidates"], serde_json::json!([]));
 
-        super::super::add_local_source(&state, second_source.path())
-            .await
-            .expect("register second source");
+        add_portable_skill_source(&state, second_source.path()).await;
         let ambiguous: serde_json::Value = serde_json::from_str(
             &server
                 .skills_find_and_install(
@@ -7477,7 +7481,7 @@ mod tests {
             "---\nname: Reviewer\ndescription: Reviews code\n---\nReview carefully.\n",
         )
         .expect("Agent markdown");
-        let registered = crate::agents::add_local_source(app.path(), source.path())
+        let registered = crate::agents::add_test_github_source(app.path(), source.path())
             .await
             .expect("register Agent source");
         let canonical_project = std::fs::canonicalize(project.path())
@@ -7636,9 +7640,7 @@ mod tests {
         )
         .await
         .expect("persist MCP settings");
-        let registered = super::super::add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_skill_source(&state, source.path()).await;
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let server = SkillMcpServer::new(Arc::clone(&state));
         let server_task = tokio::spawn(async move {
@@ -7895,9 +7897,7 @@ mod tests {
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
-        let registered = super::super::add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_skill_source(&state, source.path()).await;
         let installed = super::super::install_skill(
             &state,
             &registered.id,
@@ -7994,9 +7994,7 @@ mod tests {
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
-        let registered = super::super::add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_skill_source(&state, source.path()).await;
         let installed = super::super::install_skill(
             &state,
             &registered.id,

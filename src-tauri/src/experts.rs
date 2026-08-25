@@ -4135,7 +4135,7 @@ mod tests {
             .await
             .unwrap();
         let state = test_state(root.path());
-        let registered = crate::skills::add_local_source(&state, source.path())
+        let registered = crate::skills::add_test_github_source(&state, source.path())
             .await
             .unwrap();
         crate::skills::install_skill_with_dependencies(

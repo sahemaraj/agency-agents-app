@@ -271,6 +271,40 @@ pub(crate) async fn add_local_source(
     Ok(source)
 }
 
+#[cfg(test)]
+pub(crate) async fn add_test_github_source(
+    app_data_dir: &Path,
+    root: &Path,
+) -> Result<AgentSource, AppError> {
+    let source = add_github_source(
+        app_data_dir,
+        &format!(
+            "https://github.com/agency-agents-test/{}.git",
+            Uuid::new_v4()
+        ),
+        None,
+        None,
+    )
+    .await?;
+    let mut sources = load_registered_sources(app_data_dir).await?;
+    let portable = sources
+        .iter_mut()
+        .find(|candidate| candidate.id == source.id)
+        .ok_or_else(|| invalid("registered test Agent source disappeared"))?;
+    if let AgentSourceKind::Github {
+        resolved_commit,
+        active_checkout,
+        ..
+    } = &mut portable.kind
+    {
+        *resolved_commit = Some("a".repeat(40));
+        *active_checkout = Some(std::fs::canonicalize(root)?.to_string_lossy().into_owned());
+    }
+    let portable = portable.clone();
+    save_registered_sources(app_data_dir, &sources).await?;
+    Ok(portable)
+}
+
 pub(crate) async fn add_github_source(
     app_data_dir: &Path,
     repository: &str,

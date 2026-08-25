@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::install::lockfile::{
-    cli_lock_apply, cli_lock_check, cli_lock_plan, LockCheckResult, LockOperation, LockPlan,
+    cli_lock_apply, cli_lock_check, cli_lock_plan, verify_lockfile, LockCheckResult, LockOperation,
+    LockPlan, VerifyEntry, VerifyResult, VerifyStatus, LOCK_FILENAME,
 };
 use crate::state::AppState;
 
@@ -22,6 +23,16 @@ struct CheckJson<'a> {
     project_path: &'a str,
     clean: bool,
     entries: &'a [crate::install::lockfile::LockCheckEntry],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyJson<'a> {
+    version: u8,
+    command: &'static str,
+    project_path: &'a str,
+    clean: bool,
+    entries: &'a [VerifyEntry],
 }
 
 #[derive(Serialize)]
@@ -69,18 +80,22 @@ pub async fn run(
     dry_run: bool,
     merge: bool,
 ) -> Result<CliOutcome, String> {
+    let project = match project {
+        Some(project) => project,
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
+    };
+    let project = canonical_project(&project.to_string_lossy())?
+        .to_string_lossy()
+        .into_owned();
+    if command == "verify" {
+        return run_verify(&project, json);
+    }
+
     #[cfg(target_os = "windows")]
     return Err("CLI mode is supported on macOS and Linux only".into());
 
     #[cfg(not(target_os = "windows"))]
     {
-        let project = match project {
-            Some(project) => project,
-            None => std::env::current_dir().map_err(|error| error.to_string())?,
-        };
-        let project = canonical_project(&project.to_string_lossy())?
-            .to_string_lossy()
-            .into_owned();
         let state = AppState::build().map_err(|error| error.to_string())?;
         crate::corpus::ensure_corpus_headless(&state)
             .await
@@ -93,6 +108,23 @@ pub async fn run(
             _ => Err(format!("unknown CLI command: {command}")),
         }
     }
+}
+
+fn run_verify(project: &str, json: bool) -> Result<CliOutcome, String> {
+    let lockfile = Path::new(project).join(LOCK_FILENAME);
+    let bytes = std::fs::read(&lockfile)
+        .map_err(|error| format!("read {}: {error}", lockfile.display()))?;
+    let result = verify_lockfile(&bytes, Path::new(project), |path| std::fs::read(path))
+        .map_err(|error| error.to_string())?;
+    let stdout = if json {
+        verify_json(project, &result)?
+    } else {
+        human_verify(&result)
+    };
+    Ok(CliOutcome {
+        stdout,
+        exit_code: check_exit(result.clean),
+    })
 }
 
 async fn run_check(state: &AppState, project: &str, json: bool) -> Result<CliOutcome, String> {
@@ -269,6 +301,34 @@ fn human_check(check: &LockCheckResult) -> String {
     output
 }
 
+fn human_verify(result: &VerifyResult) -> String {
+    let mut output = if result.clean {
+        format!("verify: in sync ({} entry(s))\n", result.entries.len())
+    } else {
+        format!("verify: drift ({} entry(s))\n", result.entries.len())
+    };
+    for checked in &result.entries {
+        if checked.status == VerifyStatus::Skipped {
+            output.push_str(&format!(
+                "skipped: {} {} {} {}\n",
+                checked.reason.unwrap_or("unknown"),
+                checked.entry.kind,
+                checked.entry.source_relative_path,
+                checked.entry.tool
+            ));
+        } else {
+            output.push_str(&format!(
+                "{} {} {} {}\n",
+                state_name(checked.status),
+                checked.entry.kind,
+                checked.entry.source_relative_path,
+                checked.entry.tool
+            ));
+        }
+    }
+    output
+}
+
 fn human_plan(plan: &LockPlan, label: &str) -> String {
     let mut output = format!(
         "{label}: {} operation(s), {} blocker(s)\n",
@@ -312,6 +372,16 @@ fn list_json(project: &str, items: &[InventoryItem]) -> Result<String, String> {
         command: "list",
         project_path: project,
         items,
+    })
+}
+
+fn verify_json(project: &str, result: &VerifyResult) -> Result<String, String> {
+    json_line(&VerifyJson {
+        version: OUTPUT_VERSION,
+        command: "verify",
+        project_path: project,
+        clean: result.clean,
+        entries: &result.entries,
     })
 }
 
@@ -380,6 +450,17 @@ mod tests {
             })
             .unwrap(),
             "{\"version\":1,\"command\":\"apply\",\"projectPath\":\"/tmp/project\",\"dryRun\":true,\"applied\":false,\"operations\":[],\"warnings\":[],\"blockers\":[]}\n"
+        );
+        assert_eq!(
+            verify_json(
+                "/tmp/project",
+                &VerifyResult {
+                    entries: vec![],
+                    clean: true,
+                },
+            )
+            .unwrap(),
+            "{\"version\":1,\"command\":\"verify\",\"projectPath\":\"/tmp/project\",\"clean\":true,\"entries\":[]}\n"
         );
     }
 }

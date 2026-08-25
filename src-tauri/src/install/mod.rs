@@ -14507,7 +14507,7 @@ mod tests {
             )
             .unwrap();
         }
-        let source = crate::agents::add_local_source(app.path(), source_root.path())
+        let source = crate::agents::add_test_github_source(app.path(), source_root.path())
             .await
             .unwrap();
         let project_path = std::fs::canonicalize(project.path()).unwrap();
@@ -15054,7 +15054,7 @@ mod tests {
             )
             .unwrap();
         }
-        let source = crate::agents::add_local_source(app_data.path(), source_root.path())
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
             .await
             .unwrap();
         let references = ["agent.md", "reviewer.md"]

@@ -40,7 +40,7 @@ where
     }
     if matches!(
         args.first().map(String::as_str),
-        Some("check" | "plan" | "apply" | "list")
+        Some("check" | "plan" | "apply" | "list" | "verify")
     ) {
         return parse_cli(&args).map(Mode::Cli);
     }
@@ -57,7 +57,7 @@ where
     }
     if args.first().map(String::as_str) != Some("--mcp-http") {
         return Err(
-            "expected check, plan, apply, list, --mcp, or --mcp-http [--bind LOOPBACK:PORT]".into(),
+            "expected check, plan, apply, list, verify, --mcp, or --mcp-http [--bind LOOPBACK:PORT]".into(),
         );
     }
     let bind = match args.as_slice() {
@@ -120,7 +120,7 @@ fn main() {
         Err(error) => {
             let is_cli = matches!(
                 std::env::args().nth(1).as_deref(),
-                Some("check" | "plan" | "apply" | "list")
+                Some("check" | "plan" | "apply" | "list" | "verify")
             );
             eprintln!(
                 "{}",
@@ -276,6 +276,16 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_mode(["app", "verify", "--json", "--project", "."]).unwrap(),
+            Mode::Cli(CliArgs {
+                command: "verify".into(),
+                project: Some(".".into()),
+                json: true,
+                dry_run: false,
+                merge: false,
+            })
+        );
+        assert_eq!(
             parse_mode(["app", "apply", "--merge"]).unwrap(),
             Mode::Cli(CliArgs {
                 command: "apply".into(),
@@ -294,6 +304,7 @@ mod tests {
         assert!(parse_mode(["app", "list", "--json", "--json"]).is_err());
         assert!(parse_mode(["app", "plan", "--merge"]).is_err());
         assert!(parse_mode(["app", "plan", "--unknown"]).is_err());
+        assert!(parse_mode(["app", "verify", "--merge"]).is_err());
     }
 
     #[cfg(target_os = "macos")]

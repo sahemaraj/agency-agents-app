@@ -82,6 +82,13 @@ jobs:
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Self-check stateless lockfile verification
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --bin agency-agents-app
+          src-tauri/target/debug/agency-agents-app verify \
+            --project src-tauri/tests/fixtures/verify-project \
+            --json
+
       - name: Audit Rust dependencies
         uses: rustsec/audit-check@v2.0.0
         with:
