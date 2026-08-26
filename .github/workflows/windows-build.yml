@@ -77,12 +77,7 @@ jobs:
       # rest. This is a runner environment collision, not a product defect --
       # the app itself builds and bundles fine on Windows.
       - name: Test Rust
-        shell: pwsh
-        run: |
-          $env:PATH = ($env:PATH -split ';' |
-            Where-Object { $_ -notmatch 'Java_|jdk' }) -join ';'
-          cargo test --manifest-path src-tauri/Cargo.toml
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: cargo test --manifest-path src-tauri/Cargo.toml
 
       # TEMPORARY DIAGNOSTIC — remove once the loader failure is understood.
       #
@@ -120,9 +115,27 @@ jobs:
             else { Write-Host "$d -> NOT FOUND on PATH" }
           }
 
-          Write-Host '--- duplicate windows-targets generations (suspected cause) ---'
-          cargo tree --manifest-path src-tauri/Cargo.toml -i windows-targets 2>$null |
-            Select-Object -First 40
+          # Decisive part: run the binary under several PATH variants and
+          # report which one lets it load. Resolution above comes from
+          # Get-Command (PATH order); the real loader uses its own order, so
+          # only actually executing it settles which fix works. --list is used
+          # so a successful load returns quickly instead of running the suite.
+          $orig = $env:PATH
+          $variants = [ordered]@{
+            'as-is'                     = $orig
+            'system32 first'            = "C:\Windows\System32;$orig"
+            'no Java/Python'            = (($orig -split ';' | Where-Object { $_ -notmatch 'Java_|jdk|Python' }) -join ';')
+            'no hostedtoolcache at all' = (($orig -split ';' | Where-Object { $_ -notmatch 'hostedtoolcache' }) -join ';')
+          }
+          foreach ($name in $variants.Keys) {
+            $env:PATH = $variants[$name]
+            & $exe.FullName --list *> $null
+            $code = $LASTEXITCODE
+            $hex = '0x{0:x8}' -f ($code -band 0xffffffff)
+            if ($code -eq 0) { Write-Host "PATH[$name] -> LOADS OK" }
+            else { Write-Host "PATH[$name] -> exit $code ($hex)" }
+          }
+          $env:PATH = $orig
 
       - name: Self-check stateless lockfile verification
         shell: pwsh
