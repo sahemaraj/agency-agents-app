@@ -67,6 +67,46 @@ jobs:
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # TEMPORARY DIAGNOSTIC — remove once the loader failure is understood.
+      #
+      # The lib test binary has never run on Windows: it exits 0xc0000139
+      # (STATUS_ENTRYPOINT_NOT_FOUND) at load, before a single test executes,
+      # so CI reports a Rust failure that says nothing about the Rust code.
+      # That status means a DLL was found but did not export a symbol the
+      # binary imports. This dumps the import table and resolves each
+      # dependency so the offending DLL/export pair is identifiable, rather
+      # than guessing. Runs on failure only, and never changes the job result.
+      - name: "Diagnose Windows loader failure (temporary)"
+        if: failure()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem src-tauri/target/debug/deps -Filter 'agency_agents_lib-*.exe' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) { Write-Host 'no lib test binary found'; exit 0 }
+          Write-Host "target: $($exe.FullName)"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          if (-not $dumpbin) { Write-Host 'dumpbin not found'; exit 0 }
+
+          Write-Host '--- imported DLLs ---'
+          & $dumpbin.FullName /dependents $exe.FullName | Select-String -Pattern '^\s{4}\S+\.dll' |
+            ForEach-Object { $_.ToString().Trim() } | Tee-Object -Variable dlls
+
+          Write-Host '--- resolution of each imported DLL ---'
+          foreach ($d in $dlls) {
+            $found = Get-Command $d -ErrorAction SilentlyContinue
+            if ($found) { Write-Host "$d -> $($found.Source)" }
+            else { Write-Host "$d -> NOT FOUND on PATH" }
+          }
+
+          Write-Host '--- duplicate windows-targets generations (suspected cause) ---'
+          cargo tree --manifest-path src-tauri/Cargo.toml -i windows-targets 2>$null |
+            Select-Object -First 40
+
       - name: Self-check stateless lockfile verification
         shell: pwsh
         run: |
