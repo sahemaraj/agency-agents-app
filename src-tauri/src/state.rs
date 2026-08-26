@@ -186,6 +186,9 @@ pub struct AppState {
     pub app_data_dir: PathBuf,
 
     #[cfg(not(test))]
+    headless: bool,
+
+    #[cfg(not(test))]
     pub(crate) storage_lease: std::sync::Mutex<Option<crate::state_db::StorageLease>>,
 
     #[cfg(not(test))]
@@ -229,6 +232,22 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(not(test))]
+    pub(crate) fn set_headless(&mut self) {
+        self.headless = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_headless(&mut self) {}
+
+    pub(crate) fn is_headless(&self) -> bool {
+        #[cfg(not(test))]
+        return self.headless;
+
+        #[cfg(test)]
+        false
+    }
+
     pub(crate) fn state_database_if_present(&self) -> Option<crate::state_db::StateDatabase> {
         #[cfg(not(test))]
         return Some(self.state_database.clone());
@@ -321,6 +340,8 @@ impl AppState {
 
         Ok(Self {
             app_data_dir,
+            #[cfg(not(test))]
+            headless: false,
             #[cfg(not(test))]
             storage_lease: std::sync::Mutex::new(Some(storage_lease)),
             #[cfg(not(test))]

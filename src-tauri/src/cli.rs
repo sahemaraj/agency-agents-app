@@ -96,7 +96,8 @@ pub async fn run(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let state = AppState::build().map_err(|error| error.to_string())?;
+        let mut state = AppState::build().map_err(|error| error.to_string())?;
+        state.set_headless();
         crate::corpus::ensure_corpus_headless(&state)
             .await
             .map_err(|error| error.to_string())?;

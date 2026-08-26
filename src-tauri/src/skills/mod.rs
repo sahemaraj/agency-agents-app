@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
@@ -37,6 +39,8 @@ const MAX_SKILL_TAGS: usize = 12;
 const MAX_SKILL_DEPENDENCIES: usize = 32;
 const MAX_SKILL_TAXONOMY_SEGMENT_BYTES: usize = 32;
 const SKILL_TRUST_KEY_ACCOUNT: &str = "skill-trust-hmac-v1";
+const HEADLESS_TRUST_KEY_TIMEOUT: Duration = Duration::from_secs(2);
+const DESKTOP_TRUST_KEY_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SKILL_HISTORY_ENTRIES: usize = 10;
 const MAX_SKILL_HISTORY_SCAN_ENTRIES: usize = 64;
 const MAX_SKILL_HISTORY_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -310,7 +314,9 @@ fn parse_skill_trust_import(raw: &[u8]) -> Result<String, AppError> {
     })
 }
 
-async fn load_skill_trust_for_state(state: &AppState) -> Result<Vec<SkillTrustRecord>, AppError> {
+async fn load_skill_trust_records_for_state(
+    state: &AppState,
+) -> Result<Vec<SkillTrustRecord>, AppError> {
     let records = if let Some(database) = state.completed_state_database().await? {
         database
             .read(skill_trust_spec())
@@ -322,6 +328,11 @@ async fn load_skill_trust_for_state(state: &AppState) -> Result<Vec<SkillTrustRe
         load_skill_trust(&state.app_data_dir).await?
     };
     validate_skill_trust(&records)?;
+    Ok(records)
+}
+
+async fn load_skill_trust_for_state(state: &AppState) -> Result<Vec<SkillTrustRecord>, AppError> {
+    let records = load_skill_trust_records_for_state(state).await?;
     if records.is_empty() {
         return Ok(records);
     }
@@ -1119,25 +1130,65 @@ pub(crate) async fn discover_source(source: SkillSource) -> Result<SkillSourceRe
         })?
 }
 
-async fn persisted_trust_key() -> Option<Vec<u8>> {
-    tokio::task::spawn_blocking(|| read_trust_key_with(&SystemKeychain))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten()
+fn trust_key_timeout(headless: bool) -> Duration {
+    if headless {
+        HEADLESS_TRUST_KEY_TIMEOUT
+    } else {
+        DESKTOP_TRUST_KEY_TIMEOUT
+    }
+}
+
+async fn persisted_trust_key_with(
+    keychain: Arc<dyn KeychainSlot>,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let read = tokio::task::spawn_blocking(move || read_trust_key_with(keychain.as_ref()));
+    match tokio::time::timeout(timeout, read).await {
+        Ok(result) => result.ok().and_then(Result::ok).flatten(),
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis(),
+                "skill trust could not be verified before timeout; packages will be treated as untrusted"
+            );
+            None
+        }
+    }
+}
+
+async fn persisted_trust(
+    state: &AppState,
+    keychain: Arc<dyn KeychainSlot>,
+    headless: bool,
+) -> Option<(Vec<SkillTrustRecord>, Option<Vec<u8>>)> {
+    let Ok(records) = load_skill_trust_records_for_state(state).await else {
+        return None;
+    };
+    if records.is_empty() {
+        return Some((records, None));
+    }
+    let key = persisted_trust_key_with(keychain, trust_key_timeout(headless)).await;
+    if key.as_deref().is_some_and(|key| {
+        records
+            .iter()
+            .any(|record| !verify_trust_record(record, key))
+    }) {
+        return None;
+    }
+    Some((records, key))
 }
 
 async fn apply_persisted_trust(
     state: &AppState,
     result: &mut SkillSourceResult,
 ) -> Result<(), AppError> {
-    let Ok(records) = load_skill_trust_for_state(state).await else {
+    let Some((records, key)) =
+        persisted_trust(state, Arc::new(SystemKeychain), state.is_headless()).await
+    else {
         return Ok(());
     };
     if records.is_empty() {
         return Ok(());
     }
-    let key = persisted_trust_key().await;
     let source_root = canonical_skill_source_root(&result.source)?;
     apply_skill_trust(&source_root, result, &records, key.as_deref());
     Ok(())
@@ -1146,12 +1197,26 @@ async fn apply_persisted_trust(
 pub(crate) async fn inspect_skill_sources(
     state: &AppState,
 ) -> Result<Vec<SkillSourceResult>, AppError> {
+    inspect_skill_sources_with_keychain(state, Arc::new(SystemKeychain), state.is_headless()).await
+}
+
+async fn inspect_skill_sources_with_keychain(
+    state: &AppState,
+    keychain: Arc<dyn KeychainSlot>,
+    headless: bool,
+) -> Result<Vec<SkillSourceResult>, AppError> {
     let sources = load_skill_sources_for_state(state).await?;
+    let trust = persisted_trust(state, keychain, headless).await;
     let mut results = Vec::with_capacity(sources.len());
     for source in sources {
         match discover_source(source.clone()).await {
             Ok(mut result) => {
-                apply_persisted_trust(state, &mut result).await?;
+                if let Some((records, key)) = &trust {
+                    if !records.is_empty() {
+                        let source_root = canonical_skill_source_root(&result.source)?;
+                        apply_skill_trust(&source_root, &mut result, records, key.as_deref());
+                    }
+                }
                 results.push(result);
             }
             Err(error) => results.push(SkillSourceResult {
@@ -5667,10 +5732,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::json;
     use sha2::Digest;
@@ -5680,13 +5745,15 @@ mod tests {
 
     use super::{
         add_github_source, add_local_source, add_test_github_source, apply_skill_trust,
-        discover_source, discover_source_blocking, ensure_local_source, inspect_skill_sources,
+        canonical_skill_source_root, discover_source, discover_source_blocking,
+        ensure_local_source, inspect_skill_sources, inspect_skill_sources_with_keychain,
         is_windows_reparse_point, load_or_create_trust_key_with, load_skill_sources,
         load_skill_sources_for_state, read_skill_file, refresh_git_source_from,
-        remove_skill_source, reset_refresh_fs_probe, resolve_skill_package, sign_trust_record,
-        skill_destination_presence, skill_sources_path, skill_sources_spec, take_refresh_fs_probe,
-        trust_fingerprint, validate_imported_skill_trust, validate_package, verify_publisher,
-        SkillPublisherMetadata, SkillTrustRecord, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
+        remove_skill_source, reset_refresh_fs_probe, resolve_skill_package, save_skill_trust,
+        sign_trust_record, skill_destination_presence, skill_sources_path, skill_sources_spec,
+        take_refresh_fs_probe, trust_fingerprint, validate_imported_skill_trust, validate_package,
+        verify_publisher, SkillPublisherMetadata, SkillTrustRecord, HEADLESS_TRUST_KEY_TIMEOUT,
+        MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES, SKILL_TRUST_KEY_ACCOUNT,
     };
 
     #[test]
@@ -8662,6 +8729,144 @@ mod tests {
         let mut original = discover_source_blocking(result.source).expect("rediscover original");
         apply_skill_trust(source.path(), &mut original, &[forged], Some(&key));
         assert!(!original.packages[0].installable);
+    }
+
+    struct ObservedKeychain {
+        reads: AtomicUsize,
+        value: Option<String>,
+        delay: Duration,
+    }
+
+    impl ObservedKeychain {
+        fn new(key: Option<&[u8]>, delay: Duration) -> Self {
+            Self {
+                reads: AtomicUsize::new(0),
+                value: key.map(|key| base64::engine::general_purpose::STANDARD.encode(key)),
+                delay,
+            }
+        }
+    }
+
+    impl KeychainSlot for ObservedKeychain {
+        fn read(&self, account: &str) -> Result<Option<String>, AppError> {
+            assert_eq!(account, SKILL_TRUST_KEY_ACCOUNT);
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            Ok(self.value.clone())
+        }
+
+        fn write(&self, _account: &str, _value: &str) -> Result<(), AppError> {
+            Err(AppError::KeychainUnavailable {
+                message: "unexpected test keychain write".into(),
+            })
+        }
+
+        fn delete(&self, _account: &str) -> Result<(), AppError> {
+            Err(AppError::KeychainUnavailable {
+                message: "unexpected test keychain delete".into(),
+            })
+        }
+    }
+
+    fn signed_trust_record(source: &SkillSource, key: &[u8]) -> SkillTrustRecord {
+        let result = discover_source_blocking(source.clone()).expect("discover source");
+        let package = result.packages.first().expect("skill package");
+        let source_root = canonical_skill_source_root(source).expect("source root");
+        let package_root = source_root.join(&package.relative_path);
+        let (tree_hash, executables) =
+            trust_fingerprint(&package_root, package).expect("trust fingerprint");
+        let mut record = SkillTrustRecord {
+            source_id: package.source_id.clone(),
+            relative_path: package.relative_path.clone(),
+            tree_hash,
+            executables,
+            granted_at: "2026-08-26T00:00:00Z".into(),
+            signature: String::new(),
+        };
+        record.signature = sign_trust_record(&record, key).expect("sign trust record");
+        record
+    }
+
+    async fn add_scripted_source(state: &AppState, root: &Path, name: &str) -> SkillSource {
+        write_skill(root, "", name, "Script-bearing skill");
+        std::fs::create_dir_all(root.join("scripts")).expect("scripts");
+        std::fs::write(root.join("scripts/run.py"), b"print('trusted')\n").expect("script");
+        add_local_source(state, root).await.expect("add source")
+    }
+
+    #[tokio::test]
+    async fn headless_trust_lookup_times_out_and_leaves_packages_untrusted() {
+        let app = tempdir().expect("app data");
+        let sources = tempdir().expect("sources");
+        let state = test_state(app.path());
+        let key = [7_u8; 32];
+        let source = add_scripted_source(&state, &sources.path().join("one"), "one").await;
+        save_skill_trust(app.path(), &[signed_trust_record(&source, &key)])
+            .await
+            .expect("save trust");
+        let keychain = Arc::new(ObservedKeychain::new(
+            Some(&key),
+            HEADLESS_TRUST_KEY_TIMEOUT + Duration::from_secs(3),
+        ));
+
+        let started = Instant::now();
+        let results = inspect_skill_sources_with_keychain(&state, keychain, true)
+            .await
+            .expect("inspect sources");
+
+        assert!(
+            started.elapsed() < HEADLESS_TRUST_KEY_TIMEOUT + Duration::from_secs(1),
+            "headless trust lookup exceeded its timeout"
+        );
+        let package = &results[0].packages[0];
+        assert!(!package.installable);
+        assert!(package
+            .errors
+            .iter()
+            .any(|error| error.code == SkillValidationCode::TrustRequired));
+    }
+
+    #[tokio::test]
+    async fn inspect_reads_trust_key_once_across_multiple_sources() {
+        let app = tempdir().expect("app data");
+        let sources = tempdir().expect("sources");
+        let state = test_state(app.path());
+        let key = [9_u8; 32];
+        let first = add_scripted_source(&state, &sources.path().join("one"), "one").await;
+        let second = add_scripted_source(&state, &sources.path().join("two"), "two").await;
+        save_skill_trust(
+            app.path(),
+            &[
+                signed_trust_record(&first, &key),
+                signed_trust_record(&second, &key),
+            ],
+        )
+        .await
+        .expect("save trust");
+        let keychain = Arc::new(ObservedKeychain::new(Some(&key), Duration::ZERO));
+
+        let results = inspect_skill_sources_with_keychain(&state, keychain.clone(), true)
+            .await
+            .expect("inspect sources");
+
+        assert_eq!(keychain.reads.load(Ordering::SeqCst), 1);
+        assert!(results.iter().all(|result| result.packages[0].installable));
+    }
+
+    #[tokio::test]
+    async fn inspect_without_trust_records_never_reads_keychain() {
+        let app = tempdir().expect("app data");
+        let sources = tempdir().expect("sources");
+        let state = test_state(app.path());
+        add_scripted_source(&state, &sources.path().join("one"), "one").await;
+        let keychain = Arc::new(ObservedKeychain::new(None, Duration::ZERO));
+
+        let results = inspect_skill_sources_with_keychain(&state, keychain.clone(), true)
+            .await
+            .expect("inspect sources");
+
+        assert_eq!(keychain.reads.load(Ordering::SeqCst), 0);
+        assert!(!results[0].packages[0].installable);
     }
 
     #[test]
