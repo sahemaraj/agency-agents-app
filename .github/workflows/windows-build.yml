@@ -64,8 +64,25 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # The runner's Temurin JDK ships its own api-ms-win-core-synch-l1-2-0.dll
+      # in Java_Temurin-Hotspot_jdk\...\bin, which is on PATH. That copy is
+      # older than the one the Rust std sync primitives import from, so the
+      # test binary loaded it and died with 0xc0000139
+      # (STATUS_ENTRYPOINT_NOT_FOUND) before running a single test -- the DLL
+      # resolves, but does not export what the binary asks for.
+      #
+      # Diagnostic evidence: of the 14 DLLs the test binary imports, 13 resolve
+      # to C:\Windows\system32; only that one resolved into the JDK. Dropping
+      # the JDK from PATH for this step lets it resolve from system32 like the
+      # rest. This is a runner environment collision, not a product defect --
+      # the app itself builds and bundles fine on Windows.
       - name: Test Rust
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        shell: pwsh
+        run: |
+          $env:PATH = ($env:PATH -split ';' |
+            Where-Object { $_ -notmatch 'Java_|jdk' }) -join ';'
+          cargo test --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # TEMPORARY DIAGNOSTIC — remove once the loader failure is understood.
       #
