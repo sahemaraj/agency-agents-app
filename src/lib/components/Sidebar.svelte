@@ -77,7 +77,7 @@
 >
   <button class="brand" onclick={() => onNavigate("personas")} title={i18n.t("nav.homeTitle")}>
     <span class="brand-mark" aria-hidden="true">🤖</span>
-    <span class="brand-name">Shikigami</span>
+    <span class="brand-name">Agency Agents</span>
   </button>
 
   <nav>

@@ -1,12 +1,12 @@
 /**
- * "Report to Shikigami" — surfaces a pre-filled GitHub new-issue URL
+ * "Report to Agency Agents" — surfaces a pre-filled GitHub new-issue URL
  * from any error context the user encounters in the app.
  *
  * Entry point:
  *
  *   - `reportableToastError(title, error)` — for catch blocks. Shows a
  *     `toast.error` with the friendly message in the body AND a
- *     "Report to Shikigami" action button below it. One-call upgrade
+ *     "Report to Agency Agents" action button below it. One-call upgrade
  *     of the old `toast.error(title, isAppError(e) ? e.code : String(e))`
  *     anti-pattern (which threw away the friendly message and gave the
  *     user no recourse beyond the raw discriminator string).
@@ -68,7 +68,7 @@ async function getAppVersion(): Promise<string> {
 /** Build the issue body (markdown). */
 function buildBody(ctx: ReportContext, appVer: string): string {
   const lines: string[] = [
-    `**Shikigami:** ${appVer}`,
+    `**Agency Agents:** ${appVer}`,
   ];
   if (ctx.errorCode) lines.push(`**Error code:** \`${ctx.errorCode}\``);
   if (ctx.command) lines.push(`**Command:** \`${ctx.command}\``);
@@ -97,7 +97,7 @@ export async function openReportIssue(ctx: ReportContext): Promise<void> {
   const appVer = await getAppVersion();
 
   const params = new URLSearchParams();
-  params.set("title", `[Shikigami] ${ctx.summary}`);
+  params.set("title", `[Agency Agents] ${ctx.summary}`);
   params.set("body", buildBody(ctx, appVer));
   params.set("labels", "from-app");
 
@@ -123,7 +123,7 @@ export function reportContextFromError(
  *   toast.error(title, isAppError(e) ? e.code : String(e))
  *
  * Renders the friendly message in the toast body AND attaches a
- * "Report to Shikigami" action button that opens the pre-filled
+ * "Report to Agency Agents" action button that opens the pre-filled
  * GitHub new-issue URL via `safeOpenUrl`.
  *
  * The friendly message comes from `appErrorMessage(e)`, which maps each

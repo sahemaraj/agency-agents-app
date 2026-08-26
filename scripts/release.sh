@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# release.sh — signed + notarized macOS build of Shikigami.
+# release.sh — signed + notarized macOS build of Agency Agents.
 #
 # Secrets live in the macOS Keychain, NOT in env files or shell history. This
 # script pulls them out at build time and hands them to Tauri (which signs with
@@ -96,11 +96,11 @@ DMG_DIRS=()
 
 for target in "${TARGETS[@]}"; do
   if [[ "$target" == "$HOST_TRIPLE" ]]; then
-    echo "▸ Building signed + notarized Shikigami for ${target} (native, Team $APPLE_TEAM_ID)…"
+    echo "▸ Building signed + notarized Agency Agents for ${target} (native, Team $APPLE_TEAM_ID)…"
     npm run tauri build -- ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
     DMG_DIRS+=("src-tauri/target/release/bundle/dmg/")
   else
-    echo "▸ Building signed + notarized Shikigami for ${target} (cross, Team $APPLE_TEAM_ID)…"
+    echo "▸ Building signed + notarized Agency Agents for ${target} (cross, Team $APPLE_TEAM_ID)…"
     npm run tauri build -- --target "$target" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
     DMG_DIRS+=("src-tauri/target/${target}/release/bundle/dmg/")
   fi

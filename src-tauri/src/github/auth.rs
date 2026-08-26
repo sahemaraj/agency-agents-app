@@ -84,7 +84,7 @@ pub const KEYCHAIN_ACCOUNT_USERNAME: &str = "github_username";
 /// GitHub App's client_id (see `docs/BUILD.md` §"GitHub OAuth App").
 ///
 /// The current value is the real `client_id` for the upstream
-/// Shikigami GitHub OAuth App under `msitarzewski`'s account.
+/// Agency Agents GitHub OAuth App under `msitarzewski`'s account.
 /// Maintained by the upstream maintainer; do not reuse from forks —
 /// rate-limit budget and any future revocation would tie back to
 /// upstream rather than the fork.

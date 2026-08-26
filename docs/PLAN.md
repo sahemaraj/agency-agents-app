@@ -1,6 +1,6 @@
-# Shikigami App Plan
+# Agency Agents App Plan
 
-**Product:** Shikigami
+**Product:** Agency Agents  
 **Repo:** `github:msitarzewski/agency-agents-app`  
 **Catalog:** `github:msitarzewski/agency-agents`  
 **Stack:** Tauri 2, Rust, SvelteKit, Svelte 5, TypeScript  
@@ -191,7 +191,7 @@ cargo test --manifest-path src-tauri/Cargo.toml upstream_convert_sh_is_byte_iden
 
 ## Definition Of Done For 1.0
 
-- public docs describe Shikigami, not the inherited source app
+- public docs describe Agency Agents, not the inherited source app
 - app name, bundle ID, updater host, and release artifacts are consistent
 - supported install paths have primary-source verification
 - renderer parity passes for supported transform tools

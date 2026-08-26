@@ -103,7 +103,7 @@
       ].filter(Boolean).join(" and ");
       sendNotification({
         title: agents > 0 ? "Agent drift needs review" : "Skill drift needs review",
-        body: `${counts} newly need attention. Open Shikigami to review.`,
+        body: `${counts} newly need attention. Open Agency Agents to review.`,
         extra: { review: agents > 0 ? "agents" : "skills" },
       });
     } catch {

@@ -1,5 +1,5 @@
 /**
- * Platform helpers — Shikigami ships on macOS, Linux, and Windows 11, so
+ * Platform helpers — Agency Agents ships on macOS, Linux, and Windows 11, so
  * the UI must not hardcode Mac-only affordances. The most visible one is the
  * keyboard-shortcut glyph: ⌘ on macOS, "Ctrl" everywhere else. The matching
  * keydown handlers already accept both (metaKey || ctrlKey), so this only

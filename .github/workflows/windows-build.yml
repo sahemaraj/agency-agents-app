@@ -1,4 +1,4 @@
-# Windows build — produces Shikigami's NSIS installers for x64 and arm64
+# Windows build — produces Agency Agents' NSIS installers for x64 and arm64
 # on a native windows-latest (x64) runner. arm64 is cross-compiled in-OS via
 # the aarch64-pc-windows-msvc target (the same trick the local VM matrix uses),
 # so one runner yields both installers.
@@ -63,8 +63,8 @@ jobs:
       - name: Self-check stateless lockfile verification
         shell: pwsh
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml --bin shikigami
-          & src-tauri/target/debug/shikigami.exe verify `
+          cargo build --manifest-path src-tauri/Cargo.toml --bin agency-agents-app
+          & src-tauri/target/debug/agency-agents-app.exe verify `
             --project src-tauri/tests/fixtures/verify-project `
             --json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -112,13 +112,13 @@ jobs:
       - name: Upload x64 installer
         uses: actions/upload-artifact@v4
         with:
-          name: shikigami-windows-x64
+          name: agency-agents-windows-x64
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
 
       - name: Upload arm64 installer
         uses: actions/upload-artifact@v4
         with:
-          name: shikigami-windows-arm64
+          name: agency-agents-windows-arm64
           path: src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
           if-no-files-found: error

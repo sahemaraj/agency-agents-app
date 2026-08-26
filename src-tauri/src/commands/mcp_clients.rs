@@ -493,7 +493,7 @@ fn app_command(executable: &Path, client: McpClient) -> Result<(String, Vec<Stri
         .is_ok_and(|temporary| executable.starts_with(temporary));
     if in_temporary_directory || is_ephemeral_executable(&executable) {
         return Err(invalid(
-            "move Shikigami to Applications before connecting an MCP client",
+            "move Agency Agents to Applications before connecting an MCP client",
         ));
     }
     Ok((
@@ -905,7 +905,7 @@ fn classify(
         },
         command: expected,
         detail: if exact {
-            "Connected to this Shikigami app".into()
+            "Connected to this Agency Agents app".into()
         } else {
             "The existing agency-agents registration points elsewhere".into()
         },
@@ -1298,7 +1298,7 @@ async fn mcp_inventory_for_state_inner(
         servers,
         trusted_templates: vec![McpTrustedTemplate {
             id: SERVER_NAME.into(),
-            name: "Shikigami".into(),
+            name: "Agency Agents".into(),
             clients: vec![McpClient::Claude, McpClient::Codex],
             tool_names: trusted_tools,
             automatic_configuration: true,

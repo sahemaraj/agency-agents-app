@@ -571,7 +571,7 @@ export function factoryReceiptFromRun(run: ExpertRun, projectLabel: string): Fac
     limitations,
     provenance: "clientReported",
     detail: workflow.terminal.outcome === "cancelled"
-      ? `Shikigami revoked control-plane authority; external work was not stopped or deleted.${workflow.terminal.safeDetail ? ` ${workflow.terminal.safeDetail}` : ""}`
+      ? `Agency Agents revoked control-plane authority; external work was not stopped or deleted.${workflow.terminal.safeDetail ? ` ${workflow.terminal.safeDetail}` : ""}`
       : (workflow.terminal.safeDetail ?? undefined),
   });
   return raw && isFactoryActivityReceipt(raw) ? raw : undefined;

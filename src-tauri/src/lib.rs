@@ -1,4 +1,4 @@
-//! Shikigami — Tauri 2 backend entrypoint.
+//! Agency Agents — Tauri 2 backend entrypoint.
 //!
 //! Module layout per `memory-bank/backendApi.md` §9. This file is the
 //! Tauri Builder + invoke_handler registration; every command lives

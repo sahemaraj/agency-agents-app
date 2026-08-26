@@ -88,7 +88,7 @@ const USER_AGENT: &str = concat!(
 /// Wire shape returned by `github_create_issue`. Only the fields the
 /// frontend actually needs — the full issue JSON is intentionally
 /// discarded (GitHub returns ~40 fields, most of which would mean
-/// nothing in the Shikigami UI).
+/// nothing in the Agency Agents UI).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CreatedIssue {

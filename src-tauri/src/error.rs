@@ -1,4 +1,4 @@
-//! Typed error model for Shikigami.
+//! Typed error model for Agency Agents.
 //!
 //! `AppError` is the single error type returned by every Tauri command.
 //! It serializes to a tagged JSON shape (`code` discriminator) so the
@@ -37,9 +37,7 @@ pub enum AppError {
     #[error("internal error: {message}")]
     Internal { message: String },
 
-    #[error(
-        "Shikigami is busy with another desktop or MCP operation. Nothing was changed. Try again."
-    )]
+    #[error("Agency Agents is busy with another desktop or MCP operation. Nothing was changed. Try again.")]
     StorageBusy,
 
     #[error("stored application data is invalid: {message}")]

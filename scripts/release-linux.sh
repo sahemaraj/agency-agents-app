@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # release-linux.sh — build Linux desktop bundles (.deb / .rpm / .AppImage) for
-# Shikigami inside a Docker container, so they can be produced from a Mac
+# Agency Agents inside a Docker container, so they can be produced from a Mac
 # (or any Docker host) without a native Linux machine.
 #
 #   ./scripts/release-linux.sh            # x86_64 (default; QEMU-emulated on Apple Silicon)

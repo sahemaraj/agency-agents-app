@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * SettingsSectionNetwork.svelte — Shikigami
+   * SettingsSectionNetwork.svelte — Agency Agents
    *
    * Privacy controls for the app's small, well-defined network surface. Agency
    * Agents talks to exactly two places: GitHub (to fetch/clone/pull the
@@ -163,7 +163,7 @@
         <span class="toggle-track" aria-hidden="true"></span>
         <span class="toggle-label">Drift notifications</span>
       </label>
-      <p class="hint" id="drift-notifications-hint">Every 15 minutes while Shikigami is backgrounded, check local managed files and notify once about newly outdated, modified, or missing items.</p>
+      <p class="hint" id="drift-notifications-hint">Every 15 minutes while Agency Agents is backgrounded, check local managed files and notify once about newly outdated, modified, or missing items.</p>
       {#if driftNotificationError}<p class="callout-error" data-drift-notification-error>{driftNotificationError}</p>{/if}
     </div>
 

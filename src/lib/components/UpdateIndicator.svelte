@@ -2,7 +2,7 @@
   /**
    * UpdateIndicator.svelte — Phase 15
    *
-   * Title-bar pill that surfaces a "newer Shikigami version is
+   * Title-bar pill that surfaces a "newer Agency Agents version is
    * available" notice in chrome (the Mac convention — Mail's unread
    * count, Notes's sync dot) rather than in a modal.
    *

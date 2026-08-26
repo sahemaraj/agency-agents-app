@@ -705,7 +705,7 @@ pub(crate) fn sanitize_field(value: &str, home: Option<&Path>) -> String {
 
 fn format_report(report: &DoctorReport) -> String {
     let mut output = format!(
-        "Shikigami Doctor\nGenerated: {}\nOverall: {}\nHealthy: {} | Needs attention: {} | Unavailable: {}\n",
+        "Agency Agents Doctor\nGenerated: {}\nOverall: {}\nHealthy: {} | Needs attention: {} | Unavailable: {}\n",
         report.generated_at,
         report.overall.label(),
         report.counts.healthy,

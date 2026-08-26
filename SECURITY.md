@@ -1,6 +1,6 @@
 # Security Policy
 
-Thanks for taking the time to look. Shikigami writes files into developer-tool configuration directories, so security reports are welcome.
+Thanks for taking the time to look. Agency Agents writes files into developer-tool configuration directories, so security reports are welcome.
 
 ## Supported Versions
 

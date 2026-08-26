@@ -1,15 +1,15 @@
-name: Shikigami lockfile verify
-description: Verify shikigami.lock.json against project files without desktop state
+name: Agency lockfile verify
+description: Verify agency.lock.json against project files without desktop state
 
 inputs:
   version:
-    description: Pinned Shikigami release tag (for example, v1.2.3)
+    description: Pinned Agency Agents release tag (for example, v1.2.3)
     required: true
   sha256:
     description: SHA-256 digest of the released Linux AppImage
     required: true
   project-path:
-    description: Project directory containing shikigami.lock.json
+    description: Project directory containing agency.lock.json
     default: .
   fail-on-drift:
     description: Fail the step when verify reports missing or modified files
@@ -18,7 +18,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Download Shikigami
+    - name: Download Agency Agents
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -27,7 +27,7 @@ runs:
       run: |
         set -euo pipefail
         if [[ "$RUNNER_OS" != "Linux" || "$RUNNER_ARCH" != "X64" ]]; then
-          echo "shikigami-verify currently supports Linux x64 runners" >&2
+          echo "agency-verify currently supports Linux x64 runners" >&2
           exit 2
         fi
         if [[ -z "$INPUT_VERSION" || "$INPUT_VERSION" == "latest" ]]; then
@@ -42,7 +42,7 @@ runs:
         if [[ "$tag" != v* ]]; then
           tag="v$tag"
         fi
-        download_dir="$RUNNER_TEMP/shikigami-verify"
+        download_dir="$RUNNER_TEMP/agency-verify"
         mkdir -p "$download_dir"
         gh release download "$tag" \
           --repo msitarzewski/agency-agents-app \
@@ -56,20 +56,20 @@ runs:
         fi
         echo "$INPUT_SHA256  ${binaries[0]}" | sha256sum --check --status
         chmod +x "${binaries[0]}"
-        echo "SHIKIGAMI_VERIFY_BIN=${binaries[0]}" >> "$GITHUB_ENV"
+        echo "AGENCY_VERIFY_BIN=${binaries[0]}" >> "$GITHUB_ENV"
 
-    - name: Verify shikigami.lock.json
+    - name: Verify agency.lock.json
       shell: bash
       env:
         INPUT_PROJECT_PATH: ${{ inputs.project-path }}
         INPUT_FAIL_ON_DRIFT: ${{ inputs.fail-on-drift }}
       run: |
         set +e
-        APPIMAGE_EXTRACT_AND_RUN=1 "$SHIKIGAMI_VERIFY_BIN" verify --project "$INPUT_PROJECT_PATH"
+        APPIMAGE_EXTRACT_AND_RUN=1 "$AGENCY_VERIFY_BIN" verify --project "$INPUT_PROJECT_PATH"
         status=$?
         set -e
         if [[ "$status" -eq 1 && "$INPUT_FAIL_ON_DRIFT" == "false" ]]; then
-          echo "::warning::Shikigami lockfile drift detected"
+          echo "::warning::Agency lockfile drift detected"
           exit 0
         fi
         exit "$status"

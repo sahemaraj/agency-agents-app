@@ -2344,7 +2344,7 @@ impl SkillMcpServer {
         .await
     }
 
-    #[tool(description = "Compare a project's disk and install ledgers with shikigami.lock.json")]
+    #[tool(description = "Compare a project's disk and install ledgers with agency.lock.json")]
     async fn lock_check(
         &self,
         Parameters(LockRequest { project_path }): Parameters<LockRequest>,
@@ -2364,7 +2364,7 @@ impl SkillMcpServer {
         .await
     }
 
-    #[tool(description = "Plan project installs and updates required by shikigami.lock.json")]
+    #[tool(description = "Plan project installs and updates required by agency.lock.json")]
     async fn lock_plan(
         &self,
         Parameters(LockRequest { project_path }): Parameters<LockRequest>,
@@ -2384,7 +2384,7 @@ impl SkillMcpServer {
         .await
     }
 
-    #[tool(description = "Apply an unchanged, unblocked shikigami.lock.json plan")]
+    #[tool(description = "Apply an unchanged, unblocked agency.lock.json plan")]
     async fn lock_apply(
         &self,
         Parameters(LockApplyRequest {

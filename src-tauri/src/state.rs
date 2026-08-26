@@ -1188,7 +1188,7 @@ pub(crate) async fn migration_status(
         ),
         crate::types::StorageMigrationState::Unsupported => (
             Some("unsupported".into()),
-            Some("This data was created by a newer Shikigami version.".into()),
+            Some("This data was created by a newer Agency Agents version.".into()),
             Vec::new(),
         ),
     };

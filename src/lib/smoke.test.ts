@@ -1774,7 +1774,7 @@ describe("frontend test harness", () => {
         return copied!;
       });
       expect(copiedFactoryPrompt).toContain("Factory Run ID: factory-new");
-      expect(copiedFactoryPrompt).toContain("Shikigami remains the control plane");
+      expect(copiedFactoryPrompt).toContain("Agency Agents remains the control plane");
       expect(copiedFactoryPrompt).not.toContain("expert_runs_get_contract");
 
       target.querySelector<HTMLButtonElement>('button[role="tab"]:nth-of-type(3)')!.click();
@@ -1797,7 +1797,7 @@ describe("frontend test harness", () => {
       });
       expect(planDialog.textContent).toContain("Approve plan");
       expect(planDialog.textContent).toContain("Reject plan");
-      expect(planDialog.textContent).toContain("Shikigami cannot stop an external process");
+      expect(planDialog.textContent).toContain("Agency Agents cannot stop an external process");
       expect(planDialog.textContent).toContain("Release claim");
       [...planDialog.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.trim() === "Release claim")!.click();
@@ -2228,7 +2228,7 @@ describe("frontend test harness", () => {
         ? journaled.receipt.detail
         : null;
       expect(cancellationDetail).toContain(
-        "Shikigami revoked control-plane authority; external work was not stopped or deleted.",
+        "Agency Agents revoked control-plane authority; external work was not stopped or deleted.",
       );
       expect(cancellationDetail).toContain("Cancelled by the desktop user.");
 
@@ -4935,7 +4935,7 @@ describe("frontend test harness", () => {
     ["catalog status", "catalog_status", { code: "io", message: "scan failed" }, () => catalog.loadStatus(), "I/O error: scan failed"],
     ["corrupt settings", "settings_get", { code: "internal", message: "settings unreadable" }, () => settings.load(), "Internal error: settings unreadable"],
     ["invalid settings", "settings_set", { code: "invalid_argument", message: "setting is invalid" }, () => settings.save({ paranoidMode: true }), "Invalid argument: setting is invalid"],
-    ["settings reset", "settings_reset", { code: "storage_busy" }, () => settings.reset(), "Shikigami is busy in another desktop or MCP session. Close it and try again."],
+    ["settings reset", "settings_reset", { code: "storage_busy" }, () => settings.reset(), "Agency Agents is busy in another desktop or MCP session. Close it and try again."],
     ["Expert load", "experts_list", { code: "network", url: "https://example.test", message: "offline" }, () => experts.load(), "Network error: offline"],
   ])("renders semantic %s store failures", async (_label, command, payload, run, expected) => {
     const invokeMock = vi.mocked(invoke);
@@ -5845,7 +5845,7 @@ describe("frontend test harness", () => {
       },
     });
     await tick();
-    expect(target.textContent).toContain("Shikigami needs a one-time data update");
+    expect(target.textContent).toContain("Agency Agents needs a one-time data update");
     expect(target.textContent).toContain("Checking data");
     expect(target.textContent).toContain("Verifying backup");
     expect(target.textContent).toContain("Moving records");
@@ -5888,7 +5888,7 @@ describe("frontend test harness", () => {
       },
     });
     await tick();
-    expect(target.textContent).toContain("newer Shikigami version");
+    expect(target.textContent).toContain("newer Agency Agents version");
     expect(target.querySelector("button.btn-primary")).toBeNull();
     unmount(unsupported);
     target.remove();
@@ -6160,7 +6160,7 @@ describe("frontend test harness", () => {
 
     expect(skillSources.installed).toEqual([row]);
     expect(skillSources.reconciled).toBe(true);
-    expect(skillSources.reconcileError).toBe("Shikigami is busy in another desktop or MCP session. Close it and try again.");
+    expect(skillSources.reconcileError).toBe("Agency Agents is busy in another desktop or MCP session. Close it and try again.");
     expect(skillSources.addError).toBe("Source refresh failed");
 
     invokeMock.mockImplementation(async (command: string) => {
@@ -9059,7 +9059,7 @@ describe("MCP inventory settings", () => {
             },
           ],
           trustedTemplates: [{
-            id: "agency-agents", name: "Shikigami", clients: ["claude", "codex"],
+            id: "agency-agents", name: "Agency Agents", clients: ["claude", "codex"],
             toolNames: ["agents_search", "skills_search"], automaticConfiguration: true,
           }],
           issues: ["Codex inventory partially unavailable"],
@@ -9077,7 +9077,7 @@ describe("MCP inventory settings", () => {
     const text = document.body.textContent ?? "";
     for (const evidence of [
       "MCP inventory", "project-memory", "Project", "/project", "Blocked",
-      "Tools unavailable", "Shikigami", "agents_search", "skills_search",
+      "Tools unavailable", "Agency Agents", "agents_search", "skills_search",
       "declared-tools", "declared_read", "Codex inventory partially unavailable",
     ]) expect(text).toContain(evidence);
     expect(text).not.toContain("secret-value");

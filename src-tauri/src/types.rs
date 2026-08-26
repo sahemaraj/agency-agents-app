@@ -622,7 +622,7 @@ fn default_mcp_audit_phase() -> String {
 }
 
 // =========================================================
-// Shikigami — corpus subsystem (contracts.md §A)
+// Agency Agents — corpus subsystem (contracts.md §A)
 // =========================================================
 //
 // Wire format mirrors `src/lib/types.ts`.
@@ -1818,7 +1818,7 @@ pub struct ProjectInfo {
 mod tests {
     use super::*;
 
-    // ---------- Shikigami: Tool id ----------
+    // ---------- Agency Agents: Tool id ----------
     //
     // `Tool` is now a `String` camelCase id sourced from the embedded JSON
     // registry (which self-tests its id set in `crate::registry`). A tool id is
