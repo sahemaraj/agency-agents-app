@@ -38,9 +38,10 @@
   import { skillSources } from "$lib/stores/skillSources.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { toast } from "$lib/stores/toast.svelte";
+  import { projectDetectStack, taskRecommendations } from "$lib/api";
   import { resolveCategoryIcon } from "$lib/util/categoryIcon";
   import { i18n } from "$lib/stores/i18n.svelte";
-  import { appErrorMessage, isAppError, type AgentPackageResult, type InstalledAgent, type ProjectReadinessBaseline, type ProjectReadinessReport, type ProjectRecommendation } from "$lib/types";
+  import { appErrorMessage, isAppError, type AgentPackageResult, type InstalledAgent, type ProjectReadinessBaseline, type ProjectReadinessReport, type ProjectRecommendation, type ProjectStackDetection, type TaskRecommendation } from "$lib/types";
   import type { ProjectInstructionApplyResult, ProjectInstructionOperation, ProjectInstructionPlan, ProjectInstructionSnippet, ProjectInstructionTarget } from "$lib/types";
   import { diffLines, diffStat, type DiffRow } from "$lib/util/diff";
 
@@ -165,6 +166,52 @@
 
   // ── Deploy into a project: the two-pane DeployBrowser. ──
   let browseFor = $state<string | null>(null); // project path, or null = closed
+
+  // ── Root-manifest stack detection + suggestion-only catalog matches. ──
+  let detectedStack = $state<ProjectStackDetection | null>(null);
+  let stackRecommendations = $state<TaskRecommendation[]>([]);
+  let stackBusy = $state(false);
+  let stackError = $state<string | null>(null);
+  let stackGeneration = 0;
+  const stackLanguages = $derived(detectedStack?.languages ?? []);
+  const stackEvidence = $derived(detectedStack?.evidence ?? []);
+
+  $effect(() => {
+    const projectPath = selected?.path;
+    const generation = ++stackGeneration;
+    detectedStack = null;
+    stackRecommendations = [];
+    stackError = null;
+    stackBusy = Boolean(projectPath);
+    if (projectPath) {
+      void (async () => {
+        try {
+          const detection = await projectDetectStack(projectPath);
+          if (generation !== stackGeneration) return;
+          detectedStack = detection;
+          if ((detection.languages ?? []).length > 0) {
+            const nextRecommendations = await taskRecommendations("", 10, detection.languages);
+            if (generation !== stackGeneration) return;
+            stackRecommendations = nextRecommendations;
+          }
+        } catch (error) {
+          if (generation === stackGeneration) {
+            stackError = isAppError(error) ? appErrorMessage(error) : String(error);
+          }
+        } finally {
+          if (generation === stackGeneration) stackBusy = false;
+        }
+      })();
+    }
+    return () => {
+      if (generation === stackGeneration) stackGeneration += 1;
+    };
+  });
+
+  function openStackRecommendation(recommendation: TaskRecommendation): void {
+    if (recommendation.kind === "agent") ui.openAgentReference(recommendation.package.reference);
+    else ui.openSkill({ sourceId: recommendation.package.sourceId, relativePath: recommendation.package.relativePath });
+  }
 
   // ── Readiness baseline + opt-in catalog recommendations. ──
   let readiness = $state<ProjectReadinessReport | null>(null);
@@ -778,6 +825,43 @@
       <button class="btn danger-ic" disabled={!mutationTruthFresh} title={i18n.t("projects.removeTitle")} aria-label={i18n.t("projects.removeAria")} onclick={() => (confirm = { path: selected.path, label: selected.label, agentCount: agentCountFor(selected.path), skillCount: skillsFor(selected.path).length })}><Trash2 size={15} /></button>
     </header>
 
+    <section class="stack-onboarding" aria-labelledby="project-stack-heading" aria-busy={stackBusy}>
+      <div class="stack-heading">
+        <h3 id="project-stack-heading">{i18n.optional("projects.stack.title", "Detected stack")}</h3>
+        <p>{i18n.optional("projects.stack.description", "Suggestions from root project manifests. Nothing is installed automatically.")}</p>
+      </div>
+      {#if stackError}<p class="stack-error">{i18n.optional("projects.stack.unavailable", "Stack suggestions unavailable: {message}", { message: stackError })}</p>{/if}
+      {#if stackBusy}
+        <p class="stack-muted">{i18n.optional("projects.stack.detecting", "Detecting stack…")}</p>
+      {:else if stackLanguages.length === 0 && !stackError}
+        <p class="stack-muted">{i18n.optional("projects.stack.empty", "No supported root manifests detected.")}</p>
+      {:else if stackLanguages.length > 0}
+        <div class="stack-chips" aria-label={i18n.optional("projects.stack.evidence", "Detected stack evidence")}>
+          {#each stackEvidence as item (`${item.file}:${item.token}`)}
+            <span class="stack-chip"><strong>{item.token}</strong><span>{item.file}</span></span>
+          {/each}
+        </div>
+        <div class="recommendations stack-recommendations">
+          <h4>{i18n.optional("projects.stack.recommendations", "Stack recommendations")} <span>{stackRecommendations.length}</span></h4>
+          {#if stackRecommendations.length > 0}
+            <ul>
+              {#each stackRecommendations as recommendation (recommendation.kind === "agent" ? `agent:${recommendation.package.reference.sourceId}:${recommendation.package.reference.relativePath}` : `skill:${recommendation.package.sourceId}:${recommendation.package.relativePath}`)}
+                <li>
+                  <div>
+                    <strong>{recommendation.kind === "agent" ? recommendation.package.agent?.name ?? recommendation.package.reference.relativePath : recommendation.package.name ?? recommendation.package.relativePath}</strong>
+                    <span>{i18n.optional("projects.stack.score", "Score {score}", { score: recommendation.score })} · {recommendation.reasons.join(" · ")}</span>
+                  </div>
+                  <button class="btn" onclick={() => openStackRecommendation(recommendation)}>{i18n.optional("projects.stack.open", "Open")}</button>
+                </li>
+              {/each}
+            </ul>
+          {:else}
+            <p>{i18n.optional("projects.stack.noRecommendations", "No matching agents or skills.")}</p>
+          {/if}
+        </div>
+      {/if}
+    </section>
+
     <section bind:this={readinessRoot} class="readiness" aria-labelledby="project-readiness-heading" aria-busy={readinessBusy}>
       <div class="readiness-heading">
         <div>
@@ -1052,7 +1136,14 @@
   }
   .pr-count { color: var(--color-text-secondary); font-size: var(--text-body-sm); }
   .pr-actions { display: flex; gap: var(--space-2); }
-  .readiness, .instruction-manager { flex: none; max-height: 280px; overflow-y: auto; padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); }
+  .stack-onboarding, .readiness, .instruction-manager { flex: none; max-height: 280px; overflow-y: auto; padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border); }
+  .stack-heading { display: grid; gap: 2px; }
+  .stack-heading h3 { margin: 0; font-size: var(--text-body); }
+  .stack-heading p, .stack-muted { margin: 0; color: var(--color-text-muted); font-size: var(--text-caption); }
+  .stack-chips { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3); }
+  .stack-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 3px 8px; font-size: var(--text-caption); }
+  .stack-chip span, .stack-recommendations li span { color: var(--color-text-muted); }
+  .stack-error { color: var(--color-danger); overflow-wrap: anywhere; }
   .readiness-heading, .instruction-heading { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
   .readiness-heading > div, .instruction-heading > div { flex: 1; min-width: 12rem; }
   .readiness-heading h3, .instruction-heading h3, .readiness-category h4, .recommendations h4 { margin: 0; }
@@ -1182,7 +1273,7 @@
     .pr-head { flex-wrap: wrap; padding: var(--space-3); }
     .pr-head.detail .dh-id { flex-basis: calc(100% - 52px); }
     .pr-head.detail .dh-count { margin-left: 52px; }
-    .readiness, .instruction-manager { padding-left: var(--space-3); padding-right: var(--space-3); }
+    .stack-onboarding, .readiness, .instruction-manager { padding-left: var(--space-3); padding-right: var(--space-3); }
     .readiness-heading > div, .instruction-heading > div { min-width: 100%; }
     .recommendations li, .instruction-target { align-items: stretch; flex-direction: column; }
     .recommendations li .btn, .instruction-target .btn { align-self: flex-start; }

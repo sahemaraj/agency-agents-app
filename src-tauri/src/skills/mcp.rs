@@ -624,6 +624,11 @@ struct ExpertCreationContextRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProjectDetectStackRequest {
+    project_path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ExpertCreationSubmitRequest {
     client_request_id: String,
     outcome: String,
@@ -1565,6 +1570,7 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "skills_recommend"
         | "skills_plan_install"
         | "skills_version_history" => Some(McpAction::Read),
+        "project_detect_stack" => Some(McpAction::Read),
         "experts_list"
         | "expert_runs_list"
         | "expert_runs_get"
@@ -1649,7 +1655,9 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "agents_list_folders"
         | "agents_list_approvals"
         | "agents_plan_install"
-        | "agents_version_history" => Some(McpAction::Read),
+        | "agents_version_history"
+        | "lock_check"
+        | "lock_plan" => Some(McpAction::Read),
         "agents_add_local_source"
         | "agents_add_github_source"
         | "agents_refresh_source"
@@ -1673,7 +1681,8 @@ fn action_for_tool(tool: &str) -> Option<McpAction> {
         | "agents_install_with_dependencies"
         | "agents_find_and_install"
         | "agents_update"
-        | "agents_enable" => Some(McpAction::AgentInstall),
+        | "agents_enable"
+        | "lock_apply" => Some(McpAction::AgentInstall),
         "agents_remove_source"
         | "agents_delete_folder"
         | "agents_delete_collection"
@@ -2361,7 +2370,11 @@ impl SkillMcpServer {
             project_path.clone(),
             async {
                 if let Some(project_path) = project_path.as_deref() {
-                    languages.extend(detect_project_languages(project_path)?);
+                    languages.extend(
+                        crate::projects::detect_project_stack(project_path)
+                            .map_err(|error| error.to_string())?
+                            .languages,
+                    );
                     languages.sort();
                     languages.dedup();
                 }
@@ -2376,6 +2389,28 @@ impl SkillMcpServer {
                         limit.unwrap_or(10).clamp(1, 50),
                     )
                     .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Detect bounded root-manifest stack tokens for an allowlisted project")]
+    async fn project_detect_stack(
+        &self,
+        Parameters(ProjectDetectStackRequest { project_path }): Parameters<
+            ProjectDetectStackRequest,
+        >,
+    ) -> Result<String, String> {
+        self.run_tool(
+            "project_detect_stack",
+            McpAction::Read,
+            Some(project_path.clone()),
+            async {
+                serde_json::to_string_pretty(
+                    &crate::projects::detect_project_stack(&project_path)
+                        .map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())
             },
@@ -3113,7 +3148,9 @@ impl SkillMcpServer {
                     crate::experts::mcp_creation_context(&self.state, &outcome, &project_path)
                         .await
                         .map_err(|error| error.to_string())?;
-                let languages = detect_project_languages(&project_path)?;
+                let languages = crate::projects::detect_project_stack(&project_path)
+                    .map_err(|error| error.to_string())?
+                    .languages;
                 let sources = super::inspect_skill_sources(&self.state)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -3878,35 +3915,6 @@ impl SkillMcpServer {
     }
 }
 
-fn detect_project_languages(project_path: &str) -> Result<Vec<String>, String> {
-    let root = std::fs::canonicalize(project_path)
-        .map_err(|error| format!("open recommendation project: {error}"))?;
-    if !root.is_dir() {
-        return Err("recommendation project must be a directory".into());
-    }
-    let names = std::fs::read_dir(&root)
-        .map_err(|error| format!("read recommendation project: {error}"))?
-        .take(256)
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-        .collect::<HashSet<_>>();
-    let mut languages = Vec::new();
-    for (manifest, detected) in [
-        ("package.json", "typescript"),
-        ("Cargo.toml", "rust"),
-        ("pyproject.toml", "python"),
-        ("requirements.txt", "python"),
-        ("go.mod", "go"),
-        ("pom.xml", "java"),
-        ("build.gradle", "java"),
-    ] {
-        if names.contains(manifest) {
-            languages.push(detected.into());
-        }
-    }
-    Ok(languages)
-}
-
 #[rmcp::tool_handler(router = self.tool_router)]
 impl ServerHandler for SkillMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -4614,11 +4622,10 @@ mod tests {
 
     use super::{
         action_for_tool, agency_agents_tool_names, canonical_mcp_client_identity, catalog_revision,
-        detect_project_languages, package_resource_uri, parse_package_resource_uri,
-        parse_skill_type, parse_update_policy, pause_next_factory_read_dispatch,
-        resource_list_changed, search_packages, FindAndInstallRequest, HttpAuth,
-        NamedApprovalRequest, RecommendRequest, SkillMcpServer, SkillRuntime, SourceRequest,
-        FACTORY_TOOL_NAMES,
+        package_resource_uri, parse_package_resource_uri, parse_skill_type, parse_update_policy,
+        pause_next_factory_read_dispatch, resource_list_changed, search_packages,
+        FindAndInstallRequest, HttpAuth, NamedApprovalRequest, RecommendRequest, SkillMcpServer,
+        SkillRuntime, SourceRequest, FACTORY_TOOL_NAMES,
     };
 
     fn package(name: &str, description: &str, installable: bool) -> SkillPackageResult {
@@ -4660,6 +4667,15 @@ mod tests {
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         })
+    }
+
+    async fn add_portable_skill_source(
+        state: &AppState,
+        root: &std::path::Path,
+    ) -> crate::types::SkillSource {
+        super::super::add_test_github_source(state, root)
+            .await
+            .expect("register portable test source")
     }
 
     async fn create_factory_mcp_run(
@@ -5132,6 +5148,7 @@ mod tests {
                 kind: SkillSourceKind::Github {
                     repository: "https://github.com/example/skills.git".into(),
                     git_ref: Some("main".into()),
+                    resolved_commit: Some("a".repeat(40)),
                     subdirectory: Some("skills".into()),
                     active_checkout: Some(checkout.into()),
                 },
@@ -5380,9 +5397,7 @@ mod tests {
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
-        let registered = super::super::add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_skill_source(&state, source.path()).await;
         let installed = super::super::install_skill(
             &state,
             &registered.id,
@@ -5392,9 +5407,10 @@ mod tests {
         )
         .await
         .expect("seed managed install");
-        let registered_agent = crate::agents::add_local_source(app.path(), agent_source.path())
-            .await
-            .expect("register Agent source");
+        let registered_agent =
+            crate::agents::add_test_github_source(app.path(), agent_source.path())
+                .await
+                .expect("register Agent source");
         let responses = call_tools_over_stdio(
             Arc::clone(&state),
             vec![
@@ -5909,9 +5925,7 @@ mod tests {
             ))),
             updater_state: crate::commands::updater::empty_state(),
         });
-        super::super::add_local_source(&state, first_source.path())
-            .await
-            .expect("register first source");
+        add_portable_skill_source(&state, first_source.path()).await;
         let server = SkillMcpServer::new(Arc::clone(&state));
         let installed: serde_json::Value = serde_json::from_str(
             &server
@@ -5930,9 +5944,7 @@ mod tests {
         assert_eq!(installed["installed"]["state"], "current");
         assert_eq!(installed["candidates"], serde_json::json!([]));
 
-        super::super::add_local_source(&state, second_source.path())
-            .await
-            .expect("register second source");
+        add_portable_skill_source(&state, second_source.path()).await;
         let ambiguous: serde_json::Value = serde_json::from_str(
             &server
                 .skills_find_and_install(
@@ -7145,7 +7157,7 @@ mod tests {
             "every routed tool must have an explicit audit/policy class"
         );
 
-        assert_eq!(names.len(), 137);
+        assert_eq!(names.len(), 141);
         assert_eq!(
             names
                 .iter()
@@ -7217,8 +7229,8 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<std::collections::HashSet<_>>();
 
-        assert_eq!(skill_names.len(), 86);
-        assert_eq!(agent_names.len(), 51);
+        assert_eq!(skill_names.len(), 87);
+        assert_eq!(agent_names.len(), 54);
         assert!(skill_names.is_disjoint(&agent_names));
     }
 
@@ -7469,7 +7481,7 @@ mod tests {
             "---\nname: Reviewer\ndescription: Reviews code\n---\nReview carefully.\n",
         )
         .expect("Agent markdown");
-        let registered = crate::agents::add_local_source(app.path(), source.path())
+        let registered = crate::agents::add_test_github_source(app.path(), source.path())
             .await
             .expect("register Agent source");
         let canonical_project = std::fs::canonicalize(project.path())
@@ -7591,17 +7603,6 @@ mod tests {
         assert!(parse_update_policy("always").is_err());
     }
 
-    #[test]
-    fn project_recommendations_detect_bounded_root_manifests() {
-        let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("Cargo.toml"), "[package]").unwrap();
-        std::fs::write(project.path().join("package.json"), "{}").unwrap();
-        assert_eq!(
-            detect_project_languages(project.path().to_str().unwrap()).unwrap(),
-            ["typescript", "rust"]
-        );
-    }
-
     #[tokio::test]
     async fn mcp_installs_a_skill_at_the_requested_project_runtime() {
         let app = tempfile::tempdir().expect("app data");
@@ -7639,9 +7640,7 @@ mod tests {
         )
         .await
         .expect("persist MCP settings");
-        let registered = super::super::add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_skill_source(&state, source.path()).await;
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let server = SkillMcpServer::new(Arc::clone(&state));
         let server_task = tokio::spawn(async move {
@@ -7898,9 +7897,7 @@ mod tests {
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
-        let registered = super::super::add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_skill_source(&state, source.path()).await;
         let installed = super::super::install_skill(
             &state,
             &registered.id,
@@ -7997,9 +7994,7 @@ mod tests {
             settings: Arc::new(RwLock::new(SettingsLoadState::FirstLaunch)),
             updater_state: crate::commands::updater::empty_state(),
         });
-        let registered = super::super::add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_skill_source(&state, source.path()).await;
         let installed = super::super::install_skill(
             &state,
             &registered.id,

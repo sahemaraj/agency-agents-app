@@ -26,10 +26,24 @@ jobs:
   verify:
     name: Verify Linux
     runs-on: ubuntu-22.04
+    env:
+      # Required for every cargo invocation below: tauri-build checks the tauri
+      # Cargo features against the config allowlist, and macos-private-api is
+      # enabled unconditionally in Cargo.toml. Only the Tauri CLI merges
+      # tauri.macos.conf.json, so plain cargo needs the value supplied here.
+      # Scoped to this job so the bundling job's config stays untouched.
+      TAURI_CONFIG: '{"app":{"macOSPrivateApi":true}}'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Checkout upstream parity fixture
+        uses: actions/checkout@v4
+        with:
+          repository: msitarzewski/agency-agents
+          ref: ebe9c99acb5c96f9468de368d8bead775387d1a7
+          path: agency-agents-parity
 
       - name: Install system dependencies
         run: |
@@ -81,6 +95,18 @@ jobs:
 
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Test upstream renderer parity
+        env:
+          AGENCY_AGENTS_PARITY_ROOT: ${{ github.workspace }}/agency-agents-parity
+        run: cargo test --manifest-path src-tauri/Cargo.toml upstream_convert_sh_is_byte_identical -- --ignored
+
+      - name: Self-check stateless lockfile verification
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --bin agency-agents-app
+          src-tauri/target/debug/agency-agents-app verify \
+            --project src-tauri/tests/fixtures/verify-project \
+            --json
 
       - name: Audit Rust dependencies
         uses: rustsec/audit-check@v2.0.0

@@ -59,6 +59,7 @@ import type {
   AgentSourceResult,
   AgentUpdatePolicy,
   AgentMutationPlan,
+  AgentMergePreview,
   AgentRosterInstallRecord,
   AgentRosterMutationPlan,
   AgentVersionSnapshot,
@@ -66,6 +67,9 @@ import type {
   AgentDiff,
   BaselineAgentRequirement,
   InstallRecord,
+  LockApplyResponse,
+  LockCheckResult,
+  LockPlan,
   Tool,
   StorageMigrationStatus,
   TaskRecommendation,
@@ -78,6 +82,7 @@ import type {
   ProjectReadinessReport,
   ProjectRecommendation,
   ProjectInfo,
+  ProjectStackDetection,
   PlaybookCatalogEntry,
   PlaybookDocument,
   InstalledAgent,
@@ -124,8 +129,22 @@ export const storageOpenDataDirectory = () => invoke<void>("storage_open_data_di
 export const storageLegacyConflictsDismiss = () =>
   invoke<void>("storage_legacy_conflicts_dismiss");
 
-export const taskRecommendations = (task: string, limit = 10) =>
-  invoke<TaskRecommendation[]>("task_recommendations", { task, limit });
+export const lockCheck = (projectPath: string) =>
+  invoke<LockCheckResult>("lock_check", { projectPath });
+export const lockPlan = (projectPath: string) =>
+  invoke<LockPlan>("lock_plan", { projectPath });
+export const lockApply = (projectPath: string, revision: string) =>
+  invoke<LockApplyResponse>("lock_apply", { projectPath, revision });
+
+export const taskRecommendations = (task: string, limit = 10, languages?: string[]) =>
+  invoke<TaskRecommendation[]>("task_recommendations", {
+    task,
+    limit,
+    ...(languages ? { languages } : {}),
+  });
+
+export const projectDetectStack = (projectPath: string) =>
+  invoke<ProjectStackDetection>("project_detect_stack", { projectPath });
 
 export const catalogFeedList = () => invoke<CatalogFeedState>("catalog_feed_list");
 export const catalogSourceTransitionRecover = () =>
@@ -357,6 +376,24 @@ export const agentDiffExact = (
   tool: Tool,
   projectPath: string | null,
 ) => invoke<AgentDiff>("agent_diff", exactAgentArgs(reference, tool, projectPath));
+
+export const agentMergePreview = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+) => invoke<AgentMergePreview>(
+  "agent_merge_preview", exactAgentArgs(reference, tool, projectPath),
+);
+
+export const agentMergeApply = (
+  reference: AgentReference,
+  tool: Tool,
+  projectPath: string | null,
+  previewHash: string,
+  confirmed: boolean,
+) => invoke<InstallRecord>("agent_merge_apply", {
+  ...exactAgentArgs(reference, tool, projectPath), previewHash, confirmed,
+});
 
 export const agentUninstallExact = (
   reference: AgentReference,

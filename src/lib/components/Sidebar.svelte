@@ -58,7 +58,7 @@
 
   function badge(id: SidebarSection): string | null {
     if (id === "personas") {
-      const n = install.installed.filter((row) => row.tracked && ["outdated", "missing"].includes(row.state)).length
+      const n = install.installed.filter((row) => row.tracked && ["outdated", "modified", "missing"].includes(row.state)).length
         + skillSources.installed.filter((row) => row.tracked && ["outdated", "missing"].includes(row.state)).length;
       return n > 0 ? String(n) : null;
     }

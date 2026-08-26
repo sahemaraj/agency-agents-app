@@ -11,7 +11,7 @@
   import { i18n } from "$lib/stores/i18n.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { appErrorMessage, isAppError } from "$lib/types";
-  import type { AgentMutationPlan, InstalledAgent, InstalledSkill, InstallState, SkillInstallState, SkillMutationPlan } from "$lib/types";
+  import type { AgentMergePreview, AgentMutationPlan, InstalledAgent, InstalledSkill, InstallState, SkillInstallState, SkillMutationPlan } from "$lib/types";
 
   interface Props {
     onClose: () => void;
@@ -22,30 +22,36 @@
     | { kind: "agent"; key: string; row: InstalledAgent }
     | { kind: "skill"; key: string; row: InstalledSkill };
   type ReviewPlan =
-    | { kind: "agent"; candidate: Extract<RepairCandidate, { kind: "agent" }>; plan: AgentMutationPlan | null; error: string | null }
+    | { kind: "agent"; candidate: Extract<RepairCandidate, { kind: "agent" }>; plan: AgentMutationPlan | null; mergePreview: AgentMergePreview | null; error: string | null }
     | { kind: "skill"; candidate: Extract<RepairCandidate, { kind: "skill" }>; plan: SkillMutationPlan | null; sourceFiles: { relativePath: string; sizeBytes: number; sha256: string }[]; error: string | null };
   interface RepairResult {
     candidate: RepairCandidate;
     ok: boolean;
+    stale: boolean;
     error: string | null;
   }
+  type RepairAction = "update" | "merge" | "overwrite" | "skip";
+  type AgentReviewPlan = Extract<ReviewPlan, { kind: "agent" }>;
+  type AgentCandidate = Extract<RepairCandidate, { kind: "agent" }>;
+  type DiffView = { candidate: AgentCandidate; mergedPreview?: string; conflictSummaries?: string[] };
 
-  const repairable = (state: InstallState | SkillInstallState) => state === "outdated" || state === "missing";
+  const repairableAgent = (state: InstallState) => state === "outdated" || state === "missing" || state === "modified";
+  const repairableSkill = (state: SkillInstallState) => state === "outdated" || state === "missing";
   const agentKey = (row: InstalledAgent) => ["agent", row.sourceId, row.relativePath, row.tool, row.projectPath ?? ""].join("\0");
   const skillKey = (row: InstalledSkill) => ["skill", row.sourceId, row.relativePath, row.runtime, row.projectPath ?? ""].join("\0");
 
   const collectCandidates = (): RepairCandidate[] => [
     ...install.installed
-      .filter((row) => row.tracked && repairable(row.state))
+      .filter((row) => row.tracked && repairableAgent(row.state))
       .map((row) => ({ kind: "agent" as const, key: agentKey(row), row })),
     ...skillSources.installed
-      .filter((row) => row.tracked && repairable(row.state))
+      .filter((row) => row.tracked && repairableSkill(row.state))
       .map((row) => ({ kind: "skill" as const, key: skillKey(row), row })),
   ];
   const candidates = $derived.by(collectCandidates);
   const unsafe = $derived.by<RepairCandidate[]>(() => [
     ...install.installed
-      .filter((row) => ["modified", "foreign", "disabled", "sourceUnavailable"].includes(row.state))
+      .filter((row) => ["foreign", "disabled", "sourceUnavailable"].includes(row.state))
       .map((row) => ({ kind: "agent" as const, key: row.tracked ? agentKey(row) : ["agent", "unsafe", row.tool, row.dest].join("\0"), row })),
     ...skillSources.installed
       .filter((row) => ["modified", "foreign", "disabled", "sourceUnavailable"].includes(row.state))
@@ -57,12 +63,14 @@
   let planning = $state(false);
   let applying = $state(false);
   let progress = $state(0);
+  let applyTotal = $state(0);
   let results = $state<RepairResult[]>([]);
   let receiptId = $state<string | null>(null);
   let reviewPlans = $state<ReviewPlan[]>([]);
   let reviewedSignature = $state("");
   let staleMessage = $state<string | null>(null);
-  let diffCandidate = $state<Extract<RepairCandidate, { kind: "agent" }> | null>(null);
+  let actions = $state<Record<string, RepairAction>>({});
+  let diffView = $state<DiffView | null>(null);
   const selected = $derived(candidates.filter((candidate) => !deselected.has(candidate.key)));
   const allSelected = $derived(candidates.length > 0 && selected.length === candidates.length);
   const someSelected = $derived(selected.length > 0 && !allSelected);
@@ -118,6 +126,14 @@
     return isAppError(error) ? appErrorMessage(error) : error instanceof Error ? error.message : String(error);
   }
 
+  function mergePreviewIsStale(error: unknown): boolean {
+    const message = errorMessage(error);
+    // Backend `agent_merge_apply` reports both branches as invalid_argument,
+    // so these messages are the only available discriminants.
+    return message.includes("Agent merge preview is stale")
+      || message.includes("Agent merge is no longer clean");
+  }
+
   function viewReceipt() {
     if (!receiptId) return;
     const id = receiptId;
@@ -145,7 +161,19 @@
             candidate.row.tool,
             candidate.row.projectPath,
           );
-          return { kind: "agent", candidate, plan, error: null };
+          if (candidate.row.state === "modified" && plan.mergeOutcome?.status === "clean") {
+            try {
+              const mergePreview = await install.mergePreviewReference(
+                { sourceId: candidate.row.sourceId, relativePath: candidate.row.relativePath },
+                candidate.row.tool,
+                candidate.row.projectPath,
+              );
+              return { kind: "agent", candidate, plan, mergePreview, error: null };
+            } catch (error) {
+              return { kind: "agent", candidate, plan, mergePreview: null, error: errorMessage(error) };
+            }
+          }
+          return { kind: "agent", candidate, plan, mergePreview: null, error: null };
         }
         const plan = await skillInstallPlan(
           candidate.row.sourceId,
@@ -161,7 +189,7 @@
         return { kind: "skill", candidate, plan, sourceFiles: pkg.files, error: null };
       } catch (error) {
         return candidate.kind === "agent"
-          ? { kind: "agent", candidate, plan: null, error: errorMessage(error) }
+          ? { kind: "agent", candidate, plan: null, mergePreview: null, error: errorMessage(error) }
           : { kind: "skill", candidate, plan: null, sourceFiles: [], error: errorMessage(error) };
       }
     }));
@@ -172,15 +200,67 @@
       key: item.candidate.key,
       state: item.candidate.row.state,
       plan: item.plan,
+      mergePreview: item.kind === "agent" ? item.mergePreview : undefined,
       sourceFiles: item.kind === "skill" ? item.sourceFiles : undefined,
       error: item.error,
     })));
   }
 
-  const reviewBlocked = $derived(
-    reviewPlans.length === 0
-    || reviewPlans.some(({ plan, error }) => Boolean(error) || !plan || plan.blockers.length > 0),
-  );
+  async function reverifyReviewedPlan(item: ReviewPlan): Promise<ReviewPlan | null> {
+    const [fresh] = await buildPlans([item.candidate]);
+    return fresh && planSignature([fresh]) === planSignature([item]) ? fresh : null;
+  }
+
+  function defaultAction(item: ReviewPlan): RepairAction {
+    if (item.candidate.row.state !== "modified") return "update";
+    return item.kind === "agent" && item.plan?.mergeOutcome?.status === "clean" && item.mergePreview
+      ? "merge"
+      : "skip";
+  }
+
+  function actionFor(item: ReviewPlan): RepairAction {
+    return actions[item.candidate.key] ?? defaultAction(item);
+  }
+
+  function chooseAction(item: ReviewPlan, action: RepairAction) {
+    actions = { ...actions, [item.candidate.key]: action };
+  }
+
+  function plainUnavailableReason(reason: string): string {
+    if (reason.includes("no canonical base snapshot")) {
+      return i18n.optional("agentUpdates.mergeNoBase", "No recorded base exists for this install yet. Overwrite once to enable merging next time.");
+    }
+    if (reason.includes("multi-artifact") || reason.includes("aggregate roster") || reason.includes("multi-Agent")) {
+      return i18n.optional("agentUpdates.mergeMultipleFiles", "This install writes more than one file, so its changes cannot be combined here.");
+    }
+    if (reason.includes("UTF-8") || reason.includes("only md, toml, and mdc")) {
+      return i18n.optional("agentUpdates.mergeNonText", "This is not a supported text file, so its changes cannot be combined here.");
+    }
+    if (reason.includes("enable the Agent")) {
+      return i18n.optional("agentUpdates.mergeDisabled", "Enable this Agent before combining changes.");
+    }
+    return reason;
+  }
+
+  function showMerged(item: AgentReviewPlan) {
+    if (!item.mergePreview) return;
+    chooseAction(item, "merge");
+    diffView = { candidate: item.candidate, mergedPreview: item.mergePreview.preview };
+  }
+
+  function showConflicts(item: AgentReviewPlan) {
+    const outcome = item.plan?.mergeOutcome;
+    if (outcome?.status !== "conflicts") return;
+    diffView = { candidate: item.candidate, conflictSummaries: outcome.hunkSummaries };
+  }
+
+  const reviewBlocked = $derived.by(() => {
+    const actionable = reviewPlans.filter((item) => actionFor(item) !== "skip");
+    return actionable.length === 0
+      || actionable.some((item) => !item.plan
+        || item.plan.blockers.length > 0
+        || (Boolean(item.error) && (item.kind === "skill" || actionFor(item) === "merge")));
+  });
 
   async function reviewSelected() {
     if (!truthReady || selected.length === 0 || planning) return;
@@ -188,6 +268,7 @@
     staleMessage = null;
     try {
       reviewPlans = await buildPlans(selected);
+      actions = Object.fromEntries(reviewPlans.map((item) => [item.candidate.key, defaultAction(item)]));
       reviewedSignature = planSignature(reviewPlans);
       stage = "review";
       await tick();
@@ -216,6 +297,7 @@
       const freshSignature = planSignature(freshPlans);
       if (freshCandidates.length !== selectedKeys.size || freshSignature !== reviewedSignature) {
         reviewPlans = freshPlans;
+        actions = Object.fromEntries(freshPlans.map((item) => [item.candidate.key, defaultAction(item)]));
         reviewedSignature = freshSignature;
         staleMessage = i18n.optional("agentUpdates.planChanged", "Repair plan changed. Review the updated plan before approving again.");
         return;
@@ -224,31 +306,63 @@
       progress = 0;
       results = [];
       receiptId = null;
-      for (const item of freshPlans) {
+      const actionable = freshPlans.filter((item) => actionFor(item) !== "skip");
+      applyTotal = actionable.length;
+      for (const item of actionable) {
         let result: RepairResult;
-        try {
-          if (item.candidate.kind === "agent") {
-            await install.updateReference(
-              { sourceId: item.candidate.row.sourceId, relativePath: item.candidate.row.relativePath },
-              item.candidate.row.tool,
-              item.candidate.row.projectPath,
-              true,
-            );
-            result = { candidate: item.candidate, ok: true, error: null };
+        const verified = await reverifyReviewedPlan(item);
+        if (!verified) {
+          result = {
+            candidate: item.candidate,
+            ok: false,
+            stale: true,
+            error: i18n.optional("agentUpdates.contentChanged", "This installation changed since review. Review the updated content before trying again."),
+          };
+        } else try {
+          if (verified.kind === "agent") {
+            const reference = { sourceId: verified.candidate.row.sourceId, relativePath: verified.candidate.row.relativePath };
+            if (actionFor(verified) === "merge") {
+              if (verified.plan?.mergeOutcome?.status !== "clean" || !verified.mergePreview) {
+                throw new Error("A fresh merge preview is required");
+              }
+              await install.mergeApplyReference(
+                reference,
+                verified.candidate.row.tool,
+                verified.candidate.row.projectPath,
+                verified.mergePreview.previewHash,
+              );
+            } else {
+              await install.updateReference(
+                reference,
+                verified.candidate.row.tool,
+                verified.candidate.row.projectPath,
+                true,
+              );
+            }
+            result = { candidate: verified.candidate, ok: true, stale: false, error: null };
           } else {
             const ok = await skillSources.lifecycle(
               "update",
-              item.candidate.row,
+              verified.candidate.row,
               projects.list.map((project) => project.path),
             );
             result = {
-              candidate: item.candidate,
+              candidate: verified.candidate,
               ok,
-              error: ok ? null : skillSources.installErrors[item.candidate.key.slice("skill\0".length)] ?? i18n.optional("agentUpdates.unknownFailure", "Repair failed"),
+              stale: false,
+              error: ok ? null : skillSources.installErrors[verified.candidate.key.slice("skill\0".length)] ?? i18n.optional("agentUpdates.unknownFailure", "Repair failed"),
             };
           }
         } catch (error) {
-          result = { candidate: item.candidate, ok: false, error: safeActivityDetail(errorMessage(error)) };
+          const stale = mergePreviewIsStale(error);
+          result = {
+            candidate: item.candidate,
+            ok: false,
+            stale,
+            error: stale
+              ? i18n.optional("agentUpdates.mergeStale", "This file changed on disk after the preview. Review a fresh preview before trying again.")
+              : safeActivityDetail(errorMessage(error)),
+          };
         }
         results = [...results, result];
         progress += 1;
@@ -284,6 +398,26 @@
       planning = false;
     }
   }
+
+  async function repreview(result: RepairResult) {
+    if (!result.stale || planning) return;
+    planning = true;
+    try {
+      const [fresh] = await buildPlans([result.candidate]);
+      if (!fresh) return;
+      reviewPlans = [fresh];
+      actions = { [fresh.candidate.key]: defaultAction(fresh) };
+      reviewedSignature = planSignature(reviewPlans);
+      staleMessage = fresh.kind === "agent"
+        ? i18n.optional("agentUpdates.mergeRepreviewed", "The preview was refreshed from the file now on disk. Review it before applying.")
+        : i18n.optional("agentUpdates.reviewRefreshed", "The repair review was refreshed from the current content. Review it before applying.");
+      stage = "review";
+      if (fresh.kind === "agent" && fresh.mergePreview) showMerged(fresh);
+      else if (fresh.kind === "agent" && fresh.plan?.mergeOutcome?.status === "conflicts") showConflicts(fresh);
+    } finally {
+      planning = false;
+    }
+  }
 </script>
 
 <Modal open size="wide" dismissible={!planning} title={stage === "results" ? i18n.optional("agentUpdates.resultsTitle", "Repair results") : i18n.optional("agentUpdates.repairTitle", "Safe repair", { count: candidates.length })} onClose={onClose}>
@@ -315,7 +449,7 @@
               />
               <span class="details">
                 <span class="name">{candidate.row.name}</span>
-                <span class="meta">{candidate.kind === "agent" ? "Agent" : "Skill"} · {target(candidate)} · {candidate.row.state === "missing" ? i18n.optional("agentUpdates.reinstall", "Reinstall") : i18n.optional("agentUpdates.update", "Update")}</span>
+                <span class="meta">{candidate.kind === "agent" ? "Agent" : "Skill"} · {target(candidate)} · {candidate.row.state === "missing" ? i18n.optional("agentUpdates.reinstall", "Reinstall") : candidate.row.state === "modified" ? i18n.optional("agentUpdates.reviewChanges", "Review local edits") : i18n.optional("agentUpdates.update", "Update")}</span>
                 <span class="path" title={destination(candidate)}>{destination(candidate)}</span>
               </span>
             </label>
@@ -348,12 +482,13 @@
         <li>
           <div class="plan-head">
             <span class="name">{item.candidate.row.name}</span>
-            <span class="operation">{item.candidate.row.state === "missing" ? i18n.optional("agentUpdates.reinstall", "Reinstall") : i18n.optional("agentUpdates.update", "Update")}</span>
+            <span class="operation">{item.candidate.row.state === "missing" ? i18n.optional("agentUpdates.reinstall", "Reinstall") : item.candidate.row.state === "modified" ? i18n.optional("agentUpdates.reviewChanges", "Review local edits") : i18n.optional("agentUpdates.update", "Update")}</span>
           </div>
           <p class="meta">{item.candidate.kind === "agent" ? "Agent" : "Skill"} · {item.candidate.row.sourceId} · {item.candidate.row.relativePath}</p>
-          {#if item.error}
+          {#if !item.plan}
             <p class="error">{item.error}</p>
-          {:else if item.plan}
+          {:else}
+            {#if item.error}<p class="error">{item.error}</p>{/if}
             <ul class="packages">
               {#if item.kind === "agent"}
                 {#each item.plan.agents as pkg}
@@ -374,15 +509,41 @@
             {#each item.plan.warnings as warning}<p class="warning">{warning}</p>{/each}
             {#each item.plan.blockers as blocker}<p class="error">{blocker}</p>{/each}
             <p class="meta">{item.plan.rollbackAvailable ? i18n.optional("agentUpdates.rollbackAvailable", "Rollback available") : i18n.optional("agentUpdates.rollbackUnavailable", "No existing content requires backup")}</p>
-            {#if item.kind === "agent"}
-              <button class="diff-link" onclick={() => (diffCandidate = item.candidate)}>{i18n.optional("agentUpdates.viewDiff", "View diff")}</button>
+            {#if item.kind === "agent" && item.candidate.row.state === "modified" && item.plan.mergeOutcome}
+              <section class="merge-review" data-merge-status={item.plan.mergeOutcome.status}>
+                {#if item.plan.mergeOutcome.status === "clean"}
+                  <p class="merge-title">{i18n.optional("agentUpdates.mergeClean", "Your edits are kept, and upstream changes are added.")}</p>
+                  <div class="merge-actions">
+                    <Button size="sm" variant="primary" disabled={!item.mergePreview} onclick={() => showMerged(item)}>{i18n.optional("agentUpdates.mergeAndUpdate", "Merge and update")}</Button>
+                    <Button size="sm" variant="danger" onclick={() => chooseAction(item, "overwrite")}>{i18n.optional("agentUpdates.overwriteEdits", "Overwrite local edits")}</Button>
+                    <Button size="sm" variant="secondary" onclick={() => chooseAction(item, "skip")}>{i18n.optional("agentUpdates.skip", "Skip")}</Button>
+                  </div>
+                {:else if item.plan.mergeOutcome.status === "conflicts"}
+                  <p class="merge-title">{i18n.optional("agentUpdates.mergeConflicts", "{count} conflicting parts need your choice. Nothing will be merged automatically.", { count: item.plan.mergeOutcome.count })}</p>
+                  <div class="merge-actions">
+                    <Button size="sm" variant="secondary" onclick={() => showConflicts(item)}>{i18n.optional("agentUpdates.viewConflicts", "View conflicting parts")}</Button>
+                    <Button size="sm" variant="danger" onclick={() => chooseAction(item, "overwrite")}>{i18n.optional("agentUpdates.overwriteEdits", "Overwrite local edits")}</Button>
+                    <Button size="sm" variant="secondary" onclick={() => chooseAction(item, "skip")}>{i18n.optional("agentUpdates.skip", "Skip")}</Button>
+                  </div>
+                {:else}
+                  <p class="merge-title">{plainUnavailableReason(item.plan.mergeOutcome.reason)}</p>
+                  <div class="merge-actions">
+                    <Button size="sm" variant="danger" onclick={() => chooseAction(item, "overwrite")}>{i18n.optional("agentUpdates.overwriteEdits", "Overwrite local edits")}</Button>
+                    <Button size="sm" variant="secondary" onclick={() => chooseAction(item, "skip")}>{i18n.optional("agentUpdates.skip", "Skip")}</Button>
+                  </div>
+                {/if}
+                <p class="choice-status">{actionFor(item) === "merge" ? i18n.optional("agentUpdates.choiceMerge", "Selected: keep edits and update") : actionFor(item) === "overwrite" ? i18n.optional("agentUpdates.choiceOverwrite", "Selected: overwrite local edits") : i18n.optional("agentUpdates.choiceSkip", "Selected: skip")}</p>
+                <button class="diff-link" onclick={() => (diffView = { candidate: item.candidate })}>{i18n.optional("agentUpdates.viewOverwriteDiff", "View overwrite diff")}</button>
+              </section>
+            {:else if item.kind === "agent"}
+              <button class="diff-link" onclick={() => (diffView = { candidate: item.candidate })}>{i18n.optional("agentUpdates.viewDiff", "View diff")}</button>
             {/if}
           {/if}
         </li>
       {/each}
     </ul>
     {#if applying}
-      <p class="progress" role="status" aria-live="polite">{i18n.optional("agentUpdates.progress", "Repairing {done} of {total}", { done: progress, total: reviewPlans.length })}</p>
+      <p class="progress" role="status" aria-live="polite">{i18n.optional("agentUpdates.progress", "Repairing {done} of {total}", { done: progress, total: applyTotal })}</p>
     {/if}
   {:else}
     <p class="sub">{i18n.optional("agentUpdates.resultsSub", "Every selected installation reached a terminal result.")}</p>
@@ -394,6 +555,7 @@
             <span class="name">{result.candidate.row.name}</span>
             <span class="meta">{result.ok ? `${i18n.optional("agentUpdates.repaired", "Repaired")} · ${finalState(result.candidate)}` : result.error}</span>
             <span class="path" title={destination(result.candidate)}>{destination(result.candidate)}</span>
+            {#if result.stale}<button class="diff-link" onclick={() => void repreview(result)}>{result.candidate.kind === "agent" ? i18n.optional("agentUpdates.repreview", "Re-preview") : i18n.optional("agentUpdates.reviewAgain", "Review again")}</button>{/if}
           </span>
         </li>
       {/each}
@@ -423,14 +585,16 @@
   {/snippet}
 </Modal>
 
-{#if diffCandidate}
+{#if diffView}
   <DiffModal
-    slug={diffCandidate.row.slug}
-    name={diffCandidate.row.name}
-    tool={diffCandidate.row.tool}
-    projectPath={diffCandidate.row.projectPath}
-    reference={{ sourceId: diffCandidate.row.sourceId, relativePath: diffCandidate.row.relativePath }}
-    onClose={() => (diffCandidate = null)}
+    slug={diffView.candidate.row.slug}
+    name={diffView.candidate.row.name}
+    tool={diffView.candidate.row.tool}
+    projectPath={diffView.candidate.row.projectPath}
+    reference={{ sourceId: diffView.candidate.row.sourceId, relativePath: diffView.candidate.row.relativePath }}
+    mergedPreview={diffView.mergedPreview}
+    conflictSummaries={diffView.conflictSummaries}
+    onClose={() => (diffView = null)}
   />
 {/if}
 
@@ -460,6 +624,10 @@
   .packages { list-style: none; margin: var(--space-2) 0; padding: 0; }
   .packages li { display: flex; flex-direction: column; gap: 2px; padding: var(--space-1) 0; }
   .warning { margin: var(--space-1) 0; color: var(--color-warning); font-size: var(--text-caption); }
+  .merge-review { margin-top: var(--space-3); padding: var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); }
+  .merge-title { margin: 0 0 var(--space-2); color: var(--color-text-primary); font-size: var(--text-body-sm); }
+  .merge-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+  .choice-status { margin: var(--space-2) 0 0; color: var(--color-text-secondary); font-size: var(--text-caption); }
   .diff-link { margin-top: var(--space-2); padding: 0; background: transparent; color: var(--color-text-link); font-size: var(--text-body-sm); cursor: pointer; }
   .diff-link:hover { text-decoration: underline; }
   .progress { color: var(--color-text-secondary); font-size: var(--text-body-sm); }

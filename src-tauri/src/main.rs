@@ -1,7 +1,10 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+};
 
 const DEFAULT_MCP_HTTP_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8765);
 
@@ -10,6 +13,16 @@ enum Mode {
     App,
     Stdio(String),
     Http(SocketAddr),
+    Cli(CliArgs),
+}
+
+#[derive(Debug, PartialEq)]
+struct CliArgs {
+    command: String,
+    project: Option<PathBuf>,
+    json: bool,
+    dry_run: bool,
+    merge: bool,
 }
 
 fn parse_mode<I, S>(args: I) -> Result<Mode, String>
@@ -25,6 +38,12 @@ where
     if args.is_empty() {
         return Ok(Mode::App);
     }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("check" | "plan" | "apply" | "list" | "verify")
+    ) {
+        return parse_cli(&args).map(Mode::Cli);
+    }
     if args == ["--mcp"] {
         return Ok(Mode::Stdio("unknown".into()));
     }
@@ -37,7 +56,9 @@ where
         }
     }
     if args.first().map(String::as_str) != Some("--mcp-http") {
-        return Err("expected --mcp or --mcp-http [--bind LOOPBACK:PORT]".into());
+        return Err(
+            "expected check, plan, apply, list, verify, --mcp, or --mcp-http [--bind LOOPBACK:PORT]".into(),
+        );
     }
     let bind = match args.as_slice() {
         [_] => DEFAULT_MCP_HTTP_BIND,
@@ -52,29 +73,130 @@ where
     Ok(Mode::Http(bind))
 }
 
-#[tokio::main]
-async fn main() {
-    let result = match parse_mode(std::env::args()) {
-        Ok(Mode::App) => {
-            agency_agents_lib::run();
-            return;
+fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
+    let command = args[0].clone();
+    let mut project = None;
+    let mut json = false;
+    let mut dry_run = false;
+    let mut merge = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--project" if project.is_none() => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| "--project requires a path".to_string())?;
+                project = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--json" if !json => {
+                json = true;
+                index += 1;
+            }
+            "--dry-run" if command == "apply" && !dry_run => {
+                dry_run = true;
+                index += 1;
+            }
+            "--merge" if command == "apply" && !merge => {
+                merge = true;
+                index += 1;
+            }
+            flag => return Err(format!("invalid {command} option: {flag}")),
         }
-        Ok(Mode::Stdio(client)) => agency_agents_lib::run_mcp(client).await,
-        Ok(Mode::Http(bind)) => match std::env::var("AGENCY_AGENTS_MCP_TOKEN") {
-            Ok(token) => agency_agents_lib::run_mcp_http(bind, token).await,
-            Err(_) => Err("AGENCY_AGENTS_MCP_TOKEN is required".into()),
-        },
-        Err(error) => Err(error),
+    }
+    Ok(CliArgs {
+        command,
+        project,
+        json,
+        dry_run,
+        merge,
+    })
+}
+
+fn is_cli_invocation(first: Option<&str>) -> bool {
+    first.is_some_and(|argument| !argument.starts_with('-'))
+}
+
+fn main() {
+    let mode = match parse_mode(std::env::args()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            let first = std::env::args().nth(1);
+            let is_cli = is_cli_invocation(first.as_deref());
+            eprintln!(
+                "{}",
+                if is_cli {
+                    format!("error: {error}")
+                } else {
+                    format!("MCP server failed: {error}")
+                }
+            );
+            std::process::exit(if is_cli { 2 } else { 1 });
+        }
     };
-    if let Err(error) = result {
-        eprintln!("MCP server failed: {error}");
-        std::process::exit(1);
+
+    if matches!(&mode, Mode::App) {
+        agency_agents_lib::run();
+        return;
+    }
+
+    let cli_mode = matches!(&mode, Mode::Cli(_));
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|error| {
+        eprintln!(
+            "{}",
+            if cli_mode {
+                format!("error: {error}")
+            } else {
+                format!("MCP server failed: {error}")
+            }
+        );
+        std::process::exit(if cli_mode { 2 } else { 1 });
+    });
+    let result = runtime.block_on(async move {
+        match mode {
+            Mode::Stdio(client) => agency_agents_lib::run_mcp(client).await.map(|_| 0),
+            Mode::Http(bind) => match std::env::var("AGENCY_AGENTS_MCP_TOKEN") {
+                Ok(token) => agency_agents_lib::run_mcp_http(bind, token)
+                    .await
+                    .map(|_| 0),
+                Err(_) => Err("AGENCY_AGENTS_MCP_TOKEN is required".into()),
+            },
+            Mode::Cli(args) => agency_agents_lib::run_cli(
+                &args.command,
+                args.project,
+                args.json,
+                args.dry_run,
+                args.merge,
+            )
+            .await
+            .map(|outcome| {
+                print!("{}", outcome.stdout);
+                outcome.exit_code
+            }),
+            Mode::App => unreachable!(),
+        }
+    });
+    match result {
+        Ok(0) => {}
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                if cli_mode {
+                    format!("error: {error}")
+                } else {
+                    format!("MCP server failed: {error}")
+                }
+            );
+            std::process::exit(if cli_mode { 2 } else { 1 });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mode, Mode, DEFAULT_MCP_HTTP_BIND};
+    use super::{is_cli_invocation, parse_mode, CliArgs, Mode, DEFAULT_MCP_HTTP_BIND};
 
     #[test]
     fn parses_mcp_modes() {
@@ -103,5 +225,132 @@ mod tests {
         }
         assert!(parse_mode(["app", "--mcp", "--mcp-http"]).is_err());
         assert!(parse_mode(["app", "--bind", "127.0.0.1:1"]).is_err());
+    }
+
+    #[test]
+    fn parses_cli_verbs_and_flags() {
+        assert_eq!(
+            parse_mode(["app", "check"]).unwrap(),
+            Mode::Cli(CliArgs {
+                command: "check".into(),
+                project: None,
+                json: false,
+                dry_run: false,
+                merge: false,
+            })
+        );
+        assert_eq!(
+            parse_mode(["app", "plan", "--json", "--project", "/tmp/project"]).unwrap(),
+            Mode::Cli(CliArgs {
+                command: "plan".into(),
+                project: Some("/tmp/project".into()),
+                json: true,
+                dry_run: false,
+                merge: false,
+            })
+        );
+        assert_eq!(
+            parse_mode([
+                "app",
+                "apply",
+                "--project",
+                "/tmp/project",
+                "--dry-run",
+                "--json",
+            ])
+            .unwrap(),
+            Mode::Cli(CliArgs {
+                command: "apply".into(),
+                project: Some("/tmp/project".into()),
+                json: true,
+                dry_run: true,
+                merge: false,
+            })
+        );
+        assert_eq!(
+            parse_mode(["app", "list", "--project", "."]).unwrap(),
+            Mode::Cli(CliArgs {
+                command: "list".into(),
+                project: Some(".".into()),
+                json: false,
+                dry_run: false,
+                merge: false,
+            })
+        );
+        assert_eq!(
+            parse_mode(["app", "verify", "--json", "--project", "."]).unwrap(),
+            Mode::Cli(CliArgs {
+                command: "verify".into(),
+                project: Some(".".into()),
+                json: true,
+                dry_run: false,
+                merge: false,
+            })
+        );
+        assert_eq!(
+            parse_mode(["app", "apply", "--merge"]).unwrap(),
+            Mode::Cli(CliArgs {
+                command: "apply".into(),
+                project: None,
+                json: false,
+                dry_run: false,
+                merge: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cli_options() {
+        assert!(parse_mode(["app", "chek"]).is_err());
+        assert!(parse_mode(["app", "check", "--dry-run"]).is_err());
+        assert!(parse_mode(["app", "apply", "--project"]).is_err());
+        assert!(parse_mode(["app", "list", "--json", "--json"]).is_err());
+        assert!(parse_mode(["app", "plan", "--merge"]).is_err());
+        assert!(parse_mode(["app", "plan", "--unknown"]).is_err());
+        assert!(parse_mode(["app", "verify", "--merge"]).is_err());
+        assert!(is_cli_invocation(Some("chek")));
+        assert!(is_cli_invocation(Some("plan")));
+        assert!(!is_cli_invocation(Some("--mcp-http")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "launches the native desktop binary"]
+    fn desktop_app_stays_alive_past_startup() {
+        use std::{
+            io::Read,
+            path::PathBuf,
+            process::{Command, Stdio},
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let binary =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/agency-agents-app");
+        assert!(
+            binary.is_file(),
+            "build the desktop binary before running this test"
+        );
+        let mut child = Command::new(binary)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch desktop binary");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().expect("poll desktop binary") {
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .expect("capture desktop stderr")
+                    .read_to_string(&mut stderr)
+                    .expect("read desktop stderr");
+                panic!("desktop app exited during startup ({status}): {stderr}");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        child.kill().expect("stop desktop binary");
+        child.wait().expect("reap desktop binary");
     }
 }

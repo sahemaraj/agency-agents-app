@@ -137,6 +137,7 @@ fn validate_registered_sources(sources: &[AgentSource]) -> Result<(), AppError> 
             AgentSourceKind::Github {
                 repository,
                 git_ref,
+                resolved_commit,
                 subdirectory,
                 active_checkout,
             } => {
@@ -146,6 +147,7 @@ fn validate_registered_sources(sources: &[AgentSource]) -> Result<(), AppError> 
                     ));
                 }
                 crate::skills::validated_git_ref(git_ref.as_deref())?;
+                crate::skills::validated_resolved_commit(resolved_commit.as_deref())?;
                 crate::skills::validated_subdirectory(subdirectory.as_deref())?;
                 if active_checkout
                     .as_deref()
@@ -269,6 +271,40 @@ pub(crate) async fn add_local_source(
     Ok(source)
 }
 
+#[cfg(test)]
+pub(crate) async fn add_test_github_source(
+    app_data_dir: &Path,
+    root: &Path,
+) -> Result<AgentSource, AppError> {
+    let source = add_github_source(
+        app_data_dir,
+        &format!(
+            "https://github.com/agency-agents-test/{}.git",
+            Uuid::new_v4()
+        ),
+        None,
+        None,
+    )
+    .await?;
+    let mut sources = load_registered_sources(app_data_dir).await?;
+    let portable = sources
+        .iter_mut()
+        .find(|candidate| candidate.id == source.id)
+        .ok_or_else(|| invalid("registered test Agent source disappeared"))?;
+    if let AgentSourceKind::Github {
+        resolved_commit,
+        active_checkout,
+        ..
+    } = &mut portable.kind
+    {
+        *resolved_commit = Some("a".repeat(40));
+        *active_checkout = Some(std::fs::canonicalize(root)?.to_string_lossy().into_owned());
+    }
+    let portable = portable.clone();
+    save_registered_sources(app_data_dir, &sources).await?;
+    Ok(portable)
+}
+
 pub(crate) async fn add_github_source(
     app_data_dir: &Path,
     repository: &str,
@@ -313,6 +349,7 @@ pub(crate) async fn add_github_source(
         kind: AgentSourceKind::Github {
             repository,
             git_ref,
+            resolved_commit: None,
             subdirectory,
             active_checkout: None,
         },
@@ -784,10 +821,19 @@ pub(crate) async fn refresh_git_source(
     refresh_git_source_from(state, source_id, &repository).await
 }
 
-async fn refresh_git_source_from(
+pub(crate) async fn refresh_git_source_from(
     state: &AppState,
     source_id: &str,
     clone_source: &str,
+) -> Result<AgentSourceResult, AppError> {
+    refresh_git_source_from_ref(state, source_id, clone_source, None).await
+}
+
+async fn refresh_git_source_from_ref(
+    state: &AppState,
+    source_id: &str,
+    clone_source: &str,
+    checkout_override: Option<&str>,
 ) -> Result<AgentSourceResult, AppError> {
     state.require_network("agent_source_refresh").await?;
     let _guard = lock_sources_async(state.app_data_dir.clone()).await?;
@@ -829,7 +875,7 @@ async fn refresh_git_source_from(
         &[
             "checkout",
             "--detach",
-            git_ref.as_deref().unwrap_or("HEAD"),
+            checkout_override.or(git_ref.as_deref()).unwrap_or("HEAD"),
             "--",
         ],
         Some(&staging),
@@ -839,6 +885,13 @@ async fn refresh_git_source_from(
         cleanup_checkout(&staging).await;
         return Err(error);
     }
+    let resolved_commit = match corpus::run_git(&["rev-parse", "HEAD"], Some(&staging)).await {
+        Ok(value) => Some(value.trim().to_ascii_lowercase()),
+        Err(error) => {
+            cleanup_checkout(&staging).await;
+            return Err(error);
+        }
+    };
 
     let checkout_root = std::fs::canonicalize(&staging).map_err(|error| AppError::Io {
         message: format!(
@@ -927,10 +980,12 @@ async fn refresh_git_source_from(
     let mut active_source = candidate.source;
     if let AgentSourceKind::Github {
         active_checkout: active,
+        resolved_commit: commit,
         ..
     } = &mut active_source.kind
     {
         *active = Some(active_checkout.to_string_lossy().into_owned());
+        *commit = resolved_commit;
     }
     sources[source_index] = active_source.clone();
     if let Err(error) = save_registered_sources(&state.app_data_dir, &sources).await {
@@ -944,6 +999,18 @@ async fn refresh_git_source_from(
         errors: candidate.errors,
         revision: candidate.revision,
     })
+}
+
+pub(crate) async fn materialize_github_source(
+    state: &AppState,
+    repository: &str,
+    requested_ref: Option<&str>,
+    resolved_commit: Option<&str>,
+    subdirectory: Option<&str>,
+) -> Result<AgentSourceResult, AppError> {
+    let source =
+        add_github_source(&state.app_data_dir, repository, requested_ref, subdirectory).await?;
+    refresh_git_source_from_ref(state, &source.id, repository, resolved_commit).await
 }
 
 pub(crate) async fn inspect_agent_sources(
@@ -1751,6 +1818,7 @@ mod tests {
             kind: AgentSourceKind::Github {
                 repository: "https://github.com/acme/agents.git".into(),
                 git_ref: None,
+                resolved_commit: None,
                 subdirectory: None,
                 active_checkout: None,
             },
@@ -1785,7 +1853,11 @@ mod tests {
         let persisted = load_registered_sources(app_data.path()).await.unwrap();
         assert!(matches!(
             &persisted[0].kind,
-            AgentSourceKind::Github { active_checkout: Some(path), .. } if path == &active
+            AgentSourceKind::Github {
+                active_checkout: Some(path),
+                resolved_commit: Some(commit),
+                ..
+            } if path == &active && commit.len() == 40
         ));
     }
 

@@ -23,6 +23,7 @@ const github: SkillSource = {
     kind: "github",
     repository: "owner/repo",
     gitRef: null,
+    resolvedCommit: null,
     subdirectory: null,
     activeCheckout: null,
   },

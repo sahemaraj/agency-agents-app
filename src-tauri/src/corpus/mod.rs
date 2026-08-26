@@ -3613,6 +3613,21 @@ pub(crate) async fn ensure_corpus<R: Runtime>(
     ensure_corpus_at(&adir, &bdir, state).await
 }
 
+pub(crate) async fn ensure_corpus_headless(state: &AppState) -> Result<Arc<Corpus>, AppError> {
+    let context = crate::app_context();
+    let resource_dir =
+        tauri::utils::platform::resource_dir(context.package_info(), &tauri::Env::default())
+            .map_err(|error| AppError::Internal {
+                message: format!("resolve headless resource_dir: {error}"),
+            })?;
+    ensure_corpus_at(
+        &state.app_data_dir,
+        &resource_dir.join("resources").join("corpus-baseline"),
+        state,
+    )
+    .await
+}
+
 async fn ensure_corpus_at(
     app_data_dir: &Path,
     baseline_dir: &Path,

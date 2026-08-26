@@ -1,0 +1,75 @@
+name: Agency lockfile verify
+description: Verify agency.lock.json against project files without desktop state
+
+inputs:
+  version:
+    description: Pinned Agency Agents release tag (for example, v1.2.3)
+    required: true
+  sha256:
+    description: SHA-256 digest of the released Linux AppImage
+    required: true
+  project-path:
+    description: Project directory containing agency.lock.json
+    default: .
+  fail-on-drift:
+    description: Fail the step when verify reports missing or modified files
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Download Agency Agents
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_SHA256: ${{ inputs.sha256 }}
+      run: |
+        set -euo pipefail
+        if [[ "$RUNNER_OS" != "Linux" || "$RUNNER_ARCH" != "X64" ]]; then
+          echo "agency-verify currently supports Linux x64 runners" >&2
+          exit 2
+        fi
+        if [[ -z "$INPUT_VERSION" || "$INPUT_VERSION" == "latest" ]]; then
+          echo "version must be a pinned release tag, not latest" >&2
+          exit 2
+        fi
+        if [[ ! "$INPUT_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+          echo "sha256 must be a 64-character hexadecimal digest" >&2
+          exit 2
+        fi
+        tag="$INPUT_VERSION"
+        if [[ "$tag" != v* ]]; then
+          tag="v$tag"
+        fi
+        download_dir="$RUNNER_TEMP/agency-verify"
+        mkdir -p "$download_dir"
+        gh release download "$tag" \
+          --repo msitarzewski/agency-agents-app \
+          --pattern '*.AppImage' \
+          --dir "$download_dir" \
+          --clobber
+        mapfile -t binaries < <(find "$download_dir" -maxdepth 1 -type f -name '*.AppImage')
+        if [[ "${#binaries[@]}" -ne 1 ]]; then
+          echo "expected one Linux AppImage for $tag, found ${#binaries[@]}" >&2
+          exit 2
+        fi
+        echo "$INPUT_SHA256  ${binaries[0]}" | sha256sum --check --status
+        chmod +x "${binaries[0]}"
+        echo "AGENCY_VERIFY_BIN=${binaries[0]}" >> "$GITHUB_ENV"
+
+    - name: Verify agency.lock.json
+      shell: bash
+      env:
+        INPUT_PROJECT_PATH: ${{ inputs.project-path }}
+        INPUT_FAIL_ON_DRIFT: ${{ inputs.fail-on-drift }}
+      run: |
+        set +e
+        APPIMAGE_EXTRACT_AND_RUN=1 "$AGENCY_VERIFY_BIN" verify --project "$INPUT_PROJECT_PATH"
+        status=$?
+        set -e
+        if [[ "$status" -eq 1 && "$INPUT_FAIL_ON_DRIFT" == "false" ]]; then
+          echo "::warning::Agency lockfile drift detected"
+          exit 0
+        fi
+        exit "$status"

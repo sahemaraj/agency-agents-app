@@ -25,11 +25,12 @@ use crate::registry;
 use crate::render;
 use crate::state::{AppState, AuthorizedMcpProject};
 use crate::types::{
-    AgentApprovalAction, AgentArtifactDiff, AgentDiff, AgentInstallIdentity, AgentMutationPlan,
-    AgentPlanItem, AgentReference, AgentRosterDestinationObservation, AgentRosterInstallRecord,
-    AgentRosterMember, AgentRosterMutationPlan, AgentRosterPathObservation, AgentSourceResult,
-    AgentVersionSnapshot, BaselineAgentRequirement, BaselineRequirement, BaselineSkillRequirement,
-    CatalogChange, CatalogFeedBatch, InstallArtifact, InstallRecord, InstallState, InstalledAgent,
+    AgentApprovalAction, AgentArtifactDiff, AgentDiff, AgentInstallIdentity, AgentMergeOutcome,
+    AgentMergePreview, AgentMutationPlan, AgentPlanItem, AgentReference,
+    AgentRosterDestinationObservation, AgentRosterInstallRecord, AgentRosterMember,
+    AgentRosterMutationPlan, AgentRosterPathObservation, AgentSourceResult, AgentVersionSnapshot,
+    BaselineAgentRequirement, BaselineRequirement, BaselineSkillRequirement, CatalogChange,
+    CatalogFeedBatch, InstallArtifact, InstallRecord, InstallState, InstalledAgent,
     InstalledAgentRoster, ProjectInfo, ProjectReadinessBaseline, ProjectReadinessOverall,
     ProjectReadinessReport, ProjectRecommendation, ProjectRecommendationTarget,
     ProjectSubscription, ReadinessCategoryKind, ReadinessCategoryReport, ReadinessCategoryState,
@@ -39,6 +40,7 @@ use crate::types::{
 use crate::util::fs::{atomic_write, read_capped};
 
 mod history;
+pub(crate) mod lockfile;
 
 /// Cap on an installed agent file we read back during reconciliation.
 const MAX_INSTALLED_BYTES: u64 = 4 * 1024 * 1024;
@@ -327,29 +329,25 @@ pub(crate) async fn load_ledger<R: Runtime>(
     state: &AppState,
 ) -> Result<Vec<InstallRecord>, AppError> {
     corpus::ensure_corpus(app, state).await?;
+    load_ledger_for_install(state).await
+}
+
+async fn load_ledger_for_install(state: &AppState) -> Result<Vec<InstallRecord>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
-        return database
-            .read(installs_spec())
-            .await?
-            .ok_or_else(|| AppError::StorageCorrupt {
-                message: "Agent install ledger is missing after SQLite migration".into(),
-            })
-            .map(agent_entries);
+        return Ok(agent_entries(
+            load_migrated_database_entries(&database, None).await?,
+        ));
     }
     let built_in = crate::agents::inspect_builtin_agent_source(&state.app_data_dir).await?;
-    let path = ledger_path(app)?;
+    let path = ledger_path_for(&state.app_data_dir);
     load_migrated_ledger_path(&path, Some(&built_in), &now_iso()).await
 }
 
 async fn load_ledger_for_state(state: &AppState) -> Result<Vec<InstallRecord>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
-        return database
-            .read(installs_spec())
-            .await?
-            .ok_or_else(|| AppError::StorageCorrupt {
-                message: "Agent install ledger is missing after SQLite migration".into(),
-            })
-            .map(agent_entries);
+        return Ok(agent_entries(
+            load_migrated_database_entries(&database, None).await?,
+        ));
     }
     let built_in = crate::agents::inspect_builtin_agent_source(&state.app_data_dir)
         .await
@@ -366,12 +364,7 @@ async fn load_install_entries_for_state(
     state: &AppState,
 ) -> Result<Vec<InstallLedgerEntry>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
-        return database
-            .read(installs_spec())
-            .await?
-            .ok_or_else(|| AppError::StorageCorrupt {
-                message: "Agent install ledger is missing after SQLite migration".into(),
-            });
+        return load_migrated_database_entries(&database, None).await;
     }
     let path = ledger_path_for(&state.app_data_dir);
     match read_capped(&path, MAX_LEDGER_BYTES).await {
@@ -390,6 +383,70 @@ async fn load_install_entries_for_state(
     }
 }
 
+async fn load_migrated_database_entries(
+    database: &crate::state_db::StateDatabase,
+    built_in: Option<&AgentSourceResult>,
+) -> Result<Vec<InstallLedgerEntry>, AppError> {
+    let values =
+        database
+            .read(raw_installs_spec())
+            .await?
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "Agent install ledger is missing after SQLite migration".into(),
+            })?;
+    let roster_values = values
+        .iter()
+        .filter(|value| install_value_is_roster(value))
+        .cloned()
+        .collect::<Vec<_>>();
+    let records = values
+        .iter()
+        .filter(|value| !install_value_is_roster(value))
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<InstallRecord>, _>>()
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent install ledger entries are invalid".into(),
+        })?;
+    let (records, changed) = migrate_install_records(records, built_in)?;
+    let mut migrated_values = records
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AppError::Internal {
+            message: format!("serialize migrated Agent install record: {error}"),
+        })?;
+    migrated_values.extend(roster_values);
+    if changed {
+        let replacement = migrated_values.clone();
+        database
+            .mutate(raw_installs_spec(), Vec::new(), move |current| {
+                *current = replacement;
+                Ok(())
+            })
+            .await?;
+    }
+    let entries = migrated_values
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<InstallLedgerEntry>, _>>()
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent install ledger entries are invalid".into(),
+        })?;
+    validate_install_entries(&entries)?;
+    Ok(entries)
+}
+
+async fn load_ledger_for_lock(state: &AppState) -> Result<Vec<InstallRecord>, AppError> {
+    if let Some(database) = state.completed_state_database().await? {
+        let Some(values) = database.read(raw_installs_spec()).await? else {
+            return Ok(Vec::new());
+        };
+        return parse_readiness_agent_entries(&values, None);
+    }
+    load_ledger_for_state(state).await
+}
+
 async fn load_rosters_for_state(
     state: &AppState,
 ) -> Result<Vec<AgentRosterInstallRecord>, AppError> {
@@ -402,13 +459,14 @@ pub(crate) async fn load_ledger_read_only(
     state: &AppState,
 ) -> Result<Vec<InstallRecord>, AppError> {
     if let Some(database) = state.completed_state_database().await? {
-        return database
-            .read(installs_spec())
-            .await?
-            .ok_or_else(|| AppError::StorageCorrupt {
-                message: "Agent install ledger is missing after SQLite migration".into(),
-            })
-            .map(agent_entries);
+        let values =
+            database
+                .read(raw_installs_spec())
+                .await?
+                .ok_or_else(|| AppError::StorageCorrupt {
+                    message: "Agent install ledger is missing after SQLite migration".into(),
+                })?;
+        return parse_readiness_agent_entries(&values, None);
     }
     load_ledger_read_only_at(&ledger_path_for(&state.app_data_dir)).await
 }
@@ -716,7 +774,48 @@ async fn load_readiness_install_values(
 }
 
 pub(crate) fn installs_import_spec() -> crate::state_db::ImportSpec {
-    crate::state_db::ImportSpec::document(installs_spec(), Vec::new())
+    crate::state_db::ImportSpec::new("installs", "[]", parse_installs_import)
+}
+
+fn parse_installs_import(raw: &[u8]) -> Result<String, AppError> {
+    let mut values = serde_json::from_slice::<Vec<serde_json::Value>>(raw).map_err(|_| {
+        AppError::StorageCorrupt {
+            message: "installs legacy state is malformed".into(),
+        }
+    })?;
+    for value in values
+        .iter_mut()
+        .filter(|value| !install_value_is_roster(value))
+    {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| AppError::StorageCorrupt {
+                message: "installs legacy state is invalid".into(),
+            })?;
+        if !object.contains_key("sourceRevision") {
+            let source_hash =
+                object
+                    .get("sourceHash")
+                    .cloned()
+                    .ok_or_else(|| AppError::StorageCorrupt {
+                        message: "installs legacy state is invalid".into(),
+                    })?;
+            object.insert("sourceRevision".into(), source_hash);
+        }
+    }
+    let entries = values
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<InstallLedgerEntry>, _>>()
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "installs legacy state is invalid".into(),
+        })?;
+    validate_install_entries(&entries).map_err(|_| AppError::StorageCorrupt {
+        message: "installs legacy state is invalid".into(),
+    })?;
+    serde_json::to_string(&entries).map_err(|_| AppError::Internal {
+        message: "serialize installs migration state".into(),
+    })
 }
 
 /// Upgrade pre-source ledgers entirely in memory. Existing source-aware rows
@@ -769,6 +868,21 @@ fn migrate_install_records(
         if record.source_snapshot_hash.is_empty() {
             record.source_snapshot_hash = record.source_hash.clone();
             changed = true;
+        }
+        if record.source_revision.is_empty() {
+            record.source_revision = record.source_hash.clone();
+            changed = true;
+        }
+        if record.base_snapshot_id.as_deref().is_some_and(|id| {
+            id.is_empty()
+                || id.len() > 128
+                || id
+                    .chars()
+                    .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        }) {
+            return Err(AppError::InvalidArgument {
+                message: format!("invalid Agent base snapshot for {}", record.slug),
+            });
         }
         if !record.artifacts.is_empty() {
             let valid_hash =
@@ -958,10 +1072,6 @@ fn now_iso() -> String {
 /// under app data, NOT inside any tool's agent dir — so the Foreign sweep never
 /// mistakes a backup for an installed agent. Every destructive write copies the
 /// prior bytes here first, making install/update/restore reversible.
-fn backups_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, AppError> {
-    Ok(backups_dir_for(&corpus::app_data_dir(app)?))
-}
-
 fn backups_dir_for(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("backups")
 }
@@ -1000,12 +1110,57 @@ fn record_for(
         artifacts: Vec::new(),
         disabled_path: None,
         source_snapshot_hash: source_hash.to_string(),
+        base_snapshot_id: None,
         capabilities: Vec::new(),
         publisher_key: None,
         publisher_verified: false,
         installed_at: installed_at.to_string(),
         corpus_version: corpus_version.to_string(),
+        source_revision: source_hash.to_string(),
         deployment_notice: (tool == "openclaw").then(|| OPENCLAW_DEPLOYMENT_NOTICE.into()),
+    }
+}
+
+async fn installed_source_revision(
+    state: &AppState,
+    reference: &AgentReference,
+    source_hash: &str,
+) -> Result<String, AppError> {
+    if reference.source_id == crate::agents::BUILTIN_AGENT_SOURCE_ID {
+        let revision = crate::agents::inspect_builtin_agent_source(&state.app_data_dir)
+            .await?
+            .revision;
+        return Ok(select_source_revision(
+            &reference.source_id,
+            source_hash,
+            Some(&revision),
+            None,
+        ));
+    }
+    let source = crate::agents::source_by_id(&state.app_data_dir, &reference.source_id).await?;
+    Ok(select_source_revision(
+        &reference.source_id,
+        source_hash,
+        None,
+        Some(&source.kind),
+    ))
+}
+
+fn select_source_revision(
+    source_id: &str,
+    source_hash: &str,
+    builtin_revision: Option<&str>,
+    kind: Option<&crate::types::AgentSourceKind>,
+) -> String {
+    if source_id == crate::agents::BUILTIN_AGENT_SOURCE_ID {
+        return builtin_revision.unwrap_or(source_hash).to_string();
+    }
+    match kind {
+        Some(crate::types::AgentSourceKind::Github {
+            resolved_commit: Some(commit),
+            ..
+        }) => commit.clone(),
+        _ => source_hash.to_string(),
     }
 }
 
@@ -1039,6 +1194,234 @@ fn record_artifacts(record: &InstallRecord) -> Vec<InstallArtifact> {
     } else {
         record.artifacts.clone()
     }
+}
+
+struct AgentMergeComputation {
+    outcome: AgentMergeOutcome,
+    preview: Option<AgentMergePreview>,
+    verified_installed: Option<Vec<u8>>,
+}
+
+fn unavailable_merge(reason: impl Into<String>) -> AgentMergeComputation {
+    AgentMergeComputation {
+        outcome: AgentMergeOutcome::Unavailable {
+            reason: reason.into(),
+        },
+        preview: None,
+        verified_installed: None,
+    }
+}
+
+fn conflict_hunk_summaries(conflicted: &str) -> Vec<String> {
+    let mut summaries = Vec::new();
+    let mut start = None;
+    for (index, line) in conflicted.lines().enumerate() {
+        if line.starts_with("<<<<<<< ") {
+            start = Some(index + 1);
+        } else if line.starts_with(">>>>>>> ") {
+            if let Some(start) = start.take() {
+                summaries.push(format!(
+                    "Conflict {}: merged lines {start}-{}",
+                    summaries.len() + 1,
+                    index + 1
+                ));
+            }
+        }
+    }
+    summaries
+}
+
+fn merge_preview_hash(
+    record: &InstallRecord,
+    base_snapshot_id: &str,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    preview: &[u8],
+) -> Result<String, AppError> {
+    let binding = serde_json::to_vec(&(
+        "agent-drift-merge-v1",
+        install_identity(record),
+        &record.dest,
+        base_snapshot_id,
+        render::sha256_hex(base),
+        render::sha256_hex(ours),
+        render::sha256_hex(theirs),
+        render::sha256_hex(preview),
+    ))
+    .map_err(|error| AppError::Internal {
+        message: format!("serialize Agent merge preview binding: {error}"),
+    })?;
+    Ok(render::sha256_hex(&binding))
+}
+
+fn merge_utf8(
+    record: &InstallRecord,
+    base_snapshot_id: &str,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+) -> Result<AgentMergeComputation, AppError> {
+    let Ok(base_text) = std::str::from_utf8(base) else {
+        return Ok(unavailable_merge("base snapshot is not valid UTF-8"));
+    };
+    let Ok(ours_text) = std::str::from_utf8(ours) else {
+        return Ok(unavailable_merge("installed Agent is not valid UTF-8"));
+    };
+    let Ok(theirs_text) = std::str::from_utf8(theirs) else {
+        return Ok(unavailable_merge("rendered Agent is not valid UTF-8"));
+    };
+    match diffy::merge(base_text, ours_text, theirs_text) {
+        Ok(preview) => {
+            let preview_hash = merge_preview_hash(
+                record,
+                base_snapshot_id,
+                base,
+                ours,
+                theirs,
+                preview.as_bytes(),
+            )?;
+            Ok(AgentMergeComputation {
+                outcome: AgentMergeOutcome::Clean {
+                    preview_hash: preview_hash.clone(),
+                },
+                preview: Some(AgentMergePreview {
+                    preview,
+                    preview_hash,
+                }),
+                verified_installed: None,
+            })
+        }
+        Err(conflicted) => {
+            let hunk_summaries = conflict_hunk_summaries(&conflicted);
+            Ok(AgentMergeComputation {
+                outcome: AgentMergeOutcome::Conflicts {
+                    count: hunk_summaries.len() as u32,
+                    hunk_summaries,
+                },
+                preview: None,
+                verified_installed: None,
+            })
+        }
+    }
+}
+
+fn merge_eligibility(
+    record: &InstallRecord,
+    paths: &[PathBuf],
+    theirs: &[render::RenderedArtifact],
+) -> Option<&'static str> {
+    if record.disabled_path.is_some() {
+        return Some("enable the Agent before merging");
+    }
+    if paths.len() != 1 || theirs.len() != 1 || record_artifacts(record).len() != 1 {
+        return Some("multi-artifact Agent installs cannot be merged");
+    }
+    if !paths[0]
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "md" | "toml" | "mdc"))
+    {
+        return Some("only md, toml, and mdc Agent installs can be merged");
+    }
+    if record.base_snapshot_id.is_none() {
+        return Some("no canonical base snapshot; overwrite once to enable merging");
+    }
+    None
+}
+
+fn require_merge_preview_hash(actual: &str, expected: &str) -> Result<(), AppError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument {
+            message: "Agent merge preview is stale; base, installed, or rendered bytes changed"
+                .into(),
+        })
+    }
+}
+
+async fn merge_for_record(
+    state: &AppState,
+    record: &InstallRecord,
+    paths: &[PathBuf],
+    theirs: &[render::RenderedArtifact],
+) -> Result<AgentMergeComputation, AppError> {
+    if let Some(reason) = merge_eligibility(record, paths, theirs) {
+        return Ok(unavailable_merge(reason));
+    }
+    let Some(base_snapshot_id) = record.base_snapshot_id.as_deref() else {
+        return Ok(unavailable_merge(
+            "no canonical base snapshot; overwrite once to enable merging",
+        ));
+    };
+    let ours = match read_capped(&paths[0], MAX_INSTALLED_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(unavailable_merge("installed Agent bytes are unavailable")),
+    };
+    let (snapshot, contents) = match history::snapshot_contents(
+        &state.app_data_dir,
+        &install_identity(record),
+        base_snapshot_id,
+        paths,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => return Ok(unavailable_merge("canonical base snapshot is unavailable")),
+    };
+    if contents.len() != 1
+        || snapshot.artifact_hashes.len() != 1
+        || snapshot.source_hash != record.source_snapshot_hash
+        || snapshot.artifact_hashes[0] != render::sha256_hex(&contents[0])
+        || snapshot.rendered_hash != snapshot.artifact_hashes[0]
+    {
+        return Ok(unavailable_merge(
+            "canonical base snapshot failed verification",
+        ));
+    }
+    let mut computed = merge_utf8(
+        record,
+        base_snapshot_id,
+        &contents[0],
+        &ours,
+        theirs[0].content.as_bytes(),
+    )?;
+    if computed.preview.is_some() {
+        computed.verified_installed = Some(ours);
+    }
+    Ok(computed)
+}
+
+async fn merge_for_reference(
+    state: &AppState,
+    reference: &AgentReference,
+    tool: &str,
+    project_path: Option<&str>,
+) -> Result<AgentMergeComputation, AppError> {
+    reject_generic_roster_target(tool)?;
+    let records = load_ledger_for_state(state).await?;
+    let index = install_record_index(
+        &records,
+        &reference.source_id,
+        &reference.relative_path,
+        tool,
+        project_path,
+    )?;
+    let record = &records[index];
+    let package = crate::agents::resolve_agent_package(&state.app_data_dir, reference).await?;
+    let raw = crate::agents::read_agent_text(&state.app_data_dir, reference).await?;
+    if render::sha256_hex(raw.as_bytes()) != package.source_hash {
+        return Err(AppError::InvalidArgument {
+            message: "Agent source changed after inspection".into(),
+        });
+    }
+    let agent = package.agent.ok_or_else(|| AppError::InvalidArgument {
+        message: "Agent package has no valid metadata".into(),
+    })?;
+    let theirs = render::render_artifacts(&agent, &raw, tool)?;
+    let paths = resolved_record_paths(state, record).await?;
+    merge_for_record(state, record, &paths, &theirs).await
 }
 
 /// Copy `dest`'s current bytes into `backup_dir` before it's overwritten, but
@@ -1077,7 +1460,48 @@ async fn backup_if_differs(
     atomic_write(&backup, &existing).await
 }
 
+async fn backup_verified_if_differs(
+    dest: &Path,
+    existing: Option<&[u8]>,
+    new_bytes: &[u8],
+    backup_dir: &Path,
+    stamp: &str,
+) -> Result<(), AppError> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if existing == new_bytes {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(backup_dir)
+        .await
+        .map_err(|error| AppError::Io {
+            message: format!("create backups dir {}: {error}", backup_dir.display()),
+        })?;
+    let filename = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "agent".into());
+    atomic_write(
+        &backup_dir.join(format!("{filename}.{}.bak", fs_stamp(stamp))),
+        existing,
+    )
+    .await
+}
+
 // ---------- Install / update (shared core) ----------
+
+#[derive(Clone, Copy)]
+enum AgentInstallConsent {
+    Desktop { confirmed: bool },
+    Lockfile,
+}
+
+impl AgentInstallConsent {
+    fn confirmed(self) -> bool {
+        matches!(self, Self::Desktop { confirmed: true })
+    }
+}
 
 pub(crate) async fn do_install<R: Runtime>(
     app: &AppHandle<R>,
@@ -1091,7 +1515,120 @@ pub(crate) async fn do_install<R: Runtime>(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
-    do_install_locked(app, state, reference, tool, project_path, confirmed).await
+    corpus::ensure_corpus(app, state).await?;
+    let record = do_install_locked(
+        state,
+        reference,
+        tool,
+        project_path,
+        AgentInstallConsent::Desktop { confirmed },
+        None,
+    )
+    .await?;
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(record)
+}
+
+pub(crate) async fn do_install_lockfile_desktop<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: String,
+) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    corpus::ensure_corpus(app, state).await?;
+    do_install_locked(
+        state,
+        reference,
+        tool,
+        Some(project_path),
+        AgentInstallConsent::Desktop { confirmed: true },
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn do_install_headless_lock(
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: String,
+) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    let record = do_install_locked(
+        state,
+        reference,
+        tool,
+        Some(project_path),
+        AgentInstallConsent::Lockfile,
+        None,
+    )
+    .await?;
+    Ok(record)
+}
+
+async fn do_install_merge<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: Option<String>,
+    confirmed: bool,
+    preview_hash: &str,
+) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    corpus::ensure_corpus(app, state).await?;
+    let record = do_install_locked(
+        state,
+        reference,
+        tool,
+        project_path,
+        AgentInstallConsent::Desktop { confirmed },
+        Some(preview_hash),
+    )
+    .await?;
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(record)
+}
+
+pub(crate) async fn do_install_headless_merge(
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: String,
+    preview_hash: &str,
+) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    do_install_locked(
+        state,
+        reference,
+        tool,
+        Some(project_path),
+        AgentInstallConsent::Lockfile,
+        Some(preview_hash),
+    )
+    .await
 }
 
 pub(crate) async fn do_install_legacy(
@@ -1105,16 +1642,15 @@ pub(crate) async fn do_install_legacy(
     do_install(app, state, reference, tool, project_path, false).await
 }
 
-async fn do_install_locked<R: Runtime>(
-    app: &AppHandle<R>,
+async fn do_install_locked(
     state: &AppState,
     reference: AgentReference,
     tool: Tool,
     project_path: Option<String>,
-    confirmed: bool,
+    consent: AgentInstallConsent,
+    merge_preview_hash: Option<&str>,
 ) -> Result<InstallRecord, AppError> {
     reject_generic_roster_target(&tool)?;
-    corpus::ensure_corpus(app, state).await?;
     let package = crate::agents::resolve_agent_package(&state.app_data_dir, &reference).await?;
     if !package.installable {
         return Err(AppError::InvalidArgument {
@@ -1143,8 +1679,8 @@ async fn do_install_locked<R: Runtime>(
 
     let home = tool_home(state, &tool).await?;
     let proot = project_path.as_ref().map(PathBuf::from);
-    let backups = backups_dir(app)?;
-    let mut ledger = load_ledger(app, state).await?;
+    let backups = backups_dir_for(&state.app_data_dir);
+    let mut ledger = load_ledger_for_install(state).await?;
     let existing_record = ledger
         .iter()
         .find(|record| {
@@ -1155,6 +1691,7 @@ async fn do_install_locked<R: Runtime>(
         })
         .cloned();
     if let Some(existing) = &existing_record {
+        let confirmed = consent.confirmed();
         let library = crate::agents::organize::list(state).await?;
         let policy = library
             .update_policies
@@ -1185,6 +1722,40 @@ async fn do_install_locked<R: Runtime>(
         Some(record) => resolved_record_paths(state, record).await?,
         None => install_target_paths(&agent, Some(&raw), &tool, &home, proot.as_deref(), None)?,
     };
+    let mut verified_existing = None;
+    if merge_preview_hash.is_none() {
+        if let (Some(existing), AgentInstallConsent::Lockfile) = (&existing_record, consent) {
+            let expected = record_rendered_hashes(existing, targets.len());
+            let mut verified = Vec::with_capacity(targets.len());
+            for (path, expected_hash) in targets.iter().zip(expected) {
+                match tokio::fs::read(path).await {
+                    Ok(bytes) if render::sha256_hex(&bytes) == expected_hash => {
+                        verified.push(Some(bytes));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        verified.push(None);
+                    }
+                    Ok(_) => {
+                        return Err(AppError::InvalidArgument {
+                            message: format!(
+                                "managed Agent has local modifications: {}",
+                                path.display()
+                            ),
+                        })
+                    }
+                    Err(error) => {
+                        return Err(AppError::Io {
+                            message: format!(
+                                "read managed Agent before lockfile apply {}: {error}",
+                                path.display()
+                            ),
+                        })
+                    }
+                }
+            }
+            verified_existing = Some(verified);
+        }
+    }
     ensure_destinations_available(
         &ledger,
         &reference,
@@ -1205,7 +1776,29 @@ async fn do_install_locked<R: Runtime>(
         .collect::<Vec<_>>();
     let installed_at = now_iso();
     let rendered = render::render_artifacts(&agent, &raw, &tool)?;
-    let manifest = artifact_manifest(&targets, &rendered)?;
+    let write_rendered = if let Some(expected_preview_hash) = merge_preview_hash {
+        let existing = existing_record
+            .as_ref()
+            .ok_or_else(|| AppError::InvalidArgument {
+                message: "Agent merge requires an existing install".into(),
+            })?;
+        let computed = merge_for_record(state, existing, &targets, &rendered).await?;
+        let preview = computed.preview.ok_or_else(|| AppError::InvalidArgument {
+            message: "Agent merge is no longer clean; request a new preview".into(),
+        })?;
+        verified_existing = Some(vec![Some(computed.verified_installed.ok_or_else(
+            || AppError::Internal {
+                message: "Agent merge lost its verified installed bytes".into(),
+            },
+        )?)]);
+        require_merge_preview_hash(&preview.preview_hash, expected_preview_hash)?;
+        vec![render::RenderedArtifact {
+            content: preview.preview,
+        }]
+    } else {
+        rendered.clone()
+    };
+    let manifest = artifact_manifest(&targets, &write_rendered)?;
     let mut planned_record = record_for(
         &agent,
         &targets[0],
@@ -1221,9 +1814,33 @@ async fn do_install_locked<R: Runtime>(
     planned_record.source_id = reference.source_id.clone();
     planned_record.relative_path = reference.relative_path.clone();
     planned_record.source_snapshot_hash = package.source_hash.clone();
+    planned_record.source_revision =
+        installed_source_revision(state, &reference, &package.source_hash).await?;
     planned_record.capabilities = package.capabilities.clone();
     planned_record.publisher_key = package.publisher_key.clone();
     planned_record.publisher_verified = package.publisher_verified;
+    let prior_snapshot = match (existing_record.as_ref(), prior_paths.is_empty()) {
+        (Some(record), false) => Some(snapshot_record(state, record, &prior_paths).await?),
+        _ => None,
+    };
+    let canonical_manifest = artifact_manifest(&targets, &rendered)?;
+    let canonical_contents = rendered
+        .iter()
+        .map(|artifact| artifact.content.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let base_snapshot = history::create_snapshot_from_bytes_protecting(
+        &state.app_data_dir,
+        &install_identity(&planned_record),
+        &canonical_contents,
+        &package.source_hash,
+        &canonical_manifest[0].rendered_hash,
+        &installed_at,
+        existing_record
+            .as_ref()
+            .and_then(|record| record.base_snapshot_id.as_deref()),
+    )
+    .await?;
+    planned_record.base_snapshot_id = Some(base_snapshot.id);
     let database = state.completed_state_database().await?;
     let operation = if let Some(database) = &database {
         Some(
@@ -1241,11 +1858,14 @@ async fn do_install_locked<R: Runtime>(
                             .iter()
                             .map(|path| path.to_string_lossy().into_owned())
                             .collect(),
-                        rendered: if rendered.len() == 1 {
-                            AgentRenderedPayload::One(rendered[0].content.clone())
+                        rendered: if write_rendered.len() == 1 {
+                            AgentRenderedPayload::One(write_rendered[0].content.clone())
                         } else {
                             AgentRenderedPayload::Many(
-                                rendered.iter().map(|item| item.content.clone()).collect(),
+                                write_rendered
+                                    .iter()
+                                    .map(|item| item.content.clone())
+                                    .collect(),
                             )
                         },
                     },
@@ -1255,25 +1875,16 @@ async fn do_install_locked<R: Runtime>(
     } else {
         None
     };
-    let prior_snapshot = match (existing_record.as_ref(), prior_paths.is_empty()) {
-        (Some(record), false) => Some(snapshot_record(state, record, &prior_paths).await?),
-        _ => None,
-    };
-    let write_result = write_agent_files_at(
-        &agent,
-        &raw,
-        &tool,
-        proot.as_deref(),
-        Some(&backups),
-        &package.source_hash,
-        &package.body_hash,
-        &revision,
-        &installed_at,
+    let write_result = write_rendered_agent_files(
         &targets,
+        &write_rendered,
+        Some(&backups),
+        &installed_at,
+        verified_existing.as_deref(),
     )
     .await;
-    let mut record = match write_result {
-        Ok(record) => record,
+    let record = match write_result {
+        Ok(()) => planned_record,
         Err(error) => {
             let restore = restore_install_transaction(
                 state,
@@ -1294,12 +1905,6 @@ async fn do_install_locked<R: Runtime>(
             };
         }
     };
-    record.source_id = reference.source_id.clone();
-    record.relative_path = reference.relative_path.clone();
-    record.source_snapshot_hash = package.source_hash;
-    record.capabilities = package.capabilities;
-    record.publisher_key = package.publisher_key;
-    record.publisher_verified = package.publisher_verified;
 
     ledger.retain(|existing| {
         !(existing.source_id == reference.source_id
@@ -1310,7 +1915,7 @@ async fn do_install_locked<R: Runtime>(
     ledger.push(record.clone());
     let save = match &operation {
         Some(operation) => save_ledger_after_filesystem(state, &ledger, &operation.id).await,
-        None => save_ledger(app, &ledger).await,
+        None => save_ledger_for(&state.app_data_dir, &ledger).await,
     };
     if let Err(error) = save {
         if operation.is_some() {
@@ -1410,6 +2015,27 @@ async fn capture_batch_files(paths: &[PathBuf]) -> Result<Vec<BatchFileSnapshot>
         snapshots.push(BatchFileSnapshot { path, bytes });
     }
     Ok(snapshots)
+}
+
+async fn require_destination_unchanged(
+    path: &Path,
+    expected: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let current = capture_batch_files(&[path.to_path_buf()])
+        .await?
+        .pop()
+        .expect("one destination snapshot")
+        .bytes;
+    if current.as_deref() == expected {
+        Ok(current)
+    } else {
+        Err(AppError::InvalidArgument {
+            message: format!(
+                "Agent destination changed on disk after verification: {}",
+                path.display()
+            ),
+        })
+    }
 }
 
 async fn restore_batch_files(snapshots: &[BatchFileSnapshot]) -> Result<(), AppError> {
@@ -1911,6 +2537,8 @@ async fn do_track<R: Runtime>(
     )?;
     record.source_id = reference.source_id.clone();
     record.relative_path = reference.relative_path.clone();
+    record.source_revision =
+        installed_source_revision(state, &reference, &package.source_hash).await?;
     record.source_snapshot_hash = package.source_hash;
     record.capabilities = package.capabilities;
     record.publisher_key = package.publisher_key;
@@ -1924,6 +2552,11 @@ async fn do_track<R: Runtime>(
     });
     ledger.push(record.clone());
     save_ledger(app, &ledger).await?;
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
     Ok(record)
 }
 
@@ -2557,6 +3190,31 @@ async fn recover_agent_install_operation(
         return Err(AppError::StorageCorrupt {
             message: "Agent install recovery destinations changed".into(),
         });
+    }
+    if let Some(base_snapshot_id) = payload.next.base_snapshot_id.as_deref() {
+        let (snapshot, contents) = history::snapshot_contents(
+            &state.app_data_dir,
+            &install_identity(&payload.next),
+            base_snapshot_id,
+            &resolved,
+        )
+        .await
+        .map_err(|_| AppError::StorageCorrupt {
+            message: "Agent install recovery lost its canonical base snapshot".into(),
+        })?;
+        if snapshot.source_hash != payload.next.source_snapshot_hash
+            || snapshot.artifact_hashes.len() != contents.len()
+            || snapshot.rendered_hash != snapshot.artifact_hashes[0]
+            || snapshot
+                .artifact_hashes
+                .iter()
+                .zip(&contents)
+                .any(|(expected, bytes)| *expected != render::sha256_hex(bytes))
+        {
+            return Err(AppError::StorageCorrupt {
+                message: "Agent install recovery canonical base snapshot changed".into(),
+            });
+        }
     }
     let base = payload
         .next
@@ -3954,6 +4612,7 @@ async fn write_agent_files_to(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn write_agent_files_at(
     agent: &crate::types::Agent,
     raw: &str,
@@ -3968,36 +4627,7 @@ async fn write_agent_files_at(
 ) -> Result<InstallRecord, AppError> {
     let rendered = render::render_artifacts(agent, raw, tool)?;
     let manifest = artifact_manifest(paths, &rendered)?;
-    let prior = capture_batch_files(paths).await?;
-    for ((dest, artifact), entry) in paths.iter().zip(&rendered).zip(&manifest) {
-        if let Some(bdir) = backup_dir {
-            backup_if_differs(dest, artifact.content.as_bytes(), bdir, installed_at).await?;
-        }
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| AppError::Io {
-                    message: format!("create {}: {e}", parent.display()),
-                })?;
-        }
-        let write = async {
-            atomic_write(dest, artifact.content.as_bytes()).await?;
-            let saved = read_capped(dest, MAX_INSTALLED_BYTES).await?;
-            if render::sha256_hex(&saved) != entry.rendered_hash {
-                return Err(AppError::Internal {
-                    message: format!("verify Agent artifact {} failed", dest.display()),
-                });
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = write {
-            return match restore_batch_files(&prior).await {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(rollback_error("write Agent artifacts", error, rollback)),
-            };
-        }
-    }
+    write_rendered_agent_files(paths, &rendered, backup_dir, installed_at, None).await?;
     let mut record = record_for(
         agent,
         &paths[0],
@@ -4011,6 +4641,76 @@ async fn write_agent_files_at(
     );
     record.artifacts = manifest;
     Ok(record)
+}
+
+async fn write_rendered_agent_files(
+    paths: &[PathBuf],
+    rendered: &[render::RenderedArtifact],
+    backup_dir: Option<&Path>,
+    installed_at: &str,
+    verified_existing: Option<&[Option<Vec<u8>>]>,
+) -> Result<(), AppError> {
+    let manifest = artifact_manifest(paths, rendered)?;
+    let prior = capture_batch_files(paths).await?;
+    if verified_existing.is_some_and(|expected| expected.len() != paths.len()) {
+        return Err(AppError::Internal {
+            message: "Agent verified destination count changed before write".into(),
+        });
+    }
+    let mut written = Vec::new();
+    for (index, ((dest, artifact), entry)) in paths.iter().zip(rendered).zip(&manifest).enumerate()
+    {
+        let expected = verified_existing
+            .map(|items| items[index].as_deref())
+            .unwrap_or_else(|| {
+                prior
+                    .iter()
+                    .find(|snapshot| snapshot.path == *dest)
+                    .and_then(|snapshot| snapshot.bytes.as_deref())
+            });
+        let write = async {
+            let verified = require_destination_unchanged(dest, expected).await?;
+            if let Some(bdir) = backup_dir {
+                backup_verified_if_differs(
+                    dest,
+                    verified.as_deref(),
+                    artifact.content.as_bytes(),
+                    bdir,
+                    installed_at,
+                )
+                .await?;
+            }
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| AppError::Io {
+                        message: format!("create {}: {e}", parent.display()),
+                    })?;
+            }
+            atomic_write(dest, artifact.content.as_bytes()).await?;
+            written.push(dest.clone());
+            let saved = read_capped(dest, MAX_INSTALLED_BYTES).await?;
+            if render::sha256_hex(&saved) != entry.rendered_hash {
+                return Err(AppError::Internal {
+                    message: format!("verify Agent artifact {} failed", dest.display()),
+                });
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = write {
+            let restore = prior
+                .iter()
+                .filter(|snapshot| written.contains(&snapshot.path))
+                .cloned()
+                .collect::<Vec<_>>();
+            return match restore_batch_files(&restore).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("write Agent artifacts", error, rollback)),
+            };
+        }
+    }
+    Ok(())
 }
 
 fn install_target_paths(
@@ -4367,6 +5067,9 @@ async fn build_mutation_plan(
             warnings: Vec::new(),
             blockers: vec![GENERIC_ROSTER_BLOCKER.into()],
             rollback_available: true,
+            merge_outcome: (operation == "update").then(|| AgentMergeOutcome::Unavailable {
+                reason: "aggregate roster installs cannot be merged".into(),
+            }),
         };
         plan.revision =
             render::sha256_hex(
@@ -4522,6 +5225,22 @@ async fn build_mutation_plan(
     warnings.dedup();
     blockers.sort();
     blockers.dedup();
+    let merge_outcome = if operation != "update" {
+        None
+    } else if roots.len() != 1 {
+        Some(AgentMergeOutcome::Unavailable {
+            reason: "multi-Agent update plans cannot be merged".into(),
+        })
+    } else {
+        Some(
+            match merge_for_reference(state, &roots[0], &tool, project_path.as_deref()).await {
+                Ok(computed) => computed.outcome,
+                Err(error) => AgentMergeOutcome::Unavailable {
+                    reason: error.to_string(),
+                },
+            },
+        )
+    };
     let mut plan = AgentMutationPlan {
         revision: String::new(),
         operation: operation.into(),
@@ -4532,6 +5251,7 @@ async fn build_mutation_plan(
         warnings,
         blockers,
         rollback_available: true,
+        merge_outcome,
     };
     plan.revision =
         render::sha256_hex(
@@ -6087,12 +6807,12 @@ async fn execute_install_plan(
     let mut installed = Vec::with_capacity(plan.agents.len());
     for item in &plan.agents {
         match do_install_locked(
-            app,
             state,
             item.reference.clone(),
             plan.tool.clone(),
             plan.project_path.clone(),
-            confirmed,
+            AgentInstallConsent::Desktop { confirmed },
+            None,
         )
         .await
         {
@@ -6113,6 +6833,11 @@ async fn execute_install_plan(
                 };
             }
         }
+    }
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = plan.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
     }
     Ok(installed)
 }
@@ -6182,6 +6907,11 @@ async fn execute_uninstall_plan(
                 }),
             };
         }
+    }
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = plan.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
     }
     Ok(removed)
 }
@@ -6331,6 +7061,35 @@ pub(crate) async fn mcp_install_agent_clean(
     project_path: Option<String>,
     authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<InstallRecord, AppError> {
+    mcp_install_agent_clean_inner(state, reference, tool, project_path, authorization, true).await
+}
+
+pub(crate) async fn mcp_install_agent_clean_for_lockfile(
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: String,
+    authorization: Option<&AuthorizedMcpProject>,
+) -> Result<InstallRecord, AppError> {
+    mcp_install_agent_clean_inner(
+        state,
+        reference,
+        tool,
+        Some(project_path),
+        authorization,
+        false,
+    )
+    .await
+}
+
+async fn mcp_install_agent_clean_inner(
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: Option<String>,
+    authorization: Option<&AuthorizedMcpProject>,
+    sync_lockfile: bool,
+) -> Result<InstallRecord, AppError> {
     reject_generic_roster_target(&tool)?;
     let authorization = authorized_agent_project(project_path.as_deref(), authorization)?;
     let _guard = state.skill_installs_write_lock.lock().await;
@@ -6451,16 +7210,48 @@ pub(crate) async fn mcp_install_agent_clean(
     record.artifacts = manifest;
     record.source_id = reference.source_id.clone();
     record.relative_path = reference.relative_path.clone();
+    record.source_revision =
+        installed_source_revision(state, &reference, &package.source_hash).await?;
     record.source_snapshot_hash = package.source_hash;
     record.capabilities = package.capabilities;
     record.publisher_key = package.publisher_key;
     record.publisher_verified = package.publisher_verified;
+    let snapshot_contents = rendered
+        .iter()
+        .map(|artifact| artifact.content.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let base_snapshot = history::create_snapshot_from_bytes_protecting(
+        &state.app_data_dir,
+        &install_identity(&record),
+        &snapshot_contents,
+        &record.source_snapshot_hash,
+        &record.rendered_hash,
+        &record.installed_at,
+        None,
+    )
+    .await;
+    match base_snapshot {
+        Ok(snapshot) => record.base_snapshot_id = Some(snapshot.id),
+        Err(error) => {
+            return match rollback_clean_agent_files(&created, &hashes, authorization).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback_error("snapshot Agent install", error, rollback)),
+            };
+        }
+    }
     ledger.push(record.clone());
     if let Err(error) = save_ledger_for(&state.app_data_dir, &ledger).await {
         return match rollback_clean_agent_files(&created, &hashes, authorization).await {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback_error("save Agent install", error, rollback)),
         };
+    }
+    drop(_file_guard);
+    drop(_guard);
+    if sync_lockfile {
+        if let Some(project) = record.project_path.as_deref() {
+            lockfile::sync_project_lock_best_effort(state, project).await;
+        }
     }
     Ok(record)
 }
@@ -6558,13 +7349,14 @@ pub(crate) async fn mcp_move_agent_install(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        history::create_snapshot_from_bytes(
+        history::create_snapshot_from_bytes_protecting(
             &state.app_data_dir,
             &install_identity(&records[index]),
             &contents,
             &records[index].source_snapshot_hash,
             &records[index].rendered_hash,
             &now_iso(),
+            records[index].base_snapshot_id.as_deref(),
         )
         .await?;
         for (moved, (source, destination)) in sources.iter().zip(destinations).enumerate() {
@@ -6638,7 +7430,13 @@ pub(crate) async fn mcp_move_agent_install(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    Ok(records[index].clone())
+    let record = records[index].clone();
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(record)
 }
 
 pub(crate) async fn mcp_agent_version_history(
@@ -6858,6 +7656,75 @@ pub async fn update_agent(
         tool,
         project_path,
         confirmed.unwrap_or(false),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn agent_merge_preview(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: Option<String>,
+    relative_path: Option<String>,
+    slug: Option<String>,
+    tool: Tool,
+    project_path: Option<String>,
+) -> Result<AgentMergePreview, AppError> {
+    corpus::ensure_corpus(&app, &state).await?;
+    let reference = resolve_command_reference(
+        &app,
+        &state,
+        source_id.as_deref(),
+        relative_path.as_deref(),
+        slug.as_deref(),
+    )
+    .await?;
+    let computed = merge_for_reference(&state, &reference, &tool, project_path.as_deref()).await?;
+    computed.preview.ok_or_else(|| AppError::InvalidArgument {
+        message: match computed.outcome {
+            AgentMergeOutcome::Conflicts { count, .. } => {
+                format!("Agent merge has {count} conflict(s)")
+            }
+            AgentMergeOutcome::Unavailable { reason } => reason,
+            AgentMergeOutcome::Clean { .. } => "Agent merge preview is unavailable".into(),
+        },
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // ponytail: flat Tauri args preserve the existing command ABI.
+pub async fn agent_merge_apply(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: Option<String>,
+    relative_path: Option<String>,
+    slug: Option<String>,
+    tool: Tool,
+    project_path: Option<String>,
+    preview_hash: String,
+    confirmed: Option<bool>,
+) -> Result<InstallRecord, AppError> {
+    if confirmed != Some(true) {
+        return Err(AppError::InvalidArgument {
+            message: "Agent merge requires explicit confirmation".into(),
+        });
+    }
+    let reference = resolve_command_reference(
+        &app,
+        &state,
+        source_id.as_deref(),
+        relative_path.as_deref(),
+        slug.as_deref(),
+    )
+    .await?;
+    do_install_merge(
+        &app,
+        &state,
+        reference,
+        tool,
+        project_path,
+        true,
+        &preview_hash,
     )
     .await
 }
@@ -7251,7 +8118,7 @@ async fn snapshot_record(
     record: &InstallRecord,
     paths: &[PathBuf],
 ) -> Result<AgentVersionSnapshot, AppError> {
-    snapshot_record_protected(state, record, paths, None).await
+    snapshot_record_protected(state, record, paths, record.base_snapshot_id.as_deref()).await
 }
 
 async fn snapshot_record_protected(
@@ -7428,6 +8295,7 @@ async fn rollback_agent_version(
     let mut next = previous.clone();
     next.source_hash = selected_meta.source_hash.clone();
     next.source_snapshot_hash = selected_meta.source_hash.clone();
+    next.base_snapshot_id = None;
     next.rendered_hash = selected_meta.rendered_hash.clone();
     if !next.artifacts.is_empty() {
         for (artifact, hash) in next
@@ -7511,7 +8379,13 @@ async fn rollback_agent_version(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    Ok(records[index].clone())
+    let record = records[index].clone();
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(record)
 }
 
 fn require_plan_revision(plan: &AgentMutationPlan, expected: &str) -> Result<(), AppError> {
@@ -7796,7 +8670,13 @@ async fn do_uninstall(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
-    do_uninstall_locked(state, reference, tool, project_path).await
+    let record = do_uninstall_locked(state, reference, tool, project_path).await?;
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(())
 }
 
 async fn do_uninstall_locked(
@@ -7804,7 +8684,7 @@ async fn do_uninstall_locked(
     reference: AgentReference,
     tool: Tool,
     project_path: Option<String>,
-) -> Result<(), AppError> {
+) -> Result<InstallRecord, AppError> {
     reject_generic_roster_target(&tool)?;
     let mut ledger = load_ledger_for_state(state).await?;
     let index = install_record_index(
@@ -7912,7 +8792,7 @@ async fn do_uninstall_locked(
             }
         }
     }
-    Ok(())
+    Ok(record)
 }
 
 pub(crate) async fn do_uninstall_legacy(
@@ -11866,7 +12746,7 @@ async fn apply_project_instruction(
 
 // ---------- Loadouts (Agentfile) ----------
 
-const WORKSPACE_PACK_VERSION: u32 = 1;
+const WORKSPACE_PACK_VERSION: u32 = 2;
 const MAX_WORKSPACE_PACK_ITEMS: usize = 256;
 const MAX_WORKSPACE_PACK_NAME_BYTES: usize = 160;
 const MAX_WORKSPACE_PACK_REQUIREMENT_BYTES: usize = 512;
@@ -11889,6 +12769,38 @@ pub struct WorkspacePack {
     mcp_servers: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePackV1 {
+    workspace_pack: u32,
+    name: String,
+    scope: WorkspacePackScope,
+    #[serde(default)]
+    agents: Vec<WorkspacePackAgentV1>,
+    #[serde(default)]
+    skills: Vec<WorkspacePackSkillV1>,
+    #[serde(default)]
+    runbook: Option<String>,
+    #[serde(default)]
+    instructions: Vec<String>,
+    #[serde(default)]
+    mcp_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePackAgentV1 {
+    reference: AgentReference,
+    tool: Tool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePackSkillV1 {
+    reference: SkillReference,
+    runtime: String,
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkspacePackScope {
@@ -11899,6 +12811,7 @@ pub enum WorkspacePackScope {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspacePackAgent {
+    source: PortableSource,
     reference: AgentReference,
     tool: Tool,
 }
@@ -11906,8 +12819,38 @@ struct WorkspacePackAgent {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspacePackSkill {
+    source: PortableSource,
     reference: SkillReference,
     runtime: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum PortableSource {
+    Builtin {
+        source_revision: String,
+    },
+    Github {
+        repository: String,
+        requested_ref: Option<String>,
+        resolved_commit: Option<String>,
+        subdirectory: Option<String>,
+    },
+    Legacy {
+        source_id: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePackSourceAddition {
+    kind: String,
+    source: PortableSource,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -11943,6 +12886,7 @@ pub struct WorkspacePackPlan {
     warnings: Vec<String>,
     blockers: Vec<String>,
     rollback_scope: Vec<String>,
+    source_additions: Vec<WorkspacePackSourceAddition>,
     revision: String,
 }
 
@@ -12068,6 +13012,7 @@ fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, Ap
         }
     }
     for agent in &pack.agents {
+        validate_portable_source(&agent.source)?;
         crate::library::validate_reference(
             &agent.reference.source_id,
             &agent.reference.relative_path,
@@ -12075,6 +13020,7 @@ fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, Ap
         validate_workspace_pack_runtime(&agent.tool, "agent tool")?;
     }
     for skill in &pack.skills {
+        validate_portable_source(&skill.source)?;
         crate::library::validate_reference(
             &skill.reference.source_id,
             &skill.reference.relative_path,
@@ -12098,16 +13044,23 @@ fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, Ap
         }
     }
 
-    pack.agents
-        .sort_by(|left, right| (&left.reference, &left.tool).cmp(&(&right.reference, &right.tool)));
+    pack.agents.sort_by(|left, right| {
+        (&left.source, &left.reference, &left.tool).cmp(&(
+            &right.source,
+            &right.reference,
+            &right.tool,
+        ))
+    });
     pack.agents.dedup();
     pack.skills.sort_by(|left, right| {
         (
+            &left.source,
             &left.reference.source_id,
             &left.reference.relative_path,
             &left.runtime,
         )
             .cmp(&(
+                &right.source,
                 &right.reference.source_id,
                 &right.reference.relative_path,
                 &right.runtime,
@@ -12119,6 +13072,75 @@ fn normalize_workspace_pack(mut pack: WorkspacePack) -> Result<WorkspacePack, Ap
     pack.mcp_servers.sort();
     pack.mcp_servers.dedup();
     Ok(pack)
+}
+
+fn validate_portable_source(source: &PortableSource) -> Result<(), AppError> {
+    match source {
+        PortableSource::Builtin { source_revision } => {
+            if !valid_sha256(source_revision) {
+                return Err(invalid_workspace_pack(
+                    "built-in source revision must be a SHA-256",
+                ));
+            }
+        }
+        PortableSource::Github {
+            repository,
+            requested_ref,
+            resolved_commit,
+            subdirectory,
+        } => {
+            if crate::skills::canonical_github_repository(repository)? != *repository
+                || crate::skills::validated_git_ref(requested_ref.as_deref())? != *requested_ref
+                || crate::skills::validated_resolved_commit(resolved_commit.as_deref())?
+                    != *resolved_commit
+                || crate::skills::validated_subdirectory(subdirectory.as_deref())? != *subdirectory
+            {
+                return Err(invalid_workspace_pack(
+                    "GitHub source coordinate is invalid",
+                ));
+            }
+        }
+        PortableSource::Legacy { source_id } => {
+            crate::library::validate_reference(source_id, "source.md")?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_workspace_pack_v1(pack: WorkspacePackV1) -> Result<WorkspacePack, AppError> {
+    if pack.workspace_pack != 1 {
+        return Err(invalid_workspace_pack("Unsupported Workspace Pack version"));
+    }
+    normalize_workspace_pack(WorkspacePack {
+        workspace_pack: WORKSPACE_PACK_VERSION,
+        name: pack.name,
+        scope: pack.scope,
+        agents: pack
+            .agents
+            .into_iter()
+            .map(|entry| WorkspacePackAgent {
+                source: PortableSource::Legacy {
+                    source_id: entry.reference.source_id.clone(),
+                },
+                reference: entry.reference,
+                tool: entry.tool,
+            })
+            .collect(),
+        skills: pack
+            .skills
+            .into_iter()
+            .map(|entry| WorkspacePackSkill {
+                source: PortableSource::Legacy {
+                    source_id: entry.reference.source_id.clone(),
+                },
+                reference: entry.reference,
+                runtime: entry.runtime,
+            })
+            .collect(),
+        runbook: pack.runbook,
+        instructions: pack.instructions,
+        mcp_servers: pack.mcp_servers,
+    })
 }
 
 fn serialize_workspace_pack(pack: &WorkspacePack) -> Result<Vec<u8>, AppError> {
@@ -12149,10 +13171,27 @@ fn parse_workspace_pack_input(bytes: &[u8]) -> Result<WorkspacePackInput, AppErr
     ) {
         (Some(version), None) if version == u64::from(WORKSPACE_PACK_VERSION) => {
             validate_workspace_pack_json_shape(object)?;
-            let pack = serde_json::from_value(value).map_err(|error| {
+            let pack: WorkspacePack = serde_json::from_value(value).map_err(|error| {
                 invalid_workspace_pack(format!("parse Workspace Pack: {error}"))
             })?;
+            if pack.agents.iter().any(|entry: &WorkspacePackAgent| {
+                matches!(entry.source, PortableSource::Legacy { .. })
+            }) || pack.skills.iter().any(|entry: &WorkspacePackSkill| {
+                matches!(entry.source, PortableSource::Legacy { .. })
+            }) {
+                return Err(invalid_workspace_pack(
+                    "Workspace Pack v2 must use portable sources",
+                ));
+            }
             Ok(WorkspacePackInput::Pack(normalize_workspace_pack(pack)?))
+        }
+        (Some(1), None) => {
+            validate_workspace_pack_json_shape(object)?;
+            validate_workspace_pack_v1_entries(object)?;
+            let pack: WorkspacePackV1 = serde_json::from_value(value).map_err(|error| {
+                invalid_workspace_pack(format!("parse Workspace Pack v1: {error}"))
+            })?;
+            Ok(WorkspacePackInput::Pack(normalize_workspace_pack_v1(pack)?))
         }
         (None, Some(1)) => {
             let legacy: Agentfile = serde_json::from_value(value)
@@ -12186,6 +13225,12 @@ fn validate_workspace_pack_json_shape(
             "Workspace Pack contains an unknown field",
         ));
     }
+    Ok(())
+}
+
+fn validate_workspace_pack_v1_entries(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), AppError> {
     for (label, entries, target) in [
         ("agent", object.get("agents"), "tool"),
         ("skill", object.get("skills"), "runtime"),
@@ -12230,6 +13275,8 @@ fn workspace_pack_from_ledgers(
     project_path: Option<&str>,
     agent_records: &[InstallRecord],
     skill_records: &[crate::types::SkillInstallRecord],
+    agent_sources: &[crate::types::AgentSource],
+    skill_sources: &[crate::types::SkillSource],
 ) -> Result<WorkspacePack, AppError> {
     let selected = |candidate: Option<&str>| match scope {
         WorkspacePackScope::User => candidate.is_none(),
@@ -12242,29 +13289,94 @@ fn workspace_pack_from_ledgers(
         agents: agent_records
             .iter()
             .filter(|record| selected(record.project_path.as_deref()))
-            .map(|record| WorkspacePackAgent {
-                reference: AgentReference {
-                    source_id: record.source_id.clone(),
-                    relative_path: record.relative_path.clone(),
-                },
-                tool: record.tool.clone(),
+            .map(|record| {
+                Ok(WorkspacePackAgent {
+                    source: portable_agent_source(record, agent_sources)?,
+                    reference: AgentReference {
+                        source_id: record.source_id.clone(),
+                        relative_path: record.relative_path.clone(),
+                    },
+                    tool: record.tool.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, AppError>>()?,
         skills: skill_records
             .iter()
             .filter(|record| selected(record.project_path.as_deref()))
-            .map(|record| WorkspacePackSkill {
-                reference: SkillReference {
-                    source_id: record.source_id.clone(),
-                    relative_path: record.relative_path.clone(),
-                },
-                runtime: record.runtime.clone(),
+            .map(|record| {
+                Ok(WorkspacePackSkill {
+                    source: portable_skill_source(record, skill_sources)?,
+                    reference: SkillReference {
+                        source_id: record.source_id.clone(),
+                        relative_path: record.relative_path.clone(),
+                    },
+                    runtime: record.runtime.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, AppError>>()?,
         runbook: None,
         instructions: Vec::new(),
         mcp_servers: Vec::new(),
     })
+}
+
+fn portable_agent_source(
+    record: &InstallRecord,
+    sources: &[crate::types::AgentSource],
+) -> Result<PortableSource, AppError> {
+    if record.source_id == crate::agents::BUILTIN_AGENT_SOURCE_ID {
+        return Ok(PortableSource::Builtin {
+            source_revision: record.source_revision.clone(),
+        });
+    }
+    let source = sources
+        .iter()
+        .find(|source| source.id == record.source_id)
+        .ok_or_else(|| invalid_workspace_pack("Agent source is unavailable for export"))?;
+    match &source.kind {
+        crate::types::AgentSourceKind::Github {
+            repository,
+            git_ref,
+            resolved_commit,
+            subdirectory,
+            ..
+        } => Ok(PortableSource::Github {
+            repository: repository.clone(),
+            requested_ref: git_ref.clone(),
+            resolved_commit: resolved_commit.clone(),
+            subdirectory: subdirectory.clone(),
+        }),
+        _ => Err(invalid_workspace_pack(
+            "Workspace Pack export requires built-in or GitHub Agent sources",
+        )),
+    }
+}
+
+fn portable_skill_source(
+    record: &crate::types::SkillInstallRecord,
+    sources: &[crate::types::SkillSource],
+) -> Result<PortableSource, AppError> {
+    let source = sources
+        .iter()
+        .find(|source| source.id == record.source_id)
+        .ok_or_else(|| invalid_workspace_pack("Skill source is unavailable for export"))?;
+    match &source.kind {
+        crate::types::SkillSourceKind::Github {
+            repository,
+            git_ref,
+            resolved_commit,
+            subdirectory,
+            ..
+        } => Ok(PortableSource::Github {
+            repository: repository.clone(),
+            requested_ref: git_ref.clone(),
+            resolved_commit: resolved_commit.clone(),
+            subdirectory: subdirectory.clone(),
+        }),
+        _ => Err(invalid_workspace_pack(
+            "Workspace Pack export requires GitHub Skill sources",
+        )),
+    }
 }
 
 fn convert_legacy_agentfile(
@@ -12309,8 +13421,12 @@ fn convert_legacy_agentfile(
         .map(|entry| {
             validate_workspace_pack_text(&entry.slug, "legacy slug", 160)?;
             validate_workspace_pack_runtime(&entry.tool, "legacy tool")?;
+            let reference = resolve_legacy_workspace_pack_reference(sources, &entry.slug)?;
             Ok(WorkspacePackAgent {
-                reference: resolve_legacy_workspace_pack_reference(sources, &entry.slug)?,
+                source: PortableSource::Legacy {
+                    source_id: reference.source_id.clone(),
+                },
+                reference,
                 tool: entry.tool,
             })
         })
@@ -12400,6 +13516,8 @@ fn finalize_workspace_pack_plan(plan: &mut WorkspacePackPlan) -> Result<(), AppE
         values.sort();
         values.dedup();
     }
+    plan.source_additions.sort();
+    plan.source_additions.dedup();
     plan.revision.clear();
     plan.revision =
         render::sha256_hex(
@@ -12516,11 +13634,160 @@ fn skill_install_state_name(state: crate::types::SkillInstallState) -> &'static 
     }
 }
 
+fn github_agent_coordinate_matches(
+    kind: &crate::types::AgentSourceKind,
+    coordinate: &PortableSource,
+) -> bool {
+    matches!(
+        (kind, coordinate),
+        (
+            crate::types::AgentSourceKind::Github {
+                repository,
+                git_ref,
+                resolved_commit,
+                subdirectory,
+                ..
+            },
+            PortableSource::Github {
+                repository: expected_repository,
+                requested_ref,
+                resolved_commit: expected_commit,
+                subdirectory: expected_subdirectory,
+            }
+        ) if repository == expected_repository
+            && git_ref == requested_ref
+            && resolved_commit == expected_commit
+            && subdirectory == expected_subdirectory
+    )
+}
+
+fn github_skill_coordinate_matches(
+    kind: &crate::types::SkillSourceKind,
+    coordinate: &PortableSource,
+) -> bool {
+    matches!(
+        (kind, coordinate),
+        (
+            crate::types::SkillSourceKind::Github {
+                repository,
+                git_ref,
+                resolved_commit,
+                subdirectory,
+                ..
+            },
+            PortableSource::Github {
+                repository: expected_repository,
+                requested_ref,
+                resolved_commit: expected_commit,
+                subdirectory: expected_subdirectory,
+            }
+        ) if repository == expected_repository
+            && git_ref == requested_ref
+            && resolved_commit == expected_commit
+            && subdirectory == expected_subdirectory
+    )
+}
+
+fn unresolved_source_id(kind: &str, source: &PortableSource) -> Result<String, AppError> {
+    Ok(format!(
+        "pending:{kind}:{}",
+        render::sha256_hex(
+            &serde_json::to_vec(source).map_err(|error| AppError::Internal {
+                message: format!("serialize portable source coordinate: {error}"),
+            })?
+        )
+    ))
+}
+
+async fn resolve_workspace_pack_sources(
+    state: &AppState,
+    pack: &mut WorkspacePack,
+) -> Result<(Vec<WorkspacePackSourceAddition>, Vec<String>), AppError> {
+    let agent_sources = crate::agents::load_agent_sources(&state.app_data_dir).await?;
+    let skill_sources = crate::skills::load_skill_sources_for_state(state).await?;
+    let builtin_revision = if pack
+        .agents
+        .iter()
+        .any(|entry| matches!(entry.source, PortableSource::Builtin { .. }))
+    {
+        Some(
+            crate::agents::inspect_builtin_agent_source(&state.app_data_dir)
+                .await?
+                .revision,
+        )
+    } else {
+        None
+    };
+    let mut additions = Vec::new();
+    let mut blockers = Vec::new();
+
+    for entry in &mut pack.agents {
+        match &entry.source {
+            PortableSource::Builtin { source_revision } => {
+                entry.reference.source_id = crate::agents::BUILTIN_AGENT_SOURCE_ID.into();
+                if Some(source_revision) != builtin_revision.as_ref() {
+                    blockers.push(format!(
+                        "Built-in Agent source revision is unavailable: {source_revision}"
+                    ));
+                }
+            }
+            PortableSource::Github { .. } => {
+                if let Some(source) = agent_sources
+                    .iter()
+                    .find(|source| github_agent_coordinate_matches(&source.kind, &entry.source))
+                {
+                    entry.reference.source_id.clone_from(&source.id);
+                } else {
+                    entry.reference.source_id = unresolved_source_id("agent", &entry.source)?;
+                    additions.push(WorkspacePackSourceAddition {
+                        kind: "agent".into(),
+                        source: entry.source.clone(),
+                    });
+                }
+            }
+            PortableSource::Legacy { source_id } => {
+                entry.reference.source_id.clone_from(source_id);
+            }
+        }
+    }
+    for entry in &mut pack.skills {
+        match &entry.source {
+            PortableSource::Github { .. } => {
+                if let Some(source) = skill_sources
+                    .iter()
+                    .find(|source| github_skill_coordinate_matches(&source.kind, &entry.source))
+                {
+                    entry.reference.source_id.clone_from(&source.id);
+                } else {
+                    entry.reference.source_id = unresolved_source_id("skill", &entry.source)?;
+                    additions.push(WorkspacePackSourceAddition {
+                        kind: "skill".into(),
+                        source: entry.source.clone(),
+                    });
+                }
+            }
+            PortableSource::Legacy { source_id } => {
+                entry.reference.source_id.clone_from(source_id);
+            }
+            PortableSource::Builtin { .. } => blockers.push(
+                "Built-in source markers are not valid for Skill Workspace Pack entries".into(),
+            ),
+        }
+    }
+    additions.sort();
+    additions.dedup();
+    blockers.sort();
+    blockers.dedup();
+    Ok((additions, blockers))
+}
+
 async fn build_workspace_pack_plan(
     state: &AppState,
-    pack: WorkspacePack,
+    mut pack: WorkspacePack,
     project_path: Option<String>,
 ) -> Result<WorkspacePackPlan, AppError> {
+    let (source_additions, source_blockers) =
+        resolve_workspace_pack_sources(state, &mut pack).await?;
     let project_path = bind_workspace_pack_project(state, pack.scope, project_path).await?;
     if pack.scope == WorkspacePackScope::Project && project_path.is_none() {
         let mut plan = WorkspacePackPlan {
@@ -12554,6 +13821,7 @@ async fn build_workspace_pack_plan(
             warnings: Vec::new(),
             blockers: vec!["Project Workspace Pack requires an explicit project binding".into()],
             rollback_scope: Vec::new(),
+            source_additions,
             revision: String::new(),
         };
         finalize_workspace_pack_plan(&mut plan)?;
@@ -12575,16 +13843,43 @@ async fn build_workspace_pack_plan(
         warnings: Vec::new(),
         blockers: Vec::new(),
         rollback_scope: Vec::new(),
+        source_additions,
         revision: String::new(),
     };
+    plan.blockers.extend(source_blockers);
 
     for requested in &plan.pack.agents {
+        if plan
+            .source_additions
+            .iter()
+            .any(|addition| addition.kind == "agent" && addition.source == requested.source)
+        {
+            plan.agents.push(WorkspacePackAgentPlan {
+                reference: requested.reference.clone(),
+                name: requested.reference.relative_path.clone(),
+                tool: requested.tool.clone(),
+                destinations: Vec::new(),
+                dependency: false,
+                state: "sourceMissing".into(),
+            });
+            continue;
+        }
+        let mutation_operation = if installed_agents.iter().any(|installed| {
+            installed.source_id == requested.reference.source_id
+                && installed.relative_path == requested.reference.relative_path
+                && installed.tool == requested.tool
+                && installed.project_path == plan.project_path
+        }) {
+            "update"
+        } else {
+            "install"
+        };
         let mutation = match build_mutation_plan(
             state,
             vec![requested.reference.clone()],
             requested.tool.clone(),
             plan.project_path.clone(),
-            "install",
+            mutation_operation,
             true,
         )
         .await
@@ -12671,6 +13966,22 @@ async fn build_workspace_pack_plan(
     }
 
     for requested in &plan.pack.skills {
+        if plan
+            .source_additions
+            .iter()
+            .any(|addition| addition.kind == "skill" && addition.source == requested.source)
+        {
+            plan.skills.push(WorkspacePackSkillPlan {
+                reference: requested.reference.clone(),
+                name: requested.reference.relative_path.clone(),
+                runtime: requested.runtime.clone(),
+                destinations: Vec::new(),
+                dependency: false,
+                state: "sourceMissing".into(),
+                permissions: Vec::new(),
+            });
+            continue;
+        }
         let mutation = match crate::skills::plan_skill_install(
             state,
             &requested.reference.source_id,
@@ -12831,6 +14142,8 @@ pub async fn loadout_export(
     }
     let agent_records = load_ledger(&app, &state).await?;
     let skill_records = crate::skills::install::load_ledger_for_state(&state).await?;
+    let agent_source_records = crate::agents::load_agent_sources(&state.app_data_dir).await?;
+    let skill_source_records = crate::skills::load_skill_sources_for_state(&state).await?;
     if agent_records
         .iter()
         .filter(|record| selected(record.project_path.as_deref()))
@@ -12852,6 +14165,8 @@ pub async fn loadout_export(
         project_path.as_deref(),
         &agent_records,
         &skill_records,
+        &agent_source_records,
+        &skill_source_records,
     )?;
     let n = (pack.agents.len() + pack.skills.len()) as u32;
     let bytes = serialize_workspace_pack(&pack)?;
@@ -12918,6 +14233,47 @@ fn expected_workspace_pack_creations(plan: &WorkspacePackPlan) -> Vec<WorkspaceP
         .collect::<Vec<_>>();
     created.dedup();
     created
+}
+
+async fn materialize_workspace_pack_sources(
+    state: &AppState,
+    additions: &[WorkspacePackSourceAddition],
+) -> Result<(), AppError> {
+    for addition in additions {
+        let PortableSource::Github {
+            repository,
+            requested_ref,
+            resolved_commit,
+            subdirectory,
+        } = &addition.source
+        else {
+            continue;
+        };
+        match addition.kind.as_str() {
+            "agent" => {
+                crate::agents::materialize_github_source(
+                    state,
+                    repository,
+                    requested_ref.as_deref(),
+                    resolved_commit.as_deref(),
+                    subdirectory.as_deref(),
+                )
+                .await?;
+            }
+            "skill" => {
+                crate::skills::materialize_github_source(
+                    state,
+                    repository,
+                    requested_ref.as_deref(),
+                    resolved_commit.as_deref(),
+                    subdirectory.as_deref(),
+                )
+                .await?;
+            }
+            _ => return Err(invalid_workspace_pack("unknown planned source addition")),
+        }
+    }
+    Ok(())
 }
 
 async fn rollback_workspace_pack_created(
@@ -13064,9 +14420,19 @@ pub async fn loadout_apply(
     revision: String,
 ) -> Result<WorkspacePackApplyResponse, AppError> {
     let pack = read_workspace_pack_file(&app, &state, Path::new(&path)).await?;
-    let plan = build_workspace_pack_plan(&state, pack, project_path).await?;
+    let mut plan = build_workspace_pack_plan(&state, pack, project_path).await?;
     if require_workspace_pack_revision(&plan, &revision).is_err() || !plan.blockers.is_empty() {
         return Ok(WorkspacePackApplyResponse { plan, result: None });
+    }
+    if !plan.source_additions.is_empty() {
+        materialize_workspace_pack_sources(&state, &plan.source_additions).await?;
+        let approved_revision = plan.revision.clone();
+        plan =
+            build_workspace_pack_plan(&state, plan.pack.clone(), plan.project_path.clone()).await?;
+        plan.revision = approved_revision;
+        if !plan.source_additions.is_empty() || !plan.blockers.is_empty() {
+            return Ok(WorkspacePackApplyResponse { plan, result: None });
+        }
     }
 
     let expected_created = expected_workspace_pack_creations(&plan);
@@ -13349,7 +14715,7 @@ mod tests {
             )
             .unwrap();
         }
-        let source = crate::agents::add_local_source(app.path(), source_root.path())
+        let source = crate::agents::add_test_github_source(app.path(), source_root.path())
             .await
             .unwrap();
         let project_path = std::fs::canonicalize(project.path()).unwrap();
@@ -13472,6 +14838,9 @@ mod tests {
                 .iter()
                 .cloned()
                 .map(|reference| WorkspacePackAgent {
+                    source: PortableSource::Legacy {
+                        source_id: reference.source_id.clone(),
+                    },
                     reference,
                     tool: "aider".into(),
                 })
@@ -13523,12 +14892,12 @@ mod tests {
         );
         assert_blocked(
             do_install_locked(
-                &handle,
                 &state,
                 reference.clone(),
                 "windsurf".into(),
                 None,
-                false,
+                AgentInstallConsent::Desktop { confirmed: false },
+                None,
             )
             .await,
         );
@@ -13878,6 +15247,1081 @@ mod tests {
             .unwrap()
     }
 
+    fn read_project_lock(project: &Path) -> lockfile::AgencyLock {
+        serde_json::from_slice(&std::fs::read(project.join(lockfile::LOCK_FILENAME)).unwrap())
+            .unwrap()
+    }
+
+    type LockIdentity = (String, String, String);
+
+    fn lock_identities(lock: &lockfile::AgencyLock) -> BTreeSet<LockIdentity> {
+        lock.entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.kind.clone(),
+                    entry.source_relative_path.clone(),
+                    entry.tool.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn expected_lock_identities(entries: &[(&str, &str, &str)]) -> BTreeSet<LockIdentity> {
+        entries
+            .iter()
+            .map(|(kind, path, tool)| ((*kind).into(), (*path).into(), (*tool).into()))
+            .collect()
+    }
+
+    fn assert_complete_project_lock(
+        project: &Path,
+        expected: &[(&str, &str, &str)],
+    ) -> lockfile::AgencyLock {
+        let bytes = std::fs::read(project.join(lockfile::LOCK_FILENAME)).unwrap();
+        let lock: lockfile::AgencyLock = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(lock.entries.len(), expected.len());
+        assert_eq!(lock_identities(&lock), expected_lock_identities(expected));
+        let verified = lockfile::verify_lockfile(&bytes, project).unwrap();
+        assert!(verified.clean);
+        assert_eq!(verified.entries.len(), expected.len());
+        assert!(verified
+            .entries
+            .iter()
+            .all(|entry| entry.status == lockfile::VerifyStatus::Ok));
+        lock
+    }
+
+    fn write_lock_agent(root: &Path, path: &str, name: &str, body: &str) {
+        std::fs::write(
+            root.join(path),
+            format!("---\nname: {name}\ndescription: Test.\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_lock_skill(root: &Path, path: &str, name: &str, body: &str) {
+        let package = root.join(path);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Test.\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    async fn ledger_project_identities(
+        state: &AppState,
+        project_path: &str,
+    ) -> BTreeSet<LockIdentity> {
+        let mut identities = BTreeSet::new();
+        for entry in load_install_entries_for_state(state).await.unwrap() {
+            match entry {
+                InstallLedgerEntry::Agent(record)
+                    if record.scope == crate::types::Scope::Project
+                        && record.project_path.as_deref() == Some(project_path)
+                        && record.disabled_path.is_none() =>
+                {
+                    identities.insert(("agent".into(), record.relative_path, record.tool));
+                }
+                InstallLedgerEntry::Agent(_) | InstallLedgerEntry::Roster(_) => {}
+            }
+        }
+        for record in crate::skills::install::load_ledger_for_state(state)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.scope == "project"
+                    && record.project_path.as_deref() == Some(project_path)
+                    && record.disabled_path.is_none()
+            })
+        {
+            identities.insert(("skill".into(), record.relative_path, record.runtime));
+        }
+        identities
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_is_complete_for_multiple_agents_and_skills() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [
+            ("architect.md", "Architect"),
+            ("reviewer.md", "Reviewer"),
+            ("tester.md", "Tester"),
+        ] {
+            write_lock_agent(agent_source.path(), path, name, "Agent body.");
+        }
+        for (path, name) in [("review", "review"), ("test", "test")] {
+            write_lock_skill(skill_source.path(), path, name, "# Skill body");
+        }
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+
+        for (path, tool) in [
+            ("architect.md", "codex"),
+            ("reviewer.md", "cursor"),
+            ("tester.md", "opencode"),
+        ] {
+            do_install(
+                app.handle(),
+                &state,
+                AgentReference {
+                    source_id: agents.id.clone(),
+                    relative_path: path.into(),
+                },
+                tool.into(),
+                Some(project_path.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        for path in ["review", "test"] {
+            crate::skills::install_skill(&state, &skills.id, path, "codex", Some(&project_path))
+                .await
+                .unwrap();
+        }
+
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("agent", "reviewer.md", "cursor"),
+                ("agent", "tester.md", "opencode"),
+                ("skill", "review", "codex"),
+                ("skill", "test", "codex"),
+            ],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_stays_complete_through_mixed_lifecycle() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [
+            ("architect.md", "Architect"),
+            ("reviewer.md", "Reviewer"),
+            ("tester.md", "Tester"),
+        ] {
+            write_lock_agent(agent_source.path(), path, name, "Version zero.");
+        }
+        for (path, name) in [("review", "review"), ("test", "test")] {
+            write_lock_skill(skill_source.path(), path, name, "# Skill body");
+        }
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+        let architect = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "architect.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "reviewer.md".into(),
+        };
+        let tester = AgentReference {
+            source_id: agents.id,
+            relative_path: "tester.md".into(),
+        };
+
+        let original = do_install(
+            app.handle(),
+            &state,
+            architect.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_complete_project_lock(project.path(), &[("agent", "architect.md", "codex")]);
+
+        do_install(
+            app.handle(),
+            &state,
+            reviewer.clone(),
+            "cursor".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("agent", "reviewer.md", "cursor"),
+            ],
+        );
+
+        for path in ["review", "test"] {
+            crate::skills::install_skill(&state, &skills.id, path, "codex", Some(&project_path))
+                .await
+                .unwrap();
+            let expected = if path == "review" {
+                vec![
+                    ("agent", "architect.md", "codex"),
+                    ("agent", "reviewer.md", "cursor"),
+                    ("skill", "review", "codex"),
+                ]
+            } else {
+                vec![
+                    ("agent", "architect.md", "codex"),
+                    ("agent", "reviewer.md", "cursor"),
+                    ("skill", "review", "codex"),
+                    ("skill", "test", "codex"),
+                ]
+            };
+            assert_complete_project_lock(project.path(), &expected);
+        }
+
+        crate::skills::disable_skill(&state, &skills.id, "review", "codex", Some(&project_path))
+            .await
+            .unwrap();
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("agent", "reviewer.md", "cursor"),
+                ("skill", "test", "codex"),
+            ],
+        );
+
+        crate::skills::enable_skill(&state, &skills.id, "review", "codex", Some(&project_path))
+            .await
+            .unwrap();
+        let complete_before_rollback = [
+            ("agent", "architect.md", "codex"),
+            ("agent", "reviewer.md", "cursor"),
+            ("skill", "review", "codex"),
+            ("skill", "test", "codex"),
+        ];
+        assert_complete_project_lock(project.path(), &complete_before_rollback);
+
+        write_lock_agent(
+            agent_source.path(),
+            "architect.md",
+            "Architect",
+            "Version one.",
+        );
+        do_install(
+            app.handle(),
+            &state,
+            architect.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_complete_project_lock(project.path(), &complete_before_rollback);
+        let snapshot = history::list_snapshots(&state.app_data_dir, &install_identity(&original))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.source_hash == original.source_hash)
+            .unwrap();
+        rollback_agent_version(
+            &state,
+            architect,
+            "codex".into(),
+            Some(project_path.clone()),
+            snapshot.id,
+        )
+        .await
+        .unwrap();
+        let rolled_back = assert_complete_project_lock(project.path(), &complete_before_rollback);
+        assert_eq!(
+            rolled_back
+                .entries
+                .iter()
+                .find(|entry| entry.source_relative_path == "architect.md")
+                .unwrap()
+                .source_hash,
+            original.source_hash
+        );
+
+        do_uninstall(
+            &state,
+            reviewer,
+            "cursor".into(),
+            Some(project_path.clone()),
+        )
+        .await
+        .unwrap();
+        let after_uninstall = [
+            ("agent", "architect.md", "codex"),
+            ("skill", "review", "codex"),
+            ("skill", "test", "codex"),
+        ];
+        assert_complete_project_lock(project.path(), &after_uninstall);
+
+        do_install(
+            app.handle(),
+            &state,
+            tester,
+            "opencode".into(),
+            Some(project_path),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("agent", "tester.md", "opencode"),
+                ("skill", "review", "codex"),
+                ("skill", "test", "codex"),
+            ],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_isolated_between_registered_projects() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        write_lock_agent(
+            agent_source.path(),
+            "architect.md",
+            "Architect",
+            "Agent body.",
+        );
+        write_lock_agent(
+            agent_source.path(),
+            "reviewer.md",
+            "Reviewer",
+            "Agent body.",
+        );
+        write_lock_skill(skill_source.path(), "review", "review", "# Skill body");
+        write_lock_skill(skill_source.path(), "test", "test", "# Skill body");
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_a_path = register_project(
+            app_data.path(),
+            std::fs::canonicalize(project_a.path())
+                .unwrap()
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .await
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        let project_b_path = register_project(
+            app_data.path(),
+            std::fs::canonicalize(project_b.path())
+                .unwrap()
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .await
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        assert_eq!(registered_projects(app_data.path()).await.unwrap().len(), 2);
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+        let architect = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "architect.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: agents.id,
+            relative_path: "reviewer.md".into(),
+        };
+
+        do_install(
+            app.handle(),
+            &state,
+            architect.clone(),
+            "codex".into(),
+            Some(project_a_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        do_install(
+            app.handle(),
+            &state,
+            reviewer,
+            "cursor".into(),
+            Some(project_b_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        crate::skills::install_skill(&state, &skills.id, "test", "codex", Some(&project_b_path))
+            .await
+            .unwrap();
+        assert_complete_project_lock(project_a.path(), &[("agent", "architect.md", "codex")]);
+        let project_b_expected = [
+            ("agent", "reviewer.md", "cursor"),
+            ("skill", "test", "codex"),
+        ];
+        assert_complete_project_lock(project_b.path(), &project_b_expected);
+        let project_b_before =
+            std::fs::read(project_b.path().join(lockfile::LOCK_FILENAME)).unwrap();
+
+        crate::skills::install_skill(&state, &skills.id, "review", "codex", Some(&project_a_path))
+            .await
+            .unwrap();
+        assert_complete_project_lock(
+            project_a.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("skill", "review", "codex"),
+            ],
+        );
+        assert_eq!(
+            std::fs::read(project_b.path().join(lockfile::LOCK_FILENAME)).unwrap(),
+            project_b_before
+        );
+        assert_complete_project_lock(project_b.path(), &project_b_expected);
+
+        do_uninstall(&state, architect, "codex".into(), Some(project_a_path))
+            .await
+            .unwrap();
+        assert_complete_project_lock(project_a.path(), &[("skill", "review", "codex")]);
+        assert_eq!(
+            std::fs::read(project_b.path().join(lockfile::LOCK_FILENAME)).unwrap(),
+            project_b_before
+        );
+        assert_complete_project_lock(project_b.path(), &project_b_expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_excludes_user_scope() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let user_tool_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [
+            ("architect.md", "Architect"),
+            ("reviewer.md", "Reviewer"),
+            ("tester.md", "Tester"),
+        ] {
+            write_lock_agent(agent_source.path(), path, name, "Agent body.");
+        }
+        write_lock_skill(skill_source.path(), "review", "review", "# Skill body");
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "kimi".into(),
+            std::fs::canonicalize(user_tool_root.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+
+        for path in ["architect.md", "reviewer.md"] {
+            mcp_install_agent_clean(
+                &state,
+                AgentReference {
+                    source_id: agents.id.clone(),
+                    relative_path: path.into(),
+                },
+                "kimi".into(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        do_install(
+            app.handle(),
+            &state,
+            AgentReference {
+                source_id: agents.id,
+                relative_path: "tester.md".into(),
+            },
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        crate::skills::install_skill(&state, &skills.id, "review", "codex", Some(&project_path))
+            .await
+            .unwrap();
+
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "tester.md", "codex"),
+                ("skill", "review", "codex"),
+            ],
+        );
+        assert!(!user_tool_root.path().join(lockfile::LOCK_FILENAME).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_matches_independent_ledgers() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let user_tool_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [
+            ("architect.md", "Architect"),
+            ("reviewer.md", "Reviewer"),
+            ("tester.md", "Tester"),
+        ] {
+            write_lock_agent(agent_source.path(), path, name, "Agent body.");
+        }
+        for (path, name) in [("review", "review"), ("test", "test")] {
+            write_lock_skill(skill_source.path(), path, name, "# Skill body");
+        }
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        register_project(app_data.path(), &project_path)
+            .await
+            .unwrap();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "kimi".into(),
+            std::fs::canonicalize(user_tool_root.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+        let architect = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "architect.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "reviewer.md".into(),
+        };
+
+        for (reference, tool) in [(architect.clone(), "codex"), (reviewer.clone(), "cursor")] {
+            do_install(
+                app.handle(),
+                &state,
+                reference,
+                tool.into(),
+                Some(project_path.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        for path in ["review", "test"] {
+            crate::skills::install_skill(&state, &skills.id, path, "codex", Some(&project_path))
+                .await
+                .unwrap();
+        }
+        crate::skills::disable_skill(&state, &skills.id, "test", "codex", Some(&project_path))
+            .await
+            .unwrap();
+        mcp_install_agent_clean(
+            &state,
+            AgentReference {
+                source_id: agents.id,
+                relative_path: "tester.md".into(),
+            },
+            "kimi".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let roster_plan = build_roster_plan(
+            &state,
+            vec![architect, reviewer],
+            "aider".into(),
+            project_path.clone(),
+            "install",
+        )
+        .await
+        .unwrap();
+        apply_roster_plan(&state, &roster_plan, &roster_plan.revision, true)
+            .await
+            .unwrap();
+
+        let expected = [
+            ("agent", "architect.md", "codex"),
+            ("agent", "reviewer.md", "cursor"),
+            ("skill", "review", "codex"),
+        ];
+        let lock = assert_complete_project_lock(project.path(), &expected);
+        let ledger_entries = load_install_entries_for_state(&state).await.unwrap();
+        assert!(ledger_entries
+            .iter()
+            .any(|entry| matches!(entry, InstallLedgerEntry::Roster(_))));
+        assert!(ledger_entries.iter().any(|entry| matches!(
+            entry,
+            InstallLedgerEntry::Agent(record) if record.scope == crate::types::Scope::User
+        )));
+        assert!(crate::skills::install::load_ledger_for_state(&state)
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.disabled_path.is_some()));
+        assert_eq!(
+            lock_identities(&lock),
+            ledger_project_identities(&state, &project_path).await
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_agent_disable_enable_updates_lock_and_stays_clean() {
+        use crate::commands::settings::Settings;
+        use crate::state::McpAction;
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [("agent.md", "Agent"), ("reviewer.md", "Reviewer")] {
+            std::fs::write(
+                source_root.path().join(path),
+                format!("---\nname: {name}\ndescription: Test.\n---\n{name} body.\n"),
+            )
+            .unwrap();
+        }
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app_data.path(),
+            Settings {
+                paranoid_mode: false,
+                mcp_agent_install_access: true,
+                mcp_agent_destructive_access: true,
+                mcp_project_allowlist: vec![project_path.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let authorization = state
+            .authorize_mcp_client("test", McpAction::AgentDestructive, Some(&project_path))
+            .await
+            .unwrap()
+            .unwrap();
+        let agent = AgentReference {
+            source_id: source.id.clone(),
+            relative_path: "agent.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: source.id,
+            relative_path: "reviewer.md".into(),
+        };
+
+        for reference in [agent.clone(), reviewer] {
+            do_install(
+                app.handle(),
+                &state,
+                reference,
+                "codex".into(),
+                Some(project_path.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        mcp_move_agent_install(
+            &state,
+            agent.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+            Some(&authorization),
+        )
+        .await
+        .unwrap();
+        let lock_path = project.path().join(lockfile::LOCK_FILENAME);
+        let disabled_bytes = std::fs::read(&lock_path).unwrap();
+        let disabled_lock: lockfile::AgencyLock = serde_json::from_slice(&disabled_bytes).unwrap();
+        assert_eq!(disabled_lock.entries.len(), 1);
+        assert_eq!(disabled_lock.entries[0].source_relative_path, "reviewer.md");
+        let verify = lockfile::verify_lockfile(&disabled_bytes, project.path()).unwrap();
+        assert!(verify.clean);
+        assert!(verify
+            .entries
+            .iter()
+            .all(|entry| entry.status == lockfile::VerifyStatus::Ok));
+        let check = lockfile::mcp_lock_check(&state, &project_path)
+            .await
+            .unwrap();
+        assert!(check.clean);
+        assert!(check
+            .entries
+            .iter()
+            .all(|entry| entry.status == lockfile::LockEntryStatus::Current));
+
+        mcp_move_agent_install(
+            &state,
+            agent,
+            "codex".into(),
+            Some(project_path.clone()),
+            true,
+            Some(&authorization),
+        )
+        .await
+        .unwrap();
+        let enabled_bytes = std::fs::read(lock_path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<lockfile::AgencyLock>(&enabled_bytes)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        assert!(
+            lockfile::verify_lockfile(&enabled_bytes, project.path())
+                .unwrap()
+                .clean
+        );
+        assert!(
+            lockfile::mcp_lock_check(&state, &project_path)
+                .await
+                .unwrap()
+                .clean
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_agent_uninstall_rederives_lock_and_preserves_other_agents() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [("agent.md", "Agent"), ("reviewer.md", "Reviewer")] {
+            std::fs::write(
+                source_root.path().join(path),
+                format!("---\nname: {name}\ndescription: Test.\n---\n{name} body.\n"),
+            )
+            .unwrap();
+        }
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let agent = AgentReference {
+            source_id: source.id.clone(),
+            relative_path: "agent.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: source.id,
+            relative_path: "reviewer.md".into(),
+        };
+
+        do_install(
+            app.handle(),
+            &state,
+            agent.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        do_install(
+            app.handle(),
+            &state,
+            reviewer.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_project_lock(project.path()).entries.len(), 2);
+
+        do_uninstall(&state, agent, "codex".into(), Some(project_path.clone()))
+            .await
+            .unwrap();
+        let lock = read_project_lock(project.path());
+        assert_eq!(lock.entries.len(), 1);
+        assert_eq!(lock.entries[0].source_relative_path, "reviewer.md");
+
+        do_uninstall(&state, reviewer, "codex".into(), Some(project_path))
+            .await
+            .unwrap();
+        assert!(read_project_lock(project.path()).entries.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unresolvable_agent_does_not_block_uninstalling_another_agent() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let dead_source_root = tempfile::tempdir().unwrap();
+        let live_source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        std::fs::write(
+            dead_source_root.path().join("agent.md"),
+            "---\nname: Agent\ndescription: Test.\n---\nAgent body.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            live_source_root.path().join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: Test.\n---\nReviewer body.\n",
+        )
+        .unwrap();
+        let dead_source =
+            crate::agents::add_test_github_source(app_data.path(), dead_source_root.path())
+                .await
+                .unwrap();
+        let live_source =
+            crate::agents::add_test_github_source(app_data.path(), live_source_root.path())
+                .await
+                .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let dead_agent = AgentReference {
+            source_id: dead_source.id.clone(),
+            relative_path: "agent.md".into(),
+        };
+        let live_agent = AgentReference {
+            source_id: live_source.id,
+            relative_path: "reviewer.md".into(),
+        };
+
+        for reference in [dead_agent, live_agent.clone()] {
+            do_install(
+                app.handle(),
+                &state,
+                reference,
+                "codex".into(),
+                Some(project_path.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let lock_path = project.path().join(lockfile::LOCK_FILENAME);
+        let unchanged_lock = std::fs::read(&lock_path).unwrap();
+        assert!(
+            crate::agents::remove_agent_source(app_data.path(), &dead_source.id)
+                .await
+                .unwrap()
+        );
+
+        do_uninstall(&state, live_agent, "codex".into(), Some(project_path))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(lock_path).unwrap(), unchanged_lock);
+    }
+
+    #[tokio::test]
+    async fn user_agent_uninstall_does_not_create_a_lockfile() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let tool_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source_root.path().join("agent.md"),
+            "---\nname: Agent\ndescription: Test.\n---\nAgent body.\n",
+        )
+        .unwrap();
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "kimi".into(),
+            std::fs::canonicalize(tool_home.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let reference = AgentReference {
+            source_id: source.id,
+            relative_path: "agent.md".into(),
+        };
+
+        mcp_install_agent_clean(&state, reference.clone(), "kimi".into(), None, None)
+            .await
+            .unwrap();
+        do_uninstall(&state, reference, "kimi".into(), None)
+            .await
+            .unwrap();
+
+        assert!(!app_data.path().join(lockfile::LOCK_FILENAME).exists());
+        assert!(!tool_home.path().join(lockfile::LOCK_FILENAME).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_version_rollback_rederives_the_project_lock() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        let source_file = source_root.path().join("agent.md");
+        std::fs::write(
+            &source_file,
+            "---\nname: Agent\ndescription: Test.\n---\nVersion zero.\n",
+        )
+        .unwrap();
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let reference = AgentReference {
+            source_id: source.id,
+            relative_path: "agent.md".into(),
+        };
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let installed = do_install(
+            app.handle(),
+            &state,
+            reference.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        let old_hash = read_project_lock(project.path()).entries[0]
+            .source_hash
+            .clone();
+        std::fs::write(
+            &source_file,
+            "---\nname: Agent\ndescription: Test.\n---\nVersion one.\n",
+        )
+        .unwrap();
+        do_install(
+            app.handle(),
+            &state,
+            reference.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        let new_hash = read_project_lock(project.path()).entries[0]
+            .source_hash
+            .clone();
+        let snapshot = history::list_snapshots(&state.app_data_dir, &install_identity(&installed))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.source_hash == old_hash)
+            .unwrap();
+
+        rollback_agent_version(
+            &state,
+            reference,
+            "codex".into(),
+            Some(project_path),
+            snapshot.id,
+        )
+        .await
+        .unwrap();
+
+        let rolled_back_hash = &read_project_lock(project.path()).entries[0].source_hash;
+        assert_eq!(rolled_back_hash, &old_hash);
+        assert_ne!(rolled_back_hash, &new_hash);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn roster_production_commands_cover_all_boundaries_and_uninstall_route() {
         use tauri::Manager as _;
@@ -13893,7 +16337,7 @@ mod tests {
             )
             .unwrap();
         }
-        let source = crate::agents::add_local_source(app_data.path(), source_root.path())
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
             .await
             .unwrap();
         let references = ["agent.md", "reviewer.md"]
@@ -16109,11 +18553,17 @@ mod tests {
 
     fn workspace_pack_fixture() -> WorkspacePack {
         WorkspacePack {
-            workspace_pack: 1,
+            workspace_pack: WORKSPACE_PACK_VERSION,
             name: "Review workspace".into(),
             scope: WorkspacePackScope::Project,
             agents: vec![
                 WorkspacePackAgent {
+                    source: PortableSource::Github {
+                        repository: "https://github.com/acme/agents.git".into(),
+                        requested_ref: Some("main".into()),
+                        resolved_commit: Some("a".repeat(40)),
+                        subdirectory: None,
+                    },
                     reference: AgentReference {
                         source_id: "source-b".into(),
                         relative_path: "nested/writer.md".into(),
@@ -16121,6 +18571,12 @@ mod tests {
                     tool: "claudeCode".into(),
                 },
                 WorkspacePackAgent {
+                    source: PortableSource::Github {
+                        repository: "https://github.com/acme/agents.git".into(),
+                        requested_ref: Some("main".into()),
+                        resolved_commit: Some("a".repeat(40)),
+                        subdirectory: None,
+                    },
                     reference: AgentReference {
                         source_id: "source-a".into(),
                         relative_path: "engineering/reviewer.md".into(),
@@ -16129,6 +18585,12 @@ mod tests {
                 },
             ],
             skills: vec![WorkspacePackSkill {
+                source: PortableSource::Github {
+                    repository: "https://github.com/acme/skills.git".into(),
+                    requested_ref: Some("v1".into()),
+                    resolved_commit: Some("b".repeat(40)),
+                    subdirectory: Some("skills".into()),
+                },
                 reference: crate::types::SkillReference {
                     source_id: "skills".into(),
                     relative_path: "audit".into(),
@@ -18359,7 +20821,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_pack_v1_is_deterministic_bounded_and_path_private() {
+    fn workspace_pack_v2_is_deterministic_bounded_and_path_private() {
         let mut pack = workspace_pack_fixture();
         pack.agents.reverse();
         pack.agents.push(pack.agents[0].clone());
@@ -18369,7 +20831,8 @@ mod tests {
         assert_eq!(normalized.agents.len(), 2);
         assert_eq!(normalized.agents[0].reference.source_id, "source-a");
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("\"workspacePack\": 1"));
+        assert!(text.contains("\"workspacePack\": 2"));
+        assert!(text.contains("\"resolvedCommit\""));
         assert!(!text.contains("/Users/") && !text.contains("projectPath"));
 
         let mut oversize = workspace_pack_fixture();
@@ -18397,8 +20860,14 @@ mod tests {
             panic!("legacy Agentfile must enter review conversion")
         };
         assert_eq!(legacy.installs.len(), 1);
+        let v1 = br#"{"workspacePack":1,"name":"old","scope":"user","agents":[{"reference":{"sourceId":"source-a","relativePath":"reviewer.md"},"tool":"codex"}],"skills":[]}"#;
+        let WorkspacePackInput::Pack(v1) = parse_workspace_pack_input(v1).unwrap() else {
+            panic!("Workspace Pack v1 must normalize into v2")
+        };
+        assert_eq!(v1.workspace_pack, 2);
+        assert!(matches!(v1.agents[0].source, PortableSource::Legacy { .. }));
         assert!(parse_workspace_pack_input(
-            br#"{"workspacePack":2,"name":"future","scope":"user","agents":[],"skills":[]}"#
+            br#"{"workspacePack":3,"name":"future","scope":"user","agents":[],"skills":[]}"#
         )
         .is_err());
         assert!(parse_workspace_pack_input(br#"{"agentfile":2,"installs":[]}"#).is_err());
@@ -18431,6 +20900,17 @@ mod tests {
             Some(project),
             &agents,
             &skills,
+            &[],
+            &[crate::types::SkillSource {
+                id: "skills".into(),
+                kind: crate::types::SkillSourceKind::Github {
+                    repository: "https://github.com/acme/skills.git".into(),
+                    git_ref: None,
+                    resolved_commit: Some("c".repeat(40)),
+                    subdirectory: None,
+                    active_checkout: None,
+                },
+            }],
         )
         .unwrap();
         let text = String::from_utf8(serialize_workspace_pack(&pack).unwrap()).unwrap();
@@ -18438,6 +20918,45 @@ mod tests {
         assert_eq!(pack.skills.len(), 1);
         assert!(text.contains("project.md") && text.contains("\"audit\""));
         assert!(!text.contains(project) && !text.contains("global.md"));
+    }
+
+    #[test]
+    fn github_coordinate_matching_includes_resolved_commit() {
+        let kind = crate::types::AgentSourceKind::Github {
+            repository: "https://github.com/acme/agents.git".into(),
+            git_ref: Some("main".into()),
+            resolved_commit: Some("a".repeat(40)),
+            subdirectory: Some("agents".into()),
+            active_checkout: Some("/tmp/checkout".into()),
+        };
+        let coordinate = PortableSource::Github {
+            repository: "https://github.com/acme/agents.git".into(),
+            requested_ref: Some("main".into()),
+            resolved_commit: Some("a".repeat(40)),
+            subdirectory: Some("agents".into()),
+        };
+        assert!(github_agent_coordinate_matches(&kind, &coordinate));
+        let mut changed = coordinate;
+        if let PortableSource::Github {
+            resolved_commit, ..
+        } = &mut changed
+        {
+            *resolved_commit = Some("b".repeat(40));
+        }
+        assert!(!github_agent_coordinate_matches(&kind, &changed));
+    }
+
+    #[test]
+    fn builtin_install_revision_uses_corpus_content_revision() {
+        assert_eq!(
+            select_source_revision(
+                crate::agents::BUILTIN_AGENT_SOURCE_ID,
+                &"b".repeat(64),
+                Some(&"a".repeat(64)),
+                None,
+            ),
+            "a".repeat(64)
+        );
     }
 
     #[test]
@@ -18500,6 +21019,7 @@ mod tests {
             warnings: vec!["z".into(), "a".into(), "a".into()],
             blockers: Vec::new(),
             rollback_scope: vec!["/bound/project/.codex/agents/reviewer.md".into()],
+            source_additions: Vec::new(),
             revision: String::new(),
         };
         finalize_workspace_pack_plan(&mut plan).unwrap();
@@ -18532,6 +21052,7 @@ mod tests {
             warnings: Vec::new(),
             blockers: Vec::new(),
             rollback_scope: Vec::new(),
+            source_additions: Vec::new(),
             revision: String::new(),
         };
         finalize_workspace_pack_plan(&mut plan).unwrap();
@@ -18609,10 +21130,13 @@ mod tests {
         );
         *state.settings.write().await = SettingsLoadState::Loaded(settings);
         let pack = WorkspacePack {
-            workspace_pack: 1,
+            workspace_pack: WORKSPACE_PACK_VERSION,
             name: "Local review".into(),
             scope: WorkspacePackScope::User,
             agents: vec![WorkspacePackAgent {
+                source: PortableSource::Legacy {
+                    source_id: source.id.clone(),
+                },
                 reference: AgentReference {
                     source_id: source.id,
                     relative_path: "lead.md".into(),
@@ -18663,13 +21187,110 @@ mod tests {
             artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: String::new(),
+            base_snapshot_id: None,
             capabilities: Vec::new(),
             publisher_key: None,
             publisher_verified: false,
             installed_at: String::new(),
             corpus_version: String::new(),
+            source_revision: "a".repeat(64),
             deployment_notice: None,
         }
+    }
+
+    #[tokio::test]
+    async fn portable_derivation_uses_the_commit_from_a_real_git_checkout() {
+        let app_data = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(
+            repository.path().join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: Reviews.\n---\nReview.\n",
+        )
+        .unwrap();
+        run_git(&["add", "reviewer.md"]);
+        run_git(&["commit", "-m", "fixture"]);
+        let commit = run_git(&["rev-parse", "HEAD"]);
+
+        let source = crate::agents::add_github_source(
+            app_data.path(),
+            "https://github.com/agency-agents-test/reviewer.git",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        *state.settings.write().await = crate::commands::settings::SettingsLoadState::FirstLaunch;
+        let refreshed = crate::agents::refresh_git_source_from(
+            &state,
+            &source.id,
+            repository.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut record = row("reviewer", "codex", None);
+        record.source_id = source.id;
+        record.relative_path = "reviewer.md".into();
+        let pack = workspace_pack_from_ledgers(
+            "real git".into(),
+            WorkspacePackScope::User,
+            None,
+            &[record],
+            &[],
+            std::slice::from_ref(&refreshed.source),
+            &[],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &pack.agents[0].source,
+            PortableSource::Github {
+                resolved_commit: Some(resolved),
+                ..
+            } if resolved == &commit
+        ));
+    }
+
+    #[tokio::test]
+    async fn genuine_local_source_fails_closed_during_portable_derivation() {
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let source = crate::agents::add_local_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let mut record = row("reviewer", "codex", None);
+        record.source_id = source.id.clone();
+        record.relative_path = "reviewer.md".into();
+
+        assert!(workspace_pack_from_ledgers(
+            "local".into(),
+            WorkspacePackScope::User,
+            None,
+            &[record],
+            &[],
+            &[source],
+            &[],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("requires built-in or GitHub Agent sources"));
     }
 
     fn recovery_record(project: &Path, rendered_hash: String) -> InstallRecord {
@@ -18688,13 +21309,200 @@ mod tests {
             artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: "a".repeat(64),
+            base_snapshot_id: None,
             capabilities: Vec::new(),
             publisher_key: None,
             publisher_verified: false,
             installed_at: "2026-08-06T00:00:00Z".into(),
             corpus_version: "1".into(),
+            source_revision: "a".repeat(64),
             deployment_notice: None,
         }
+    }
+
+    #[test]
+    fn three_way_merge_combines_independent_edits() {
+        let mut record = row("reviewer", "codex", Some("/project"));
+        record.dest = "/project/.codex/agents/reviewer.toml".into();
+        let computed = merge_utf8(
+            &record,
+            "base",
+            b"alpha\nbeta\n",
+            b"ALPHA\nbeta\n",
+            b"alpha\nbeta\ngamma\n",
+        )
+        .unwrap();
+        assert_eq!(computed.preview.unwrap().preview, "ALPHA\nbeta\ngamma\n");
+        assert!(matches!(computed.outcome, AgentMergeOutcome::Clean { .. }));
+    }
+
+    #[test]
+    fn three_way_merge_reports_conflicts_without_returning_markers() {
+        let record = row("reviewer", "codex", Some("/project"));
+        let computed = merge_utf8(
+            &record,
+            "base",
+            b"alpha\nbeta\n",
+            b"alpha\nours\n",
+            b"alpha\ntheirs\n",
+        )
+        .unwrap();
+        assert!(computed.preview.is_none());
+        match computed.outcome {
+            AgentMergeOutcome::Conflicts {
+                count,
+                hunk_summaries,
+            } => {
+                assert_eq!(count, 1);
+                assert_eq!(hunk_summaries.len(), 1);
+                assert!(!hunk_summaries[0].contains("<<<<<<<"));
+            }
+            outcome => panic!("expected conflicts, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn three_way_merge_rejects_non_utf8() {
+        let record = row("reviewer", "codex", Some("/project"));
+        let computed = merge_utf8(
+            &record,
+            "base",
+            b"alpha\n",
+            &[0xff, b'\n'],
+            b"alpha\nbeta\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            computed.outcome,
+            AgentMergeOutcome::Unavailable { reason } if reason.contains("UTF-8")
+        ));
+    }
+
+    #[test]
+    fn three_way_merge_requires_a_single_artifact_and_base_snapshot() {
+        let mut record = row("reviewer", "codex", Some("/project"));
+        let paths = vec![PathBuf::from("/project/reviewer.toml")];
+        let rendered = vec![render::RenderedArtifact {
+            content: "agent".into(),
+        }];
+        assert!(merge_eligibility(&record, &paths, &rendered)
+            .unwrap()
+            .contains("base snapshot"));
+
+        record.base_snapshot_id = Some("base".into());
+        record.artifacts = vec![
+            InstallArtifact {
+                dest: "/project/reviewer.toml".into(),
+                rendered_hash: "a".repeat(64),
+                disabled_path: None,
+            },
+            InstallArtifact {
+                dest: "/project/reviewer.md".into(),
+                rendered_hash: "b".repeat(64),
+                disabled_path: None,
+            },
+        ];
+        assert!(merge_eligibility(&record, &paths, &rendered)
+            .unwrap()
+            .contains("multi-artifact"));
+    }
+
+    #[test]
+    fn merge_preview_hash_rejects_ours_changed_after_preview() {
+        let record = row("reviewer", "codex", Some("/project"));
+        let first = merge_utf8(
+            &record,
+            "base",
+            b"alpha\nbeta\n",
+            b"ALPHA\nbeta\n",
+            b"alpha\nbeta\ngamma\n",
+        )
+        .unwrap()
+        .preview
+        .unwrap();
+        let changed = merge_utf8(
+            &record,
+            "base",
+            b"alpha\nbeta\n",
+            b"Alpha changed again\nbeta\n",
+            b"alpha\nbeta\ngamma\n",
+        )
+        .unwrap()
+        .preview
+        .unwrap();
+        assert!(require_merge_preview_hash(&changed.preview_hash, &first.preview_hash).is_err());
+    }
+
+    #[tokio::test]
+    async fn base_snapshot_lifecycle_install_modify_update() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let destination = project_path.join("reviewer.md");
+        let base = b"alpha\nbeta\n".to_vec();
+        std::fs::write(&destination, &base).unwrap();
+
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let mut record = row("reviewer", "claudeCode", project_path.to_str());
+        record.dest = destination.to_string_lossy().into_owned();
+        record.source_snapshot_hash = "a".repeat(64);
+        record.rendered_hash = render::sha256_hex(&base);
+        let identity = install_identity(&record);
+        let first = history::create_snapshot_from_bytes_protecting(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&base),
+            &record.source_snapshot_hash,
+            &record.rendered_hash,
+            "2026-08-26T00:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        record.base_snapshot_id = Some(first.id.clone());
+
+        std::fs::write(&destination, b"ALPHA\nbeta\n").unwrap();
+        let theirs = vec![render::RenderedArtifact {
+            content: "alpha\nbeta\ngamma\n".into(),
+        }];
+        let computed =
+            merge_for_record(&state, &record, std::slice::from_ref(&destination), &theirs)
+                .await
+                .unwrap();
+        let preview = computed.preview.unwrap();
+        assert_eq!(preview.preview, "ALPHA\nbeta\ngamma\n");
+
+        let canonical = theirs[0].content.as_bytes().to_vec();
+        let second = history::create_snapshot_from_bytes_protecting(
+            app_data.path(),
+            &identity,
+            std::slice::from_ref(&canonical),
+            &"b".repeat(64),
+            &render::sha256_hex(&canonical),
+            "2026-08-26T00:01:00Z",
+            record.base_snapshot_id.as_deref(),
+        )
+        .await
+        .unwrap();
+        record.base_snapshot_id = Some(second.id.clone());
+        record.rendered_hash = render::sha256_hex(preview.preview.as_bytes());
+        std::fs::write(&destination, preview.preview).unwrap();
+
+        assert_ne!(first.id, second.id);
+        let (_, refreshed_base) = history::snapshot_contents(
+            app_data.path(),
+            &identity,
+            &second.id,
+            std::slice::from_ref(&destination),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed_base, vec![canonical]);
+        assert_eq!(
+            render::sha256_hex(&std::fs::read(&destination).unwrap()),
+            record.rendered_hash
+        );
     }
 
     async fn completed_sqlite_kimi_install(
@@ -19855,6 +22663,10 @@ mod tests {
         );
         assert_eq!(migrated[0].relative_path, "engineering/unique.md");
         assert_eq!(migrated[0].source_snapshot_hash, "old-source");
+        assert_eq!(migrated[0].source_revision, "old-source");
+        assert!(migrated
+            .iter()
+            .all(|record| record.base_snapshot_id.is_none()));
         for row in &migrated[1..] {
             assert_eq!(row.source_id, "legacy:unresolved");
             assert!(row.relative_path.starts_with("legacy/"));
@@ -19898,10 +22710,22 @@ mod tests {
             "sourceId": "local:external",
             "relativePath": "nested/external.md",
             "disabledPath": null,
-            "sourceSnapshotHash": "snapshot"
+            "sourceSnapshotHash": "snapshot",
+            "sourceRevision": "source"
         }))
         .unwrap();
         let original = serde_json::to_value(&migrated).unwrap();
+        let mut legacy_database_row = original.clone();
+        legacy_database_row
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceRevision");
+        let imported =
+            parse_installs_import(&serde_json::to_vec(&vec![legacy_database_row]).unwrap())
+                .unwrap();
+        let imported: Vec<InstallRecord> = serde_json::from_str(&imported).unwrap();
+        assert_eq!(imported[0].source_revision, "source");
+
         let (rows, changed) = migrate_install_records(vec![migrated], None).unwrap();
         assert!(!changed);
         assert_eq!(serde_json::to_value(&rows[0]).unwrap(), original);
@@ -20270,6 +23094,9 @@ mod tests {
 
     #[test]
     fn install_update_requires_confirmation_for_broadened_capabilities() {
+        assert!(!AgentInstallConsent::Lockfile.confirmed());
+        assert!(!AgentInstallConsent::Desktop { confirmed: false }.confirmed());
+        assert!(AgentInstallConsent::Desktop { confirmed: true }.confirmed());
         assert!(!update_policy_allows(
             crate::types::AgentUpdatePolicy::AutoTrusted,
             false,
@@ -20354,6 +23181,7 @@ mod tests {
             warnings: Vec::new(),
             blockers: Vec::new(),
             rollback_available: false,
+            merge_outcome: None,
         };
         assert!(require_plan_revision(&plan, "stale").is_err());
         assert!(require_plan_revision(&plan, "current").is_ok());
@@ -20396,6 +23224,34 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].slug, original_ledger[0].slug);
         assert_eq!(restored[0].dest, original_ledger[0].dest);
+    }
+
+    #[tokio::test]
+    async fn verified_agent_destination_change_aborts_before_backup_or_write() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("agent.md");
+        let backups = root.path().join("backups");
+        std::fs::write(&destination, b"verified").unwrap();
+        let verified = vec![Some(b"verified".to_vec())];
+        std::fs::write(&destination, b"external save").unwrap();
+
+        let error = write_rendered_agent_files(
+            std::slice::from_ref(&destination),
+            &[render::RenderedArtifact {
+                content: "replacement".into(),
+            }],
+            Some(&backups),
+            "2026-08-26T00:00:00Z",
+            Some(&verified),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("changed on disk after verification"));
+        assert_eq!(std::fs::read(destination).unwrap(), b"external save");
+        assert!(!backups.exists());
     }
 
     #[tokio::test]
@@ -21560,11 +24416,13 @@ mod tests {
             artifacts: Vec::new(),
             disabled_path: None,
             source_snapshot_hash: "sh".into(),
+            base_snapshot_id: None,
             capabilities: Vec::new(),
             publisher_key: None,
             publisher_verified: false,
             installed_at: "2026-06-05T00:00:00Z".into(),
             corpus_version: "v".into(),
+            source_revision: "sh".into(),
             deployment_notice: None,
         }];
         let bytes = serde_json::to_vec(&recs).unwrap();

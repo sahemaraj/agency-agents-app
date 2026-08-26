@@ -648,12 +648,12 @@ mod tests {
 
     #[test]
     fn openclaw_artifact_set_matches_upstream_converter() {
-        let source = "---\nname: Frontend Developer\ndescription: Builds UIs.\nemoji: 🎨\nvibe: Ships pixels.\n---\n## Mission\nBuild reliable UIs.\n## Identity\nYou care about craft.\n## Workflow\nVerify the result.\n## Communication Style\nBe direct.\n";
+        let source = "---\nname: Frontend Developer\ndescription: Builds UIs.\nemoji: 🎨\nvibe: Ships pixels.\n---\n## Mission\nBuild reliable UIs.\n## Identity\nYou care about craft.\n## Learning & Memory\nRecord durable lessons.\n## Workflow\nVerify the result.\n## Communication Style\nBe direct.\n";
         let artifacts = render_artifacts(&agent(), source, "openclaw").unwrap();
         assert_eq!(artifacts.len(), 3);
         assert_eq!(
             artifacts[0].content,
-            "## Identity\nYou care about craft.\n## Communication Style\nBe direct.\n\n"
+            "## Identity\nYou care about craft.\n## Learning & Memory\nRecord durable lessons.\n## Communication Style\nBe direct.\n\n"
         );
         assert_eq!(
             artifacts[1].content,
@@ -776,23 +776,30 @@ mod tests {
         let categories: Vec<&str> = dirs_body.split_whitespace().collect();
 
         let temp = tempfile::tempdir().unwrap();
+        // Every single-artifact transform the pinned upstream converter emits.
+        // Keep this list exhaustive: silently dropping a tool here turns a
+        // parity regression into a green build.
         let tools = [
             ("cursor", "cursor/rules", "mdc"),
-            ("codex", "codex/agents", "toml"),
             ("geminiCli", "gemini-cli/agents", "md"),
             ("opencode", "opencode/agents", "md"),
             ("qwen", "qwen/agents", "md"),
+            ("codex", "codex/agents", "toml"),
             ("zcode", "zcode/agents", "md"),
         ];
         for (_, tool_id, _) in tools {
             let tool = tool_id.split('/').next().unwrap();
-            let status = Command::new("bash")
+            let output = Command::new("bash")
                 .arg(&script)
                 .args(["--tool", tool, "--out"])
                 .arg(temp.path())
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success(), "convert.sh failed for {tool}");
+            assert!(
+                output.status.success(),
+                "upstream converter failed for required parity tool '{tool}': {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         let mut files = Vec::new();
@@ -820,7 +827,7 @@ mod tests {
                 vibe: None,
                 body: String::new(),
             };
-            let converted_slug = output_slug(&agent, &raw, "codex");
+            let converted_slug = output_slug(&agent, &raw, "cursor");
             assert!(
                 conversion_slugs.insert(converted_slug.clone()),
                 "duplicate conversion slug: {converted_slug}"

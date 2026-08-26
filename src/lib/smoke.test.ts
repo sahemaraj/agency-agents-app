@@ -126,6 +126,7 @@ const installRecord = (slug: string, dest: string): InstallRecord => ({
   projectPath: null, dest, sourceHash: "source", bodyHash: "body", renderedHash: "rendered",
   disabledPath: null, sourceSnapshotHash: "snapshot", capabilities: [], publisherKey: null,
   publisherVerified: false, installedAt: "2026-08-14T01:00:00Z", corpusVersion: "test",
+  sourceRevision: "source",
 });
 const catalogStatusFixture: CatalogStatus = {
   source: { kind: "bundled" }, root: null, isGit: false, branch: null, commit: null,
@@ -2950,16 +2951,16 @@ describe("frontend test harness", () => {
   it("reviews then applies one mixed Workspace Pack and records exact retained results", async () => {
     const plan: WorkspacePackPlan = {
       pack: {
-        workspacePack: 1, name: "Review workspace", scope: "project",
-        agents: [{ reference: { sourceId: "agents", relativePath: "reviewer.md" }, tool: "codex" }],
-        skills: [{ reference: { sourceId: "skills", relativePath: "audit" }, runtime: "codex" }],
+        workspacePack: 2, name: "Review workspace", scope: "project",
+        agents: [{ source: { kind: "github", repository: "https://github.com/acme/agents.git", requestedRef: "main", resolvedCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", subdirectory: null }, reference: { sourceId: "agents", relativePath: "reviewer.md" }, tool: "codex" }],
+        skills: [{ source: { kind: "github", repository: "https://github.com/acme/skills.git", requestedRef: "main", resolvedCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", subdirectory: null }, reference: { sourceId: "skills", relativePath: "audit" }, runtime: "codex" }],
         runbook: "review-flow", instructions: ["Follow AGENTS.md"], mcpServers: ["memory"],
       },
       projectPath: "/project",
       agents: [{ reference: { sourceId: "agents", relativePath: "reviewer.md" }, name: "Reviewer", tool: "codex", destinations: ["/project/.codex/agents/reviewer.toml"], dependency: false, state: "missing" }],
       skills: [{ reference: { sourceId: "skills", relativePath: "audit" }, name: "Audit", runtime: "codex", destinations: ["/project/.agents/skills/audit"], dependency: false, state: "current", permissions: [] }],
       warnings: ["MCP requirements are declarative"], blockers: [],
-      rollbackScope: ["/project/.codex/agents/reviewer.toml"], revision: "revision-1",
+      rollbackScope: ["/project/.codex/agents/reviewer.toml"], sourceAdditions: [], revision: "revision-1",
     };
     vi.mocked(invoke).mockImplementation(async (command: string) => {
       if (command === "loadout_import") return plan as never;
@@ -7100,7 +7101,7 @@ describe("frontend test harness", () => {
     }
   });
 
-  it("offers only exact tracked outdated and missing Agent and Skill repairs", async () => {
+  it("offers exact tracked outdated, missing, and modified Agent repairs while Skills stay reject-on-modified", async () => {
     install.reconciled = true;
     skillSources.reconciled = true;
     install.installed = [
@@ -7113,6 +7114,7 @@ describe("frontend test harness", () => {
     skillSources.installed = [
       { sourceId: "skills", relativePath: "audit", name: "Audit", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/audit", state: "outdated", tracked: true },
       { sourceId: "skills", relativePath: "build", name: "Build", runtime: "claudeCode", scope: "project", projectPath: "/tmp/project", path: "/tmp/project/build", state: "missing", tracked: true },
+      { sourceId: "skills", relativePath: "edited", name: "Edited Skill", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/edited-skill", state: "modified", tracked: true },
       { sourceId: "skills", relativePath: "off", name: "Off", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/off", state: "disabled", tracked: true },
       { sourceId: "gone", relativePath: "source", name: "Gone", runtime: "codex", scope: "user", projectPath: null, path: "/tmp/gone", state: "sourceUnavailable", tracked: true },
     ];
@@ -7122,21 +7124,153 @@ describe("frontend test harness", () => {
     try {
       await tick();
       const choices = [...target.querySelectorAll<HTMLInputElement>('input[name="repair-item"]')];
-      expect(choices).toHaveLength(4);
+      expect(choices).toHaveLength(5);
       expect(choices.every((choice) => choice.checked)).toBe(true);
       expect(choices.map((choice) => choice.dataset.candidateKey)).toEqual([
         "agent\0built-in\0reviewer.md\0claudeCode\0",
         "agent\0local\0nested/writer.md\0claudeCode\0/tmp/project",
+        "agent\0local\0edited.md\0claudeCode\0",
         "skill\0skills\0audit\0codex\0",
         "skill\0skills\0build\0claudeCode\0/tmp/project",
       ]);
       expect(target.textContent).toContain("Update");
       expect(target.textContent).toContain("Reinstall");
+      expect(target.textContent).toContain("Review local edits");
+      expect(target.textContent).toContain("Edited Skill");
       expect(target.textContent).toContain("Local changes require manual review");
       expect(target.textContent).toContain("Untracked content requires manual review");
       expect(target.textContent).toContain("Other Foreign");
       expect(target.textContent).toContain("Enable this installation before repair");
       expect(target.textContent).toContain("Restore its source before repair");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("renders every modified-Agent merge outcome and offers merge apply only for a clean preview", async () => {
+    const modified = (relativePath: string, name: string): InstalledAgent => ({
+      ...staleControlRow,
+      slug: relativePath.replace(".md", ""),
+      name,
+      sourceId: "built-in",
+      relativePath,
+      dest: `/tmp/${relativePath}`,
+      state: "modified",
+      tracked: true,
+    });
+    const clean = modified("clean.md", "Clean Agent");
+    const conflicts = modified("conflicts.md", "Conflict Agent");
+    const unavailable = modified("unavailable.md", "Unavailable Agent");
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [clean, conflicts, unavailable];
+    vi.mocked(invoke).mockImplementation(async (command: string, args?: unknown) => {
+      const relativePath = String(args && typeof args === "object" && !Array.isArray(args)
+        ? (args as Record<string, unknown>).relativePath ?? ""
+        : "");
+      if (command === "agent_update_plan") {
+        const mergeOutcome = relativePath === "clean.md"
+          ? { status: "clean" as const, previewHash: "preview-clean" }
+          : relativePath === "conflicts.md"
+            ? { status: "conflicts" as const, count: 2, hunkSummaries: ["Conflict 1: merged lines 4-8", "Conflict 2: merged lines 14-17"] }
+            : { status: "unavailable" as const, reason: "no canonical base snapshot; overwrite once to enable merging" };
+        return {
+          revision: `rev-${relativePath}`, operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+          agents: [{ reference: { sourceId: "built-in", relativePath }, name: relativePath, sourceHash: "hash", dependency: false, destination: `/tmp/${relativePath}`, renderedFileCount: 1, capabilities: [] }],
+          warnings: [], blockers: [], rollbackAvailable: true, mergeOutcome,
+        } as never;
+      }
+      if (command === "agent_merge_preview") return { preview: "local edit\nupstream addition\n", previewHash: "preview-clean" } as never;
+      if (command === "agent_diff") return {
+        slug: "clean", tool: "claudeCode", projectPath: null, dest: "/tmp/clean.md",
+        onDisk: "local edit\n", proposed: "upstream only\n", differs: true, artifacts: [],
+      } as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      expect(target.querySelectorAll('input[name="repair-item"]')).toHaveLength(3);
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.querySelectorAll("[data-merge-status]")).toHaveLength(3));
+      expect(target.querySelectorAll('[data-merge-status="clean"]')).toHaveLength(1);
+      expect(target.querySelectorAll('[data-merge-status="conflicts"]')).toHaveLength(1);
+      expect(target.querySelectorAll('[data-merge-status="unavailable"]')).toHaveLength(1);
+      const mergeButtons = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .filter((button) => button.textContent?.includes("Merge and update"));
+      expect(mergeButtons).toHaveLength(1);
+      expect(target.textContent).toContain("Your edits are kept, and upstream changes are added.");
+      expect(target.textContent).toContain("2 conflicting parts need your choice");
+      expect(target.textContent).toContain("No recorded base exists for this install yet");
+
+      mergeButtons[0].click();
+      await vi.waitFor(() => expect(target.textContent).toContain("upstream addition"));
+      expect(target.textContent).toContain("Merged result");
+      target.querySelector<HTMLButtonElement>(".box .close")!.click();
+      await tick();
+
+      [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("View conflicting parts"))!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Conflict 1: merged lines 4-8"));
+      expect(target.textContent).toContain("Nothing has been written");
+      expect(target.textContent).not.toContain("<<<<<<<");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it.each([
+    ["stale preview", "Agent merge preview is stale; base, installed, or rendered bytes changed"],
+    ["no-longer-clean preview", "Agent merge is no longer clean; request a new preview"],
+  ])("reports a %s merge apply and re-previews without silently retrying", async (_case, rejection) => {
+    const agent: InstalledAgent = {
+      ...staleControlRow,
+      sourceId: "built-in",
+      relativePath: "reviewer.md",
+      state: "modified",
+      tracked: true,
+    };
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [agent];
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "agent_update_plan") return {
+        revision: "merge-rev", operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath: "reviewer.md" }, name: "Reviewer", sourceHash: "hash", dependency: false, destination: "/tmp/reviewer.md", renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+        mergeOutcome: { status: "clean", previewHash: "bound-preview" },
+      } as never;
+      if (command === "agent_merge_preview") return { preview: "local edit\nupstream update\n", previewHash: "bound-preview" } as never;
+      if (command === "agent_merge_apply") throw { code: "invalid_argument", message: rejection };
+      if (command === "installs_reconcile") return [agent] as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "agent_diff") return {
+        slug: "reviewer", tool: "claudeCode", projectPath: null, dest: "/tmp/reviewer.md",
+        onDisk: "changed again\n", proposed: "upstream\n", differs: true, artifacts: [],
+      } as never;
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Merge and update"));
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("This file changed on disk after the preview"));
+      expect(target.textContent).not.toContain("Repaired ·");
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_apply")).toHaveLength(1);
+
+      [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("Re-preview"))!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("The preview was refreshed from the file now on disk"));
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_preview")).toHaveLength(4);
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_apply")).toHaveLength(1);
     } finally {
       unmount(component);
       target.remove();
@@ -7234,6 +7368,70 @@ describe("frontend test harness", () => {
       await vi.waitFor(() => expect(target.textContent).toContain("Repair plan changed"));
       expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "update_agent")).toBe(false);
       expect(target.textContent).toContain("Review the updated plan");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("stops a later overwrite when its content changes after an earlier repair", async () => {
+    const modified = (relativePath: string, name: string): InstalledAgent => ({
+      ...staleControlRow,
+      slug: relativePath.replace(".md", ""),
+      name,
+      sourceId: "built-in",
+      relativePath,
+      dest: `/tmp/${relativePath}`,
+      state: "modified",
+      tracked: true,
+    });
+    const first = modified("first.md", "First Agent");
+    const second = modified("second.md", "Second Agent");
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [first, second];
+    let secondRevision = "second-rev-1";
+    vi.mocked(invoke).mockImplementation(async (command: string, args?: unknown) => {
+      const relativePath = String(args && typeof args === "object" && !Array.isArray(args)
+        ? (args as Record<string, unknown>).relativePath ?? ""
+        : "");
+      if (command === "agent_update_plan") return {
+        revision: relativePath === "second.md" ? secondRevision : "first-rev-1",
+        operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath }, name: relativePath, sourceHash: "hash", dependency: false, destination: `/tmp/${relativePath}`, renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+        mergeOutcome: { status: "unavailable", reason: "no canonical base snapshot" },
+      } as never;
+      if (command === "installs_reconcile") return [first, second] as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "update_agent") {
+        if (relativePath === "first.md") secondRevision = "second-rev-2";
+        return {} as never;
+      }
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Approve repairs"));
+      const overwriteButtons = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .filter((button) => button.textContent?.includes("Overwrite local edits"));
+      expect(overwriteButtons).toHaveLength(2);
+      overwriteButtons.forEach((button) => button.click());
+      await tick();
+      vi.mocked(invoke).mockClear();
+      const approve = target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!;
+      expect(approve.disabled).toBe(false);
+      approve.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("This installation changed since review"));
+      const updates = vi.mocked(invoke).mock.calls.filter(([command]) => command === "update_agent");
+      expect(updates).toHaveLength(1);
+      expect(updates[0]?.[1]).toMatchObject({ relativePath: "first.md" });
+      expect(target.textContent).toContain("Second Agent");
+      expect([...target.querySelectorAll<HTMLButtonElement>("button")].some((button) => button.textContent?.includes("Re-preview"))).toBe(true);
     } finally {
       unmount(component);
       target.remove();
@@ -7504,20 +7702,20 @@ describe("frontend test harness", () => {
       ["./components/InstallModal.svelte", [/async function reviewPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewCollection[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollback[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function reviewRoster[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function applyRosterPlan[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function runRosterLifecycle[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function showRosterHistory[^]*?actionError = isAppError[^\n]*appErrorMessage/, /async function rollbackRoster[^]*?actionError = isAppError[^\n]*appErrorMessage/]],
       ["./components/DiffModal.svelte", [/install\.diff[^]*?appErrorMessage/]],
       ["./components/AgencyDashboard.svelte", [/async function updateCatalog[^]*?appErrorMessage/]],
-      ["./components/Projects.svelte", [/async function reveal[^]*?appErrorMessage/, /async function forgetProject[^]*?appErrorMessage/, /async function uninstallAndRemove[^]*?appErrorMessage/, /async function refreshProjectInstructions[^]*?appErrorMessage/, /async function reviewInstruction[^]*?appErrorMessage/, /async function applyInstruction[^]*?appErrorMessage/]],
+      ["./components/Projects.svelte", [/const detection = await projectDetectStack[^]*?stackError = isAppError[^\n]*appErrorMessage/, /async function reveal[^]*?appErrorMessage/, /async function forgetProject[^]*?appErrorMessage/, /async function uninstallAndRemove[^]*?appErrorMessage/, /async function refreshProjectInstructions[^]*?appErrorMessage/, /async function reviewInstruction[^]*?appErrorMessage/, /async function applyInstruction[^]*?appErrorMessage/]],
       ["./stores/catalog.svelte.ts", [/catalog_status[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_check_updates[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_detect[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /async setSource[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /async provisionManaged[^]*?this\.error = isAppError[^\n]*appErrorMessage/, /catalog_pull[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/settings.svelte.ts", [/corruptOnDisk = true[^]*?this\.error = appErrorMessage/, /else if \(isAppError\(e\)\)[^]*?this\.error = appErrorMessage/, /async save[^]*?this\.error = appErrorMessage/, /async reset[^]*?this\.error = appErrorMessage/, /async applySecurityPosture[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/experts.svelte.ts", [/expert_runs_list[^]*?this\.error = isAppError[^\n]*appErrorMessage/]],
       ["./stores/activity.svelte.ts", [/safeActivityDetail[^]*?isAppError\(value\) \? appErrorMessage\(value\)/]],
     ]);
-    expect([...inventory.values()].flat()).toHaveLength(53);
+    expect([...inventory.values()].flat()).toHaveLength(54);
     for (const [path, markers] of inventory) {
       const source = rel01Sources[path];
       expect(source, path).toBeTruthy();
       for (const marker of markers) expect(source.match(marker) ?? [], `${path}: ${marker}`).toHaveLength(1);
     }
     expect([...inventory.keys()].flatMap((path) => rel01Sources[path].match(/\bappErrorMessage\(/g) ?? []))
-      .toHaveLength(65);
+      .toHaveLength(66);
 
     const installSource = rel01Sources["./stores/install.svelte.ts"];
     const propagationEdges = new Map([
@@ -7714,6 +7912,76 @@ describe("frontend test harness", () => {
       expect(invokeMock.mock.calls.filter(([command]) => command === "installs_reconcile"))
         .toHaveLength(genericReconcilesAfterMount);
       expect(install.reconciled).toBe(false);
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("shows manifest evidence and routes stack-aware Agent and Skill suggestions through existing views", async () => {
+    const { default: Projects } = await import("$lib/components/Projects.svelte");
+    const projectPath = "/tmp/stack-project";
+    const projectRows = [{ path: projectPath, label: "Stack project", installedCount: 0 }];
+    const recommendations = [
+      {
+        kind: "agent" as const,
+        package: staleControlPackage,
+        score: 3,
+        reasons: ["language:rust"],
+      },
+      {
+        ...skillRecommendation(),
+        score: 3,
+        reasons: ["language:typescript"],
+      },
+    ];
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string, args) => {
+      if (command === "installs_reconcile" || command === "agent_rosters_reconcile"
+        || command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "projects_list") return projectRows as never;
+      if (command === "project_instructions_inspect" || command === "project_recommendations_list") return [] as never;
+      if (command === "project_readiness_get") return readinessFixture(projectPath, false) as never;
+      if (command === "project_detect_stack") {
+        expect(args).toEqual({ projectPath });
+        return {
+          languages: ["typescript", "rust"],
+          evidence: [
+            { file: "package.json", token: "typescript" },
+            { file: "Cargo.toml", token: "rust" },
+          ],
+        } as never;
+      }
+      if (command === "task_recommendations") {
+        expect(args).toEqual({ task: "", limit: 10, languages: ["typescript", "rust"] });
+        return recommendations as never;
+      }
+      return [] as never;
+    });
+    projects.list = projectRows;
+    ui.projectsSelected = projectPath;
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(Projects, { target });
+    try {
+      const stack = await vi.waitFor(() => {
+        const candidate = target.querySelector<HTMLElement>(".stack-onboarding");
+        expect(candidate?.textContent).toContain("package.json");
+        expect(candidate?.textContent).toContain("Cargo.toml");
+        expect(candidate?.textContent).toContain("language:rust");
+        expect(candidate?.textContent).toContain("language:typescript");
+        return candidate!;
+      });
+      const open = [...stack.querySelectorAll<HTMLButtonElement>(".stack-recommendations button")];
+      expect(open).toHaveLength(2);
+      const callsBeforeNavigation = invokeMock.mock.calls.length;
+      open[0].click();
+      expect(ui.section).toBe("personas");
+      expect(ui.agentsReference).toEqual(staleControlPackage.reference);
+      open[1].click();
+      expect(ui.section).toBe("skills");
+      expect(ui.skillsSelected).toEqual({ sourceId: "skills-b", relativePath: "nested/reviewer" });
+      expect(invokeMock.mock.calls).toHaveLength(callsBeforeNavigation);
     } finally {
       unmount(component);
       target.remove();

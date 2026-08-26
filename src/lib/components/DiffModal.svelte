@@ -22,19 +22,31 @@
     projectPath: string | null;
     name: string;
     reference?: AgentReference;
+    mergedPreview?: string;
+    conflictSummaries?: string[];
     onClose: () => void;
   }
-  let { slug, tool, projectPath, name, reference, onClose }: Props = $props();
+  let {
+    slug, tool, projectPath, name, reference, mergedPreview, conflictSummaries, onClose,
+  }: Props = $props();
 
   let data = $state<AgentDiff | null>(null);
   let error = $state<string | null>(null);
   let loading = $state(true);
 
   onMount(() => {
+    if (conflictSummaries) {
+      loading = false;
+      return;
+    }
     void (reference
       ? install.diffReference(reference, tool, projectPath)
       : install.diff(slug, tool, projectPath))
-      .then((d) => (data = d))
+      .then((d) => (data = mergedPreview === undefined ? d : {
+        ...d,
+        proposed: mergedPreview,
+        differs: d.onDisk !== mergedPreview,
+      }))
       .catch((e) => (error = isAppError(e) ? appErrorMessage(e) : String(e)))
       .finally(() => (loading = false));
   });
@@ -73,6 +85,11 @@
       <p class="muted">{i18n.t("diff.comparing")}</p>
     {:else if error}
       <p class="err">{error}</p>
+    {:else if conflictSummaries}
+      <p class="muted">{i18n.optional("agentUpdates.conflictPreviewHelp", "Nothing has been written. These parts need your choice before your edits and the update can be combined.")}</p>
+      <ul class="conflicts">
+        {#each conflictSummaries as summary}<li>{summary}</li>{/each}
+      </ul>
     {:else if data && data.onDisk === null}
       <p class="muted">{i18n.t("diff.fileMissing")}</p>
     {:else if data && !data.differs}
@@ -80,7 +97,7 @@
     {:else}
       <div class="legend">
         <span class="rem">{i18n.t("diff.onDisk")}</span>
-        <span class="add">{i18n.t("diff.catalog")}</span>
+        <span class="add">{mergedPreview === undefined ? i18n.t("diff.catalog") : i18n.optional("agentUpdates.mergedResult", "Merged result")}</span>
       </div>
       <pre class="diff">{#each rows as r (`${r.oldNo ?? "x"}:${r.newNo ?? "x"}:${r.tag}`)}<span
             class="line {r.tag === '+' ? 'l-add' : r.tag === '-' ? 'l-rem' : 'l-ctx'}"
@@ -129,6 +146,8 @@
   .body { flex: 1; min-height: 0; overflow: auto; padding: var(--space-3) var(--space-4); }
   .muted { color: var(--color-text-muted); font-size: var(--text-body-sm); }
   .err { color: var(--color-danger); font-size: var(--text-body-sm); }
+  .conflicts { margin: var(--space-3) 0 0; padding-left: var(--space-5); color: var(--color-text-primary); font-family: var(--font-mono); font-size: var(--text-mono); }
+  .conflicts li { margin-bottom: var(--space-2); }
   .legend { display: flex; gap: var(--space-4); font-family: var(--font-mono); font-size: var(--text-caption); margin-bottom: var(--space-2); }
   .diff { margin: 0; font-family: var(--font-mono); font-size: var(--text-mono); line-height: 1.5; white-space: pre; }
   .line { display: block; }

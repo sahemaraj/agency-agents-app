@@ -26,6 +26,13 @@ jobs:
   verify:
     name: Verify Windows
     runs-on: windows-latest
+    env:
+      # Required for every cargo invocation below: tauri-build checks the tauri
+      # Cargo features against the config allowlist, and macos-private-api is
+      # enabled unconditionally in Cargo.toml. Only the Tauri CLI merges
+      # tauri.macos.conf.json, so plain cargo needs the value supplied here.
+      # Scoped to this job so the bundling job's config stays untouched.
+      TAURI_CONFIG: '{"app":{"macOSPrivateApi":true}}'
 
     steps:
       - name: Checkout
@@ -59,6 +66,15 @@ jobs:
 
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Self-check stateless lockfile verification
+        shell: pwsh
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --bin agency-agents-app
+          & src-tauri/target/debug/agency-agents-app.exe verify `
+            --project src-tauri/tests/fixtures/verify-project `
+            --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   build:
     name: Build Windows installers (x64 + arm64, unsigned)

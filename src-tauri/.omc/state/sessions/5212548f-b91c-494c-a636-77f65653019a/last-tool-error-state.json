@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"rtk git add -A src-tauri/src README.md src-tauri/Cargo.toml src-tauri/Cargo.lock 2>/dev/null; rtk git commit -m \\\"feat: headless CLI companion — check/plan/apply/list (F2)\\n\\n- direct verb...",
+  "error": "Exit code 1\nOn branch traycer/crisp-koala\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n\tmodified:   ../README.md\n\tmodified:   src/corpus/mod.rs\n\tmodified:   src/install/lockfile.rs\n\tmodified:   src/install/mod.rs\n\tmodified:   src/lib.rs\n\tmodified:   src/main.rs\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\t../.context/\n\t../.omc/\n\t.omc/\n\tsrc/...",
+  "timestamp": "2026-08-25T21:35:35.380Z",
+  "retry_count": 1
+}

@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
@@ -37,6 +39,8 @@ const MAX_SKILL_TAGS: usize = 12;
 const MAX_SKILL_DEPENDENCIES: usize = 32;
 const MAX_SKILL_TAXONOMY_SEGMENT_BYTES: usize = 32;
 const SKILL_TRUST_KEY_ACCOUNT: &str = "skill-trust-hmac-v1";
+const HEADLESS_TRUST_KEY_TIMEOUT: Duration = Duration::from_secs(2);
+const DESKTOP_TRUST_KEY_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SKILL_HISTORY_ENTRIES: usize = 10;
 const MAX_SKILL_HISTORY_SCAN_ENTRIES: usize = 64;
 const MAX_SKILL_HISTORY_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -310,7 +314,9 @@ fn parse_skill_trust_import(raw: &[u8]) -> Result<String, AppError> {
     })
 }
 
-async fn load_skill_trust_for_state(state: &AppState) -> Result<Vec<SkillTrustRecord>, AppError> {
+async fn load_skill_trust_records_for_state(
+    state: &AppState,
+) -> Result<Vec<SkillTrustRecord>, AppError> {
     let records = if let Some(database) = state.completed_state_database().await? {
         database
             .read(skill_trust_spec())
@@ -322,6 +328,11 @@ async fn load_skill_trust_for_state(state: &AppState) -> Result<Vec<SkillTrustRe
         load_skill_trust(&state.app_data_dir).await?
     };
     validate_skill_trust(&records)?;
+    Ok(records)
+}
+
+async fn load_skill_trust_for_state(state: &AppState) -> Result<Vec<SkillTrustRecord>, AppError> {
+    let records = load_skill_trust_records_for_state(state).await?;
     if records.is_empty() {
         return Ok(records);
     }
@@ -537,11 +548,13 @@ fn validate_skill_sources(sources: &[SkillSource]) -> Result<(), AppError> {
             SkillSourceKind::Github {
                 repository,
                 git_ref,
+                resolved_commit,
                 subdirectory,
                 active_checkout,
             } => {
                 if canonical_github_repository(repository)? != *repository
                     || validated_git_ref(git_ref.as_deref())? != *git_ref
+                    || validated_resolved_commit(resolved_commit.as_deref())? != *resolved_commit
                     || validated_subdirectory(subdirectory.as_deref())? != *subdirectory
                     || active_checkout
                         .as_ref()
@@ -621,6 +634,37 @@ pub(crate) async fn add_local_source(
     ensure_local_source(state, root)
         .await
         .map(|(source, _)| source)
+}
+
+#[cfg(test)]
+pub(crate) async fn add_test_github_source(
+    state: &AppState,
+    root: &Path,
+) -> Result<SkillSource, AppError> {
+    let source = add_local_source(state, root).await?;
+    let source_id = source.id.clone();
+    let portable = SkillSource {
+        id: source.id,
+        kind: SkillSourceKind::Github {
+            repository: format!("https://github.com/agency-agents-test/{source_id}.git"),
+            git_ref: None,
+            resolved_commit: Some("a".repeat(40)),
+            subdirectory: None,
+            active_checkout: Some(std::fs::canonicalize(root)?.to_string_lossy().into_owned()),
+        },
+    };
+    let replacement = portable.clone();
+    mutate_skill_sources(state, move |sources| {
+        *sources
+            .iter_mut()
+            .find(|source| source.id == source_id)
+            .ok_or_else(|| AppError::Internal {
+                message: "registered test source disappeared".into(),
+            })? = replacement;
+        Ok(())
+    })
+    .await?;
+    Ok(portable)
 }
 
 pub(crate) async fn ensure_local_source(
@@ -726,6 +770,20 @@ pub(crate) fn validated_git_ref(git_ref: Option<&str>) -> Result<Option<String>,
     Ok(Some(value.to_string()))
 }
 
+pub(crate) fn validated_resolved_commit(
+    resolved_commit: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let Some(value) = resolved_commit else {
+        return Ok(None);
+    };
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::InvalidArgument {
+            message: "resolved Git commit must be a 40-character SHA".into(),
+        });
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
 pub(crate) fn validated_subdirectory(
     subdirectory: Option<&str>,
 ) -> Result<Option<String>, AppError> {
@@ -784,6 +842,7 @@ pub(crate) async fn add_github_source(
             kind: SkillSourceKind::Github {
                 repository,
                 git_ref,
+                resolved_commit: None,
                 subdirectory,
                 active_checkout: None,
             },
@@ -850,6 +909,15 @@ async fn refresh_git_source_from(
     source_id: &str,
     clone_source: &str,
 ) -> Result<SkillSourceResult, AppError> {
+    refresh_git_source_from_ref(state, source_id, clone_source, None).await
+}
+
+async fn refresh_git_source_from_ref(
+    state: &AppState,
+    source_id: &str,
+    clone_source: &str,
+    checkout_override: Option<&str>,
+) -> Result<SkillSourceResult, AppError> {
     state.require_network("skill_source_refresh").await?;
     let sources = load_skill_sources_for_state(state).await?;
     let source_index = sources
@@ -900,7 +968,7 @@ async fn refresh_git_source_from(
         cleanup_unreferenced(staging).await;
         return Err(error);
     }
-    let checkout_ref = git_ref.as_deref().unwrap_or("HEAD");
+    let checkout_ref = checkout_override.or(git_ref.as_deref()).unwrap_or("HEAD");
     if let Err(error) = crate::corpus::run_git(
         &["checkout", "--detach", checkout_ref, "--"],
         Some(&staging),
@@ -910,6 +978,14 @@ async fn refresh_git_source_from(
         cleanup_unreferenced(staging).await;
         return Err(error);
     }
+    let resolved_commit = match crate::corpus::run_git(&["rev-parse", "HEAD"], Some(&staging)).await
+    {
+        Ok(value) => Some(value.trim().to_ascii_lowercase()),
+        Err(error) => {
+            cleanup_unreferenced(staging).await;
+            return Err(error);
+        }
+    };
 
     let candidate_source = sources[source_index].clone();
     let staging_for_validation = staging.clone();
@@ -1002,10 +1078,12 @@ async fn refresh_git_source_from(
     let mut active_source = candidate.source;
     if let SkillSourceKind::Github {
         active_checkout: active,
+        resolved_commit: commit,
         ..
     } = &mut active_source.kind
     {
         *active = Some(active_checkout.to_string_lossy().into_owned());
+        *commit = resolved_commit;
     }
     refresh_fs("state_persist", || Ok(())).await?;
     let source_id = source_id.to_owned();
@@ -1033,6 +1111,17 @@ async fn refresh_git_source_from(
     })
 }
 
+pub(crate) async fn materialize_github_source(
+    state: &AppState,
+    repository: &str,
+    requested_ref: Option<&str>,
+    resolved_commit: Option<&str>,
+    subdirectory: Option<&str>,
+) -> Result<SkillSourceResult, AppError> {
+    let source = add_github_source(state, repository, requested_ref, subdirectory).await?;
+    refresh_git_source_from_ref(state, &source.id, repository, resolved_commit).await
+}
+
 pub(crate) async fn discover_source(source: SkillSource) -> Result<SkillSourceResult, AppError> {
     tokio::task::spawn_blocking(move || discover_source_blocking(source))
         .await
@@ -1041,25 +1130,65 @@ pub(crate) async fn discover_source(source: SkillSource) -> Result<SkillSourceRe
         })?
 }
 
-async fn persisted_trust_key() -> Option<Vec<u8>> {
-    tokio::task::spawn_blocking(|| read_trust_key_with(&SystemKeychain))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten()
+fn trust_key_timeout(headless: bool) -> Duration {
+    if headless {
+        HEADLESS_TRUST_KEY_TIMEOUT
+    } else {
+        DESKTOP_TRUST_KEY_TIMEOUT
+    }
+}
+
+async fn persisted_trust_key_with(
+    keychain: Arc<dyn KeychainSlot>,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let read = tokio::task::spawn_blocking(move || read_trust_key_with(keychain.as_ref()));
+    match tokio::time::timeout(timeout, read).await {
+        Ok(result) => result.ok().and_then(Result::ok).flatten(),
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis(),
+                "skill trust could not be verified before timeout; packages will be treated as untrusted"
+            );
+            None
+        }
+    }
+}
+
+async fn persisted_trust(
+    state: &AppState,
+    keychain: Arc<dyn KeychainSlot>,
+    headless: bool,
+) -> Option<(Vec<SkillTrustRecord>, Option<Vec<u8>>)> {
+    let Ok(records) = load_skill_trust_records_for_state(state).await else {
+        return None;
+    };
+    if records.is_empty() {
+        return Some((records, None));
+    }
+    let key = persisted_trust_key_with(keychain, trust_key_timeout(headless)).await;
+    if key.as_deref().is_some_and(|key| {
+        records
+            .iter()
+            .any(|record| !verify_trust_record(record, key))
+    }) {
+        return None;
+    }
+    Some((records, key))
 }
 
 async fn apply_persisted_trust(
     state: &AppState,
     result: &mut SkillSourceResult,
 ) -> Result<(), AppError> {
-    let Ok(records) = load_skill_trust_for_state(state).await else {
+    let Some((records, key)) =
+        persisted_trust(state, Arc::new(SystemKeychain), state.is_headless()).await
+    else {
         return Ok(());
     };
     if records.is_empty() {
         return Ok(());
     }
-    let key = persisted_trust_key().await;
     let source_root = canonical_skill_source_root(&result.source)?;
     apply_skill_trust(&source_root, result, &records, key.as_deref());
     Ok(())
@@ -1068,12 +1197,26 @@ async fn apply_persisted_trust(
 pub(crate) async fn inspect_skill_sources(
     state: &AppState,
 ) -> Result<Vec<SkillSourceResult>, AppError> {
+    inspect_skill_sources_with_keychain(state, Arc::new(SystemKeychain), state.is_headless()).await
+}
+
+async fn inspect_skill_sources_with_keychain(
+    state: &AppState,
+    keychain: Arc<dyn KeychainSlot>,
+    headless: bool,
+) -> Result<Vec<SkillSourceResult>, AppError> {
     let sources = load_skill_sources_for_state(state).await?;
+    let trust = persisted_trust(state, keychain, headless).await;
     let mut results = Vec::with_capacity(sources.len());
     for source in sources {
         match discover_source(source.clone()).await {
             Ok(mut result) => {
-                apply_persisted_trust(state, &mut result).await?;
+                if let Some((records, key)) = &trust {
+                    if !records.is_empty() {
+                        let source_root = canonical_skill_source_root(&result.source)?;
+                        apply_skill_trust(&source_root, &mut result, records, key.as_deref());
+                    }
+                }
                 results.push(result);
             }
             Err(error) => results.push(SkillSourceResult {
@@ -2817,6 +2960,47 @@ pub(crate) async fn install_skill_with_dependencies_authorized(
     project_path: Option<&str>,
     project_authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<Vec<InstalledSkill>, AppError> {
+    install_skill_with_dependencies_inner(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        project_path,
+        project_authorization,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn install_skill_with_dependencies_for_lockfile(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: &str,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<Vec<InstalledSkill>, AppError> {
+    install_skill_with_dependencies_inner(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        Some(project_path),
+        project_authorization,
+        false,
+    )
+    .await
+}
+
+async fn install_skill_with_dependencies_inner(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+    sync_lockfile: bool,
+) -> Result<Vec<InstalledSkill>, AppError> {
     let plan = plan_skill_install(state, source_id, relative_path, runtime, project_path).await?;
     if !plan.blockers.is_empty() {
         return Err(AppError::InvalidArgument {
@@ -2836,13 +3020,14 @@ pub(crate) async fn install_skill_with_dependencies_authorized(
         if package.dependency && already_managed {
             continue;
         }
-        match install_skill_authorized(
+        match install_skill_authorized_inner(
             state,
             &package.source_id,
             &package.relative_path,
             runtime,
             project_path,
             project_authorization,
+            sync_lockfile,
         )
         .await
         {
@@ -2915,12 +3100,14 @@ pub(crate) async fn batch_collection(
             )
             .await
             .map(|_| ()),
-            "uninstall" => uninstall_skill(
+            "uninstall" => uninstall_skill_authorized_inner(
                 state,
                 &skill.source_id,
                 &skill.relative_path,
                 runtime,
                 project_path,
+                None,
+                false,
             )
             .await
             .map(|_| ()),
@@ -2964,6 +3151,11 @@ pub(crate) async fn batch_collection(
         }
         completed.push(format!("{}/{}", skill.source_id, skill.relative_path));
     }
+    if operation == "uninstall" {
+        if let Some(project) = canonical_project_string(project_path)? {
+            crate::install::lockfile::sync_project_lock_best_effort(state, &project).await;
+        }
+    }
     Ok(SkillBatchResult {
         operation: operation.into(),
         completed,
@@ -2978,6 +3170,27 @@ pub(crate) async fn install_skill_authorized(
     runtime: &str,
     project_path: Option<&str>,
     project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<InstalledSkill, AppError> {
+    install_skill_authorized_inner(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        project_path,
+        project_authorization,
+        true,
+    )
+    .await
+}
+
+async fn install_skill_authorized_inner(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+    sync_lockfile: bool,
 ) -> Result<InstalledSkill, AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
@@ -3042,7 +3255,15 @@ pub(crate) async fn install_skill_authorized(
                 })
             }
             Some(_) if record.source_hash == source_hash => {
-                return Ok(installed_view(record, SkillInstallState::Current))
+                drop(_file_guard);
+                drop(_guard);
+                if sync_lockfile {
+                    if let Some(project) = record.project_path.as_deref() {
+                        crate::install::lockfile::sync_project_lock_best_effort(state, project)
+                            .await;
+                    }
+                }
+                return Ok(installed_view(record, SkillInstallState::Current));
             }
             Some(_) => true,
             None => false,
@@ -3164,6 +3385,13 @@ pub(crate) async fn install_skill_authorized(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         install::save_ledger_after_filesystem(state, &records, &operation.id).await?;
         database.commit_filesystem_operation(&operation.id).await?;
+    }
+    drop(_file_guard);
+    drop(_guard);
+    if sync_lockfile {
+        if let Some(project) = record.project_path.as_deref() {
+            crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+        }
     }
     Ok(installed_view(&record, SkillInstallState::Current))
 }
@@ -4071,7 +4299,7 @@ pub(crate) async fn disable_skill_authorized(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    Ok(installed_view(
+    let installed = installed_view(
         &records[index],
         install::classify(
             Some(&disabled_hash),
@@ -4080,7 +4308,13 @@ pub(crate) async fn disable_skill_authorized(
             true,
             true,
         ),
-    ))
+    );
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = records[index].project_path.as_deref() {
+        crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(installed)
 }
 
 pub(crate) async fn enable_skill(
@@ -4166,7 +4400,7 @@ pub(crate) async fn enable_skill_authorized(
         database.commit_filesystem_operation(&operation.id).await?;
     }
     let (source_available, source_current) = source_status(state, &records[index]).await;
-    Ok(installed_view(
+    let installed = installed_view(
         &records[index],
         install::classify(
             Some(&disk_hash),
@@ -4175,7 +4409,13 @@ pub(crate) async fn enable_skill_authorized(
             source_current,
             false,
         ),
-    ))
+    );
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = records[index].project_path.as_deref() {
+        crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(installed)
 }
 
 pub(crate) async fn uninstall_skill(
@@ -4195,6 +4435,27 @@ pub(crate) async fn uninstall_skill_authorized(
     runtime: &str,
     project_path: Option<&str>,
     project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<bool, AppError> {
+    uninstall_skill_authorized_inner(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        project_path,
+        project_authorization,
+        true,
+    )
+    .await
+}
+
+async fn uninstall_skill_authorized_inner(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+    sync_lockfile: bool,
 ) -> Result<bool, AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
@@ -4226,6 +4487,13 @@ pub(crate) async fn uninstall_skill_authorized(
     if target_hash.is_none() {
         after_missing_uninstall_validation(&target);
         install::save_ledger_for_state(state, &records).await?;
+        drop(_file_guard);
+        drop(_guard);
+        if sync_lockfile {
+            if let Some(project) = record.project_path.as_deref() {
+                crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+            }
+        }
         return Ok(true);
     }
     let expected_target_hash = target_hash.expect("checked present Skill target hash");
@@ -4395,6 +4663,13 @@ pub(crate) async fn uninstall_skill_authorized(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         install::save_ledger_after_filesystem(state, &records, &operation.id).await?;
         database.commit_filesystem_operation(&operation.id).await?;
+    }
+    drop(_file_guard);
+    drop(_guard);
+    if sync_lockfile {
+        if let Some(project) = record.project_path.as_deref() {
+            crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+        }
     }
     Ok(true)
 }
@@ -5101,7 +5376,13 @@ pub(crate) async fn rollback_skill_authorized(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    Ok(installed_view(&records[index], SkillInstallState::Current))
+    let installed = installed_view(&records[index], SkillInstallState::Current);
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = records[index].project_path.as_deref() {
+        crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(installed)
 }
 
 #[tauri::command]
@@ -5451,10 +5732,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::json;
     use sha2::Digest;
@@ -5463,14 +5744,16 @@ mod tests {
     use crate::types::SkillType;
 
     use super::{
-        add_github_source, add_local_source, apply_skill_trust, discover_source,
-        discover_source_blocking, ensure_local_source, inspect_skill_sources,
+        add_github_source, add_local_source, add_test_github_source, apply_skill_trust,
+        canonical_skill_source_root, discover_source, discover_source_blocking,
+        ensure_local_source, inspect_skill_sources, inspect_skill_sources_with_keychain,
         is_windows_reparse_point, load_or_create_trust_key_with, load_skill_sources,
         load_skill_sources_for_state, read_skill_file, refresh_git_source_from,
-        remove_skill_source, reset_refresh_fs_probe, resolve_skill_package, sign_trust_record,
-        skill_destination_presence, skill_sources_path, skill_sources_spec, take_refresh_fs_probe,
-        trust_fingerprint, validate_imported_skill_trust, validate_package, verify_publisher,
-        SkillPublisherMetadata, SkillTrustRecord, MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES,
+        remove_skill_source, reset_refresh_fs_probe, resolve_skill_package, save_skill_trust,
+        sign_trust_record, skill_destination_presence, skill_sources_path, skill_sources_spec,
+        take_refresh_fs_probe, trust_fingerprint, validate_imported_skill_trust, validate_package,
+        verify_publisher, SkillPublisherMetadata, SkillTrustRecord, HEADLESS_TRUST_KEY_TIMEOUT,
+        MAX_SKILL_FILES, MAX_SKILL_FILE_BYTES, SKILL_TRUST_KEY_ACCOUNT,
     };
 
     #[test]
@@ -5586,9 +5869,7 @@ mod tests {
             .expect("complete migration");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
 
         super::install_skill(
             &state,
@@ -5673,7 +5954,7 @@ mod tests {
             .unwrap();
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let package = resolve_skill_package(&state, &registered.id, "reviewer")
             .await
             .unwrap();
@@ -5780,7 +6061,7 @@ mod tests {
         let project = tempdir().expect("project");
         let (database, state) = completed_sqlite_skill_state(app.path()).await;
         write_skill(source.path(), "reviewer", "reviewer", "Version zero");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -5978,6 +6259,20 @@ mod tests {
         state
     }
 
+    fn read_project_lock(project: &Path) -> crate::install::lockfile::AgencyLock {
+        serde_json::from_slice(
+            &std::fs::read(project.join(crate::install::lockfile::LOCK_FILENAME))
+                .expect("read project lockfile"),
+        )
+        .expect("parse project lockfile")
+    }
+
+    async fn add_portable_test_source(state: &AppState, root: &Path) -> SkillSource {
+        add_test_github_source(state, root)
+            .await
+            .expect("register portable test source")
+    }
+
     fn write_skill(root: &Path, relative_dir: &str, name: &str, description: &str) {
         let package = root.join(relative_dir);
         std::fs::create_dir_all(&package).expect("create package");
@@ -6007,13 +6302,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_skill_disable_enable_updates_lock_and_stays_clean() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_portable_test_source(&state, source.path()).await;
+        let project_path = project.path().to_string_lossy().into_owned();
+
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install project skill");
+        super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("disable project skill");
+
+        let lock_path = project.path().join(crate::install::lockfile::LOCK_FILENAME);
+        let disabled_bytes = std::fs::read(&lock_path).expect("read disabled lockfile");
+        assert!(
+            serde_json::from_slice::<crate::install::lockfile::AgencyLock>(&disabled_bytes)
+                .expect("parse disabled lockfile")
+                .entries
+                .is_empty()
+        );
+        let verify = crate::install::lockfile::verify_lockfile(&disabled_bytes, project.path())
+            .expect("verify disabled lockfile");
+        assert!(verify.clean);
+        assert!(verify.entries.is_empty());
+        let check = crate::install::lockfile::mcp_lock_check(&state, &project_path)
+            .await
+            .expect("check disabled lockfile");
+        assert!(check.clean);
+        assert!(check.entries.is_empty());
+
+        super::enable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("enable project skill");
+        let enabled_bytes = std::fs::read(lock_path).expect("read enabled lockfile");
+        assert_eq!(
+            serde_json::from_slice::<crate::install::lockfile::AgencyLock>(&enabled_bytes)
+                .expect("parse enabled lockfile")
+                .entries
+                .len(),
+            1
+        );
+        assert!(
+            crate::install::lockfile::verify_lockfile(&enabled_bytes, project.path())
+                .expect("verify enabled lockfile")
+                .clean
+        );
+        assert!(
+            crate::install::lockfile::mcp_lock_check(&state, &project_path)
+                .await
+                .expect("check enabled lockfile")
+                .clean
+        );
+    }
+
+    #[tokio::test]
+    async fn project_skill_uninstall_rederives_the_lockfile() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_portable_test_source(&state, source.path()).await;
+        let project_path = project.path().to_string_lossy().into_owned();
+
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install project skill");
+        assert_eq!(read_project_lock(project.path()).entries.len(), 1);
+
+        super::uninstall_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("uninstall project skill");
+
+        assert!(read_project_lock(project.path()).entries.is_empty());
+    }
+
+    #[tokio::test]
     async fn sqlite_rollback_commits_an_exact_skill_update_after_installing_bytes() {
         let app = tempdir().expect("app data");
         let source = tempdir().expect("source");
         let project = tempdir().expect("project");
         let (database, state) = completed_sqlite_skill_state(app.path()).await;
         write_skill(source.path(), "reviewer", "reviewer", "Version zero");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -6052,6 +6458,9 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        let newer_hash = read_project_lock(project.path()).entries[0]
+            .source_hash
+            .clone();
 
         super::rollback_skill_authorized(
             &state,
@@ -6071,6 +6480,9 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        let rolled_back_hash = &read_project_lock(project.path()).entries[0].source_hash;
+        assert_eq!(rolled_back_hash, &selected.content_hash);
+        assert_ne!(rolled_back_hash, &newer_hash);
         let connection =
             rusqlite::Connection::open(app.path().join("state/agency-agents.sqlite3")).unwrap();
         let update_count: u32 = connection
@@ -6491,7 +6903,7 @@ mod tests {
         let project = tempdir().expect("project");
         let (database, state) = completed_sqlite_skill_state(app.path()).await;
         write_skill(source.path(), "reviewer", "reviewer", "Version zero");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -6610,10 +7022,8 @@ mod tests {
             "reviewer",
             "Second source v1",
         );
-        let first = add_local_source(&state, first_source.path()).await.unwrap();
-        let second = add_local_source(&state, second_source.path())
-            .await
-            .unwrap();
+        let first = add_portable_test_source(&state, first_source.path()).await;
+        let second = add_portable_test_source(&state, second_source.path()).await;
         let first_project_path = first_project.path().to_string_lossy().into_owned();
         let second_project_path = second_project.path().to_string_lossy().into_owned();
 
@@ -6755,7 +7165,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Codex version 0");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -6910,7 +7320,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Version zero");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -6989,7 +7399,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Version one");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -7058,7 +7468,7 @@ mod tests {
         let outside = tempdir().expect("outside");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Version one");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -7125,7 +7535,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Version one");
-        let registered = add_local_source(&state, source.path()).await.unwrap();
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -7412,6 +7822,7 @@ mod tests {
             SkillSourceKind::Github {
                 ref repository,
                 git_ref: Some(ref git_ref),
+                resolved_commit: None,
                 subdirectory: Some(ref subdirectory),
                 active_checkout: None,
             } if repository == "https://github.com/Owner/Repo.git"
@@ -7512,8 +7923,9 @@ mod tests {
         let active = match &result.source.kind {
             SkillSourceKind::Github {
                 active_checkout: Some(path),
+                resolved_commit: Some(commit),
                 ..
-            } => PathBuf::from(path),
+            } if commit.len() == 40 => PathBuf::from(path),
             other => panic!("missing active checkout: {other:?}"),
         };
         assert!(active.ends_with("skills"));
@@ -7746,6 +8158,7 @@ mod tests {
         let kind = SkillSourceKind::Github {
             repository: "owner/repo".into(),
             git_ref: Some("v1.0.0".into()),
+            resolved_commit: Some("a".repeat(40)),
             subdirectory: Some("skills".into()),
             active_checkout: Some("/tmp/checkout".into()),
         };
@@ -7756,6 +8169,7 @@ mod tests {
                 "kind": "github",
                 "repository": "owner/repo",
                 "gitRef": "v1.0.0",
+                "resolvedCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "subdirectory": "skills",
                 "activeCheckout": "/tmp/checkout"
             })
@@ -8317,6 +8731,144 @@ mod tests {
         assert!(!original.packages[0].installable);
     }
 
+    struct ObservedKeychain {
+        reads: AtomicUsize,
+        value: Option<String>,
+        delay: Duration,
+    }
+
+    impl ObservedKeychain {
+        fn new(key: Option<&[u8]>, delay: Duration) -> Self {
+            Self {
+                reads: AtomicUsize::new(0),
+                value: key.map(|key| base64::engine::general_purpose::STANDARD.encode(key)),
+                delay,
+            }
+        }
+    }
+
+    impl KeychainSlot for ObservedKeychain {
+        fn read(&self, account: &str) -> Result<Option<String>, AppError> {
+            assert_eq!(account, SKILL_TRUST_KEY_ACCOUNT);
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            Ok(self.value.clone())
+        }
+
+        fn write(&self, _account: &str, _value: &str) -> Result<(), AppError> {
+            Err(AppError::KeychainUnavailable {
+                message: "unexpected test keychain write".into(),
+            })
+        }
+
+        fn delete(&self, _account: &str) -> Result<(), AppError> {
+            Err(AppError::KeychainUnavailable {
+                message: "unexpected test keychain delete".into(),
+            })
+        }
+    }
+
+    fn signed_trust_record(source: &SkillSource, key: &[u8]) -> SkillTrustRecord {
+        let result = discover_source_blocking(source.clone()).expect("discover source");
+        let package = result.packages.first().expect("skill package");
+        let source_root = canonical_skill_source_root(source).expect("source root");
+        let package_root = source_root.join(&package.relative_path);
+        let (tree_hash, executables) =
+            trust_fingerprint(&package_root, package).expect("trust fingerprint");
+        let mut record = SkillTrustRecord {
+            source_id: package.source_id.clone(),
+            relative_path: package.relative_path.clone(),
+            tree_hash,
+            executables,
+            granted_at: "2026-08-26T00:00:00Z".into(),
+            signature: String::new(),
+        };
+        record.signature = sign_trust_record(&record, key).expect("sign trust record");
+        record
+    }
+
+    async fn add_scripted_source(state: &AppState, root: &Path, name: &str) -> SkillSource {
+        write_skill(root, "", name, "Script-bearing skill");
+        std::fs::create_dir_all(root.join("scripts")).expect("scripts");
+        std::fs::write(root.join("scripts/run.py"), b"print('trusted')\n").expect("script");
+        add_local_source(state, root).await.expect("add source")
+    }
+
+    #[tokio::test]
+    async fn headless_trust_lookup_times_out_and_leaves_packages_untrusted() {
+        let app = tempdir().expect("app data");
+        let sources = tempdir().expect("sources");
+        let state = test_state(app.path());
+        let key = [7_u8; 32];
+        let source = add_scripted_source(&state, &sources.path().join("one"), "one").await;
+        save_skill_trust(app.path(), &[signed_trust_record(&source, &key)])
+            .await
+            .expect("save trust");
+        let keychain = Arc::new(ObservedKeychain::new(
+            Some(&key),
+            HEADLESS_TRUST_KEY_TIMEOUT + Duration::from_secs(3),
+        ));
+
+        let started = Instant::now();
+        let results = inspect_skill_sources_with_keychain(&state, keychain, true)
+            .await
+            .expect("inspect sources");
+
+        assert!(
+            started.elapsed() < HEADLESS_TRUST_KEY_TIMEOUT + Duration::from_secs(1),
+            "headless trust lookup exceeded its timeout"
+        );
+        let package = &results[0].packages[0];
+        assert!(!package.installable);
+        assert!(package
+            .errors
+            .iter()
+            .any(|error| error.code == SkillValidationCode::TrustRequired));
+    }
+
+    #[tokio::test]
+    async fn inspect_reads_trust_key_once_across_multiple_sources() {
+        let app = tempdir().expect("app data");
+        let sources = tempdir().expect("sources");
+        let state = test_state(app.path());
+        let key = [9_u8; 32];
+        let first = add_scripted_source(&state, &sources.path().join("one"), "one").await;
+        let second = add_scripted_source(&state, &sources.path().join("two"), "two").await;
+        save_skill_trust(
+            app.path(),
+            &[
+                signed_trust_record(&first, &key),
+                signed_trust_record(&second, &key),
+            ],
+        )
+        .await
+        .expect("save trust");
+        let keychain = Arc::new(ObservedKeychain::new(Some(&key), Duration::ZERO));
+
+        let results = inspect_skill_sources_with_keychain(&state, keychain.clone(), true)
+            .await
+            .expect("inspect sources");
+
+        assert_eq!(keychain.reads.load(Ordering::SeqCst), 1);
+        assert!(results.iter().all(|result| result.packages[0].installable));
+    }
+
+    #[tokio::test]
+    async fn inspect_without_trust_records_never_reads_keychain() {
+        let app = tempdir().expect("app data");
+        let sources = tempdir().expect("sources");
+        let state = test_state(app.path());
+        add_scripted_source(&state, &sources.path().join("one"), "one").await;
+        let keychain = Arc::new(ObservedKeychain::new(None, Duration::ZERO));
+
+        let results = inspect_skill_sources_with_keychain(&state, keychain.clone(), true)
+            .await
+            .expect("inspect sources");
+
+        assert_eq!(keychain.reads.load(Ordering::SeqCst), 0);
+        assert!(!results[0].packages[0].installable);
+    }
+
     #[test]
     fn missing_key_never_silently_rekeys_existing_trust_records() {
         #[derive(Default)]
@@ -8576,9 +9128,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let canonical_project = std::fs::canonicalize(project.path())
             .expect("canonical project")
@@ -8710,9 +9260,7 @@ mod tests {
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
         let first_state = Arc::new(test_state(app.path()));
         let second_state = Arc::new(test_state(app.path()));
-        let registered = add_local_source(&first_state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&first_state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let first = super::lock_skill_installs(app.path()).expect("first process lock");
         let second = Arc::clone(&second_state);
@@ -8773,9 +9321,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let installed = super::install_skill(
             &state,
@@ -8852,9 +9398,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -8896,9 +9440,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -8938,9 +9480,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         super::install_skill(
             &state,
@@ -8960,6 +9500,8 @@ mod tests {
         )
         .await
         .expect("disable skill");
+        let lock_path = project.path().join(crate::install::lockfile::LOCK_FILENAME);
+        let unchanged_lock = std::fs::read(&lock_path).expect("read disabled lockfile");
         std::fs::remove_dir_all(source.path().join("reviewer")).expect("remove source package");
 
         let enabled = super::enable_skill(
@@ -8973,6 +9515,10 @@ mod tests {
         .expect("enable missing-source skill");
         assert_eq!(enabled.state, SkillInstallState::SourceUnavailable);
         assert!(Path::new(&enabled.path).is_dir());
+        assert_eq!(
+            std::fs::read(lock_path).expect("read unchanged lockfile"),
+            unchanged_lock
+        );
     }
 
     #[tokio::test]
@@ -8982,9 +9528,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let installed = super::install_skill(
             &state,
@@ -9065,9 +9609,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let installed = super::install_skill(
             &state,
@@ -9117,9 +9659,7 @@ mod tests {
         let project = tempdir().expect("project");
         let state = test_state(app.path());
         write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
-        let registered = add_local_source(&state, source.path())
-            .await
-            .expect("register source");
+        let registered = add_portable_test_source(&state, source.path()).await;
         let project_path = project.path().to_string_lossy().into_owned();
         let installed = super::install_skill(
             &state,

@@ -128,6 +128,8 @@ pub enum SkillSourceKind {
     Github {
         repository: String,
         git_ref: Option<String>,
+        #[serde(default)]
+        resolved_commit: Option<String>,
         subdirectory: Option<String>,
         active_checkout: Option<String>,
     },
@@ -1049,6 +1051,8 @@ pub enum AgentSourceKind {
     Github {
         repository: String,
         git_ref: Option<String>,
+        #[serde(default)]
+        resolved_commit: Option<String>,
         subdirectory: Option<String>,
         active_checkout: Option<String>,
     },
@@ -1512,6 +1516,10 @@ pub struct InstallRecord {
     /// Exact source bytes selected for the installed version.
     #[serde(default)]
     pub source_snapshot_hash: String,
+    /// Verified canonical render used as the common ancestor for drift merges.
+    /// Legacy rows remain `None` until the next clean install or update.
+    #[serde(default)]
+    pub base_snapshot_id: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
@@ -1520,6 +1528,8 @@ pub struct InstallRecord {
     pub publisher_verified: bool,
     pub installed_at: String,
     pub corpus_version: String,
+    #[serde(default)]
+    pub source_revision: String,
     /// Truthful post-install follow-up for tools whose files need external activation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_notice: Option<String>,
@@ -1674,6 +1684,32 @@ pub struct AgentPlanItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentMergeOutcome {
+    Clean {
+        preview_hash: String,
+    },
+    Conflicts {
+        count: u32,
+        hunk_summaries: Vec<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMergePreview {
+    pub preview: String,
+    pub preview_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMutationPlan {
     pub revision: String,
@@ -1685,6 +1721,8 @@ pub struct AgentMutationPlan {
     pub warnings: Vec<String>,
     pub blockers: Vec<String>,
     pub rollback_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_outcome: Option<AgentMergeOutcome>,
 }
 
 /// Result of `agent_diff` — what's on disk now vs the canonical render the app
@@ -1807,6 +1845,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_merge_outcomes_serialize_for_tauri_plans() {
+        assert_eq!(
+            serde_json::to_value(AgentMergeOutcome::Clean {
+                preview_hash: "a".repeat(64),
+            })
+            .unwrap(),
+            serde_json::json!({"status": "clean", "previewHash": "a".repeat(64)})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentMergeOutcome::Conflicts {
+                count: 1,
+                hunk_summaries: vec!["Conflict 1".into()],
+            })
+            .unwrap(),
+            serde_json::json!({
+                "status": "conflicts",
+                "count": 1,
+                "hunkSummaries": ["Conflict 1"]
+            })
+        );
+    }
+
+    #[test]
     fn installed_agent_serializes_camel_case_fields() {
         let a = InstalledAgent {
             slug: "frontend-developer".into(),
@@ -1904,6 +1965,7 @@ mod tests {
             kind: AgentSourceKind::Github {
                 repository: "https://github.com/example/agents.git".into(),
                 git_ref: Some("main".into()),
+                resolved_commit: Some("a".repeat(40)),
                 subdirectory: Some("catalog".into()),
                 active_checkout: None,
             },
@@ -1911,6 +1973,10 @@ mod tests {
         let value = serde_json::to_value(&source).unwrap();
         assert_eq!(value["kind"]["kind"], "github");
         assert_eq!(value["kind"]["gitRef"], "main");
+        assert_eq!(
+            value["kind"]["resolvedCommit"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(value["kind"]["subdirectory"], "catalog");
     }
 

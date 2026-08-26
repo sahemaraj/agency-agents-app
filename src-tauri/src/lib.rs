@@ -5,6 +5,7 @@
 //! in `commands::*`.
 
 mod agents;
+mod cli;
 mod commands;
 mod corpus;
 mod error;
@@ -14,6 +15,7 @@ mod github;
 mod install;
 mod library;
 mod ollama;
+mod projects;
 mod registry;
 mod render;
 mod skills;
@@ -31,6 +33,22 @@ pub async fn run_mcp(client: String) -> Result<(), String> {
 
 pub async fn run_mcp_http(bind: std::net::SocketAddr, token: String) -> Result<(), String> {
     skills::mcp::serve_http(bind, token).await
+}
+
+pub use cli::CliOutcome;
+
+pub async fn run_cli(
+    command: &str,
+    project: Option<std::path::PathBuf>,
+    json: bool,
+    dry_run: bool,
+    merge: bool,
+) -> Result<CliOutcome, String> {
+    cli::run(command, project, json, dry_run, merge).await
+}
+
+pub(crate) fn app_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
 }
 
 // =============================================================
@@ -282,6 +300,7 @@ pub fn run() {
             agents::organize::agent_library_export,
             agents::organize::agent_library_import,
             agents::organize::agent_update_policy_set,
+            projects::project_detect_stack,
             agents::organize::agent_publisher_trust_set,
             agents::organize::agent_preferred_source_set,
             agents::organize::agent_usage_record,
@@ -344,6 +363,8 @@ pub fn run() {
             // agent state layer: render/ledger/reconcile/tools/projects.
             install::install_agent,
             install::update_agent,
+            install::agent_merge_preview,
+            install::agent_merge_apply,
             install::agent_install_plan,
             install::agent_update_plan,
             install::agent_uninstall_plan,
@@ -392,8 +413,11 @@ pub fn run() {
             install::loadout_export,
             install::loadout_import,
             install::loadout_apply,
+            install::lockfile::lock_check,
+            install::lockfile::lock_plan,
+            install::lockfile::lock_apply,
         ])
-        .run(tauri::generate_context!())
+        .run(app_context())
         .expect("error while running tauri application");
 }
 
