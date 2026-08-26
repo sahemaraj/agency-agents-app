@@ -5217,7 +5217,7 @@ async fn build_mutation_plan(
     }
     if tool == "openclaw" {
         warnings.push(
-            "OpenClaw installs workspace files only. Register the agent and restart OpenClaw separately; Agency Agents will not run the OpenClaw CLI."
+            "OpenClaw installs workspace files only. Register the agent and restart OpenClaw separately; Shikigami will not run the OpenClaw CLI."
                 .into(),
         );
     }
@@ -9399,7 +9399,7 @@ fn validate_reveal_target(path: &str, roots: &[PathBuf]) -> Result<PathBuf, AppE
         Ok(canonical)
     } else {
         Err(AppError::InvalidArgument {
-            message: "reveal path is outside supported Agency Agents locations".into(),
+            message: "reveal path is outside supported Shikigami locations".into(),
         })
     }
 }

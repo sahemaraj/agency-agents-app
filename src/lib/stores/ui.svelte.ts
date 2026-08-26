@@ -139,7 +139,7 @@ class UiStore {
   /** Optional initial section to land on when the modal opens. `null`
       means "use the modal's default (Appearance)". Cleared by closeSettings. */
   settingsInitialSection: SettingsSection | null = $state(null);
-  /** About modal — native menu "About Agency Agents" + sidebar footer link. */
+  /** About modal — native menu "About Shikigami" + sidebar footer link. */
   aboutOpen: boolean = $state(false);
   /** Playbook modal — "how to get real work out of your agents" (title-bar ?). */
   playbookOpen: boolean = $state(false);

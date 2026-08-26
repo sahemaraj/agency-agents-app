@@ -1,6 +1,6 @@
-# Agency Agents Philosophy
+# Shikigami Philosophy
 
-Agency Agents exists because useful AI-agent catalogs should be easy to inspect, install, and maintain without hiding what is being written to a developer's machine.
+Shikigami exists because useful AI-agent catalogs should be easy to inspect, install, and maintain without hiding what is being written to a developer's machine.
 
 The app is intentionally:
 
@@ -21,7 +21,7 @@ The catalog source is either bundled, managed locally, or chosen by the user. Ag
 
 Most AI coding tools read agent files from config directories, but they do not expose a shared install database.
 
-Agency Agents fills that gap with a local ledger:
+Shikigami fills that gap with a local ledger:
 
 - what agent was installed
 - where it was written
@@ -58,7 +58,7 @@ Core browsing, install tracking, reconciliation, and uninstall behavior operate 
 
 ## 5. No Telemetry
 
-Agency Agents does not collect:
+Shikigami does not collect:
 
 - analytics
 - click tracking
@@ -108,4 +108,4 @@ Over:
 - opaque recommendations
 - ornamental dashboards
 
-Agency Agents should make the user's agent setup easier to understand, not harder.
+Shikigami should make the user's agent setup easier to understand, not harder.

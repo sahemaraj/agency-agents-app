@@ -1,4 +1,4 @@
-# Contributing to Agency Agents
+# Contributing to Shikigami
 
 Thanks for considering a contribution. This project is small, opinionated, and open. The bar for landing changes is straightforward: match the existing architecture, keep changes focused, and verify them.
 

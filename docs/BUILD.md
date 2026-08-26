@@ -1,4 +1,4 @@
-# Building Agency Agents
+# Building Shikigami
 
 ## Development Build
 
@@ -113,7 +113,7 @@ src-tauri/target/release/bundle/
 ## Verify macOS Artifacts
 
 ```sh
-DMG=src-tauri/target/release/bundle/dmg/Agency\ Agents_0.1.0_aarch64.dmg
+DMG=src-tauri/target/release/bundle/dmg/Shikigami_0.1.0_aarch64.dmg
 
 codesign -dv --verbose=4 "$DMG"
 spctl --assess --type install --verbose=4 "$DMG"
@@ -124,7 +124,7 @@ The exact filename may vary by version and architecture.
 
 ## Updater Manifest
 
-Agency Agents uses `tauri-plugin-updater`. The configured endpoint is:
+Shikigami uses `tauri-plugin-updater`. The configured endpoint is:
 
 ```text
 https://agencyagents.app/updater.json

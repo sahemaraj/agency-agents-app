@@ -726,7 +726,7 @@ pub(crate) async fn persist(
 
     // Defense in depth — ensure the parent dir exists. `AppState::build`
     // already mkdir_p'd it, but a fresh checkout of the app on a system
-    // that's never run Agency Agents could plausibly hit this otherwise.
+    // that's never run Shikigami could plausibly hit this otherwise.
     if !app_data_dir.exists() {
         tokio::fs::create_dir_all(app_data_dir)
             .await

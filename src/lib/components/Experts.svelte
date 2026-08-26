@@ -130,7 +130,7 @@
       });
       const prompt = activation.runId
         ? factoryWorkOrder
-          ? `${plan.promptPreview}\n\nFactory Run ID: ${activation.runId}. External workers discover exact project-scoped work through the configured Agency Agents MCP Factory tools. Agency Agents remains the control plane and does not launch or execute the worker.`
+          ? `${plan.promptPreview}\n\nFactory Run ID: ${activation.runId}. External workers discover exact project-scoped work through the configured Shikigami MCP Factory tools. Shikigami remains the control plane and does not launch or execute the worker.`
           : `${plan.promptPreview}\n\nRun ID: ${activation.runId}. Read the quality contract with expert_runs_get_contract, then submit evidence for each check before requesting review.`
         : plan.promptPreview;
       await navigator.clipboard.writeText(prompt);
@@ -788,7 +788,7 @@
 {#if factoryBuilder}
   <Modal open title="Create Factory Run" size="wide" defaultFocus="first" onClose={() => (factoryBuilder = null)}>
     <form class="builder" onsubmit={(event) => { event.preventDefault(); void reviewFactoryCreation(); }}>
-      <p>Agency Agents governs the contract and approvals. External Claude Code or Codex workers perform implementation work.</p>
+      <p>Shikigami governs the contract and approvals. External Claude Code or Codex workers perform implementation work.</p>
       <label>Ticket reference<input aria-label="Ticket reference" required maxlength="160" bind:value={factoryBuilder.ticketReference} /></label>
       <label>Work-order title<input aria-label="Work-order title" required maxlength="160" bind:value={factoryBuilder.title} /></label>
       <label>Objective<textarea aria-label="Objective" required maxlength="4096" rows="4" bind:value={factoryBuilder.objective}></textarea></label>
@@ -859,10 +859,10 @@
           <p>{factoryReview.workflow.improvementProposal.failureClass} · {factoryReview.workflow.improvementProposal.target}</p>
           <p>{factoryReview.workflow.improvementProposal.proposal}</p>
           {#if factoryReview.workflow.improvementProposal.suggestedTest}<p>Suggested test: {factoryReview.workflow.improvementProposal.suggestedTest}</p>{/if}
-          <p>This proposal is inert; Agency Agents will not apply, publish, install, approve, or share it automatically.</p>
+          <p>This proposal is inert; Shikigami will not apply, publish, install, approve, or share it automatically.</p>
         {/if}
         {#if !factoryReview.workflow.terminal}
-          <div class="warning"><strong>Cancellation scope</strong><p>Agency Agents cannot stop an external process or delete its branch, worktree, artifacts, evidence, or repository changes. Stop external work separately if needed.</p></div>
+          <div class="warning"><strong>Cancellation scope</strong><p>Shikigami cannot stop an external process or delete its branch, worktree, artifacts, evidence, or repository changes. Stop external work separately if needed.</p></div>
         {/if}
         {#if factoryReview.humanAction?.kind === "final" && factoryMissingChecks(runReview).length}
           <label>Final waiver reason<textarea maxlength="4096" bind:value={factoryWaiverReason}></textarea></label>

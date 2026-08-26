@@ -5,7 +5,7 @@ edge highlight, depth, and Light/Dark/Clear/Tinted variants are applied *live by
 the OS* from a **layered** icon authored in **Icon Composer** (`.icon` format).
 A flat `.icns`/PNG (what `tauri icon` produces) is shown literally — no glass.
 
-This folder has everything staged to give Agency Agents the native treatment.
+This folder has everything staged to give Shikigami the native treatment.
 
 ## What's here
 

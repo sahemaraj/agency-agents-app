@@ -1,7 +1,7 @@
 {
-  "name": "agency-agents-app",
+  "name": "shikigami",
   "version": "0.3.0",
-  "description": "Agency Agents — a native app for browsing, installing, and tracking specialized AI agents across coding tools.",
+  "description": "Shikigami — a native app for browsing, installing, and tracking specialized AI agents across coding tools.",
   "type": "module",
   "author": "Michael Sitarzewski",
   "repository": "github:msitarzewski/agency-agents-app",

@@ -86,7 +86,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # paths. Filenames are fixed (no version stamp) inside `bundle/macos/`;
 # we upload to GitHub Releases under versioned names so the manifest
 # URL is unambiguous.
-ARTIFACT_PATH="$REPO_ROOT/src-tauri/target/release/bundle/macos/Agency Agents.app.tar.gz"
+ARTIFACT_PATH="$REPO_ROOT/src-tauri/target/release/bundle/macos/Shikigami.app.tar.gz"
 SIGNATURE_FILE="${ARTIFACT_PATH}.sig"
 # Versioned name used in the published GitHub Release asset URL.
 ARTIFACT_RELEASE_NAME="Agency_Agents_${VERSION}_aarch64.app.tar.gz"

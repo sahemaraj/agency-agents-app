@@ -66,8 +66,8 @@
       </button>
 
       <div class="hero">
-        <img class="brand-mark" src={appIcon} alt="Agency Agents" width="80" height="80" />
-        <h1 id="about-title">Agency Agents</h1>
+        <img class="brand-mark" src={appIcon} alt="Shikigami" width="80" height="80" />
+        <h1 id="about-title">Shikigami</h1>
         <p class="tagline">{i18n.t("about.tagline")}</p>
       </div>
 

@@ -201,19 +201,19 @@ mod tests {
     #[test]
     fn parses_mcp_modes() {
         assert_eq!(
-            parse_mode(["agency-agents-app", "--mcp"]).unwrap(),
+            parse_mode(["shikigami", "--mcp"]).unwrap(),
             Mode::Stdio("unknown".into())
         );
         assert_eq!(
-            parse_mode(["agency-agents-app", "--mcp", "--client", "codex"]).unwrap(),
+            parse_mode(["shikigami", "--mcp", "--client", "codex"]).unwrap(),
             Mode::Stdio("codex".into())
         );
         assert_eq!(
-            parse_mode(["agency-agents-app", "--mcp-http"]).unwrap(),
+            parse_mode(["shikigami", "--mcp-http"]).unwrap(),
             Mode::Http(DEFAULT_MCP_HTTP_BIND)
         );
         assert_eq!(
-            parse_mode(["agency-agents-app", "--mcp-http", "--bind", "[::1]:0"]).unwrap(),
+            parse_mode(["shikigami", "--mcp-http", "--bind", "[::1]:0"]).unwrap(),
             Mode::Http("[::1]:0".parse().unwrap())
         );
     }
@@ -325,8 +325,7 @@ mod tests {
             time::{Duration, Instant},
         };
 
-        let binary =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/agency-agents-app");
+        let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/shikigami");
         assert!(
             binary.is_file(),
             "build the desktop binary before running this test"

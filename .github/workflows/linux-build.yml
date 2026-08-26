@@ -1,4 +1,4 @@
-# Linux build — produces Agency Agents' .deb / .rpm / .AppImage bundles on a
+# Linux build — produces Shikigami's .deb / .rpm / .AppImage bundles on a
 # native x86_64 runner (no emulation, so the AppImage bundler works cleanly).
 #
 # Tauri 2 builds all three Linux bundle targets via `npm run tauri build`
@@ -84,8 +84,8 @@ jobs:
 
       - name: Self-check stateless lockfile verification
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml --bin agency-agents-app
-          src-tauri/target/debug/agency-agents-app verify \
+          cargo build --manifest-path src-tauri/Cargo.toml --bin shikigami
+          src-tauri/target/debug/shikigami verify \
             --project src-tauri/tests/fixtures/verify-project \
             --json
 
@@ -185,20 +185,20 @@ jobs:
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
-          name: agency-agents-deb
+          name: shikigami-deb
           path: src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
 
       - name: Upload .rpm
         uses: actions/upload-artifact@v4
         with:
-          name: agency-agents-rpm
+          name: shikigami-rpm
           path: src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
 
       - name: Upload .AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: agency-agents-appimage
+          name: shikigami-appimage
           path: src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error

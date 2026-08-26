@@ -1,6 +1,6 @@
 # landing
 
-Static landing page for Agency Agents, served at `agencyagents.app` via Caddy on the build host.
+Static landing page for Shikigami, served at `agencyagents.app` via Caddy on the build host.
 
 Same setup as the brew-browser landing: a self-contained static site (no build step) deployed with `rsync`.
 

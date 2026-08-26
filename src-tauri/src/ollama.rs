@@ -571,7 +571,7 @@ async fn build_plan_with<B: OllamaBackend + ?Sized>(
                 blockers.push("This Agent already has a managed Ollama deployment".into());
             } else if target_present {
                 blockers.push(
-                    "The derived Ollama target exists but is not managed by Agency Agents".into(),
+                    "The derived Ollama target exists but is not managed by Shikigami".into(),
                 );
             }
         }
@@ -580,7 +580,7 @@ async fn build_plan_with<B: OllamaBackend + ?Sized>(
                 blockers.push("This Agent has no managed Ollama deployment to update".into());
             }
             if state == Some(OllamaDeploymentState::Modified) {
-                warnings.push("The Ollama system prompt was changed outside Agency Agents and will be preserved before update".into());
+                warnings.push("The Ollama system prompt was changed outside Shikigami and will be preserved before update".into());
             }
         }
         "remove" => {

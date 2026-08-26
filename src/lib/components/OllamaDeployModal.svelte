@@ -175,7 +175,7 @@
           </select>
         </label>
       {:else}
-        <p class="notice">{i18n.optional("ollama.noModels", "No eligible local base models are installed. Agency Agents will not download one.")}</p>
+        <p class="notice">{i18n.optional("ollama.noModels", "No eligible local base models are installed. Shikigami will not download one.")}</p>
       {/if}
 
       {#if plan}

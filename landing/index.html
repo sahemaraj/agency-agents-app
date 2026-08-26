@@ -12,7 +12,7 @@
   <meta name="robots" content="index, follow, max-image-preview:large">
 
   <!-- Primary meta -->
-  <title>Agency Agents — a native installer for AI agents (Tauri + Svelte)</title>
+  <title>Shikigami — a native installer for AI agents (Tauri + Svelte)</title>
   <meta name="description" content="Browse, install, and track AI agent personas across Claude Code, Codex, Cursor, Gemini CLI, Qwen, opencode, Copilot, and Osaurus. Full source. MIT licensed. Local-first, no telemetry, no accounts.">
   <meta name="author" content="Michael Sitarzewski">
   <meta name="keywords" content="AI agents, agent personas, Claude Code, Codex, Cursor, Gemini CLI, Qwen, opencode, GitHub Copilot, Osaurus, Tauri, Svelte, Rust, native, MIT, open source, desktop app">
@@ -22,8 +22,8 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
-  <meta name="apple-mobile-web-app-title" content="Agency Agents">
-  <meta name="application-name" content="Agency Agents">
+  <meta name="apple-mobile-web-app-title" content="Shikigami">
+  <meta name="application-name" content="Shikigami">
   <meta name="msapplication-TileColor" content="#0a0d0f">
 
   <!-- PWA manifest -->
@@ -31,15 +31,15 @@
 
   <!-- Open Graph -->
   <meta property="og:type" content="website">
-  <meta property="og:site_name" content="Agency Agents">
+  <meta property="og:site_name" content="Shikigami">
   <meta property="og:url" content="https://agencyagents.app/">
-  <meta property="og:title" content="Agency Agents — a native installer for AI agents">
+  <meta property="og:title" content="Shikigami — a native installer for AI agents">
   <meta property="og:description" content="Browse, install, and track AI agent personas across the AI coding tools you actually use. Full source. MIT licensed. No telemetry, no accounts.">
   <meta property="og:image" content="https://agencyagents.app/social-card.png">
   <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="The Agency Agents Dashboard — install health, cross-tool coverage donuts, and the catalog-by-division bar.">
+  <meta property="og:image:alt" content="The Shikigami Dashboard — install health, cross-tool coverage donuts, and the catalog-by-division bar.">
   <meta property="og:locale" content="en_US">
 
   <!-- Twitter / X -->
@@ -47,17 +47,17 @@
   <meta name="twitter:site" content="@msitarzewski">
   <meta name="twitter:creator" content="@msitarzewski">
   <meta name="twitter:url" content="https://agencyagents.app/">
-  <meta name="twitter:title" content="Agency Agents — a native installer for AI agents">
+  <meta name="twitter:title" content="Shikigami — a native installer for AI agents">
   <meta name="twitter:description" content="Browse, install, and track AI agent personas across the AI coding tools you actually use. Full source. MIT licensed. No telemetry, no accounts.">
   <meta name="twitter:image" content="https://agencyagents.app/social-card.png">
-  <meta name="twitter:image:alt" content="The Agency Agents Dashboard — install health, cross-tool coverage donuts, and the catalog-by-division bar.">
+  <meta name="twitter:image:alt" content="The Shikigami Dashboard — install health, cross-tool coverage donuts, and the catalog-by-division bar.">
 
   <!-- JSON-LD structured data (Google rich results) -->
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
-    "name": "Agency Agents",
+    "name": "Shikigami",
     "description": "A native installer for AI agents. Browse, install, and track agent personas across Claude Code, Codex, Cursor, Gemini CLI, Qwen, opencode, Copilot, and Osaurus. Full source. MIT licensed. No telemetry, no accounts.",
     "applicationCategory": "DeveloperApplication",
     "applicationSubCategory": "AI Agent Manager",
@@ -86,8 +86,8 @@
 
   <header class="hero">
     <div class="hero-inner">
-      <img src="/agency-agents.png" alt="Agency Agents icon" class="hero-icon" width="160" height="160">
-      <h1>Agency Agents</h1>
+      <img src="/agency-agents.png" alt="Shikigami icon" class="hero-icon" width="160" height="160">
+      <h1>Shikigami</h1>
       <p class="tagline">A native installer for AI agents.</p>
       <p class="sub">Browse the agent catalog by division and role. Inspect a persona before you install it. Deploy deterministic renders into <strong>Claude Code, Codex, Cursor, Gemini CLI, Qwen, opencode, Copilot, and Osaurus</strong> — then track what the app wrote, detect drift, update, or back it out. A small, fast <strong>Tauri 2</strong> app (Rust + Svelte 5). The local install database your AI tools don't share.</p>
       <div class="cta-row">
@@ -104,7 +104,7 @@
       <figure class="hero-shot">
         <picture>
           <source srcset="/screenshots/dashboard-dark.png" media="(prefers-color-scheme: dark)">
-          <img src="/screenshots/dashboard-light.png" alt="Agency Agents — Dashboard: 232 agents available, 246 installed, install-health donut, coverage by tool, per-tool cross-tool coverage donuts, and the catalog-by-division bar." loading="lazy">
+          <img src="/screenshots/dashboard-light.png" alt="Shikigami — Dashboard: 232 agents available, 246 installed, install-health donut, coverage by tool, per-tool cross-tool coverage donuts, and the catalog-by-division bar." loading="lazy">
         </picture>
         <figcaption>The Dashboard — install health, cross-tool coverage, and the catalog by division.</figcaption>
       </figure>
@@ -204,8 +204,8 @@
       <p><strong>Direct download (recommended):</strong> grab the build for your platform from the <a href="https://github.com/msitarzewski/agency-agents-app/releases/latest">latest release</a>.</p>
       <p><strong>Which download?</strong></p>
       <ul class="posture">
-        <li><strong>Apple Silicon (M-series), macOS 13+.</strong> <code>Agency Agents_&lt;version&gt;_aarch64.dmg</code> — signed &amp; notarized.</li>
-        <li><strong>Intel Mac, macOS 13+.</strong> <code>Agency Agents_&lt;version&gt;_x64.dmg</code> — signed &amp; notarized.</li>
+        <li><strong>Apple Silicon (M-series), macOS 13+.</strong> <code>Shikigami_&lt;version&gt;_aarch64.dmg</code> — signed &amp; notarized.</li>
+        <li><strong>Intel Mac, macOS 13+.</strong> <code>Shikigami_&lt;version&gt;_x64.dmg</code> — signed &amp; notarized.</li>
         <li><strong>Windows (x64 / ARM64).</strong> the <code>.exe</code> installer. Not code-signed yet — on first launch SmartScreen shows "Windows protected your PC"; click <strong>More info → Run anyway</strong>.</li>
         <li><strong>Linux.</strong> <code>.deb</code> (Debian/Ubuntu), <code>.rpm</code> (Fedora/RHEL/openSUSE), or the portable <code>.AppImage</code>.</li>
       </ul>

@@ -1,4 +1,4 @@
-# Agency Agents
+# Shikigami
 
 > A native installer for AI agents.
 
@@ -7,20 +7,20 @@
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-lightgrey)](https://www.apple.com/macos)
 [![Sponsor](https://img.shields.io/badge/♥-Sponsor-EC4899?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/msitarzewski)
 
-Agency Agents is a small, native app for browsing, installing, and tracking the agent personas from [`msitarzewski/agency-agents`](https://github.com/msitarzewski/agency-agents) across the AI coding tools you actually use.
+Shikigami is a small, native app for browsing, installing, and tracking the agent personas from [`msitarzewski/agency-agents`](https://github.com/msitarzewski/agency-agents) across the AI coding tools you actually use.
 
 It is full source, MIT-licensed, local-first, and does not run telemetry.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="landing/screenshots/dashboard-dark.png">
-  <img alt="Agency Agents — Dashboard: install health, cross-tool coverage, and the catalog by division" src="landing/screenshots/dashboard-light.png">
+  <img alt="Shikigami — Dashboard: install health, cross-tool coverage, and the catalog by division" src="landing/screenshots/dashboard-light.png">
 </picture>
 
 ## Why This Exists
 
 The `agency-agents` repo is a useful catalog of specialist AI agent personas, but every coding tool has its own agent format and install path. Claude Code, Codex, Cursor, Gemini CLI, Qwen, opencode, Copilot, Osaurus, ZCode, Antigravity, Kimi, OpenClaw, Aider, and Windsurf all want similar content in slightly different places.
 
-Agency Agents gives that catalog a native control surface:
+Shikigami gives that catalog a native control surface:
 
 - browse the agent catalog by division and role
 - inspect the source persona before installing it
@@ -33,7 +33,7 @@ The core idea is simple: AI tools do not share a package database, so the app ke
 
 ## Features
 
-Agency Agents is organized into eight sections — **Dashboard**, **Agents** (who), **Skills**, **Tools** (how), **Teams** (which), **Projects** (where), **Experts**, and **Activity**:
+Shikigami is organized into eight sections — **Dashboard**, **Agents** (who), **Skills**, **Tools** (how), **Teams** (which), **Projects** (where), **Experts**, and **Activity**:
 
 - **Agents workspace** — searchable three-pane catalog, division and category filters, an install-state lens, a detail panel, and per-agent deployment controls. Agents come from multiple sources: built-in catalog, local, published, and GitHub.
 - **Skills** — a first-class skill package platform: sources, trust and approvals, dependencies, lifecycle, backups, rollback, drafts, and organization.
@@ -108,14 +108,14 @@ For a signed release build on macOS, see [docs/BUILD.md](./docs/BUILD.md).
 
 ## CLI
 
-The app binary also manages a project's `agency.lock.json` without opening the GUI:
+The app binary also manages a project's `shikigami.lock.json` without opening the GUI:
 
 ```sh
-agency-agents-app verify [--project <path>] [--json]
-agency-agents-app check [--project <path>] [--json]
-agency-agents-app plan [--project <path>] [--json]
-agency-agents-app apply [--project <path>] [--json] [--dry-run]
-agency-agents-app list [--project <path>] [--json]
+shikigami verify [--project <path>] [--json]
+shikigami check [--project <path>] [--json]
+shikigami plan [--project <path>] [--json]
+shikigami apply [--project <path>] [--json] [--dry-run]
+shikigami list [--project <path>] [--json]
 ```
 
 `verify` is available on macOS, Linux, and Windows and checks only project files; the other verbs remain macOS/Linux-only and use desktop-managed state. The project defaults to the current directory. Exit code `0` means success/in sync, `1` means drift or apply blockers, and `2` means an error. Commands never prompt.
@@ -123,7 +123,7 @@ agency-agents-app list [--project <path>] [--json]
 Use the repository's composite Action to gate CI on lockfile drift:
 
 ```yaml
-- uses: msitarzewski/agency-agents-app/.github/actions/agency-verify@main
+- uses: msitarzewski/agency-agents-app/.github/actions/shikigami-verify@main
   with:
     # both are required — the Action refuses `latest` and unverified downloads
     version: v0.3.0
@@ -210,7 +210,7 @@ No telemetry, crash reporting, advertising pixels, or product analytics are incl
 
 ## Security
 
-Agency Agents uses typed Tauri IPC commands and avoids `tauri-plugin-shell`. File writes are restricted to known install destinations, app state, backups, and user-selected paths. Modified installed files are backed up before destructive operations.
+Shikigami uses typed Tauri IPC commands and avoids `tauri-plugin-shell`. File writes are restricted to known install destinations, app state, backups, and user-selected paths. Modified installed files are backed up before destructive operations.
 
 Report vulnerabilities using [SECURITY.md](./SECURITY.md).
 
@@ -238,4 +238,4 @@ The highest-value areas before 1.0 are:
 
 ## Support The Project
 
-If Agency Agents saves you time, consider [sponsoring on GitHub](https://github.com/sponsors/msitarzewski). Sponsorship is optional and does not unlock a paid tier.
+If Shikigami saves you time, consider [sponsoring on GitHub](https://github.com/sponsors/msitarzewski). Sponsorship is optional and does not unlock a paid tier.

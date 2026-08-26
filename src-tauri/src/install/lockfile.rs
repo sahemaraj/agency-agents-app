@@ -16,7 +16,7 @@ use crate::types::{AgentReference, SkillReference};
 use crate::{render, skills};
 
 const LOCK_VERSION: u32 = 1;
-pub(crate) const LOCK_FILENAME: &str = "agency.lock.json";
+pub(crate) const LOCK_FILENAME: &str = "shikigami.lock.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -236,7 +236,7 @@ async fn require_lockfile_unchanged(project: &Path, expected: &[u8]) -> Result<(
         Ok(())
     } else {
         Err(invalid(
-            "agency.lock.json changed on disk during apply; applied changes were not allowed to overwrite it",
+            "shikigami.lock.json changed on disk during apply; applied changes were not allowed to overwrite it",
         ))
     }
 }
@@ -258,10 +258,10 @@ async fn partial_apply_error(
     AppError::Internal {
         message: match refresh {
             Ok(()) => format!(
-                "lock apply failed after {applied} completed operation(s); agency.lock.json was refreshed to the derived post-state: {error}"
+                "lock apply failed after {applied} completed operation(s); shikigami.lock.json was refreshed to the derived post-state: {error}"
             ),
             Err(refresh_error) => format!(
-                "lock apply failed after {applied} completed operation(s); filesystem or ledger state may include the failed operation, and agency.lock.json could not be refreshed ({refresh_error}): {error}"
+                "lock apply failed after {applied} completed operation(s); filesystem or ledger state may include the failed operation, and shikigami.lock.json could not be refreshed ({refresh_error}): {error}"
             ),
         },
     }

@@ -1,6 +1,6 @@
 {
-  "name": "Agency Agents",
-  "short_name": "Agency Agents",
+  "name": "Shikigami",
+  "short_name": "Shikigami",
   "description": "A native installer for AI agents. Browse, install, and track agent personas across the AI coding tools you use.",
   "start_url": "/",
   "scope": "/",

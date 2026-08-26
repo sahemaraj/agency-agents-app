@@ -141,7 +141,7 @@ export const SETTINGS_DEFAULTS: Settings = {
   // Phase 13 — AI-enriched rendering. ON by default so users get the
   // friendly names, summaries, and categories out of the box.
   aiFeaturesEnabled: true,
-  // Auto-check for new Agency Agents releases. Off by
+  // Auto-check for new Shikigami releases. Off by
   // default per the "zero outbound unless user consented" posture.
   updateAutoCheck: false,
   driftNotifications: false,
@@ -248,7 +248,7 @@ export interface CreatedIssue {
 // =========================================================
 
 /**
- * A newer Agency Agents version surfaced by the manifest at
+ * A newer Shikigami version surfaced by the manifest at
  * `agencyagents.app/updater.json`. Held by the updater store
  * once a check returns `available`. Matches the camelCase wire shape
  * the backend's `UpdateCheckOutcome::Available` flattens onto when
@@ -338,9 +338,9 @@ export function appErrorMessage(e: AppErrorPayload): string {
     case "http_status":         return `HTTP ${e.status} from ${e.url}`;
     case "invalid_argument":    return `Invalid argument: ${e.message}`;
     case "internal":            return `Internal error: ${e.message}`;
-    case "storage_busy":        return "Agency Agents is busy in another desktop or MCP session. Close it and try again.";
+    case "storage_busy":        return "Shikigami is busy in another desktop or MCP session. Close it and try again.";
     case "storage_corrupt":     return `Stored data needs attention: ${e.message}`;
-    case "storage_unsupported": return `This data requires schema ${e.found}; this Agency Agents version supports ${e.supported}.`;
+    case "storage_unsupported": return `This data requires schema ${e.found}; this Shikigami version supports ${e.supported}.`;
     case "paranoid_mode_blocked":
       return `Offline Mode is on — ${e.feature} is blocked. Disable it in Settings → Network.`;
     case "github_rate_limited": {
@@ -363,7 +363,7 @@ export function appErrorMessage(e: AppErrorPayload): string {
 }
 
 // =========================================================
-// Agency Agents — corpus subsystem (contracts.md §A)
+// Shikigami — corpus subsystem (contracts.md §A)
 // =========================================================
 //
 // Mirrors the Rust DTOs in `src-tauri/src/types.rs`. Wire shape is

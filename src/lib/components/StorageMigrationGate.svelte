@@ -36,8 +36,8 @@
 <div bind:this={gate} class="gate" role="dialog" aria-modal="true" aria-busy={busy} aria-labelledby="migration-title">
   <div class="card">
     {#if unsupported}
-      <h1 id="migration-title">A newer Agency Agents version is required</h1>
-      <p>This data was created by a newer Agency Agents version. Nothing was changed.</p>
+      <h1 id="migration-title">A newer Shikigami version is required</h1>
+      <p>This data was created by a newer Shikigami version. Nothing was changed.</p>
     {:else if complete}
       <h1 id="migration-title">Data update complete</h1>
       <p>Reopen connected Claude and Codex sessions so they use the updated storage.</p>
@@ -45,7 +45,7 @@
       <h1 id="migration-title">The data update could not finish</h1>
       <p>Nothing was lost. Your current data and verified backup remain available.</p>
     {:else}
-      <h1 id="migration-title">Agency Agents needs a one-time data update</h1>
+      <h1 id="migration-title">Shikigami needs a one-time data update</h1>
       <p>Close connected Claude and Codex sessions first. Skill and Agent package files are not moved or changed.</p>
       <ol aria-label="Data update stages">
         {#each stages as [key, label]}
