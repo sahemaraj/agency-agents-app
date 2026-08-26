@@ -26,6 +26,13 @@ jobs:
   verify:
     name: Verify Linux
     runs-on: ubuntu-22.04
+    env:
+      # Required for every cargo invocation below: tauri-build checks the tauri
+      # Cargo features against the config allowlist, and macos-private-api is
+      # enabled unconditionally in Cargo.toml. Only the Tauri CLI merges
+      # tauri.macos.conf.json, so plain cargo needs the value supplied here.
+      # Scoped to this job so the bundling job's config stays untouched.
+      TAURI_CONFIG: '{"app":{"macOSPrivateApi":true}}'
 
     steps:
       - name: Checkout

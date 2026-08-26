@@ -11,7 +11,12 @@ jobs:
     name: Verify macOS
     runs-on: macos-latest
     env:
-      TAURI_CONFIG: '{"app":{"macOSPrivateApi":false}}'
+      # tauri-build validates the tauri Cargo features against the config
+      # allowlist, but only the Tauri CLI merges tauri.macos.conf.json. Under
+      # plain cargo that file is invisible, so macOSPrivateApi must be supplied
+      # here to match the macos-private-api feature in Cargo.toml. Setting it
+      # false fails the allowlist check before any step runs.
+      TAURI_CONFIG: '{"app":{"macOSPrivateApi":true}}'
 
     steps:
       - name: Checkout
