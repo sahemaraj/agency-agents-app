@@ -15252,6 +15252,691 @@ mod tests {
             .unwrap()
     }
 
+    type LockIdentity = (String, String, String);
+
+    fn lock_identities(lock: &lockfile::AgencyLock) -> BTreeSet<LockIdentity> {
+        lock.entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.kind.clone(),
+                    entry.source_relative_path.clone(),
+                    entry.tool.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn expected_lock_identities(entries: &[(&str, &str, &str)]) -> BTreeSet<LockIdentity> {
+        entries
+            .iter()
+            .map(|(kind, path, tool)| ((*kind).into(), (*path).into(), (*tool).into()))
+            .collect()
+    }
+
+    fn assert_complete_project_lock(
+        project: &Path,
+        expected: &[(&str, &str, &str)],
+    ) -> lockfile::AgencyLock {
+        let bytes = std::fs::read(project.join(lockfile::LOCK_FILENAME)).unwrap();
+        let lock: lockfile::AgencyLock = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(lock.entries.len(), expected.len());
+        assert_eq!(lock_identities(&lock), expected_lock_identities(expected));
+        let verified = lockfile::verify_lockfile(&bytes, project).unwrap();
+        assert!(verified.clean);
+        assert_eq!(verified.entries.len(), expected.len());
+        assert!(verified
+            .entries
+            .iter()
+            .all(|entry| entry.status == lockfile::VerifyStatus::Ok));
+        lock
+    }
+
+    fn write_lock_agent(root: &Path, path: &str, name: &str, body: &str) {
+        std::fs::write(
+            root.join(path),
+            format!("---\nname: {name}\ndescription: Test.\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_lock_skill(root: &Path, path: &str, name: &str, body: &str) {
+        let package = root.join(path);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Test.\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    async fn ledger_project_identities(
+        state: &AppState,
+        project_path: &str,
+    ) -> BTreeSet<LockIdentity> {
+        let mut identities = BTreeSet::new();
+        for entry in load_install_entries_for_state(state).await.unwrap() {
+            match entry {
+                InstallLedgerEntry::Agent(record)
+                    if record.scope == crate::types::Scope::Project
+                        && record.project_path.as_deref() == Some(project_path)
+                        && record.disabled_path.is_none() =>
+                {
+                    identities.insert(("agent".into(), record.relative_path, record.tool));
+                }
+                InstallLedgerEntry::Agent(_) | InstallLedgerEntry::Roster(_) => {}
+            }
+        }
+        for record in crate::skills::install::load_ledger_for_state(state)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.scope == "project"
+                    && record.project_path.as_deref() == Some(project_path)
+                    && record.disabled_path.is_none()
+            })
+        {
+            identities.insert(("skill".into(), record.relative_path, record.runtime));
+        }
+        identities
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_is_complete_for_multiple_agents_and_skills() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [
+            ("architect.md", "Architect"),
+            ("reviewer.md", "Reviewer"),
+            ("tester.md", "Tester"),
+        ] {
+            write_lock_agent(agent_source.path(), path, name, "Agent body.");
+        }
+        for (path, name) in [("review", "review"), ("test", "test")] {
+            write_lock_skill(skill_source.path(), path, name, "# Skill body");
+        }
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+
+        for (path, tool) in [
+            ("architect.md", "codex"),
+            ("reviewer.md", "cursor"),
+            ("tester.md", "opencode"),
+        ] {
+            do_install(
+                app.handle(),
+                &state,
+                AgentReference {
+                    source_id: agents.id.clone(),
+                    relative_path: path.into(),
+                },
+                tool.into(),
+                Some(project_path.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        for path in ["review", "test"] {
+            crate::skills::install_skill(&state, &skills.id, path, "codex", Some(&project_path))
+                .await
+                .unwrap();
+        }
+
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("agent", "reviewer.md", "cursor"),
+                ("agent", "tester.md", "opencode"),
+                ("skill", "review", "codex"),
+                ("skill", "test", "codex"),
+            ],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_stays_complete_through_mixed_lifecycle() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [
+            ("architect.md", "Architect"),
+            ("reviewer.md", "Reviewer"),
+            ("tester.md", "Tester"),
+        ] {
+            write_lock_agent(agent_source.path(), path, name, "Version zero.");
+        }
+        for (path, name) in [("review", "review"), ("test", "test")] {
+            write_lock_skill(skill_source.path(), path, name, "# Skill body");
+        }
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+        let architect = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "architect.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "reviewer.md".into(),
+        };
+        let tester = AgentReference {
+            source_id: agents.id,
+            relative_path: "tester.md".into(),
+        };
+
+        let original = do_install(
+            app.handle(),
+            &state,
+            architect.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_complete_project_lock(project.path(), &[("agent", "architect.md", "codex")]);
+
+        do_install(
+            app.handle(),
+            &state,
+            reviewer.clone(),
+            "cursor".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("agent", "reviewer.md", "cursor"),
+            ],
+        );
+
+        for path in ["review", "test"] {
+            crate::skills::install_skill(&state, &skills.id, path, "codex", Some(&project_path))
+                .await
+                .unwrap();
+            let expected = if path == "review" {
+                vec![
+                    ("agent", "architect.md", "codex"),
+                    ("agent", "reviewer.md", "cursor"),
+                    ("skill", "review", "codex"),
+                ]
+            } else {
+                vec![
+                    ("agent", "architect.md", "codex"),
+                    ("agent", "reviewer.md", "cursor"),
+                    ("skill", "review", "codex"),
+                    ("skill", "test", "codex"),
+                ]
+            };
+            assert_complete_project_lock(project.path(), &expected);
+        }
+
+        crate::skills::disable_skill(&state, &skills.id, "review", "codex", Some(&project_path))
+            .await
+            .unwrap();
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("agent", "reviewer.md", "cursor"),
+                ("skill", "test", "codex"),
+            ],
+        );
+
+        crate::skills::enable_skill(&state, &skills.id, "review", "codex", Some(&project_path))
+            .await
+            .unwrap();
+        let complete_before_rollback = [
+            ("agent", "architect.md", "codex"),
+            ("agent", "reviewer.md", "cursor"),
+            ("skill", "review", "codex"),
+            ("skill", "test", "codex"),
+        ];
+        assert_complete_project_lock(project.path(), &complete_before_rollback);
+
+        write_lock_agent(
+            agent_source.path(),
+            "architect.md",
+            "Architect",
+            "Version one.",
+        );
+        do_install(
+            app.handle(),
+            &state,
+            architect.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_complete_project_lock(project.path(), &complete_before_rollback);
+        let snapshot = history::list_snapshots(&state.app_data_dir, &install_identity(&original))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.source_hash == original.source_hash)
+            .unwrap();
+        rollback_agent_version(
+            &state,
+            architect,
+            "codex".into(),
+            Some(project_path.clone()),
+            snapshot.id,
+        )
+        .await
+        .unwrap();
+        let rolled_back = assert_complete_project_lock(project.path(), &complete_before_rollback);
+        assert_eq!(
+            rolled_back
+                .entries
+                .iter()
+                .find(|entry| entry.source_relative_path == "architect.md")
+                .unwrap()
+                .source_hash,
+            original.source_hash
+        );
+
+        do_uninstall(
+            &state,
+            reviewer,
+            "cursor".into(),
+            Some(project_path.clone()),
+        )
+        .await
+        .unwrap();
+        let after_uninstall = [
+            ("agent", "architect.md", "codex"),
+            ("skill", "review", "codex"),
+            ("skill", "test", "codex"),
+        ];
+        assert_complete_project_lock(project.path(), &after_uninstall);
+
+        do_install(
+            app.handle(),
+            &state,
+            tester,
+            "opencode".into(),
+            Some(project_path),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("agent", "tester.md", "opencode"),
+                ("skill", "review", "codex"),
+                ("skill", "test", "codex"),
+            ],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_isolated_between_registered_projects() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        write_lock_agent(
+            agent_source.path(),
+            "architect.md",
+            "Architect",
+            "Agent body.",
+        );
+        write_lock_agent(
+            agent_source.path(),
+            "reviewer.md",
+            "Reviewer",
+            "Agent body.",
+        );
+        write_lock_skill(skill_source.path(), "review", "review", "# Skill body");
+        write_lock_skill(skill_source.path(), "test", "test", "# Skill body");
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_a_path = register_project(
+            app_data.path(),
+            std::fs::canonicalize(project_a.path())
+                .unwrap()
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .await
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        let project_b_path = register_project(
+            app_data.path(),
+            std::fs::canonicalize(project_b.path())
+                .unwrap()
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .await
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        assert_eq!(registered_projects(app_data.path()).await.unwrap().len(), 2);
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+        let architect = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "architect.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: agents.id,
+            relative_path: "reviewer.md".into(),
+        };
+
+        do_install(
+            app.handle(),
+            &state,
+            architect.clone(),
+            "codex".into(),
+            Some(project_a_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        do_install(
+            app.handle(),
+            &state,
+            reviewer,
+            "cursor".into(),
+            Some(project_b_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        crate::skills::install_skill(&state, &skills.id, "test", "codex", Some(&project_b_path))
+            .await
+            .unwrap();
+        assert_complete_project_lock(project_a.path(), &[("agent", "architect.md", "codex")]);
+        let project_b_expected = [
+            ("agent", "reviewer.md", "cursor"),
+            ("skill", "test", "codex"),
+        ];
+        assert_complete_project_lock(project_b.path(), &project_b_expected);
+        let project_b_before =
+            std::fs::read(project_b.path().join(lockfile::LOCK_FILENAME)).unwrap();
+
+        crate::skills::install_skill(&state, &skills.id, "review", "codex", Some(&project_a_path))
+            .await
+            .unwrap();
+        assert_complete_project_lock(
+            project_a.path(),
+            &[
+                ("agent", "architect.md", "codex"),
+                ("skill", "review", "codex"),
+            ],
+        );
+        assert_eq!(
+            std::fs::read(project_b.path().join(lockfile::LOCK_FILENAME)).unwrap(),
+            project_b_before
+        );
+        assert_complete_project_lock(project_b.path(), &project_b_expected);
+
+        do_uninstall(&state, architect, "codex".into(), Some(project_a_path))
+            .await
+            .unwrap();
+        assert_complete_project_lock(project_a.path(), &[("skill", "review", "codex")]);
+        assert_eq!(
+            std::fs::read(project_b.path().join(lockfile::LOCK_FILENAME)).unwrap(),
+            project_b_before
+        );
+        assert_complete_project_lock(project_b.path(), &project_b_expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_excludes_user_scope() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let user_tool_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [
+            ("architect.md", "Architect"),
+            ("reviewer.md", "Reviewer"),
+            ("tester.md", "Tester"),
+        ] {
+            write_lock_agent(agent_source.path(), path, name, "Agent body.");
+        }
+        write_lock_skill(skill_source.path(), "review", "review", "# Skill body");
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "kimi".into(),
+            std::fs::canonicalize(user_tool_root.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+
+        for path in ["architect.md", "reviewer.md"] {
+            mcp_install_agent_clean(
+                &state,
+                AgentReference {
+                    source_id: agents.id.clone(),
+                    relative_path: path.into(),
+                },
+                "kimi".into(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        do_install(
+            app.handle(),
+            &state,
+            AgentReference {
+                source_id: agents.id,
+                relative_path: "tester.md".into(),
+            },
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        crate::skills::install_skill(&state, &skills.id, "review", "codex", Some(&project_path))
+            .await
+            .unwrap();
+
+        assert_complete_project_lock(
+            project.path(),
+            &[
+                ("agent", "tester.md", "codex"),
+                ("skill", "review", "codex"),
+            ],
+        );
+        assert!(!user_tool_root.path().join(lockfile::LOCK_FILENAME).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_lock_derivation_matches_independent_ledgers() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let agent_source = tempfile::tempdir().unwrap();
+        let skill_source = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let user_tool_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [
+            ("architect.md", "Architect"),
+            ("reviewer.md", "Reviewer"),
+            ("tester.md", "Tester"),
+        ] {
+            write_lock_agent(agent_source.path(), path, name, "Agent body.");
+        }
+        for (path, name) in [("review", "review"), ("test", "test")] {
+            write_lock_skill(skill_source.path(), path, name, "# Skill body");
+        }
+        let agents = crate::agents::add_test_github_source(app_data.path(), agent_source.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        register_project(app_data.path(), &project_path)
+            .await
+            .unwrap();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "kimi".into(),
+            std::fs::canonicalize(user_tool_root.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let skills = crate::skills::add_test_github_source(&state, skill_source.path())
+            .await
+            .unwrap();
+        let architect = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "architect.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: agents.id.clone(),
+            relative_path: "reviewer.md".into(),
+        };
+
+        for (reference, tool) in [(architect.clone(), "codex"), (reviewer.clone(), "cursor")] {
+            do_install(
+                app.handle(),
+                &state,
+                reference,
+                tool.into(),
+                Some(project_path.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        for path in ["review", "test"] {
+            crate::skills::install_skill(&state, &skills.id, path, "codex", Some(&project_path))
+                .await
+                .unwrap();
+        }
+        crate::skills::disable_skill(&state, &skills.id, "test", "codex", Some(&project_path))
+            .await
+            .unwrap();
+        mcp_install_agent_clean(
+            &state,
+            AgentReference {
+                source_id: agents.id,
+                relative_path: "tester.md".into(),
+            },
+            "kimi".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let roster_plan = build_roster_plan(
+            &state,
+            vec![architect, reviewer],
+            "aider".into(),
+            project_path.clone(),
+            "install",
+        )
+        .await
+        .unwrap();
+        apply_roster_plan(&state, &roster_plan, &roster_plan.revision, true)
+            .await
+            .unwrap();
+
+        let expected = [
+            ("agent", "architect.md", "codex"),
+            ("agent", "reviewer.md", "cursor"),
+            ("skill", "review", "codex"),
+        ];
+        let lock = assert_complete_project_lock(project.path(), &expected);
+        let ledger_entries = load_install_entries_for_state(&state).await.unwrap();
+        assert!(ledger_entries
+            .iter()
+            .any(|entry| matches!(entry, InstallLedgerEntry::Roster(_))));
+        assert!(ledger_entries.iter().any(|entry| matches!(
+            entry,
+            InstallLedgerEntry::Agent(record) if record.scope == crate::types::Scope::User
+        )));
+        assert!(crate::skills::install::load_ledger_for_state(&state)
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.disabled_path.is_some()));
+        assert_eq!(
+            lock_identities(&lock),
+            ledger_project_identities(&state, &project_path).await
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn project_agent_disable_enable_updates_lock_and_stays_clean() {
         use crate::commands::settings::Settings;
