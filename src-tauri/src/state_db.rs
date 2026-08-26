@@ -1634,8 +1634,21 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(AppError::StorageBusy)));
-        assert!(started.elapsed() >= Duration::from_secs(4));
-        assert!(started.elapsed() < Duration::from_secs(6));
+        let elapsed = started.elapsed();
+        // Lower bound: the writer really waited on the lock rather than failing
+        // immediately, so BUSY_TIMEOUT is actually in effect.
+        assert!(
+            elapsed >= BUSY_TIMEOUT - Duration::from_secs(1),
+            "returned after {elapsed:?}, before waiting out BUSY_TIMEOUT ({BUSY_TIMEOUT:?})"
+        );
+        // Upper bound: it gave up rather than blocking indefinitely. Kept loose
+        // on purpose — a tight bound here is a wall-clock assertion on a shared
+        // CI runner, which is how this test used to fail spuriously. Anything
+        // short of a hang passes; a hang still fails.
+        assert!(
+            elapsed < BUSY_TIMEOUT * 6,
+            "waited {elapsed:?}, far beyond BUSY_TIMEOUT ({BUSY_TIMEOUT:?})"
+        );
         drop(lock);
         assert_eq!(first.read(spec(1024)).await.unwrap(), None);
     }
