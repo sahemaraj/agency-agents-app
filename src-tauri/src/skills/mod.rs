@@ -3035,12 +3035,14 @@ pub(crate) async fn batch_collection(
             )
             .await
             .map(|_| ()),
-            "uninstall" => uninstall_skill(
+            "uninstall" => uninstall_skill_authorized_inner(
                 state,
                 &skill.source_id,
                 &skill.relative_path,
                 runtime,
                 project_path,
+                None,
+                false,
             )
             .await
             .map(|_| ()),
@@ -3083,6 +3085,11 @@ pub(crate) async fn batch_collection(
             });
         }
         completed.push(format!("{}/{}", skill.source_id, skill.relative_path));
+    }
+    if operation == "uninstall" {
+        if let Some(project) = canonical_project_string(project_path)? {
+            crate::install::lockfile::sync_project_lock_best_effort(state, &project).await;
+        }
     }
     Ok(SkillBatchResult {
         operation: operation.into(),
@@ -3187,7 +3194,8 @@ async fn install_skill_authorized_inner(
                 drop(_guard);
                 if sync_lockfile {
                     if let Some(project) = record.project_path.as_deref() {
-                        crate::install::lockfile::sync_project_lock(state, project).await?;
+                        crate::install::lockfile::sync_project_lock_best_effort(state, project)
+                            .await;
                     }
                 }
                 return Ok(installed_view(record, SkillInstallState::Current));
@@ -3317,7 +3325,7 @@ async fn install_skill_authorized_inner(
     drop(_guard);
     if sync_lockfile {
         if let Some(project) = record.project_path.as_deref() {
-            crate::install::lockfile::sync_project_lock(state, project).await?;
+            crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
         }
     }
     Ok(installed_view(&record, SkillInstallState::Current))
@@ -4226,7 +4234,7 @@ pub(crate) async fn disable_skill_authorized(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    Ok(installed_view(
+    let installed = installed_view(
         &records[index],
         install::classify(
             Some(&disabled_hash),
@@ -4235,7 +4243,13 @@ pub(crate) async fn disable_skill_authorized(
             true,
             true,
         ),
-    ))
+    );
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = records[index].project_path.as_deref() {
+        crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(installed)
 }
 
 pub(crate) async fn enable_skill(
@@ -4321,7 +4335,7 @@ pub(crate) async fn enable_skill_authorized(
         database.commit_filesystem_operation(&operation.id).await?;
     }
     let (source_available, source_current) = source_status(state, &records[index]).await;
-    Ok(installed_view(
+    let installed = installed_view(
         &records[index],
         install::classify(
             Some(&disk_hash),
@@ -4330,7 +4344,13 @@ pub(crate) async fn enable_skill_authorized(
             source_current,
             false,
         ),
-    ))
+    );
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = records[index].project_path.as_deref() {
+        crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(installed)
 }
 
 pub(crate) async fn uninstall_skill(
@@ -4350,6 +4370,27 @@ pub(crate) async fn uninstall_skill_authorized(
     runtime: &str,
     project_path: Option<&str>,
     project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<bool, AppError> {
+    uninstall_skill_authorized_inner(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        project_path,
+        project_authorization,
+        true,
+    )
+    .await
+}
+
+async fn uninstall_skill_authorized_inner(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+    sync_lockfile: bool,
 ) -> Result<bool, AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
@@ -4381,6 +4422,13 @@ pub(crate) async fn uninstall_skill_authorized(
     if target_hash.is_none() {
         after_missing_uninstall_validation(&target);
         install::save_ledger_for_state(state, &records).await?;
+        drop(_file_guard);
+        drop(_guard);
+        if sync_lockfile {
+            if let Some(project) = record.project_path.as_deref() {
+                crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+            }
+        }
         return Ok(true);
     }
     let expected_target_hash = target_hash.expect("checked present Skill target hash");
@@ -4550,6 +4598,13 @@ pub(crate) async fn uninstall_skill_authorized(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         install::save_ledger_after_filesystem(state, &records, &operation.id).await?;
         database.commit_filesystem_operation(&operation.id).await?;
+    }
+    drop(_file_guard);
+    drop(_guard);
+    if sync_lockfile {
+        if let Some(project) = record.project_path.as_deref() {
+            crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+        }
     }
     Ok(true)
 }
@@ -5256,7 +5311,13 @@ pub(crate) async fn rollback_skill_authorized(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    Ok(installed_view(&records[index], SkillInstallState::Current))
+    let installed = installed_view(&records[index], SkillInstallState::Current);
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = records[index].project_path.as_deref() {
+        crate::install::lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(installed)
 }
 
 #[tauri::command]
@@ -6131,6 +6192,14 @@ mod tests {
         state
     }
 
+    fn read_project_lock(project: &Path) -> crate::install::lockfile::AgencyLock {
+        serde_json::from_slice(
+            &std::fs::read(project.join(crate::install::lockfile::LOCK_FILENAME))
+                .expect("read project lockfile"),
+        )
+        .expect("parse project lockfile")
+    }
+
     async fn add_portable_test_source(state: &AppState, root: &Path) -> SkillSource {
         add_test_github_source(state, root)
             .await
@@ -6163,6 +6232,117 @@ mod tests {
         } else {
             snapshot.join("SKILL.md")
         }
+    }
+
+    #[tokio::test]
+    async fn project_skill_disable_enable_updates_lock_and_stays_clean() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_portable_test_source(&state, source.path()).await;
+        let project_path = project.path().to_string_lossy().into_owned();
+
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install project skill");
+        super::disable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("disable project skill");
+
+        let lock_path = project.path().join(crate::install::lockfile::LOCK_FILENAME);
+        let disabled_bytes = std::fs::read(&lock_path).expect("read disabled lockfile");
+        assert!(
+            serde_json::from_slice::<crate::install::lockfile::AgencyLock>(&disabled_bytes)
+                .expect("parse disabled lockfile")
+                .entries
+                .is_empty()
+        );
+        let verify = crate::install::lockfile::verify_lockfile(&disabled_bytes, project.path())
+            .expect("verify disabled lockfile");
+        assert!(verify.clean);
+        assert!(verify.entries.is_empty());
+        let check = crate::install::lockfile::mcp_lock_check(&state, &project_path)
+            .await
+            .expect("check disabled lockfile");
+        assert!(check.clean);
+        assert!(check.entries.is_empty());
+
+        super::enable_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("enable project skill");
+        let enabled_bytes = std::fs::read(lock_path).expect("read enabled lockfile");
+        assert_eq!(
+            serde_json::from_slice::<crate::install::lockfile::AgencyLock>(&enabled_bytes)
+                .expect("parse enabled lockfile")
+                .entries
+                .len(),
+            1
+        );
+        assert!(
+            crate::install::lockfile::verify_lockfile(&enabled_bytes, project.path())
+                .expect("verify enabled lockfile")
+                .clean
+        );
+        assert!(
+            crate::install::lockfile::mcp_lock_check(&state, &project_path)
+                .await
+                .expect("check enabled lockfile")
+                .clean
+        );
+    }
+
+    #[tokio::test]
+    async fn project_skill_uninstall_rederives_the_lockfile() {
+        let app = tempdir().expect("app data");
+        let source = tempdir().expect("source");
+        let project = tempdir().expect("project");
+        let state = test_state(app.path());
+        write_skill(source.path(), "reviewer", "reviewer", "Reviews changes");
+        let registered = add_portable_test_source(&state, source.path()).await;
+        let project_path = project.path().to_string_lossy().into_owned();
+
+        super::install_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("install project skill");
+        assert_eq!(read_project_lock(project.path()).entries.len(), 1);
+
+        super::uninstall_skill(
+            &state,
+            &registered.id,
+            "reviewer",
+            "codex",
+            Some(&project_path),
+        )
+        .await
+        .expect("uninstall project skill");
+
+        assert!(read_project_lock(project.path()).entries.is_empty());
     }
 
     #[tokio::test]
@@ -6211,6 +6391,9 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        let newer_hash = read_project_lock(project.path()).entries[0]
+            .source_hash
+            .clone();
 
         super::rollback_skill_authorized(
             &state,
@@ -6230,6 +6413,9 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        let rolled_back_hash = &read_project_lock(project.path()).entries[0].source_hash;
+        assert_eq!(rolled_back_hash, &selected.content_hash);
+        assert_ne!(rolled_back_hash, &newer_hash);
         let connection =
             rusqlite::Connection::open(app.path().join("state/agency-agents.sqlite3")).unwrap();
         let update_count: u32 = connection
@@ -9109,6 +9295,8 @@ mod tests {
         )
         .await
         .expect("disable skill");
+        let lock_path = project.path().join(crate::install::lockfile::LOCK_FILENAME);
+        let unchanged_lock = std::fs::read(&lock_path).expect("read disabled lockfile");
         std::fs::remove_dir_all(source.path().join("reviewer")).expect("remove source package");
 
         let enabled = super::enable_skill(
@@ -9122,6 +9310,10 @@ mod tests {
         .expect("enable missing-source skill");
         assert_eq!(enabled.state, SkillInstallState::SourceUnavailable);
         assert!(Path::new(&enabled.path).is_dir());
+        assert_eq!(
+            std::fs::read(lock_path).expect("read unchanged lockfile"),
+            unchanged_lock
+        );
     }
 
     #[tokio::test]

@@ -327,10 +327,10 @@ async fn current_lock(state: &AppState, project: &Path) -> Result<AgencyLock, Ap
     let mut entries = Vec::new();
     let mut unresolved = Vec::new();
 
-    for record in agent_records
-        .iter()
-        .filter(|record| record.project_path.as_deref() == Some(project_string.as_ref()))
-    {
+    for record in agent_records.iter().filter(|record| {
+        record.project_path.as_deref() == Some(project_string.as_ref())
+            && record.disabled_path.is_none()
+    }) {
         let source = match portable_agent_source(record, &agent_sources) {
             Ok(source) => source,
             Err(error) => {
@@ -369,10 +369,10 @@ async fn current_lock(state: &AppState, project: &Path) -> Result<AgencyLock, Ap
         });
     }
 
-    for record in skill_records
-        .iter()
-        .filter(|record| record.project_path.as_deref() == Some(project_string.as_ref()))
-    {
+    for record in skill_records.iter().filter(|record| {
+        record.project_path.as_deref() == Some(project_string.as_ref())
+            && record.disabled_path.is_none()
+    }) {
         let source = match portable_skill_source(record, &skill_sources) {
             Ok(source) => source,
             Err(error) => {
@@ -417,6 +417,14 @@ pub(crate) async fn sync_project_lock(
     let _guard = lock_project_lockfile_async(project.clone()).await?;
     let lock = current_lock(state, &project).await?;
     crate::util::fs::atomic_write(&project.join(LOCK_FILENAME), &serialize(&lock)?).await
+}
+
+pub(crate) async fn sync_project_lock_best_effort(state: &AppState, project_path: &str) {
+    if let Err(error) = sync_project_lock(state, project_path).await {
+        tracing::warn!(
+            "project {project_path}: lockfile left unchanged, could not re-derive it: {error}"
+        );
+    }
 }
 
 fn artifact_state(project: &Path, artifacts: &[LockArtifact]) -> LockEntryStatus {

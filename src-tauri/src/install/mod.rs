@@ -1528,7 +1528,7 @@ pub(crate) async fn do_install<R: Runtime>(
     drop(_file_guard);
     drop(_guard);
     if let Some(project) = record.project_path.as_deref() {
-        lockfile::sync_project_lock(state, project).await?;
+        lockfile::sync_project_lock_best_effort(state, project).await;
     }
     Ok(record)
 }
@@ -1604,7 +1604,7 @@ async fn do_install_merge<R: Runtime>(
     drop(_file_guard);
     drop(_guard);
     if let Some(project) = record.project_path.as_deref() {
-        lockfile::sync_project_lock(state, project).await?;
+        lockfile::sync_project_lock_best_effort(state, project).await;
     }
     Ok(record)
 }
@@ -2555,7 +2555,7 @@ async fn do_track<R: Runtime>(
     drop(_file_guard);
     drop(_guard);
     if let Some(project) = record.project_path.as_deref() {
-        lockfile::sync_project_lock(state, project).await?;
+        lockfile::sync_project_lock_best_effort(state, project).await;
     }
     Ok(record)
 }
@@ -6837,7 +6837,7 @@ async fn execute_install_plan(
     drop(_file_guard);
     drop(_guard);
     if let Some(project) = plan.project_path.as_deref() {
-        lockfile::sync_project_lock(state, project).await?;
+        lockfile::sync_project_lock_best_effort(state, project).await;
     }
     Ok(installed)
 }
@@ -6907,6 +6907,11 @@ async fn execute_uninstall_plan(
                 }),
             };
         }
+    }
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = plan.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
     }
     Ok(removed)
 }
@@ -7245,7 +7250,7 @@ async fn mcp_install_agent_clean_inner(
     drop(_guard);
     if sync_lockfile {
         if let Some(project) = record.project_path.as_deref() {
-            lockfile::sync_project_lock(state, project).await?;
+            lockfile::sync_project_lock_best_effort(state, project).await;
         }
     }
     Ok(record)
@@ -7425,7 +7430,13 @@ pub(crate) async fn mcp_move_agent_install(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    Ok(records[index].clone())
+    let record = records[index].clone();
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(record)
 }
 
 pub(crate) async fn mcp_agent_version_history(
@@ -8368,7 +8379,13 @@ async fn rollback_agent_version(
     if let (Some(database), Some(operation)) = (&database, &operation) {
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    Ok(records[index].clone())
+    let record = records[index].clone();
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(record)
 }
 
 fn require_plan_revision(plan: &AgentMutationPlan, expected: &str) -> Result<(), AppError> {
@@ -8653,7 +8670,13 @@ async fn do_uninstall(
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
     recover_agent_operations_locked(state).await?;
-    do_uninstall_locked(state, reference, tool, project_path).await
+    let record = do_uninstall_locked(state, reference, tool, project_path).await?;
+    drop(_file_guard);
+    drop(_guard);
+    if let Some(project) = record.project_path.as_deref() {
+        lockfile::sync_project_lock_best_effort(state, project).await;
+    }
+    Ok(())
 }
 
 async fn do_uninstall_locked(
@@ -8661,7 +8684,7 @@ async fn do_uninstall_locked(
     reference: AgentReference,
     tool: Tool,
     project_path: Option<String>,
-) -> Result<(), AppError> {
+) -> Result<InstallRecord, AppError> {
     reject_generic_roster_target(&tool)?;
     let mut ledger = load_ledger_for_state(state).await?;
     let index = install_record_index(
@@ -8769,7 +8792,7 @@ async fn do_uninstall_locked(
             }
         }
     }
-    Ok(())
+    Ok(record)
 }
 
 pub(crate) async fn do_uninstall_legacy(
@@ -15222,6 +15245,396 @@ mod tests {
             .manage(state)
             .build(context)
             .unwrap()
+    }
+
+    fn read_project_lock(project: &Path) -> lockfile::AgencyLock {
+        serde_json::from_slice(&std::fs::read(project.join(lockfile::LOCK_FILENAME)).unwrap())
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_agent_disable_enable_updates_lock_and_stays_clean() {
+        use crate::commands::settings::Settings;
+        use crate::state::McpAction;
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [("agent.md", "Agent"), ("reviewer.md", "Reviewer")] {
+            std::fs::write(
+                source_root.path().join(path),
+                format!("---\nname: {name}\ndescription: Test.\n---\n{name} body.\n"),
+            )
+            .unwrap();
+        }
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::commands::settings::persist(
+            app_data.path(),
+            Settings {
+                paranoid_mode: false,
+                mcp_agent_install_access: true,
+                mcp_agent_destructive_access: true,
+                mcp_project_allowlist: vec![project_path.clone()],
+                ..Settings::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let authorization = state
+            .authorize_mcp_client("test", McpAction::AgentDestructive, Some(&project_path))
+            .await
+            .unwrap()
+            .unwrap();
+        let agent = AgentReference {
+            source_id: source.id.clone(),
+            relative_path: "agent.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: source.id,
+            relative_path: "reviewer.md".into(),
+        };
+
+        for reference in [agent.clone(), reviewer] {
+            do_install(
+                app.handle(),
+                &state,
+                reference,
+                "codex".into(),
+                Some(project_path.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        mcp_move_agent_install(
+            &state,
+            agent.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+            Some(&authorization),
+        )
+        .await
+        .unwrap();
+        let lock_path = project.path().join(lockfile::LOCK_FILENAME);
+        let disabled_bytes = std::fs::read(&lock_path).unwrap();
+        let disabled_lock: lockfile::AgencyLock = serde_json::from_slice(&disabled_bytes).unwrap();
+        assert_eq!(disabled_lock.entries.len(), 1);
+        assert_eq!(disabled_lock.entries[0].source_relative_path, "reviewer.md");
+        let verify = lockfile::verify_lockfile(&disabled_bytes, project.path()).unwrap();
+        assert!(verify.clean);
+        assert!(verify
+            .entries
+            .iter()
+            .all(|entry| entry.status == lockfile::VerifyStatus::Ok));
+        let check = lockfile::mcp_lock_check(&state, &project_path)
+            .await
+            .unwrap();
+        assert!(check.clean);
+        assert!(check
+            .entries
+            .iter()
+            .all(|entry| entry.status == lockfile::LockEntryStatus::Current));
+
+        mcp_move_agent_install(
+            &state,
+            agent,
+            "codex".into(),
+            Some(project_path.clone()),
+            true,
+            Some(&authorization),
+        )
+        .await
+        .unwrap();
+        let enabled_bytes = std::fs::read(lock_path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<lockfile::AgencyLock>(&enabled_bytes)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        assert!(
+            lockfile::verify_lockfile(&enabled_bytes, project.path())
+                .unwrap()
+                .clean
+        );
+        assert!(
+            lockfile::mcp_lock_check(&state, &project_path)
+                .await
+                .unwrap()
+                .clean
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_agent_uninstall_rederives_lock_and_preserves_other_agents() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        for (path, name) in [("agent.md", "Agent"), ("reviewer.md", "Reviewer")] {
+            std::fs::write(
+                source_root.path().join(path),
+                format!("---\nname: {name}\ndescription: Test.\n---\n{name} body.\n"),
+            )
+            .unwrap();
+        }
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let agent = AgentReference {
+            source_id: source.id.clone(),
+            relative_path: "agent.md".into(),
+        };
+        let reviewer = AgentReference {
+            source_id: source.id,
+            relative_path: "reviewer.md".into(),
+        };
+
+        do_install(
+            app.handle(),
+            &state,
+            agent.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        do_install(
+            app.handle(),
+            &state,
+            reviewer.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_project_lock(project.path()).entries.len(), 2);
+
+        do_uninstall(&state, agent, "codex".into(), Some(project_path.clone()))
+            .await
+            .unwrap();
+        let lock = read_project_lock(project.path());
+        assert_eq!(lock.entries.len(), 1);
+        assert_eq!(lock.entries[0].source_relative_path, "reviewer.md");
+
+        do_uninstall(&state, reviewer, "codex".into(), Some(project_path))
+            .await
+            .unwrap();
+        assert!(read_project_lock(project.path()).entries.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unresolvable_agent_does_not_block_uninstalling_another_agent() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let dead_source_root = tempfile::tempdir().unwrap();
+        let live_source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        std::fs::write(
+            dead_source_root.path().join("agent.md"),
+            "---\nname: Agent\ndescription: Test.\n---\nAgent body.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            live_source_root.path().join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: Test.\n---\nReviewer body.\n",
+        )
+        .unwrap();
+        let dead_source =
+            crate::agents::add_test_github_source(app_data.path(), dead_source_root.path())
+                .await
+                .unwrap();
+        let live_source =
+            crate::agents::add_test_github_source(app_data.path(), live_source_root.path())
+                .await
+                .unwrap();
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let dead_agent = AgentReference {
+            source_id: dead_source.id.clone(),
+            relative_path: "agent.md".into(),
+        };
+        let live_agent = AgentReference {
+            source_id: live_source.id,
+            relative_path: "reviewer.md".into(),
+        };
+
+        for reference in [dead_agent, live_agent.clone()] {
+            do_install(
+                app.handle(),
+                &state,
+                reference,
+                "codex".into(),
+                Some(project_path.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let lock_path = project.path().join(lockfile::LOCK_FILENAME);
+        let unchanged_lock = std::fs::read(&lock_path).unwrap();
+        assert!(
+            crate::agents::remove_agent_source(app_data.path(), &dead_source.id)
+                .await
+                .unwrap()
+        );
+
+        do_uninstall(&state, live_agent, "codex".into(), Some(project_path))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(lock_path).unwrap(), unchanged_lock);
+    }
+
+    #[tokio::test]
+    async fn user_agent_uninstall_does_not_create_a_lockfile() {
+        use crate::commands::settings::{Settings, SettingsLoadState};
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let tool_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source_root.path().join("agent.md"),
+            "---\nname: Agent\ndescription: Test.\n---\nAgent body.\n",
+        )
+        .unwrap();
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        let mut settings = Settings::default();
+        settings.tool_paths.insert(
+            "kimi".into(),
+            std::fs::canonicalize(tool_home.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        *state.settings.write().await = SettingsLoadState::Loaded(settings);
+        let reference = AgentReference {
+            source_id: source.id,
+            relative_path: "agent.md".into(),
+        };
+
+        mcp_install_agent_clean(&state, reference.clone(), "kimi".into(), None, None)
+            .await
+            .unwrap();
+        do_uninstall(&state, reference, "kimi".into(), None)
+            .await
+            .unwrap();
+
+        assert!(!app_data.path().join(lockfile::LOCK_FILENAME).exists());
+        assert!(!tool_home.path().join(lockfile::LOCK_FILENAME).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_version_rollback_rederives_the_project_lock() {
+        use tauri::Manager as _;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(app_data.path().join("corpus")).unwrap();
+        let source_file = source_root.path().join("agent.md");
+        std::fs::write(
+            &source_file,
+            "---\nname: Agent\ndescription: Test.\n---\nVersion zero.\n",
+        )
+        .unwrap();
+        let source = crate::agents::add_test_github_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let reference = AgentReference {
+            source_id: source.id,
+            relative_path: "agent.md".into(),
+        };
+        let project_path = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let app = command_test_app(app_data.path());
+        let state = app.state::<AppState>();
+        let installed = do_install(
+            app.handle(),
+            &state,
+            reference.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        let old_hash = read_project_lock(project.path()).entries[0]
+            .source_hash
+            .clone();
+        std::fs::write(
+            &source_file,
+            "---\nname: Agent\ndescription: Test.\n---\nVersion one.\n",
+        )
+        .unwrap();
+        do_install(
+            app.handle(),
+            &state,
+            reference.clone(),
+            "codex".into(),
+            Some(project_path.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        let new_hash = read_project_lock(project.path()).entries[0]
+            .source_hash
+            .clone();
+        let snapshot = history::list_snapshots(&state.app_data_dir, &install_identity(&installed))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.source_hash == old_hash)
+            .unwrap();
+
+        rollback_agent_version(
+            &state,
+            reference,
+            "codex".into(),
+            Some(project_path),
+            snapshot.id,
+        )
+        .await
+        .unwrap();
+
+        let rolled_back_hash = &read_project_lock(project.path()).entries[0].source_hash;
+        assert_eq!(rolled_back_hash, &old_hash);
+        assert_ne!(rolled_back_hash, &new_hash);
     }
 
     #[tokio::test(flavor = "current_thread")]
