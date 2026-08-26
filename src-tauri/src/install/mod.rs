@@ -1199,6 +1199,7 @@ fn record_artifacts(record: &InstallRecord) -> Vec<InstallArtifact> {
 struct AgentMergeComputation {
     outcome: AgentMergeOutcome,
     preview: Option<AgentMergePreview>,
+    verified_installed: Option<Vec<u8>>,
 }
 
 fn unavailable_merge(reason: impl Into<String>) -> AgentMergeComputation {
@@ -1207,6 +1208,7 @@ fn unavailable_merge(reason: impl Into<String>) -> AgentMergeComputation {
             reason: reason.into(),
         },
         preview: None,
+        verified_installed: None,
     }
 }
 
@@ -1287,6 +1289,7 @@ fn merge_utf8(
                     preview,
                     preview_hash,
                 }),
+                verified_installed: None,
             })
         }
         Err(conflicted) => {
@@ -1297,6 +1300,7 @@ fn merge_utf8(
                     hunk_summaries,
                 },
                 preview: None,
+                verified_installed: None,
             })
         }
     }
@@ -1376,13 +1380,17 @@ async fn merge_for_record(
             "canonical base snapshot failed verification",
         ));
     }
-    merge_utf8(
+    let mut computed = merge_utf8(
         record,
         base_snapshot_id,
         &contents[0],
         &ours,
         theirs[0].content.as_bytes(),
-    )
+    )?;
+    if computed.preview.is_some() {
+        computed.verified_installed = Some(ours);
+    }
+    Ok(computed)
 }
 
 async fn merge_for_reference(
@@ -1452,12 +1460,47 @@ async fn backup_if_differs(
     atomic_write(&backup, &existing).await
 }
 
+async fn backup_verified_if_differs(
+    dest: &Path,
+    existing: Option<&[u8]>,
+    new_bytes: &[u8],
+    backup_dir: &Path,
+    stamp: &str,
+) -> Result<(), AppError> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if existing == new_bytes {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(backup_dir)
+        .await
+        .map_err(|error| AppError::Io {
+            message: format!("create backups dir {}: {error}", backup_dir.display()),
+        })?;
+    let filename = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "agent".into());
+    atomic_write(
+        &backup_dir.join(format!("{filename}.{}.bak", fs_stamp(stamp))),
+        existing,
+    )
+    .await
+}
+
 // ---------- Install / update (shared core) ----------
 
 #[derive(Clone, Copy)]
 enum AgentInstallConsent {
     Desktop { confirmed: bool },
     Lockfile,
+}
+
+impl AgentInstallConsent {
+    fn confirmed(self) -> bool {
+        matches!(self, Self::Desktop { confirmed: true })
+    }
 }
 
 pub(crate) async fn do_install<R: Runtime>(
@@ -1482,10 +1525,35 @@ pub(crate) async fn do_install<R: Runtime>(
         None,
     )
     .await?;
+    drop(_file_guard);
+    drop(_guard);
     if let Some(project) = record.project_path.as_deref() {
         lockfile::sync_project_lock(state, project).await?;
     }
     Ok(record)
+}
+
+pub(crate) async fn do_install_lockfile_desktop<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: String,
+) -> Result<InstallRecord, AppError> {
+    reject_generic_roster_target(&tool)?;
+    let _guard = state.skill_installs_write_lock.lock().await;
+    let _file_guard = lock_agent_installs_async(state.app_data_dir.clone()).await?;
+    recover_agent_operations_locked(state).await?;
+    corpus::ensure_corpus(app, state).await?;
+    do_install_locked(
+        state,
+        reference,
+        tool,
+        Some(project_path),
+        AgentInstallConsent::Desktop { confirmed: true },
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn do_install_headless_lock(
@@ -1533,6 +1601,8 @@ async fn do_install_merge<R: Runtime>(
         Some(preview_hash),
     )
     .await?;
+    drop(_file_guard);
+    drop(_guard);
     if let Some(project) = record.project_path.as_deref() {
         lockfile::sync_project_lock(state, project).await?;
     }
@@ -1620,9 +1690,8 @@ async fn do_install_locked(
                 && record.project_path == project_path
         })
         .cloned();
-    if let (Some(existing), AgentInstallConsent::Desktop { confirmed }) =
-        (&existing_record, consent)
-    {
+    if let Some(existing) = &existing_record {
+        let confirmed = consent.confirmed();
         let library = crate::agents::organize::list(state).await?;
         let policy = library
             .update_policies
@@ -1653,13 +1722,19 @@ async fn do_install_locked(
         Some(record) => resolved_record_paths(state, record).await?,
         None => install_target_paths(&agent, Some(&raw), &tool, &home, proot.as_deref(), None)?,
     };
+    let mut verified_existing = None;
     if merge_preview_hash.is_none() {
         if let (Some(existing), AgentInstallConsent::Lockfile) = (&existing_record, consent) {
             let expected = record_rendered_hashes(existing, targets.len());
+            let mut verified = Vec::with_capacity(targets.len());
             for (path, expected_hash) in targets.iter().zip(expected) {
                 match tokio::fs::read(path).await {
-                    Ok(bytes) if render::sha256_hex(&bytes) == expected_hash => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(bytes) if render::sha256_hex(&bytes) == expected_hash => {
+                        verified.push(Some(bytes));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        verified.push(None);
+                    }
                     Ok(_) => {
                         return Err(AppError::InvalidArgument {
                             message: format!(
@@ -1678,6 +1753,7 @@ async fn do_install_locked(
                     }
                 }
             }
+            verified_existing = Some(verified);
         }
     }
     ensure_destinations_available(
@@ -1710,6 +1786,11 @@ async fn do_install_locked(
         let preview = computed.preview.ok_or_else(|| AppError::InvalidArgument {
             message: "Agent merge is no longer clean; request a new preview".into(),
         })?;
+        verified_existing = Some(vec![Some(computed.verified_installed.ok_or_else(
+            || AppError::Internal {
+                message: "Agent merge lost its verified installed bytes".into(),
+            },
+        )?)]);
         require_merge_preview_hash(&preview.preview_hash, expected_preview_hash)?;
         vec![render::RenderedArtifact {
             content: preview.preview,
@@ -1794,8 +1875,14 @@ async fn do_install_locked(
     } else {
         None
     };
-    let write_result =
-        write_rendered_agent_files(&targets, &write_rendered, Some(&backups), &installed_at).await;
+    let write_result = write_rendered_agent_files(
+        &targets,
+        &write_rendered,
+        Some(&backups),
+        &installed_at,
+        verified_existing.as_deref(),
+    )
+    .await;
     let record = match write_result {
         Ok(()) => planned_record,
         Err(error) => {
@@ -1928,6 +2015,27 @@ async fn capture_batch_files(paths: &[PathBuf]) -> Result<Vec<BatchFileSnapshot>
         snapshots.push(BatchFileSnapshot { path, bytes });
     }
     Ok(snapshots)
+}
+
+async fn require_destination_unchanged(
+    path: &Path,
+    expected: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let current = capture_batch_files(&[path.to_path_buf()])
+        .await?
+        .pop()
+        .expect("one destination snapshot")
+        .bytes;
+    if current.as_deref() == expected {
+        Ok(current)
+    } else {
+        Err(AppError::InvalidArgument {
+            message: format!(
+                "Agent destination changed on disk after verification: {}",
+                path.display()
+            ),
+        })
+    }
 }
 
 async fn restore_batch_files(snapshots: &[BatchFileSnapshot]) -> Result<(), AppError> {
@@ -2444,6 +2552,8 @@ async fn do_track<R: Runtime>(
     });
     ledger.push(record.clone());
     save_ledger(app, &ledger).await?;
+    drop(_file_guard);
+    drop(_guard);
     if let Some(project) = record.project_path.as_deref() {
         lockfile::sync_project_lock(state, project).await?;
     }
@@ -4517,7 +4627,7 @@ async fn write_agent_files_at(
 ) -> Result<InstallRecord, AppError> {
     let rendered = render::render_artifacts(agent, raw, tool)?;
     let manifest = artifact_manifest(paths, &rendered)?;
-    write_rendered_agent_files(paths, &rendered, backup_dir, installed_at).await?;
+    write_rendered_agent_files(paths, &rendered, backup_dir, installed_at, None).await?;
     let mut record = record_for(
         agent,
         &paths[0],
@@ -4538,22 +4648,47 @@ async fn write_rendered_agent_files(
     rendered: &[render::RenderedArtifact],
     backup_dir: Option<&Path>,
     installed_at: &str,
+    verified_existing: Option<&[Option<Vec<u8>>]>,
 ) -> Result<(), AppError> {
     let manifest = artifact_manifest(paths, rendered)?;
     let prior = capture_batch_files(paths).await?;
-    for ((dest, artifact), entry) in paths.iter().zip(rendered).zip(&manifest) {
-        if let Some(bdir) = backup_dir {
-            backup_if_differs(dest, artifact.content.as_bytes(), bdir, installed_at).await?;
-        }
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| AppError::Io {
-                    message: format!("create {}: {e}", parent.display()),
-                })?;
-        }
+    if verified_existing.is_some_and(|expected| expected.len() != paths.len()) {
+        return Err(AppError::Internal {
+            message: "Agent verified destination count changed before write".into(),
+        });
+    }
+    let mut written = Vec::new();
+    for (index, ((dest, artifact), entry)) in paths.iter().zip(rendered).zip(&manifest).enumerate()
+    {
+        let expected = verified_existing
+            .map(|items| items[index].as_deref())
+            .unwrap_or_else(|| {
+                prior
+                    .iter()
+                    .find(|snapshot| snapshot.path == *dest)
+                    .and_then(|snapshot| snapshot.bytes.as_deref())
+            });
         let write = async {
+            let verified = require_destination_unchanged(dest, expected).await?;
+            if let Some(bdir) = backup_dir {
+                backup_verified_if_differs(
+                    dest,
+                    verified.as_deref(),
+                    artifact.content.as_bytes(),
+                    bdir,
+                    installed_at,
+                )
+                .await?;
+            }
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| AppError::Io {
+                        message: format!("create {}: {e}", parent.display()),
+                    })?;
+            }
             atomic_write(dest, artifact.content.as_bytes()).await?;
+            written.push(dest.clone());
             let saved = read_capped(dest, MAX_INSTALLED_BYTES).await?;
             if render::sha256_hex(&saved) != entry.rendered_hash {
                 return Err(AppError::Internal {
@@ -4564,7 +4699,12 @@ async fn write_rendered_agent_files(
         }
         .await;
         if let Err(error) = write {
-            return match restore_batch_files(&prior).await {
+            let restore = prior
+                .iter()
+                .filter(|snapshot| written.contains(&snapshot.path))
+                .cloned()
+                .collect::<Vec<_>>();
+            return match restore_batch_files(&restore).await {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(rollback_error("write Agent artifacts", error, rollback)),
             };
@@ -6694,6 +6834,8 @@ async fn execute_install_plan(
             }
         }
     }
+    drop(_file_guard);
+    drop(_guard);
     if let Some(project) = plan.project_path.as_deref() {
         lockfile::sync_project_lock(state, project).await?;
     }
@@ -6914,6 +7056,35 @@ pub(crate) async fn mcp_install_agent_clean(
     project_path: Option<String>,
     authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<InstallRecord, AppError> {
+    mcp_install_agent_clean_inner(state, reference, tool, project_path, authorization, true).await
+}
+
+pub(crate) async fn mcp_install_agent_clean_for_lockfile(
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: String,
+    authorization: Option<&AuthorizedMcpProject>,
+) -> Result<InstallRecord, AppError> {
+    mcp_install_agent_clean_inner(
+        state,
+        reference,
+        tool,
+        Some(project_path),
+        authorization,
+        false,
+    )
+    .await
+}
+
+async fn mcp_install_agent_clean_inner(
+    state: &AppState,
+    reference: AgentReference,
+    tool: Tool,
+    project_path: Option<String>,
+    authorization: Option<&AuthorizedMcpProject>,
+    sync_lockfile: bool,
+) -> Result<InstallRecord, AppError> {
     reject_generic_roster_target(&tool)?;
     let authorization = authorized_agent_project(project_path.as_deref(), authorization)?;
     let _guard = state.skill_installs_write_lock.lock().await;
@@ -7070,8 +7241,12 @@ pub(crate) async fn mcp_install_agent_clean(
             Err(rollback) => Err(rollback_error("save Agent install", error, rollback)),
         };
     }
-    if let Some(project) = record.project_path.as_deref() {
-        lockfile::sync_project_lock(state, project).await?;
+    drop(_file_guard);
+    drop(_guard);
+    if sync_lockfile {
+        if let Some(project) = record.project_path.as_deref() {
+            lockfile::sync_project_lock(state, project).await?;
+        }
     }
     Ok(record)
 }
@@ -13666,12 +13841,22 @@ async fn build_workspace_pack_plan(
             });
             continue;
         }
+        let mutation_operation = if installed_agents.iter().any(|installed| {
+            installed.source_id == requested.reference.source_id
+                && installed.relative_path == requested.reference.relative_path
+                && installed.tool == requested.tool
+                && installed.project_path == plan.project_path
+        }) {
+            "update"
+        } else {
+            "install"
+        };
         let mutation = match build_mutation_plan(
             state,
             vec![requested.reference.clone()],
             requested.tool.clone(),
             plan.project_path.clone(),
-            "install",
+            mutation_operation,
             true,
         )
         .await
@@ -19915,6 +20100,101 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn portable_derivation_uses_the_commit_from_a_real_git_checkout() {
+        let app_data = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(
+            repository.path().join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: Reviews.\n---\nReview.\n",
+        )
+        .unwrap();
+        run_git(&["add", "reviewer.md"]);
+        run_git(&["commit", "-m", "fixture"]);
+        let commit = run_git(&["rev-parse", "HEAD"]);
+
+        let source = crate::agents::add_github_source(
+            app_data.path(),
+            "https://github.com/agency-agents-test/reviewer.git",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut state = AppState::build().unwrap();
+        state.app_data_dir = app_data.path().to_path_buf();
+        *state.settings.write().await = crate::commands::settings::SettingsLoadState::FirstLaunch;
+        let refreshed = crate::agents::refresh_git_source_from(
+            &state,
+            &source.id,
+            repository.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut record = row("reviewer", "codex", None);
+        record.source_id = source.id;
+        record.relative_path = "reviewer.md".into();
+        let pack = workspace_pack_from_ledgers(
+            "real git".into(),
+            WorkspacePackScope::User,
+            None,
+            &[record],
+            &[],
+            std::slice::from_ref(&refreshed.source),
+            &[],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &pack.agents[0].source,
+            PortableSource::Github {
+                resolved_commit: Some(resolved),
+                ..
+            } if resolved == &commit
+        ));
+    }
+
+    #[tokio::test]
+    async fn genuine_local_source_fails_closed_during_portable_derivation() {
+        let app_data = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let source = crate::agents::add_local_source(app_data.path(), source_root.path())
+            .await
+            .unwrap();
+        let mut record = row("reviewer", "codex", None);
+        record.source_id = source.id.clone();
+        record.relative_path = "reviewer.md".into();
+
+        assert!(workspace_pack_from_ledgers(
+            "local".into(),
+            WorkspacePackScope::User,
+            None,
+            &[record],
+            &[],
+            &[source],
+            &[],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("requires built-in or GitHub Agent sources"));
+    }
+
     fn recovery_record(project: &Path, rendered_hash: String) -> InstallRecord {
         let destination = project.join(".codex/agents/frontend-developer.toml");
         InstallRecord {
@@ -21716,6 +21996,9 @@ mod tests {
 
     #[test]
     fn install_update_requires_confirmation_for_broadened_capabilities() {
+        assert!(!AgentInstallConsent::Lockfile.confirmed());
+        assert!(!AgentInstallConsent::Desktop { confirmed: false }.confirmed());
+        assert!(AgentInstallConsent::Desktop { confirmed: true }.confirmed());
         assert!(!update_policy_allows(
             crate::types::AgentUpdatePolicy::AutoTrusted,
             false,
@@ -21843,6 +22126,34 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].slug, original_ledger[0].slug);
         assert_eq!(restored[0].dest, original_ledger[0].dest);
+    }
+
+    #[tokio::test]
+    async fn verified_agent_destination_change_aborts_before_backup_or_write() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("agent.md");
+        let backups = root.path().join("backups");
+        std::fs::write(&destination, b"verified").unwrap();
+        let verified = vec![Some(b"verified".to_vec())];
+        std::fs::write(&destination, b"external save").unwrap();
+
+        let error = write_rendered_agent_files(
+            std::slice::from_ref(&destination),
+            &[render::RenderedArtifact {
+                content: "replacement".into(),
+            }],
+            Some(&backups),
+            "2026-08-26T00:00:00Z",
+            Some(&verified),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("changed on disk after verification"));
+        assert_eq!(std::fs::read(destination).unwrap(), b"external save");
+        assert!(!backups.exists());
     }
 
     #[tokio::test]

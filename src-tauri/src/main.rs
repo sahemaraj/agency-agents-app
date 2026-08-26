@@ -114,14 +114,16 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
     })
 }
 
+fn is_cli_invocation(first: Option<&str>) -> bool {
+    first.is_some_and(|argument| !argument.starts_with('-'))
+}
+
 fn main() {
     let mode = match parse_mode(std::env::args()) {
         Ok(mode) => mode,
         Err(error) => {
-            let is_cli = matches!(
-                std::env::args().nth(1).as_deref(),
-                Some("check" | "plan" | "apply" | "list" | "verify")
-            );
+            let first = std::env::args().nth(1);
+            let is_cli = is_cli_invocation(first.as_deref());
             eprintln!(
                 "{}",
                 if is_cli {
@@ -194,7 +196,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mode, CliArgs, Mode, DEFAULT_MCP_HTTP_BIND};
+    use super::{is_cli_invocation, parse_mode, CliArgs, Mode, DEFAULT_MCP_HTTP_BIND};
 
     #[test]
     fn parses_mcp_modes() {
@@ -299,12 +301,16 @@ mod tests {
 
     #[test]
     fn rejects_invalid_cli_options() {
+        assert!(parse_mode(["app", "chek"]).is_err());
         assert!(parse_mode(["app", "check", "--dry-run"]).is_err());
         assert!(parse_mode(["app", "apply", "--project"]).is_err());
         assert!(parse_mode(["app", "list", "--json", "--json"]).is_err());
         assert!(parse_mode(["app", "plan", "--merge"]).is_err());
         assert!(parse_mode(["app", "plan", "--unknown"]).is_err());
         assert!(parse_mode(["app", "verify", "--merge"]).is_err());
+        assert!(is_cli_invocation(Some("chek")));
+        assert!(is_cli_invocation(Some("plan")));
+        assert!(!is_cli_invocation(Some("--mcp-http")));
     }
 
     #[cfg(target_os = "macos")]

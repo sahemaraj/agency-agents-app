@@ -2895,6 +2895,47 @@ pub(crate) async fn install_skill_with_dependencies_authorized(
     project_path: Option<&str>,
     project_authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<Vec<InstalledSkill>, AppError> {
+    install_skill_with_dependencies_inner(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        project_path,
+        project_authorization,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn install_skill_with_dependencies_for_lockfile(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: &str,
+    project_authorization: Option<&AuthorizedMcpProject>,
+) -> Result<Vec<InstalledSkill>, AppError> {
+    install_skill_with_dependencies_inner(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        Some(project_path),
+        project_authorization,
+        false,
+    )
+    .await
+}
+
+async fn install_skill_with_dependencies_inner(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+    sync_lockfile: bool,
+) -> Result<Vec<InstalledSkill>, AppError> {
     let plan = plan_skill_install(state, source_id, relative_path, runtime, project_path).await?;
     if !plan.blockers.is_empty() {
         return Err(AppError::InvalidArgument {
@@ -2914,13 +2955,14 @@ pub(crate) async fn install_skill_with_dependencies_authorized(
         if package.dependency && already_managed {
             continue;
         }
-        match install_skill_authorized(
+        match install_skill_authorized_inner(
             state,
             &package.source_id,
             &package.relative_path,
             runtime,
             project_path,
             project_authorization,
+            sync_lockfile,
         )
         .await
         {
@@ -3057,6 +3099,27 @@ pub(crate) async fn install_skill_authorized(
     project_path: Option<&str>,
     project_authorization: Option<&AuthorizedMcpProject>,
 ) -> Result<InstalledSkill, AppError> {
+    install_skill_authorized_inner(
+        state,
+        source_id,
+        relative_path,
+        runtime,
+        project_path,
+        project_authorization,
+        true,
+    )
+    .await
+}
+
+async fn install_skill_authorized_inner(
+    state: &AppState,
+    source_id: &str,
+    relative_path: &str,
+    runtime: &str,
+    project_path: Option<&str>,
+    project_authorization: Option<&AuthorizedMcpProject>,
+    sync_lockfile: bool,
+) -> Result<InstalledSkill, AppError> {
     let _guard = state.skill_installs_write_lock.lock().await;
     let _file_guard = lock_skill_installs_async(state.app_data_dir.clone()).await?;
     let package = resolve_skill_package(state, source_id, relative_path).await?;
@@ -3120,8 +3183,12 @@ pub(crate) async fn install_skill_authorized(
                 })
             }
             Some(_) if record.source_hash == source_hash => {
-                if let Some(project) = record.project_path.as_deref() {
-                    crate::install::lockfile::sync_project_lock(state, project).await?;
+                drop(_file_guard);
+                drop(_guard);
+                if sync_lockfile {
+                    if let Some(project) = record.project_path.as_deref() {
+                        crate::install::lockfile::sync_project_lock(state, project).await?;
+                    }
                 }
                 return Ok(installed_view(record, SkillInstallState::Current));
             }
@@ -3246,8 +3313,12 @@ pub(crate) async fn install_skill_authorized(
         install::save_ledger_after_filesystem(state, &records, &operation.id).await?;
         database.commit_filesystem_operation(&operation.id).await?;
     }
-    if let Some(project) = record.project_path.as_deref() {
-        crate::install::lockfile::sync_project_lock(state, project).await?;
+    drop(_file_guard);
+    drop(_guard);
+    if sync_lockfile {
+        if let Some(project) = record.project_path.as_deref() {
+            crate::install::lockfile::sync_project_lock(state, project).await?;
+        }
     }
     Ok(installed_view(&record, SkillInstallState::Current))
 }

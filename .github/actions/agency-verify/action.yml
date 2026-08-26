@@ -3,8 +3,11 @@ description: Verify agency.lock.json against project files without desktop state
 
 inputs:
   version:
-    description: Agency Agents release tag, or latest
-    default: latest
+    description: Pinned Agency Agents release tag (for example, v1.2.3)
+    required: true
+  sha256:
+    description: SHA-256 digest of the released Linux AppImage
+    required: true
   project-path:
     description: Project directory containing agency.lock.json
     default: .
@@ -20,16 +23,23 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         INPUT_VERSION: ${{ inputs.version }}
+        INPUT_SHA256: ${{ inputs.sha256 }}
       run: |
         set -euo pipefail
         if [[ "$RUNNER_OS" != "Linux" || "$RUNNER_ARCH" != "X64" ]]; then
           echo "agency-verify currently supports Linux x64 runners" >&2
           exit 2
         fi
+        if [[ -z "$INPUT_VERSION" || "$INPUT_VERSION" == "latest" ]]; then
+          echo "version must be a pinned release tag, not latest" >&2
+          exit 2
+        fi
+        if [[ ! "$INPUT_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+          echo "sha256 must be a 64-character hexadecimal digest" >&2
+          exit 2
+        fi
         tag="$INPUT_VERSION"
-        if [[ "$tag" == "latest" ]]; then
-          tag="$(gh api repos/msitarzewski/agency-agents-app/releases/latest --jq .tag_name)"
-        elif [[ "$tag" != v* ]]; then
+        if [[ "$tag" != v* ]]; then
           tag="v$tag"
         fi
         download_dir="$RUNNER_TEMP/agency-verify"
@@ -44,6 +54,7 @@ runs:
           echo "expected one Linux AppImage for $tag, found ${#binaries[@]}" >&2
           exit 2
         fi
+        echo "$INPUT_SHA256  ${binaries[0]}" | sha256sum --check --status
         chmod +x "${binaries[0]}"
         echo "AGENCY_VERIFY_BIN=${binaries[0]}" >> "$GITHUB_ENV"
 

@@ -1,4 +1,6 @@
-use std::path::{Component, Path};
+use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
@@ -157,20 +159,31 @@ fn relative_project_path(project: &Path, path: &Path) -> Result<String, AppError
     Ok(parts.join("/"))
 }
 
-fn normalize(mut lock: AgencyLock, allow_user_scope: bool) -> Result<AgencyLock, AppError> {
+fn normalize(mut lock: AgencyLock) -> Result<AgencyLock, AppError> {
     if lock.agency_lock != LOCK_VERSION {
         return Err(invalid("unsupported agency lockfile version"));
     }
+    let mut identities = BTreeSet::new();
+    let mut artifact_paths = BTreeSet::new();
     for entry in &mut lock.entries {
-        let valid_scope = entry.scope == "project" || (allow_user_scope && entry.scope == "user");
         if !matches!(entry.kind.as_str(), "agent" | "skill")
-            || !valid_scope
+            || entry.scope != "project"
             || !super::valid_sha256(&entry.source_hash)
             || entry.source_relative_path.is_empty()
             || entry.tool.is_empty()
             || matches!(entry.source, PortableSource::Legacy { .. })
         {
             return Err(invalid("agency lockfile entry is invalid"));
+        }
+        if !identities.insert((
+            entry.kind.clone(),
+            entry.scope.clone(),
+            entry.source_relative_path.clone(),
+            entry.tool.clone(),
+        )) {
+            return Err(invalid(
+                "agency lockfile contains a duplicate entry identity",
+            ));
         }
         super::validate_portable_source(&entry.source)?;
         crate::library::validate_reference("lock", &entry.source_relative_path)?;
@@ -179,38 +192,79 @@ fn normalize(mut lock: AgencyLock, allow_user_scope: bool) -> Result<AgencyLock,
             if !super::valid_sha256(&artifact.content_hash) {
                 return Err(invalid("agency lockfile artifact hash is invalid"));
             }
+            if !artifact_paths.insert(artifact.path.clone()) {
+                return Err(invalid(
+                    "agency lockfile contains a duplicate artifact path",
+                ));
+            }
         }
         entry.artifacts.sort();
-        entry.artifacts.dedup();
         if entry.artifacts.is_empty() {
             return Err(invalid("agency lockfile entry has no artifacts"));
         }
     }
     lock.entries.sort();
-    lock.entries.dedup();
     Ok(lock)
 }
 
 fn serialize(lock: &AgencyLock) -> Result<Vec<u8>, AppError> {
-    let mut bytes =
-        serde_json::to_vec_pretty(&normalize(lock.clone(), false)?).map_err(|error| {
-            AppError::Internal {
-                message: format!("serialize agency lockfile: {error}"),
-            }
-        })?;
+    let mut bytes = serde_json::to_vec_pretty(&normalize(lock.clone())?).map_err(|error| {
+        AppError::Internal {
+            message: format!("serialize agency lockfile: {error}"),
+        }
+    })?;
     bytes.push(b'\n');
     Ok(bytes)
 }
 
 async fn read(project: &Path) -> Result<AgencyLock, AppError> {
-    let bytes =
-        crate::util::fs::read_capped(&project.join(LOCK_FILENAME), super::MAX_LEDGER_BYTES).await?;
+    let bytes = read_lockfile_bytes(project).await?;
     let lock = serde_json::from_slice(&bytes).map_err(|error| AppError::JsonParse {
         command: "lock_check".into(),
         message: error.to_string(),
         raw_excerpt: String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).into_owned(),
     })?;
-    normalize(lock, false)
+    normalize(lock)
+}
+
+async fn read_lockfile_bytes(project: &Path) -> Result<Vec<u8>, AppError> {
+    crate::util::fs::read_capped(&project.join(LOCK_FILENAME), super::MAX_LEDGER_BYTES).await
+}
+
+async fn require_lockfile_unchanged(project: &Path, expected: &[u8]) -> Result<(), AppError> {
+    if read_lockfile_bytes(project).await? == expected {
+        Ok(())
+    } else {
+        Err(invalid(
+            "agency.lock.json changed on disk during apply; applied changes were not allowed to overwrite it",
+        ))
+    }
+}
+
+async fn partial_apply_error(
+    state: &AppState,
+    project: &Path,
+    original_lockfile_bytes: &[u8],
+    applied: usize,
+    error: AppError,
+) -> AppError {
+    let refresh = async {
+        let derived = current_lock(state, project).await?;
+        let bytes = serialize(&derived)?;
+        require_lockfile_unchanged(project, original_lockfile_bytes).await?;
+        crate::util::fs::atomic_write(&project.join(LOCK_FILENAME), &bytes).await
+    }
+    .await;
+    AppError::Internal {
+        message: match refresh {
+            Ok(()) => format!(
+                "lock apply failed after {applied} completed operation(s); agency.lock.json was refreshed to the derived post-state: {error}"
+            ),
+            Err(refresh_error) => format!(
+                "lock apply failed after {applied} completed operation(s); filesystem or ledger state may include the failed operation, and agency.lock.json could not be refreshed ({refresh_error}): {error}"
+            ),
+        },
+    }
 }
 
 fn finish_current_lock(
@@ -225,13 +279,35 @@ fn finish_current_lock(
             unresolved.join("; ")
         )));
     }
-    normalize(
-        AgencyLock {
-            agency_lock: LOCK_VERSION,
-            entries,
-        },
-        false,
-    )
+    normalize(AgencyLock {
+        agency_lock: LOCK_VERSION,
+        entries,
+    })
+}
+
+fn lock_project_lockfile(project: &Path) -> Result<File, AppError> {
+    let path = project.join(".agency-lockfile.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| AppError::Io {
+            message: format!("open project lockfile lock {}: {error}", path.display()),
+        })?;
+    file.lock().map_err(|error| AppError::Io {
+        message: format!("lock project lockfile {}: {error}", path.display()),
+    })?;
+    Ok(file)
+}
+
+async fn lock_project_lockfile_async(project: PathBuf) -> Result<File, AppError> {
+    tokio::task::spawn_blocking(move || lock_project_lockfile(&project))
+        .await
+        .map_err(|error| AppError::Internal {
+            message: format!("project lockfile lock task failed: {error}"),
+        })?
 }
 
 async fn current_lock(state: &AppState, project: &Path) -> Result<AgencyLock, AppError> {
@@ -338,6 +414,7 @@ pub(crate) async fn sync_project_lock(
     project_path: &str,
 ) -> Result<(), AppError> {
     let project = canonical_project(project_path)?;
+    let _guard = lock_project_lockfile_async(project.clone()).await?;
     let lock = current_lock(state, &project).await?;
     crate::util::fs::atomic_write(&project.join(LOCK_FILENAME), &serialize(&lock)?).await
 }
@@ -360,25 +437,44 @@ fn artifact_state(project: &Path, artifacts: &[LockArtifact]) -> LockEntryStatus
     }
 }
 
-fn verify_artifacts<F>(
+fn verify_artifacts(
     project: &Path,
+    project_root: &File,
     artifacts: &[LockArtifact],
-    read_file: &mut F,
-) -> Result<VerifyStatus, AppError>
-where
-    F: FnMut(&Path) -> std::io::Result<Vec<u8>>,
-{
+) -> Result<VerifyStatus, AppError> {
     let mut status = VerifyStatus::Ok;
     for artifact in artifacts {
         let path = project.join(&artifact.path);
-        match read_file(&path) {
-            Ok(bytes) if render::sha256_hex(&bytes) == artifact.content_hash => {}
-            Ok(_) => status = VerifyStatus::Modified,
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if status != VerifyStatus::Modified {
                     status = VerifyStatus::Missing;
                 }
+                continue;
             }
+            Err(error) => {
+                return Err(AppError::Io {
+                    message: format!("inspect lockfile artifact {}: {error}", path.display()),
+                })
+            }
+        };
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || crate::skills::metadata_is_reparse_point(&metadata)
+        {
+            return Err(invalid(format!(
+                "lockfile artifact is not a regular file: {}",
+                path.display()
+            )));
+        }
+        match crate::skills::install::read_project_file(
+            project_root,
+            Path::new(&artifact.path),
+            super::MAX_LEDGER_BYTES,
+        ) {
+            Ok(bytes) if render::sha256_hex(&bytes) == artifact.content_hash => {}
+            Ok(_) => status = VerifyStatus::Modified,
             Err(error) => {
                 return Err(AppError::Io {
                     message: format!("read lockfile artifact {}: {error}", path.display()),
@@ -389,14 +485,10 @@ where
     Ok(status)
 }
 
-pub(crate) fn verify_lockfile<F>(
+pub(crate) fn verify_lockfile(
     lockfile_bytes: &[u8],
     project: &Path,
-    mut read_file: F,
-) -> Result<VerifyResult, AppError>
-where
-    F: FnMut(&Path) -> std::io::Result<Vec<u8>>,
-{
+) -> Result<VerifyResult, AppError> {
     if lockfile_bytes.len() as u64 > super::MAX_LEDGER_BYTES {
         return Err(invalid("agency lockfile exceeds the size limit"));
     }
@@ -406,29 +498,25 @@ where
         raw_excerpt: String::from_utf8_lossy(&lockfile_bytes[..lockfile_bytes.len().min(256)])
             .into_owned(),
     })?;
-    let lock = normalize(lock, true)?;
+    let lock = normalize(lock)?;
+    let project_root =
+        cap_primitives::fs::open_ambient_dir(project, cap_primitives::ambient_authority())
+            .map_err(|error| AppError::Io {
+                message: format!("open lockfile project {}: {error}", project.display()),
+            })?;
     let entries = lock
         .entries
         .into_iter()
         .map(|entry| {
-            let (status, reason) = if entry.scope == "user" {
-                (VerifyStatus::Skipped, Some("user-scope"))
-            } else {
-                (
-                    verify_artifacts(project, &entry.artifacts, &mut read_file)?,
-                    None,
-                )
-            };
+            let status = verify_artifacts(project, &project_root, &entry.artifacts)?;
             Ok(VerifyEntry {
                 entry,
                 status,
-                reason,
+                reason: None,
             })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
-    let clean = entries
-        .iter()
-        .all(|entry| matches!(entry.status, VerifyStatus::Ok | VerifyStatus::Skipped));
+    let clean = entries.iter().all(|entry| entry.status == VerifyStatus::Ok);
     Ok(VerifyResult { entries, clean })
 }
 
@@ -566,10 +654,29 @@ fn merged_lock_operation(
     }
 }
 
+fn classify_workspace_warnings(
+    warnings: Vec<String>,
+    headless: bool,
+    blockers: &mut Vec<String>,
+) -> Vec<String> {
+    warnings
+        .into_iter()
+        .filter(|warning| {
+            if headless && warning.starts_with("Agent update requires explicit review:") {
+                blockers.push(warning.clone());
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
 async fn plan_at(
     state: &AppState,
     project: &Path,
     allow_merge: bool,
+    headless: bool,
 ) -> Result<LockPlan, AppError> {
     let check = check_at(state, project).await?;
     let project_string = project.to_string_lossy().into_owned();
@@ -580,12 +687,12 @@ async fn plan_at(
     )
     .await?;
     let mut operations = Vec::new();
-    let mut warnings = Vec::new();
     let mut blockers = workspace
         .blockers
         .into_iter()
         .filter(|blocker| !blocker.contains("state outdated"))
         .collect::<Vec<_>>();
+    let mut warnings = classify_workspace_warnings(workspace.warnings, headless, &mut blockers);
     for checked in &check.entries {
         match checked.status {
             LockEntryStatus::Current => {}
@@ -699,7 +806,7 @@ pub async fn lock_plan(
     project_path: String,
 ) -> Result<LockPlan, AppError> {
     let project = canonical_project(&project_path)?;
-    plan_at(&state, &project, false).await
+    plan_at(&state, &project, false, false).await
 }
 
 #[tauri::command]
@@ -726,8 +833,19 @@ async fn apply_at(
     policy: LockApplyPolicy<'_>,
 ) -> Result<LockApplyResponse, AppError> {
     let allow_merge = matches!(&policy, LockApplyPolicy::Cli { merge: true });
-    let mut plan = plan_at(state, project, allow_merge).await?;
-    if plan.revision != revision || !plan.blockers.is_empty() {
+    let headless = matches!(&policy, LockApplyPolicy::Cli { .. });
+    let _project_guard = lock_project_lockfile_async(project.to_path_buf()).await?;
+    let original_lockfile_bytes = read_lockfile_bytes(project).await?;
+    let mut plan = plan_at(state, project, allow_merge, headless).await?;
+    if plan.revision != revision {
+        plan.blockers
+            .push("Lock plan changed; review the refreshed plan before applying".into());
+        return Ok(LockApplyResponse {
+            plan,
+            applied: false,
+        });
+    }
+    if !plan.blockers.is_empty() {
         return Ok(LockApplyResponse {
             plan,
             applied: false,
@@ -758,51 +876,21 @@ async fn apply_at(
     if !workspace.source_additions.is_empty() {
         return Err(invalid("lockfile sources could not be materialized"));
     }
-    for operation in &plan.operations {
-        if operation.kind == "agent" {
-            let item = workspace
-                .agents
-                .iter()
-                .find(|item| {
-                    item.reference.relative_path == operation.source_relative_path
-                        && item.tool == operation.tool
-                })
-                .ok_or_else(|| invalid("lockfile Agent operation could not be resolved"))?;
-            let record = match &policy {
-                LockApplyPolicy::Desktop(app) => {
-                    super::do_install(
-                        app,
-                        state,
-                        item.reference.clone(),
-                        item.tool.clone(),
-                        Some(plan.project_path.clone()),
-                        true,
-                    )
-                    .await?
-                }
-                LockApplyPolicy::Mcp(authorization) => {
-                    super::mcp_install_agent_clean(
-                        state,
-                        item.reference.clone(),
-                        item.tool.clone(),
-                        Some(plan.project_path.clone()),
-                        *authorization,
-                    )
-                    .await?
-                }
-                LockApplyPolicy::Cli { .. } => match operation.merge_preview_hash.as_deref() {
-                    Some(preview_hash) => {
-                        super::do_install_headless_merge(
-                            state,
-                            item.reference.clone(),
-                            item.tool.clone(),
-                            plan.project_path.clone(),
-                            preview_hash,
-                        )
-                        .await?
-                    }
-                    None => {
-                        super::do_install_headless_lock(
+    for (applied, operation) in plan.operations.clone().into_iter().enumerate() {
+        let operation_result: Result<(), AppError> = async {
+            if operation.kind == "agent" {
+                let item = workspace
+                    .agents
+                    .iter()
+                    .find(|item| {
+                        item.reference.relative_path == operation.source_relative_path
+                            && item.tool == operation.tool
+                    })
+                    .ok_or_else(|| invalid("lockfile Agent operation could not be resolved"))?;
+                let record = match &policy {
+                    LockApplyPolicy::Desktop(app) => {
+                        super::do_install_lockfile_desktop(
+                            app,
                             state,
                             item.reference.clone(),
                             item.tool.clone(),
@@ -810,90 +898,137 @@ async fn apply_at(
                         )
                         .await?
                     }
-                },
-            };
-            let expected = plan
-                .check
-                .lock
-                .entries
-                .iter_mut()
-                .find(|entry| {
-                    entry.kind == "agent"
-                        && entry.source_relative_path == operation.source_relative_path
-                        && entry.tool == operation.tool
-                })
-                .ok_or_else(|| invalid("lockfile Agent entry disappeared"))?;
-            if operation.merge_preview_hash.is_some() {
-                let actual_hashes = if record.artifacts.is_empty() {
-                    vec![record.rendered_hash.clone()]
-                } else {
-                    record
-                        .artifacts
-                        .iter()
-                        .map(|artifact| artifact.rendered_hash.clone())
-                        .collect()
+                    LockApplyPolicy::Mcp(authorization) => {
+                        super::mcp_install_agent_clean_for_lockfile(
+                            state,
+                            item.reference.clone(),
+                            item.tool.clone(),
+                            plan.project_path.clone(),
+                            *authorization,
+                        )
+                        .await?
+                    }
+                    LockApplyPolicy::Cli { .. } => match operation.merge_preview_hash.as_deref() {
+                        Some(preview_hash) => {
+                            super::do_install_headless_merge(
+                                state,
+                                item.reference.clone(),
+                                item.tool.clone(),
+                                plan.project_path.clone(),
+                                preview_hash,
+                            )
+                            .await?
+                        }
+                        None => {
+                            super::do_install_headless_lock(
+                                state,
+                                item.reference.clone(),
+                                item.tool.clone(),
+                                plan.project_path.clone(),
+                            )
+                            .await?
+                        }
+                    },
                 };
-                if expected.artifacts.len() != actual_hashes.len() {
-                    return Err(invalid("merged Agent artifact count changed"));
-                }
-                for (locked, installed_hash) in expected.artifacts.iter_mut().zip(actual_hashes) {
-                    locked.content_hash = installed_hash;
-                }
-            }
-            let expected_source_hash = expected.source_hash.clone();
-            let expected_source = expected.source.clone();
-            if record.source_hash != expected_source_hash
-                || installed_source_revision(state, &item.reference, &record.source_hash).await?
-                    != match &expected_source {
-                        PortableSource::Builtin { source_revision } => source_revision.clone(),
-                        PortableSource::Github {
-                            resolved_commit: Some(commit),
-                            ..
-                        } => commit.clone(),
-                        _ => record.source_hash.clone(),
+                let expected = plan
+                    .check
+                    .lock
+                    .entries
+                    .iter_mut()
+                    .find(|entry| {
+                        entry.kind == "agent"
+                            && entry.source_relative_path == operation.source_relative_path
+                            && entry.tool == operation.tool
+                    })
+                    .ok_or_else(|| invalid("lockfile Agent entry disappeared"))?;
+                if operation.merge_preview_hash.is_some() {
+                    let actual_hashes = if record.artifacts.is_empty() {
+                        vec![record.rendered_hash.clone()]
+                    } else {
+                        record
+                            .artifacts
+                            .iter()
+                            .map(|artifact| artifact.rendered_hash.clone())
+                            .collect()
+                    };
+                    if expected.artifacts.len() != actual_hashes.len() {
+                        return Err(invalid("merged Agent artifact count changed"));
                     }
-            {
-                return Err(invalid(
-                    "installed Agent does not match the lockfile source",
-                ));
-            }
-        } else {
-            let item = workspace
-                .skills
-                .iter()
-                .find(|item| {
-                    item.reference.relative_path == operation.source_relative_path
-                        && item.runtime == operation.tool
-                })
-                .ok_or_else(|| invalid("lockfile Skill operation could not be resolved"))?;
-            match &policy {
-                LockApplyPolicy::Mcp(authorization) => {
-                    skills::install_skill_with_dependencies_authorized(
-                        state,
-                        &item.reference.source_id,
-                        &item.reference.relative_path,
-                        &item.runtime,
-                        Some(&plan.project_path),
-                        *authorization,
-                    )
-                    .await?;
+                    for (locked, installed_hash) in expected.artifacts.iter_mut().zip(actual_hashes)
+                    {
+                        locked.content_hash = installed_hash;
+                    }
                 }
-                LockApplyPolicy::Desktop(_) | LockApplyPolicy::Cli { .. } => {
-                    skills::install_skill_with_dependencies(
-                        state,
-                        &item.reference.source_id,
-                        &item.reference.relative_path,
-                        &item.runtime,
-                        Some(&plan.project_path),
-                    )
-                    .await?;
+                let expected_source_hash = expected.source_hash.clone();
+                let expected_source = expected.source.clone();
+                if record.source_hash != expected_source_hash
+                    || installed_source_revision(state, &item.reference, &record.source_hash)
+                        .await?
+                        != match &expected_source {
+                            PortableSource::Builtin { source_revision } => source_revision.clone(),
+                            PortableSource::Github {
+                                resolved_commit: Some(commit),
+                                ..
+                            } => commit.clone(),
+                            _ => record.source_hash.clone(),
+                        }
+                {
+                    return Err(invalid(
+                        "installed Agent does not match the lockfile source",
+                    ));
+                }
+            } else {
+                let item = workspace
+                    .skills
+                    .iter()
+                    .find(|item| {
+                        item.reference.relative_path == operation.source_relative_path
+                            && item.runtime == operation.tool
+                    })
+                    .ok_or_else(|| invalid("lockfile Skill operation could not be resolved"))?;
+                match &policy {
+                    LockApplyPolicy::Mcp(authorization) => {
+                        skills::install_skill_with_dependencies_for_lockfile(
+                            state,
+                            &item.reference.source_id,
+                            &item.reference.relative_path,
+                            &item.runtime,
+                            &plan.project_path,
+                            *authorization,
+                        )
+                        .await?;
+                    }
+                    LockApplyPolicy::Desktop(_) | LockApplyPolicy::Cli { .. } => {
+                        skills::install_skill_with_dependencies_for_lockfile(
+                            state,
+                            &item.reference.source_id,
+                            &item.reference.relative_path,
+                            &item.runtime,
+                            &plan.project_path,
+                            None,
+                        )
+                        .await?;
+                    }
                 }
             }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = operation_result {
+            return Err(partial_apply_error(
+                state,
+                project,
+                &original_lockfile_bytes,
+                applied,
+                error,
+            )
+            .await);
         }
     }
+    require_lockfile_unchanged(project, &original_lockfile_bytes).await?;
     crate::util::fs::atomic_write(&project.join(LOCK_FILENAME), &serialize(&plan.check.lock)?)
         .await?;
-    plan = plan_at(state, project, allow_merge).await?;
+    plan = plan_at(state, project, allow_merge, headless).await?;
     Ok(LockApplyResponse {
         applied: plan.check.clean,
         plan,
@@ -911,7 +1046,7 @@ pub(crate) async fn mcp_lock_plan(
     state: &AppState,
     project_path: &str,
 ) -> Result<LockPlan, AppError> {
-    plan_at(state, &canonical_project(project_path)?, false).await
+    plan_at(state, &canonical_project(project_path)?, false, false).await
 }
 
 pub(crate) async fn mcp_lock_apply(
@@ -942,7 +1077,7 @@ pub(crate) async fn cli_lock_plan(
     project_path: &str,
     allow_merge: bool,
 ) -> Result<LockPlan, AppError> {
-    plan_at(state, &canonical_project(project_path)?, allow_merge).await
+    plan_at(state, &canonical_project(project_path)?, allow_merge, true).await
 }
 
 pub(crate) async fn cli_lock_apply(
@@ -1013,8 +1148,11 @@ mod tests {
     }
 
     #[test]
-    fn stateless_verify_reports_only_filesystem_statuses_and_skips_user_scope() {
-        let project = Path::new("/project");
+    fn stateless_verify_reports_only_project_filesystem_statuses() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("agents")).unwrap();
+        std::fs::write(project.path().join("agents/ok.md"), b"ok\n").unwrap();
+        std::fs::write(project.path().join("agents/modified.md"), b"changed\n").unwrap();
         let mut ok = entry(&"c".repeat(64));
         ok.source_relative_path = "engineering/ok.md".into();
         ok.artifacts[0].path = "agents/ok.md".into();
@@ -1028,25 +1166,12 @@ mod tests {
         missing.source_relative_path = "engineering/missing.md".into();
         missing.artifacts[0].path = "agents/missing.md".into();
 
-        let mut user = entry(&"f".repeat(64));
-        user.scope = "user".into();
-        user.source_relative_path = "engineering/user.md".into();
-        user.artifacts[0].path = ".codex/agents/user.md".into();
-
         let bytes = serde_json::to_vec(&AgencyLock {
             agency_lock: LOCK_VERSION,
-            entries: vec![user, missing, modified, ok],
+            entries: vec![missing, modified, ok],
         })
         .unwrap();
-        let result = verify_lockfile(&bytes, project, |path| match path {
-            path if path == project.join("agents/ok.md") => Ok(b"ok\n".to_vec()),
-            path if path == project.join("agents/modified.md") => Ok(b"changed\n".to_vec()),
-            path if path == project.join("agents/missing.md") => {
-                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-            }
-            path => panic!("user-scope artifact must not be read: {}", path.display()),
-        })
-        .unwrap();
+        let result = verify_lockfile(&bytes, project.path()).unwrap();
 
         assert!(!result.clean);
         let mut statuses = result
@@ -1078,14 +1203,104 @@ mod tests {
                     None,
                 ),
                 ("engineering/ok.md", "project", VerifyStatus::Ok, None),
-                (
-                    "engineering/user.md",
-                    "user",
-                    VerifyStatus::Skipped,
-                    Some("user-scope"),
-                ),
             ]
         );
+    }
+
+    #[test]
+    fn stateless_verify_rejects_user_scoped_entries() {
+        let project = tempfile::tempdir().unwrap();
+        let mut user = entry(&"c".repeat(64));
+        user.scope = "user".into();
+        let bytes = serde_json::to_vec(&AgencyLock {
+            agency_lock: LOCK_VERSION,
+            entries: vec![user],
+        })
+        .unwrap();
+
+        assert!(verify_lockfile(&bytes, project.path())
+            .unwrap_err()
+            .to_string()
+            .contains("entry is invalid"));
+    }
+
+    #[test]
+    fn lockfile_rejects_duplicate_identities_and_artifact_paths() {
+        let first = entry(&"c".repeat(64));
+        let mut duplicate_identity = first.clone();
+        duplicate_identity.source_hash = "d".repeat(64);
+        assert!(normalize(AgencyLock {
+            agency_lock: LOCK_VERSION,
+            entries: vec![first.clone(), duplicate_identity],
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate entry identity"));
+
+        let mut duplicate_artifact = entry(&"d".repeat(64));
+        duplicate_artifact.source_relative_path = "engineering/other.md".into();
+        assert!(normalize(AgencyLock {
+            agency_lock: LOCK_VERSION,
+            entries: vec![first, duplicate_artifact],
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate artifact path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stateless_verify_rejects_linked_artifact_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("artifact.md"), b"outside").unwrap();
+        symlink(outside.path(), project.path().join("agents")).unwrap();
+        let mut linked = entry(&"c".repeat(64));
+        linked.artifacts[0].path = "agents/artifact.md".into();
+        linked.artifacts[0].content_hash = render::sha256_hex(b"outside");
+        let bytes = serde_json::to_vec(&AgencyLock {
+            agency_lock: LOCK_VERSION,
+            entries: vec![linked],
+        })
+        .unwrap();
+
+        assert!(verify_lockfile(&bytes, project.path())
+            .unwrap_err()
+            .to_string()
+            .contains("read lockfile artifact"));
+    }
+
+    #[tokio::test]
+    async fn apply_lock_is_exclusive_and_stale_bytes_are_rejected() {
+        let project = tempfile::tempdir().unwrap();
+        let lockfile = project.path().join(LOCK_FILENAME);
+        std::fs::write(&lockfile, b"planned").unwrap();
+        let first = lock_project_lockfile_async(project.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut second = tokio::spawn(lock_project_lockfile_async(project.path().to_path_buf()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let planned = std::fs::read(&lockfile).unwrap();
+        std::fs::write(&lockfile, b"edited").unwrap();
+        assert!(require_lockfile_unchanged(project.path(), &planned)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert_eq!(std::fs::read(lockfile).unwrap(), b"edited");
     }
 
     #[test]
@@ -1159,5 +1374,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(conflict.contains("1 merge conflict"));
+    }
+
+    #[test]
+    fn headless_lock_plans_promote_update_review_to_a_blocker() {
+        let review = "Agent update requires explicit review: Reviewer (Notify)".to_string();
+        let mut blockers = Vec::new();
+        assert!(classify_workspace_warnings(vec![review.clone()], true, &mut blockers).is_empty());
+        assert_eq!(blockers, vec![review.clone()]);
+
+        let mut desktop_blockers = Vec::new();
+        assert_eq!(
+            classify_workspace_warnings(vec![review.clone()], false, &mut desktop_blockers),
+            vec![review]
+        );
+        assert!(desktop_blockers.is_empty());
     }
 }

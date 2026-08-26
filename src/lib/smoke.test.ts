@@ -7223,7 +7223,10 @@ describe("frontend test harness", () => {
     }
   });
 
-  it("reports a stale merge apply and re-previews without silently retrying", async () => {
+  it.each([
+    ["stale preview", "Agent merge preview is stale; base, installed, or rendered bytes changed"],
+    ["no-longer-clean preview", "Agent merge is no longer clean; request a new preview"],
+  ])("reports a %s merge apply and re-previews without silently retrying", async (_case, rejection) => {
     const agent: InstalledAgent = {
       ...staleControlRow,
       sourceId: "built-in",
@@ -7242,7 +7245,7 @@ describe("frontend test harness", () => {
         mergeOutcome: { status: "clean", previewHash: "bound-preview" },
       } as never;
       if (command === "agent_merge_preview") return { preview: "local edit\nupstream update\n", previewHash: "bound-preview" } as never;
-      if (command === "agent_merge_apply") throw { code: "invalid_argument", message: "Agent merge preview is stale; base, installed, or rendered bytes changed" };
+      if (command === "agent_merge_apply") throw { code: "invalid_argument", message: rejection };
       if (command === "installs_reconcile") return [agent] as never;
       if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
       if (command === "agent_diff") return {
@@ -7266,7 +7269,7 @@ describe("frontend test harness", () => {
       [...target.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.includes("Re-preview"))!.click();
       await vi.waitFor(() => expect(target.textContent).toContain("The preview was refreshed from the file now on disk"));
-      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_preview")).toHaveLength(3);
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_preview")).toHaveLength(4);
       expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "agent_merge_apply")).toHaveLength(1);
     } finally {
       unmount(component);
@@ -7365,6 +7368,70 @@ describe("frontend test harness", () => {
       await vi.waitFor(() => expect(target.textContent).toContain("Repair plan changed"));
       expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "update_agent")).toBe(false);
       expect(target.textContent).toContain("Review the updated plan");
+    } finally {
+      unmount(component);
+      target.remove();
+    }
+  });
+
+  it("stops a later overwrite when its content changes after an earlier repair", async () => {
+    const modified = (relativePath: string, name: string): InstalledAgent => ({
+      ...staleControlRow,
+      slug: relativePath.replace(".md", ""),
+      name,
+      sourceId: "built-in",
+      relativePath,
+      dest: `/tmp/${relativePath}`,
+      state: "modified",
+      tracked: true,
+    });
+    const first = modified("first.md", "First Agent");
+    const second = modified("second.md", "Second Agent");
+    install.reconciled = true;
+    skillSources.reconciled = true;
+    install.installed = [first, second];
+    let secondRevision = "second-rev-1";
+    vi.mocked(invoke).mockImplementation(async (command: string, args?: unknown) => {
+      const relativePath = String(args && typeof args === "object" && !Array.isArray(args)
+        ? (args as Record<string, unknown>).relativePath ?? ""
+        : "");
+      if (command === "agent_update_plan") return {
+        revision: relativePath === "second.md" ? secondRevision : "first-rev-1",
+        operation: "update", tool: "claudeCode", scope: "user", projectPath: null,
+        agents: [{ reference: { sourceId: "built-in", relativePath }, name: relativePath, sourceHash: "hash", dependency: false, destination: `/tmp/${relativePath}`, renderedFileCount: 1, capabilities: [] }],
+        warnings: [], blockers: [], rollbackAvailable: true,
+        mergeOutcome: { status: "unavailable", reason: "no canonical base snapshot" },
+      } as never;
+      if (command === "installs_reconcile") return [first, second] as never;
+      if (command === "skill_installs_reconcile" || command === "skill_backups_list") return [] as never;
+      if (command === "update_agent") {
+        if (relativePath === "first.md") secondRevision = "second-rev-2";
+        return {} as never;
+      }
+      return [] as never;
+    });
+    const target = document.createElement("div");
+    document.body.append(target);
+    const component = mount(UpdatesModal, { target, props: { onClose: vi.fn() } });
+    try {
+      await tick();
+      target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("Approve repairs"));
+      const overwriteButtons = [...target.querySelectorAll<HTMLButtonElement>("button")]
+        .filter((button) => button.textContent?.includes("Overwrite local edits"));
+      expect(overwriteButtons).toHaveLength(2);
+      overwriteButtons.forEach((button) => button.click());
+      await tick();
+      vi.mocked(invoke).mockClear();
+      const approve = target.querySelector<HTMLButtonElement>('[data-modal-action="confirm"]')!;
+      expect(approve.disabled).toBe(false);
+      approve.click();
+      await vi.waitFor(() => expect(target.textContent).toContain("This installation changed since review"));
+      const updates = vi.mocked(invoke).mock.calls.filter(([command]) => command === "update_agent");
+      expect(updates).toHaveLength(1);
+      expect(updates[0]?.[1]).toMatchObject({ relativePath: "first.md" });
+      expect(target.textContent).toContain("Second Agent");
+      expect([...target.querySelectorAll<HTMLButtonElement>("button")].some((button) => button.textContent?.includes("Re-preview"))).toBe(true);
     } finally {
       unmount(component);
       target.remove();

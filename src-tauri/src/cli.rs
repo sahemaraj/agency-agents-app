@@ -114,8 +114,7 @@ fn run_verify(project: &str, json: bool) -> Result<CliOutcome, String> {
     let lockfile = Path::new(project).join(LOCK_FILENAME);
     let bytes = std::fs::read(&lockfile)
         .map_err(|error| format!("read {}: {error}", lockfile.display()))?;
-    let result = verify_lockfile(&bytes, Path::new(project), |path| std::fs::read(path))
-        .map_err(|error| error.to_string())?;
+    let result = verify_lockfile(&bytes, Path::new(project)).map_err(|error| error.to_string())?;
     let stdout = if json {
         verify_json(project, &result)?
     } else {
@@ -163,7 +162,7 @@ async fn run_plan(state: &AppState, project: &str, json: bool) -> Result<CliOutc
     };
     Ok(CliOutcome {
         stdout,
-        exit_code: 0,
+        exit_code: plan_exit(plan.blockers.len()),
     })
 }
 
@@ -174,16 +173,17 @@ async fn run_apply(
     dry_run: bool,
     merge: bool,
 ) -> Result<CliOutcome, String> {
-    let plan = cli_lock_plan(state, project, merge)
+    let mut plan = cli_lock_plan(state, project, merge)
         .await
         .map_err(|error| error.to_string())?;
-    let (applied, blockers) = if dry_run || !plan.blockers.is_empty() {
-        (false, plan.blockers.clone())
+    let applied = if dry_run || !plan.blockers.is_empty() {
+        false
     } else {
         let response = cli_lock_apply(state, project, &plan.revision, merge)
             .await
             .map_err(|error| error.to_string())?;
-        (response.applied, response.plan.blockers)
+        plan = response.plan;
+        response.applied
     };
     let stdout = if json {
         json_line(&ApplyJson {
@@ -194,22 +194,22 @@ async fn run_apply(
             applied,
             operations: &plan.operations,
             warnings: &plan.warnings,
-            blockers: &blockers,
+            blockers: &plan.blockers,
         })?
     } else if dry_run {
         human_plan(&plan, "dry run")
-    } else if blockers.is_empty() && applied {
+    } else if plan.blockers.is_empty() && applied {
         format!("applied: {} operation(s)\n", plan.operations.len())
     } else {
-        let mut output = format!("apply blocked: {} blocker(s)\n", blockers.len());
-        for blocker in &blockers {
+        let mut output = format!("apply blocked: {} blocker(s)\n", plan.blockers.len());
+        for blocker in &plan.blockers {
             output.push_str(&format!("blocker: {blocker}\n"));
         }
         output
     };
     Ok(CliOutcome {
         stdout,
-        exit_code: apply_exit(dry_run || applied, blockers.len()),
+        exit_code: apply_exit(dry_run || applied, plan.blockers.len()),
     })
 }
 
@@ -389,6 +389,10 @@ fn check_exit(clean: bool) -> i32 {
     i32::from(!clean)
 }
 
+fn plan_exit(blocker_count: usize) -> i32 {
+    i32::from(blocker_count > 0)
+}
+
 fn apply_exit(completed: bool, blocker_count: usize) -> i32 {
     i32::from(!completed || blocker_count > 0)
 }
@@ -401,6 +405,8 @@ mod tests {
     fn exit_codes_follow_check_and_apply_results() {
         assert_eq!(check_exit(true), 0);
         assert_eq!(check_exit(false), 1);
+        assert_eq!(plan_exit(0), 0);
+        assert_eq!(plan_exit(1), 1);
         assert_eq!(apply_exit(true, 0), 0);
         assert_eq!(apply_exit(true, 1), 1);
         assert_eq!(apply_exit(false, 0), 1);

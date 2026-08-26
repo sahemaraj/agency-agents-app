@@ -821,7 +821,7 @@ pub(crate) async fn refresh_git_source(
     refresh_git_source_from(state, source_id, &repository).await
 }
 
-async fn refresh_git_source_from(
+pub(crate) async fn refresh_git_source_from(
     state: &AppState,
     source_id: &str,
     clone_source: &str,

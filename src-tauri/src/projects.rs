@@ -73,6 +73,7 @@ pub(crate) fn detect_project_stack(project_path: &str) -> Result<ProjectStackDet
         entries
             .take(MAX_PROJECT_ROOT_ENTRIES)
             .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
             .map(|entry| entry.file_name()),
     ))
 }
@@ -129,6 +130,30 @@ mod tests {
                 evidence: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn directories_named_like_manifests_are_not_evidence() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("Cargo.toml")).unwrap();
+        assert!(detect_project_stack(project.path().to_str().unwrap())
+            .unwrap()
+            .evidence
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_named_like_manifests_are_not_evidence() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("real.toml"), "").unwrap();
+        symlink("real.toml", project.path().join("Cargo.toml")).unwrap();
+        assert!(detect_project_stack(project.path().to_str().unwrap())
+            .unwrap()
+            .evidence
+            .is_empty());
     }
 
     #[test]

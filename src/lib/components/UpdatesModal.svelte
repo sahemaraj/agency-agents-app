@@ -127,7 +127,11 @@
   }
 
   function mergePreviewIsStale(error: unknown): boolean {
-    return errorMessage(error).includes("Agent merge preview is stale");
+    const message = errorMessage(error);
+    // Backend `agent_merge_apply` reports both branches as invalid_argument,
+    // so these messages are the only available discriminants.
+    return message.includes("Agent merge preview is stale")
+      || message.includes("Agent merge is no longer clean");
   }
 
   function viewReceipt() {
@@ -200,6 +204,11 @@
       sourceFiles: item.kind === "skill" ? item.sourceFiles : undefined,
       error: item.error,
     })));
+  }
+
+  async function reverifyReviewedPlan(item: ReviewPlan): Promise<ReviewPlan | null> {
+    const [fresh] = await buildPlans([item.candidate]);
+    return fresh && planSignature([fresh]) === planSignature([item]) ? fresh : null;
   }
 
   function defaultAction(item: ReviewPlan): RepairAction {
@@ -301,39 +310,47 @@
       applyTotal = actionable.length;
       for (const item of actionable) {
         let result: RepairResult;
-        try {
-          if (item.kind === "agent") {
-            const reference = { sourceId: item.candidate.row.sourceId, relativePath: item.candidate.row.relativePath };
-            if (actionFor(item) === "merge") {
-              if (item.plan?.mergeOutcome?.status !== "clean" || !item.mergePreview) {
+        const verified = await reverifyReviewedPlan(item);
+        if (!verified) {
+          result = {
+            candidate: item.candidate,
+            ok: false,
+            stale: true,
+            error: i18n.optional("agentUpdates.contentChanged", "This installation changed since review. Review the updated content before trying again."),
+          };
+        } else try {
+          if (verified.kind === "agent") {
+            const reference = { sourceId: verified.candidate.row.sourceId, relativePath: verified.candidate.row.relativePath };
+            if (actionFor(verified) === "merge") {
+              if (verified.plan?.mergeOutcome?.status !== "clean" || !verified.mergePreview) {
                 throw new Error("A fresh merge preview is required");
               }
               await install.mergeApplyReference(
                 reference,
-                item.candidate.row.tool,
-                item.candidate.row.projectPath,
-                item.mergePreview.previewHash,
+                verified.candidate.row.tool,
+                verified.candidate.row.projectPath,
+                verified.mergePreview.previewHash,
               );
             } else {
               await install.updateReference(
                 reference,
-                item.candidate.row.tool,
-                item.candidate.row.projectPath,
+                verified.candidate.row.tool,
+                verified.candidate.row.projectPath,
                 true,
               );
             }
-            result = { candidate: item.candidate, ok: true, stale: false, error: null };
+            result = { candidate: verified.candidate, ok: true, stale: false, error: null };
           } else {
             const ok = await skillSources.lifecycle(
               "update",
-              item.candidate.row,
+              verified.candidate.row,
               projects.list.map((project) => project.path),
             );
             result = {
-              candidate: item.candidate,
+              candidate: verified.candidate,
               ok,
               stale: false,
-              error: ok ? null : skillSources.installErrors[item.candidate.key.slice("skill\0".length)] ?? i18n.optional("agentUpdates.unknownFailure", "Repair failed"),
+              error: ok ? null : skillSources.installErrors[verified.candidate.key.slice("skill\0".length)] ?? i18n.optional("agentUpdates.unknownFailure", "Repair failed"),
             };
           }
         } catch (error) {
@@ -383,15 +400,17 @@
   }
 
   async function repreview(result: RepairResult) {
-    if (!result.stale || result.candidate.kind !== "agent" || planning) return;
+    if (!result.stale || planning) return;
     planning = true;
     try {
       const [fresh] = await buildPlans([result.candidate]);
       if (!fresh) return;
-      reviewPlans = reviewPlans.map((item) => item.candidate.key === fresh.candidate.key ? fresh : item);
-      actions = { ...actions, [fresh.candidate.key]: defaultAction(fresh) };
+      reviewPlans = [fresh];
+      actions = { [fresh.candidate.key]: defaultAction(fresh) };
       reviewedSignature = planSignature(reviewPlans);
-      staleMessage = i18n.optional("agentUpdates.mergeRepreviewed", "The preview was refreshed from the file now on disk. Review it before applying.");
+      staleMessage = fresh.kind === "agent"
+        ? i18n.optional("agentUpdates.mergeRepreviewed", "The preview was refreshed from the file now on disk. Review it before applying.")
+        : i18n.optional("agentUpdates.reviewRefreshed", "The repair review was refreshed from the current content. Review it before applying.");
       stage = "review";
       if (fresh.kind === "agent" && fresh.mergePreview) showMerged(fresh);
       else if (fresh.kind === "agent" && fresh.plan?.mergeOutcome?.status === "conflicts") showConflicts(fresh);
@@ -536,7 +555,7 @@
             <span class="name">{result.candidate.row.name}</span>
             <span class="meta">{result.ok ? `${i18n.optional("agentUpdates.repaired", "Repaired")} · ${finalState(result.candidate)}` : result.error}</span>
             <span class="path" title={destination(result.candidate)}>{destination(result.candidate)}</span>
-            {#if result.stale}<button class="diff-link" onclick={() => void repreview(result)}>{i18n.optional("agentUpdates.repreview", "Re-preview")}</button>{/if}
+            {#if result.stale}<button class="diff-link" onclick={() => void repreview(result)}>{result.candidate.kind === "agent" ? i18n.optional("agentUpdates.repreview", "Re-preview") : i18n.optional("agentUpdates.reviewAgain", "Review again")}</button>{/if}
           </span>
         </li>
       {/each}

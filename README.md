@@ -125,12 +125,20 @@ Use the repository's composite Action to gate CI on lockfile drift:
 ```yaml
 - uses: msitarzewski/agency-agents-app/.github/actions/agency-verify@main
   with:
-    version: latest
+    # both are required — the Action refuses `latest` and unverified downloads
+    version: v0.3.0
+    sha256: <sha256 of that release's Linux AppImage>
     project-path: .
     fail-on-drift: true
 ```
 
-The Action downloads the requested released Linux AppImage and runs stateless `verify`; it does not launch or initialize the desktop app.
+The Action downloads the pinned released Linux AppImage, checks it against the
+supplied SHA-256 before making it executable, and then runs stateless `verify`;
+it does not launch or initialize the desktop app. A pinned tag and digest are
+mandatory because the step executes the downloaded binary in your CI — an
+unpinned `latest` would let a replaced release asset run code in every consumer's
+workflow. Linux x64 runners only, since the AppImage is the directly executable
+release artifact.
 
 ## Build From Source
 
