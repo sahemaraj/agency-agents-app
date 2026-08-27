@@ -115,27 +115,41 @@ jobs:
             else { Write-Host "$d -> NOT FOUND on PATH" }
           }
 
-          # Decisive part: run the binary under several PATH variants and
-          # report which one lets it load. Resolution above comes from
-          # Get-Command (PATH order); the real loader uses its own order, so
-          # only actually executing it settles which fix works. --list is used
-          # so a successful load returns quickly instead of running the suite.
-          $orig = $env:PATH
-          $variants = [ordered]@{
-            'as-is'                     = $orig
-            'system32 first'            = "C:\Windows\System32;$orig"
-            'no Java/Python'            = (($orig -split ';' | Where-Object { $_ -notmatch 'Java_|jdk|Python' }) -join ';')
-            'no hostedtoolcache at all' = (($orig -split ';' | Where-Object { $_ -notmatch 'hostedtoolcache' }) -join ';')
+          # PATH variants were already ruled out: as-is, system32-first,
+          # Java/Python stripped and hostedtoolcache stripped ALL failed with
+          # 0xc0000139 identically. So the DLL that is missing the export
+          # loads regardless of PATH. Stop guessing and compute the exact
+          # missing symbol: diff the binary's import table against each
+          # resolved DLL's real export table. Whatever is imported but not
+          # exported IS the failure.
+          Write-Host '--- imports not present in the resolved DLL exports ---'
+          $imports = & $dumpbin.FullName /imports $exe.FullName
+          $currentDll = $null
+          $wanted = @{}
+          foreach ($line in $imports) {
+            if ($line -match '^\s{4}(\S+\.dll)\s*$') { $currentDll = $Matches[1]; $wanted[$currentDll] = @(); continue }
+            if ($currentDll -and $line -match '^\s+[0-9A-Fa-f]{8,}\s+[0-9A-Fa-f]+\s+(\S+)$') { $wanted[$currentDll] += $Matches[1] }
           }
-          foreach ($name in $variants.Keys) {
-            $env:PATH = $variants[$name]
-            & $exe.FullName --list *> $null
-            $code = $LASTEXITCODE
-            $hex = '0x{0:x8}' -f ($code -band 0xffffffff)
-            if ($code -eq 0) { Write-Host "PATH[$name] -> LOADS OK" }
-            else { Write-Host "PATH[$name] -> exit $code ($hex)" }
+          $missingTotal = 0
+          foreach ($dll in $wanted.Keys) {
+            $path = Join-Path 'C:\Windows\System32' $dll
+            if (-not (Test-Path $path)) {
+              $cmd = Get-Command $dll -ErrorAction SilentlyContinue
+              if ($cmd) { $path = $cmd.Source } else { Write-Host "  $dll -> unresolvable"; continue }
+            }
+            $exports = & $dumpbin.FullName /exports $path |
+              ForEach-Object { if ($_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)') { $Matches[1] } }
+            $set = @{}; foreach ($e in $exports) { $set[$e] = $true }
+            $missing = @($wanted[$dll] | Where-Object { -not $set.ContainsKey($_) })
+            if ($missing.Count -gt 0) {
+              $missingTotal += $missing.Count
+              Write-Host ">>> $dll ($path) is MISSING $($missing.Count):"
+              $missing | Select-Object -First 15 | ForEach-Object { Write-Host "      $_" }
+            }
           }
-          $env:PATH = $orig
+          if ($missingTotal -eq 0) {
+            Write-Host 'no direct import is missing -- the failure is in a transitively loaded DLL'
+          }
 
       - name: Self-check stateless lockfile verification
         shell: pwsh
