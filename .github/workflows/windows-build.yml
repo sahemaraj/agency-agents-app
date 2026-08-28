@@ -147,8 +147,41 @@ jobs:
               $missing | Select-Object -First 15 | ForEach-Object { Write-Host "      $_" }
             }
           }
-          if ($missingTotal -eq 0) {
-            Write-Host 'no direct import is missing -- the failure is in a transitively loaded DLL'
+          # Print what was actually parsed. Without this, "nothing missing" is
+          # indistinguishable from "the parser matched no symbols" -- a
+          # vacuous pass dressed up as a clean result.
+          $totalSyms = ($wanted.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+          Write-Host "parsed $($wanted.Keys.Count) DLLs / $totalSyms imported symbols; missing = $missingTotal"
+          if ($totalSyms -eq 0) { Write-Host 'PARSER MATCHED NOTHING -- the result above is meaningless'; }
+
+          # Direct imports are clean, so recurse one level: for each DLL the
+          # binary imports, check ITS imports against its own resolved
+          # dependencies. The entry point that is missing lives somewhere in
+          # that transitive set.
+          if ($missingTotal -eq 0 -and $totalSyms -gt 0) {
+            Write-Host '--- one level deeper: transitive imports ---'
+            foreach ($dll in $wanted.Keys) {
+              $path = Join-Path 'C:\Windows\System32' $dll
+              if (-not (Test-Path $path)) { $c = Get-Command $dll -ErrorAction SilentlyContinue; if ($c) { $path = $c.Source } else { continue } }
+              $sub = & $dumpbin.FullName /imports $path
+              $cur = $null; $subWanted = @{}
+              foreach ($line in $sub) {
+                if ($line -match '^\s{4}(\S+\.dll)\s*$') { $cur = $Matches[1]; if (-not $subWanted.ContainsKey($cur)) { $subWanted[$cur] = @() }; continue }
+                if ($cur -and $line -match '^\s+[0-9A-Fa-f]{8,}\s+[0-9A-Fa-f]+\s+(\S+)$') { $subWanted[$cur] += $Matches[1] }
+              }
+              foreach ($d2 in $subWanted.Keys) {
+                $p2 = Join-Path 'C:\Windows\System32' $d2
+                if (-not (Test-Path $p2)) { $c2 = Get-Command $d2 -ErrorAction SilentlyContinue; if ($c2) { $p2 = $c2.Source } else { Write-Host "  $dll -> $d2 UNRESOLVABLE"; continue } }
+                $ex2 = & $dumpbin.FullName /exports $p2 |
+                  ForEach-Object { if ($_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)') { $Matches[1] } }
+                $s2 = @{}; foreach ($e in $ex2) { $s2[$e] = $true }
+                $m2 = @($subWanted[$d2] | Where-Object { -not $s2.ContainsKey($_) })
+                if ($m2.Count -gt 0) {
+                  Write-Host ">>> $dll needs $d2 ($p2), MISSING $($m2.Count):"
+                  $m2 | Select-Object -First 10 | ForEach-Object { Write-Host "      $_" }
+                }
+              }
+            }
           }
 
       - name: Self-check stateless lockfile verification
